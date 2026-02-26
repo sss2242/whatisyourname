@@ -43,15 +43,23 @@ You should see `(venv)` at the beginning of your terminal prompt. Every time you
 ### Step 3: Install dependencies
 
 ```bash
-pip install -r requirements.txt
+pip install --timeout 300 -r requirements.txt
 ```
 
-This will download and install all required packages. The first run takes a few minutes because PyTorch is a large download (~2 GB). Subsequent installs will be fast.
+This will download and install all required packages. The first run takes **5-10 minutes** because PyTorch is a large download (~2 GB) and some packages compile C extensions. The `--timeout 300` flag prevents pip from timing out on slow connections. If your connection is particularly slow, you can increase it further (e.g. `--timeout 600`).
 
-If you want a lighter install without deep learning models (LSTM, Transformer), you can manually install just the core packages:
+If the install stalls or times out, try again with retries:
 
 ```bash
-pip install requests pandas numpy pyarrow pyyaml python-dotenv statsmodels scikit-learn ruptures hmmlearn arch xgboost matplotlib pytest
+pip install --timeout 300 --retries 5 -r requirements.txt
+```
+
+Some packages (jquants-api-client, pykrx, sdmx1, python-bcb) require Python 3.10+. If you are on Python 3.9, pip will skip those and the pipeline will gracefully fall back to alternative data sources.
+
+**Lighter install** -- skip deep learning models (LSTM, Transformer) for faster setup:
+
+```bash
+pip install --timeout 300 requests pandas numpy pyarrow pyyaml python-dotenv statsmodels scikit-learn ruptures hmmlearn arch xgboost matplotlib yfinance fredapi wbgapi edgartools ixbrl-parse pytest
 ```
 
 The pipeline will still work -- it gracefully skips models whose dependencies are missing.
@@ -198,15 +206,19 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ### Step 3: Install dependencies
 
 ```cmd
-pip install -r requirements.txt
+pip install --timeout 300 -r requirements.txt
 ```
 
-This takes a few minutes on first run (PyTorch is ~2 GB).
-
-For a lighter install without deep learning:
+This takes **5-10 minutes** on first run (PyTorch is ~2 GB). The `--timeout 300` flag prevents pip from timing out on slow connections. If it stalls, try again with:
 
 ```cmd
-pip install requests pandas numpy pyarrow pyyaml python-dotenv statsmodels scikit-learn ruptures hmmlearn arch xgboost matplotlib pytest
+pip install --timeout 300 --retries 5 -r requirements.txt
+```
+
+**Lighter install** -- skip deep learning for faster setup:
+
+```cmd
+pip install --timeout 300 requests pandas numpy pyarrow pyyaml python-dotenv statsmodels scikit-learn ruptures hmmlearn arch xgboost matplotlib yfinance fredapi wbgapi edgartools ixbrl-parse pytest
 ```
 
 ### Step 4: Configure API keys (optional)
@@ -305,6 +317,13 @@ Run `sudo apt install python3-pip -y`.
 
 ### "'python' is not recognized" (Windows)
 Python was not added to PATH during installation. Reinstall Python and check the "Add Python to PATH" box, or use the full path: `C:\Users\YourName\AppData\Local\Programs\Python\Python310\python.exe`.
+
+### pip install times out or hangs
+The full requirements include large packages (PyTorch ~2 GB). Use the timeout flag:
+```bash
+pip install --timeout 300 --retries 5 -r requirements.txt
+```
+If it still fails, use the lighter install command shown in Step 3 -- it skips PyTorch and installs only the core packages needed for financial analysis.
 
 ### PyTorch install fails or takes too long
 PyTorch is optional. Skip it and use the lighter install command shown above. The pipeline will fall back to statistical models (Kalman, GARCH, tree ensembles).

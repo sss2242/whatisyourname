@@ -112,10 +112,18 @@ class USEdgarClient:
 
     def __init__(
         self,
-        user_agent: str = _DEFAULT_USER_AGENT,
+        user_agent: str = "",
         cache_dir: Path | str = _CACHE_DIR,
     ) -> None:
-        self._user_agent = user_agent
+        # Prefer EDGAR_IDENTITY env var (email), fall back to provided arg or default
+        self._user_agent = (
+            user_agent
+            or os.environ.get("EDGAR_IDENTITY", "")
+            or _DEFAULT_USER_AGENT
+        )
+        # SEC requires email in User-Agent; if EDGAR_IDENTITY is just an email, wrap it
+        if "@" in self._user_agent and "/" not in self._user_agent:
+            self._user_agent = f"Operator1/1.0 ({self._user_agent})"
         self._cache_dir = Path(cache_dir)
         self._edgar_initialized = False
         self._sec_api_client = None
@@ -391,7 +399,15 @@ class USEdgarClient:
                     "sic": data.get("sic", ""),
                 }
             except Exception as exc2:
-                raise USEdgarError("get_profile", f"Both methods failed for {identifier}: {exc2}") from exc2
+                # Third fallback: direct requests to SEC JSON endpoints (no library needed)
+                try:
+                    raw_profile = self._fetch_profile_direct_requests(identifier)
+                except Exception as exc3:
+                    raise USEdgarError(
+                        "get_profile",
+                        f"All three methods failed for {identifier}: "
+                        f"edgartools={exc}, sec-edgar-api={exc2}, direct={exc3}",
+                    ) from exc3
 
         # Translate to canonical profile format
         from operator1.clients.canonical_translator import translate_profile
@@ -400,6 +416,75 @@ class USEdgarClient:
         # Cache to disk
         self._write_cache(identifier, "profile.json", profile)
         return profile
+
+    def _fetch_profile_direct_requests(self, identifier: str) -> dict[str, Any]:
+        """Fetch profile using direct requests to SEC JSON endpoints.
+
+        This is the last-resort fallback when neither edgartools nor
+        sec-edgar-api is available or working. Uses only the stdlib
+        requests library with proper User-Agent headers.
+
+        SEC endpoints used:
+        - /files/company_tickers.json -- ticker-to-CIK mapping
+        - /cgi-bin/browse-edgar?action=getcompany&CIK=... -- submissions
+        - /api/xbrl/companyfacts/CIK{cik}.json -- company facts
+        """
+        import requests
+
+        headers = {"User-Agent": self._user_agent, "Accept": "application/json"}
+
+        # Step 1: Resolve ticker to CIK
+        resp = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        tickers_data = resp.json()
+
+        cik = ""
+        company_name = ""
+        ticker_upper = identifier.upper()
+        for entry in tickers_data.values():
+            if str(entry.get("ticker", "")).upper() == ticker_upper:
+                cik = str(entry["cik_str"]).zfill(10)
+                company_name = entry.get("title", "")
+                break
+            if str(entry.get("cik_str", "")) == identifier:
+                cik = str(entry["cik_str"]).zfill(10)
+                company_name = entry.get("title", "")
+                ticker_upper = str(entry.get("ticker", identifier)).upper()
+                break
+
+        if not cik:
+            raise USEdgarError("get_profile", f"Ticker/CIK not found: {identifier}")
+
+        # Step 2: Fetch company submissions for metadata
+        subs_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        resp = requests.get(subs_url, headers=headers, timeout=15)
+
+        raw_profile: dict[str, Any] = {
+            "name": company_name,
+            "ticker": ticker_upper,
+            "cik": cik,
+            "isin": "",
+            "country": "US",
+            "currency": "USD",
+        }
+
+        if resp.status_code == 200:
+            data = resp.json()
+            raw_profile.update({
+                "name": data.get("name", company_name),
+                "sector": data.get("sicDescription", ""),
+                "industry": data.get("sicDescription", ""),
+                "exchange": (data.get("exchanges") or [""])[0],
+                "fiscal_year_end": data.get("fiscalYearEnd", ""),
+                "sic": data.get("sic", ""),
+            })
+
+        logger.info("Direct requests profile for %s: %s", identifier, raw_profile.get("name"))
+        return raw_profile
 
     # -- Financial statements ------------------------------------------------
 
@@ -824,7 +909,12 @@ class USEdgarClient:
             facts = client.get_company_facts(cik)
         except Exception as exc:
             logger.error("Fallback companyfacts failed for %s: %s", identifier, exc)
-            return pd.DataFrame()
+            # Third fallback: direct requests to companyfacts endpoint
+            try:
+                facts = self._fetch_companyfacts_direct(identifier)
+            except Exception as exc2:
+                logger.error("Direct companyfacts also failed for %s: %s", identifier, exc2)
+                return pd.DataFrame()
 
         concept_map = {
             "income": _USGAAP_INCOME_CONCEPTS,
@@ -910,3 +1000,45 @@ class USEdgarClient:
                     if isinstance(v, pd.Timestamp):
                         r[k] = v.isoformat()
             self._write_cache(identifier, filename, {"period_end": period_str, "rows": records})
+
+    def _fetch_companyfacts_direct(self, identifier: str) -> dict:
+        """Fetch companyfacts JSON using direct requests (no library needed).
+
+        This is the last-resort fallback when neither edgartools nor
+        sec-editor-api is available. Uses the SEC EDGAR XBRL API directly.
+
+        Endpoint: https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json
+        """
+        import requests
+
+        headers = {"User-Agent": self._user_agent, "Accept": "application/json"}
+
+        # Resolve ticker to CIK using the tickers JSON
+        resp = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        tickers_data = resp.json()
+
+        cik = ""
+        ticker_upper = identifier.upper()
+        for entry in tickers_data.values():
+            if str(entry.get("ticker", "")).upper() == ticker_upper:
+                cik = str(entry["cik_str"]).zfill(10)
+                break
+            if str(entry.get("cik_str", "")) == identifier:
+                cik = str(entry["cik_str"]).zfill(10)
+                break
+
+        if not cik:
+            raise USEdgarError("companyfacts", f"CIK not found for: {identifier}")
+
+        # Fetch companyfacts
+        facts_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        resp = requests.get(facts_url, headers=headers, timeout=30)
+        resp.raise_for_status()
+
+        logger.info("Direct companyfacts fetched for %s (CIK %s)", identifier, cik)
+        return resp.json()

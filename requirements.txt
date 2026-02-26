@@ -38,6 +38,10 @@ dtaidistance>=2.3      # Dynamic Time Warping for historical analogs (G1)
 # Report generation (Phase 7, used in report_generator.py)
 matplotlib>=3.6
 
+# News sentiment (Step 5e, used in news_sentiment.py)
+gnews>=0.4.0               # Google News scraper (no API key) -- primary news source
+feedparser>=6.0            # RSS feed parser (Google News RSS fallback, no key)
+
 # Not yet used:
 # plotly>=5.13
 
@@ -54,7 +58,7 @@ pycvm>=0.4                 # Brazil CVM data (optional, used for local file pars
 # Phase 2: Tier 2 market wrappers (optional -- graceful degradation if not installed)
 # akshare>=1.18             # China SSE/SZSE (comprehensive: stocks, financials, macro) -- research: .roo/research/cn-sse-2026-02-24.md
 # jugaad-data>=0.29         # India NSE/BSE (stock data, RBI rates) -- research: .roo/research/in-bse-2026-02-24.md
-ixbrl-parse>=0.10          # UK Companies House iXBRL financial extraction -- research: .roo/research/uk-ixbrl-parse-2026-02-25.md
+# ixbrl-parse -- already listed above in Phase 1 section
 
 # Phase 2b: OHLCV per-region wrappers (primary sources, graceful fallback to yfinance)
 yfinance>=1.2.0            # Global OHLCV fallback (no key) -- research: .roo/research/ohlcv-yfinance-2026-02-24.md
