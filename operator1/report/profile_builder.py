@@ -178,11 +178,11 @@ def _build_current_state_section(cache: pd.DataFrame | None) -> dict[str, Any]:
         "available": True,
         "date": str(latest.name.date()) if hasattr(latest.name, "date") else str(latest.name),
         "tier1_liquidity": {
-            "cash_and_equivalents": _get("cash_and_equivalents_asof"),
+            "cash_and_equivalents": _get("cash_and_equivalents"),
             "cash_ratio": _get("cash_ratio"),
             "current_ratio": _get("current_ratio"),
-            "free_cash_flow_ttm": _get("free_cash_flow_ttm"),
-            "operating_cash_flow": _get("operating_cash_flow_asof"),
+            "free_cash_flow_ttm": _get("free_cash_flow_ttm_asof"),
+            "operating_cash_flow": _get("operating_cash_flow"),
         },
         "tier2_solvency": {
             "total_debt": _get("total_debt_asof"),

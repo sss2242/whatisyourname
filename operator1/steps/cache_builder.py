@@ -67,12 +67,15 @@ QUOTE_FIELDS = (
 
 # Financial-statement decision variables (Sec 8)
 STATEMENT_FIELDS = (
-    "revenue", "gross_profit", "operating_income", "ebit", "ebitda", "net_income",
+    "revenue", "cost_of_revenue", "gross_profit",
+    "operating_income", "ebit", "ebitda", "net_income",
     "interest_expense", "taxes",
     "total_assets", "total_liabilities", "total_equity",
     "current_assets", "current_liabilities",
     "cash_and_equivalents", "short_term_debt", "long_term_debt",
-    "total_debt", "receivables",
+    "total_debt", "retained_earnings",
+    "goodwill", "intangible_assets",
+    "receivables", "inventory", "payables",
     "operating_cash_flow", "capex", "free_cash_flow",
     "investing_cf", "financing_cf", "dividends_paid",
     "stock_buybacks",
@@ -327,6 +330,7 @@ def _build_column_rename_map(columns: list[str]) -> dict[str, str]:
         "financing_cashflow": "financing_cf",
         "pretax_income": "ebit",
         "eps": "eps",
+        "eps_basic": "eps",  # canonical translator outputs eps_basic
         "epsDiluted": "eps_diluted",
         "sharesOutstanding": "shares_outstanding",
         "marketCap": "market_cap",

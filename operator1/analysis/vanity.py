@@ -91,14 +91,8 @@ def _rnd_growth_mismatch(df: pd.DataFrame) -> pd.Series:
 
     Returns 0-100 score; NaN where inputs missing.
     """
-    rnd = df.get("rd_expenses_asof",
-                 df.get("rd_expenses",
-                        df.get("research_and_development_asof",
-                               df.get("research_and_development",
-                                      pd.Series(np.nan, index=df.index)))))
-    revenue = df.get("revenue_asof",
-                     df.get("revenue",
-                            pd.Series(np.nan, index=df.index)))
+    rnd = df.get("rd_expenses", pd.Series(np.nan, index=df.index))
+    revenue = df.get("revenue", pd.Series(np.nan, index=df.index))
 
     # R&D intensity
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -141,14 +135,8 @@ def _sga_bloat_v2(df: pd.DataFrame) -> pd.Series:
 
     Returns 0-100 score; NaN where inputs missing.
     """
-    sga = df.get("sga_expenses_asof",
-                 df.get("sga_expenses",
-                        df.get("sga_expense_asof",
-                               df.get("sga_expense",
-                                      pd.Series(np.nan, index=df.index)))))
-    revenue = df.get("revenue_asof",
-                     df.get("revenue",
-                            pd.Series(np.nan, index=df.index)))
+    sga = df.get("sga_expenses", pd.Series(np.nan, index=df.index))
+    revenue = df.get("revenue", pd.Series(np.nan, index=df.index))
     op_margin = df.get("operating_margin",
                        pd.Series(np.nan, index=df.index))
 
@@ -205,13 +193,11 @@ def _capital_misallocation(df: pd.DataFrame) -> pd.Series:
                        pd.Series(np.nan, index=df.index))
     solv_score = df.get("fh_solvency_score",
                         pd.Series(np.nan, index=df.index))
-    dividends = df.get("dividends_paid_asof",
+    dividends = df.get("dividends_paid",
                        pd.Series(np.nan, index=df.index))
     nd_ebitda = df.get("net_debt_to_ebitda",
                        pd.Series(np.nan, index=df.index))
-    revenue = df.get("revenue_asof",
-                     df.get("revenue",
-                            pd.Series(np.nan, index=df.index)))
+    revenue = df.get("revenue", pd.Series(np.nan, index=df.index))
 
     score = pd.Series(0.0, index=df.index)
     has_data = pd.Series(False, index=df.index)
