@@ -65,7 +65,8 @@ yfinance>=1.2.0            # Global OHLCV fallback (no key) -- research: .roo/re
 pykrx>=1.0                 # Korea OHLCV primary (no key) -- research: .roo/research/ohlcv-per-region-2026-02-25.md
 twstock>=1.4.0             # Taiwan OHLCV primary (no key) -- research: .roo/research/ohlcv-per-region-2026-02-25.md
 # akshare>=1.18             # China OHLCV primary (no key, heavy deps) -- optional, uncomment if needed
-jugaad-data>=0.29          # India OHLCV primary (no key) -- research: .roo/research/ohlcv-per-region-2026-02-25.md
+# jugaad-data -- REMOVED: NSE geo-blocks non-Indian IPs, causing infinite hangs.
+# India OHLCV now uses yfinance (.NS suffix) as primary. PIT uses BSE API fallback.
 
 # Phase 3: Macro data libraries (per-region primary + wbgapi fallback)
 wbgapi>=1.0.13             # Global macro fallback (no key) -- research: .roo/research/macro-wbgapi-2026-02-24.md

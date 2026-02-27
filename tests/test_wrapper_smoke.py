@@ -68,24 +68,17 @@ class TestOHLCVNoKey:
         df = fetch_ohlcv_twstock("2330", years=1)
         _non_empty_df(df, "twstock/TSMC", min_rows=10)
 
-    def test_jugaad_reliance(self):
-        """jugaad-data: fetch Reliance Industries (IN). May fail due to NSE geo-blocking."""
-        from operator1.clients.ohlcv_jugaad import fetch_ohlcv_jugaad
-        df = fetch_ohlcv_jugaad("RELIANCE", years=1)
-        if df.empty:
-            # NSE blocks non-Indian IPs; verify yfinance fallback works instead
-            logger.warning("jugaad-data returned empty (NSE geo-block); testing yfinance fallback")
-            from operator1.clients.ohlcv_yfinance import fetch_ohlcv_yfinance
-            df = fetch_ohlcv_yfinance("RELIANCE", market_id="in_bse", years=1)
-            _non_empty_df(df, "yfinance-fallback/Reliance-IN", min_rows=50)
-        else:
-            _non_empty_df(df, "jugaad/Reliance", min_rows=50)
+    def test_yfinance_reliance_india(self):
+        """yfinance: fetch Reliance Industries (IN) via .NS suffix."""
+        from operator1.clients.ohlcv_yfinance import fetch_ohlcv_yfinance
+        df = fetch_ohlcv_yfinance("RELIANCE", market_id="in_bse", years=1)
+        _non_empty_df(df, "yfinance/Reliance-IN", min_rows=50)
 
-    def test_ohlcv_provider_india_fallback(self):
-        """ohlcv_provider: verify India falls back to yfinance when jugaad fails."""
+    def test_ohlcv_provider_india(self):
+        """ohlcv_provider: verify India uses yfinance (no jugaad-data)."""
         from operator1.clients.ohlcv_provider import fetch_ohlcv
         df = fetch_ohlcv("RELIANCE", market_id="in_bse", years=1)
-        _non_empty_df(df, "ohlcv_provider/Reliance-IN-fallback", min_rows=50)
+        _non_empty_df(df, "ohlcv_provider/Reliance-IN", min_rows=50)
 
     def test_ohlcv_provider_dispatch(self):
         """ohlcv_provider: dispatch test with AAPL via yfinance fallback."""

@@ -20,7 +20,8 @@ _PRIMARY_FETCHERS: dict[str, str] = {
     "kr_dart": "pykrx",
     "tw_mops": "twstock",
     "cn_sse": "akshare",
-    "in_bse": "jugaad",
+    # India: yfinance (.NS suffix) is now the primary. jugaad-data was removed
+    # because NSE geo-blocks non-Indian IPs causing infinite connection hangs.
 }
 
 
@@ -69,13 +70,6 @@ def fetch_ohlcv(
             df = fetch_ohlcv_akshare(ticker, years=years)
         except Exception as exc:
             logger.debug("akshare primary failed: %s", exc)
-
-    elif primary == "jugaad":
-        try:
-            from operator1.clients.ohlcv_jugaad import fetch_ohlcv_jugaad
-            df = fetch_ohlcv_jugaad(ticker, years=years)
-        except Exception as exc:
-            logger.debug("jugaad-data primary failed: %s", exc)
 
     # J-Quants OHLCV is handled inside jp_jquants_wrapper.py get_quotes()
     # So jp_jquants is NOT listed here -- it goes through the PIT client path.
