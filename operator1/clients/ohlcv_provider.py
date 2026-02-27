@@ -19,8 +19,9 @@ logger = logging.getLogger(__name__)
 _PRIMARY_FETCHERS: dict[str, str] = {
     "kr_dart": "pykrx",
     "tw_mops": "twstock",
-    "cn_sse": "akshare",
-    "in_bse": "jugaad",
+    # China: yfinance (.SS/.SZ suffix) is now the primary. akshare was removed
+    # because Chinese finance APIs geo-block non-Chinese IPs.
+    "in_bse": "nselib",  # India: nselib (NSE data, no key, no geo-blocking)
 }
 
 
@@ -63,19 +64,12 @@ def fetch_ohlcv(
         except Exception as exc:
             logger.debug("twstock primary failed: %s", exc)
 
-    elif primary == "akshare":
+    elif primary == "nselib":
         try:
-            from operator1.clients.ohlcv_akshare import fetch_ohlcv_akshare
-            df = fetch_ohlcv_akshare(ticker, years=years)
+            from operator1.clients.ohlcv_nselib import fetch_ohlcv_nselib
+            df = fetch_ohlcv_nselib(ticker, years=years)
         except Exception as exc:
-            logger.debug("akshare primary failed: %s", exc)
-
-    elif primary == "jugaad":
-        try:
-            from operator1.clients.ohlcv_jugaad import fetch_ohlcv_jugaad
-            df = fetch_ohlcv_jugaad(ticker, years=years)
-        except Exception as exc:
-            logger.debug("jugaad-data primary failed: %s", exc)
+            logger.debug("nselib primary failed: %s", exc)
 
     # J-Quants OHLCV is handled inside jp_jquants_wrapper.py get_quotes()
     # So jp_jquants is NOT listed here -- it goes through the PIT client path.
