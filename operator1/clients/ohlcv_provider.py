@@ -20,8 +20,7 @@ _PRIMARY_FETCHERS: dict[str, str] = {
     "kr_dart": "pykrx",
     "tw_mops": "twstock",
     "cn_sse": "akshare",
-    # India: yfinance (.NS suffix) is now the primary. jugaad-data was removed
-    # because NSE geo-blocks non-Indian IPs causing infinite connection hangs.
+    "in_bse": "nselib",  # India: nselib (NSE data, no key, no geo-blocking)
 }
 
 
@@ -70,6 +69,13 @@ def fetch_ohlcv(
             df = fetch_ohlcv_akshare(ticker, years=years)
         except Exception as exc:
             logger.debug("akshare primary failed: %s", exc)
+
+    elif primary == "nselib":
+        try:
+            from operator1.clients.ohlcv_nselib import fetch_ohlcv_nselib
+            df = fetch_ohlcv_nselib(ticker, years=years)
+        except Exception as exc:
+            logger.debug("nselib primary failed: %s", exc)
 
     # J-Quants OHLCV is handled inside jp_jquants_wrapper.py get_quotes()
     # So jp_jquants is NOT listed here -- it goes through the PIT client path.

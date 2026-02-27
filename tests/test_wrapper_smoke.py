@@ -68,17 +68,23 @@ class TestOHLCVNoKey:
         df = fetch_ohlcv_twstock("2330", years=1)
         _non_empty_df(df, "twstock/TSMC", min_rows=10)
 
+    def test_nselib_reliance_india(self):
+        """nselib: fetch Reliance Industries (IN) -- regional primary."""
+        from operator1.clients.ohlcv_nselib import fetch_ohlcv_nselib
+        df = fetch_ohlcv_nselib("RELIANCE", years=1)
+        _non_empty_df(df, "nselib/Reliance-IN", min_rows=10)
+
     def test_yfinance_reliance_india(self):
-        """yfinance: fetch Reliance Industries (IN) via .NS suffix."""
+        """yfinance: fetch Reliance (IN) via .NS suffix -- fallback."""
         from operator1.clients.ohlcv_yfinance import fetch_ohlcv_yfinance
         df = fetch_ohlcv_yfinance("RELIANCE", market_id="in_bse", years=1)
         _non_empty_df(df, "yfinance/Reliance-IN", min_rows=50)
 
     def test_ohlcv_provider_india(self):
-        """ohlcv_provider: verify India uses yfinance (no jugaad-data)."""
+        """ohlcv_provider: India dispatch (nselib primary -> yfinance fallback)."""
         from operator1.clients.ohlcv_provider import fetch_ohlcv
         df = fetch_ohlcv("RELIANCE", market_id="in_bse", years=1)
-        _non_empty_df(df, "ohlcv_provider/Reliance-IN", min_rows=50)
+        _non_empty_df(df, "ohlcv_provider/Reliance-IN", min_rows=10)
 
     def test_ohlcv_provider_dispatch(self):
         """ohlcv_provider: dispatch test with AAPL via yfinance fallback."""
