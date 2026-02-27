@@ -107,7 +107,9 @@ _IFRS_MAP: dict[str, str] = {
     "ifrs-full:ShorttermBorrowings": "short_term_debt",
     "ifrs-full:Borrowings": "total_debt",
     "ifrs-full:NoncurrentBorrowings": "long_term_debt",
-    "ifrs-full:DepreciationAndAmortisationExpense": "ebitda",  # proxy: D&A component
+    # NOTE: D&A is a *component* of EBITDA, not EBITDA itself.
+    # EBITDA = operating_income + D&A. Mapping removed to avoid injecting
+    # incorrect values. EBITDA is computed downstream when both inputs exist.
     # free_cash_flow: computed downstream (operating_cash_flow - capex)
 }
 
@@ -375,8 +377,8 @@ _CAS_MAP: dict[str, str] = {
     "所得税费用": "taxes",
     "利息支出": "interest_expense",
     "财务费用": "interest_expense",
-    "销售费用": "sga_expenses",
-    "管理费用": "sga_expenses",
+    "销售费用": "sga_selling",       # selling expenses (component of SGA)
+    "管理费用": "sga_admin",         # admin expenses (component of SGA)
     "研发费用": "rd_expenses",
     "毛利润": "gross_profit",
     # Balance sheet (资产负债表)
@@ -462,8 +464,8 @@ _USGAAP_MAP: dict[str, str] = {
     "us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxes": "ebit",
     "IncomeLossFromContinuingOperationsBeforeIncomeTaxes": "ebit",
     "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest": "ebit",
-    # ebitda -- SEC filers rarely report EBITDA directly; use operating income as proxy
-    "us-gaap:OperatingExpenses": "ebitda",  # some filers report this
+    # NOTE: OperatingExpenses != EBITDA. Removed incorrect mapping.
+    # EBITDA is computed downstream (operating_income + depreciation_amortization).
     # goodwill
     "us-gaap:Goodwill": "goodwill",
     "Goodwill": "goodwill",
@@ -891,6 +893,19 @@ def pivot_to_canonical_wide(
             aggfunc="first",
         ).reset_index()
         wide = wide.sort_values(date_col, ascending=False)
+
+        # Sum split SGA components (China CAS reports selling + admin separately)
+        if "sga_selling" in wide.columns or "sga_admin" in wide.columns:
+            selling = wide.get("sga_selling", pd.Series(0.0, index=wide.index)).fillna(0)
+            admin = wide.get("sga_admin", pd.Series(0.0, index=wide.index)).fillna(0)
+            if "sga_expenses" not in wide.columns:
+                wide["sga_expenses"] = selling + admin
+            else:
+                # Only fill where sga_expenses is missing
+                missing = wide["sga_expenses"].isna()
+                wide.loc[missing, "sga_expenses"] = selling[missing] + admin[missing]
+            wide = wide.drop(columns=["sga_selling", "sga_admin"], errors="ignore")
+
         return wide
     except Exception as exc:
         logger.warning("Pivot to wide format failed: %s", exc)

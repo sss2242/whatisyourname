@@ -39,7 +39,7 @@ def _make_cache(days: int = 100, **overrides) -> pd.DataFrame:
         "rd_expenses": rng.uniform(50_000, 200_000, days),
         "sga_expenses": rng.uniform(200_000, 400_000, days),
         "operating_margin": rng.uniform(0.05, 0.25, days),
-        "total_debt_asof": 500_000 + rng.randn(days).cumsum() * 5_000,
+        "total_debt": 500_000 + rng.randn(days).cumsum() * 5_000,
         "fh_liquidity_score": rng.uniform(20, 80, days),
         "fh_solvency_score": rng.uniform(20, 80, days),
         "dividends_paid": rng.uniform(0, 50_000, days),
@@ -160,7 +160,7 @@ class TestCapitalMisallocation:
         days = 50
         cache = _make_cache(
             days=days,
-            total_debt_asof=np.linspace(500_000, 800_000, days),
+            total_debt=np.linspace(500_000, 800_000, days),
             fh_liquidity_score=np.linspace(70, 20, days),
         )
         result = _capital_misallocation(cache)
