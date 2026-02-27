@@ -448,18 +448,17 @@ class TestRegionalPIT:
 class TestOtherFreeWrappers:
     """akshare OHLCV, pit_registry, equity_provider, canonical_translator, supplement."""
 
-    def test_ohlcv_akshare_china(self):
-        """akshare: fetch Kweichow Moutai OHLCV (CN, no key). Falls back to yfinance if blocked."""
-        from operator1.clients.ohlcv_akshare import fetch_ohlcv_akshare
-        df = fetch_ohlcv_akshare("600519", years=1)
-        if df.empty:
-            # Chinese finance APIs (Sina/EastMoney) sometimes block cloud IPs
-            logger.warning("akshare returned empty (likely IP-blocked); verifying yfinance fallback")
-            from operator1.clients.ohlcv_yfinance import fetch_ohlcv_yfinance
-            df = fetch_ohlcv_yfinance("600519", market_id="cn_sse", years=1)
-            _non_empty_df(df, "yfinance-fallback/600519-CN", min_rows=50)
-        else:
-            _non_empty_df(df, "akshare/600519", min_rows=50)
+    def test_yfinance_china_moutai(self):
+        """yfinance: fetch Kweichow Moutai OHLCV (CN .SS suffix, no key)."""
+        from operator1.clients.ohlcv_yfinance import fetch_ohlcv_yfinance
+        df = fetch_ohlcv_yfinance("600519", market_id="cn_sse", years=1)
+        _non_empty_df(df, "yfinance/600519-CN", min_rows=50)
+
+    def test_ohlcv_provider_china(self):
+        """ohlcv_provider: China dispatch (yfinance .SS suffix)."""
+        from operator1.clients.ohlcv_provider import fetch_ohlcv
+        df = fetch_ohlcv("600519", market_id="cn_sse", years=1)
+        _non_empty_df(df, "ohlcv_provider/600519-CN", min_rows=50)
 
     def test_pit_registry_list_markets(self):
         """pit_registry: verify market listing works."""

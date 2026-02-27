@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 _PRIMARY_FETCHERS: dict[str, str] = {
     "kr_dart": "pykrx",
     "tw_mops": "twstock",
-    "cn_sse": "akshare",
+    # China: yfinance (.SS/.SZ suffix) is now the primary. akshare was removed
+    # because Chinese finance APIs geo-block non-Chinese IPs.
     "in_bse": "nselib",  # India: nselib (NSE data, no key, no geo-blocking)
 }
 
@@ -62,13 +63,6 @@ def fetch_ohlcv(
             df = fetch_ohlcv_twstock(ticker, years=years)
         except Exception as exc:
             logger.debug("twstock primary failed: %s", exc)
-
-    elif primary == "akshare":
-        try:
-            from operator1.clients.ohlcv_akshare import fetch_ohlcv_akshare
-            df = fetch_ohlcv_akshare(ticker, years=years)
-        except Exception as exc:
-            logger.debug("akshare primary failed: %s", exc)
 
     elif primary == "nselib":
         try:

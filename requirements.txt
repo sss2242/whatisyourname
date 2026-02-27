@@ -56,7 +56,8 @@ ixbrl-parse>=0.10.0           # UK iXBRL document parser for Companies House fin
 pycvm>=0.4                 # Brazil CVM data (optional, used for local file parsing)
 
 # Phase 2: Tier 2 market wrappers (optional -- graceful degradation if not installed)
-akshare>=1.18              # China SSE/SZSE (comprehensive: stocks, financials, macro) -- research: .roo/research/cn-sse-2026-02-24.md
+# akshare -- REMOVED: Chinese finance APIs (Sina/EastMoney) geo-block non-Chinese IPs.
+# China OHLCV now uses yfinance (.SS/.SZ suffix) as primary.
 # jugaad-data>=0.29         # India NSE/BSE (stock data, RBI rates) -- research: .roo/research/in-bse-2026-02-24.md
 # ixbrl-parse -- already listed above in Phase 1 section
 
@@ -64,7 +65,7 @@ akshare>=1.18              # China SSE/SZSE (comprehensive: stocks, financials, 
 yfinance>=1.2.0            # Global OHLCV fallback (no key) -- research: .roo/research/ohlcv-yfinance-2026-02-24.md
 pykrx>=1.0                 # Korea OHLCV primary (no key) -- research: .roo/research/ohlcv-per-region-2026-02-25.md
 twstock>=1.4.0             # Taiwan OHLCV primary (no key) -- research: .roo/research/ohlcv-per-region-2026-02-25.md
-# akshare -- already listed above in Phase 1 section
+# akshare -- REMOVED (see above)
 nselib>=1.0                # India OHLCV primary (no key, no geo-blocking) -- replaces jugaad-data
 # jugaad-data -- REMOVED: NSE geo-blocks non-Indian IPs, causing infinite hangs.
 
