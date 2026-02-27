@@ -38,6 +38,35 @@ _ECB_DIRECT_URLS: dict[str, str] = {
 }
 
 
+def _parse_ecb_dates(time_strings: pd.Series) -> pd.DatetimeIndex:
+    """Parse ECB time period strings robustly.
+
+    Handles: "2024" (annual), "2024-01" (monthly), "2024-Q1" (quarterly).
+    Returns a DatetimeIndex without triggering pandas format inference warnings.
+    """
+    parsed = []
+    for ts in time_strings:
+        ts = str(ts).strip()
+        try:
+            if "-Q" in ts:
+                # Quarterly: "2024-Q1" -> first month of quarter
+                year, q = ts.split("-Q")
+                month = (int(q) - 1) * 3 + 1
+                parsed.append(pd.Timestamp(year=int(year), month=month, day=1))
+            elif len(ts) == 4 and ts.isdigit():
+                # Annual: "2024"
+                parsed.append(pd.Timestamp(year=int(ts), month=1, day=1))
+            elif len(ts) == 7 and ts[4] == "-":
+                # Monthly: "2024-01"
+                parsed.append(pd.Timestamp(year=int(ts[:4]), month=int(ts[5:7]), day=1))
+            else:
+                # Fallback: let pandas try
+                parsed.append(pd.Timestamp(ts))
+        except Exception:
+            parsed.append(pd.NaT)
+    return pd.DatetimeIndex(parsed)
+
+
 def fetch_macro_ecb(
     years: int = 10,
 ) -> dict[str, pd.Series]:
@@ -113,9 +142,13 @@ def fetch_macro_ecb(
                     df = pd.read_csv(io.StringIO(resp.text))
                     if not df.empty and "OBS_VALUE" in df.columns:
                         time_col = "TIME_PERIOD" if "TIME_PERIOD" in df.columns else df.columns[0]
+                        time_strings = df[time_col].astype(str)
+                        # ECB uses mixed formats: "2024" (annual), "2024-01" (monthly),
+                        # "2024-Q1" (quarterly). Parse robustly to avoid warnings.
+                        time_index = _parse_ecb_dates(time_strings)
                         series = pd.Series(
                             pd.to_numeric(df["OBS_VALUE"], errors="coerce").values,
-                            index=pd.to_datetime(df[time_col].astype(str)),
+                            index=time_index,
                         )
 
                         # GDP level -> compute YoY growth rate
