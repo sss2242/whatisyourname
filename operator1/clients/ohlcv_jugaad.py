@@ -42,16 +42,28 @@ def fetch_ohlcv_jugaad(
         return pd.DataFrame()
 
     try:
+        import signal
+
+        def _timeout_handler(signum, frame):
+            raise TimeoutError("jugaad-data NSE request timed out (30s)")
+
         end_dt = date.today()
         start_dt = end_dt - timedelta(days=365 * years)
 
-        # Verbatim from jugaad-data docs
-        df = stock_df(
-            symbol=ticker.upper(),
-            from_date=start_dt,
-            to_date=end_dt,
-            series="EQ",
-        )
+        # Set 30s timeout -- NSE blocks non-Indian IPs with hanging connections
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(30)
+        try:
+            # Verbatim from jugaad-data docs
+            df = stock_df(
+                symbol=ticker.upper(),
+                from_date=start_dt,
+                to_date=end_dt,
+                series="EQ",
+            )
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
 
         if df is None or df.empty:
             return pd.DataFrame()
