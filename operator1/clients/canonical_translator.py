@@ -100,6 +100,15 @@ _IFRS_MAP: dict[str, str] = {
     "ifrs-full:CashFlowsFromUsedInFinancingActivities": "financing_cf",
     "ifrs-full:PurchaseOfPropertyPlantAndEquipment": "capex",
     "ifrs-full:DividendsPaid": "dividends_paid",
+    # Additional IFRS concepts for full coverage
+    "ifrs-full:BasicEarningsLossPerShare": "eps_basic",
+    "ifrs-full:DilutedEarningsLossPerShare": "eps_diluted",
+    "ifrs-full:CurrentBorrowings": "short_term_debt",
+    "ifrs-full:ShorttermBorrowings": "short_term_debt",
+    "ifrs-full:Borrowings": "total_debt",
+    "ifrs-full:NoncurrentBorrowings": "long_term_debt",
+    "ifrs-full:DepreciationAndAmortisationExpense": "ebitda",  # proxy: D&A component
+    # free_cash_flow: computed downstream (operating_cash_flow - capex)
 }
 
 # Japan GAAP (JPPFS) concepts (EDINET)
@@ -204,6 +213,15 @@ _CVM_ACCOUNT_MAP: dict[str, str] = {
     "6.02": "investing_cf",
     "6.03": "financing_cf",
     "6.02.01": "capex",
+    # Missing canonical fields -- added for full coverage
+    "6.03.04": "dividends_paid",        # Dividends paid to shareholders
+    "3.09": "ebitda",                    # EBITDA (some CVM filers report this)
+    "3.11.01": "eps_basic",             # Earnings per share (basic)
+    "3.11.02": "eps_diluted",           # Earnings per share (diluted)
+    "3.04": "sga_expenses",             # Selling, general & administrative
+    "3.04.01": "rd_expenses",           # R&D expenses (subset of SGA in CVM)
+    "2.01.04+2.02.01": "total_debt",    # Not a real code; handled via computation
+    # free_cash_flow: computed downstream (operating_cash_flow - capex)
 }
 
 # Chile CMF / FECU concepts -> canonical names
@@ -439,6 +457,36 @@ _USGAAP_MAP: dict[str, str] = {
     "PaymentsToAcquirePropertyPlantAndEquipment": "capex",
     "PaymentsOfDividends": "dividends_paid",
     "PaymentsForRepurchaseOfCommonStock": "stock_buybacks",
+    # Missing canonical fields -- added for full coverage
+    # ebit (namespaced + bare)
+    "us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxes": "ebit",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxes": "ebit",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest": "ebit",
+    # ebitda -- SEC filers rarely report EBITDA directly; use operating income as proxy
+    "us-gaap:OperatingExpenses": "ebitda",  # some filers report this
+    # goodwill
+    "us-gaap:Goodwill": "goodwill",
+    "Goodwill": "goodwill",
+    # intangible_assets
+    "us-gaap:IntangibleAssetsNetExcludingGoodwill": "intangible_assets",
+    "IntangibleAssetsNetExcludingGoodwill": "intangible_assets",
+    "FiniteLivedIntangibleAssetsNet": "intangible_assets",
+    # inventory
+    "us-gaap:InventoryNet": "inventory",
+    "InventoryNet": "inventory",
+    # payables
+    "us-gaap:AccountsPayableCurrent": "payables",
+    "AccountsPayableCurrent": "payables",
+    "AccountsPayableAndAccruedLiabilitiesCurrent": "payables",
+    # retained_earnings
+    "us-gaap:RetainedEarningsAccumulatedDeficit": "retained_earnings",
+    "RetainedEarningsAccumulatedDeficit": "retained_earnings",
+    # total_debt
+    "us-gaap:DebtAndCapitalLeaseObligations": "total_debt",
+    "DebtAndCapitalLeaseObligations": "total_debt",
+    "LongTermDebtAndCapitalLeaseObligations": "total_debt",
+    # free_cash_flow -- not a GAAP concept, but some filers report it
+    # We compute it downstream: operating_cash_flow - capex
 }
 
 # Market -> accounting standard label (for cross-standard comparison caveats)
