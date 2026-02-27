@@ -152,7 +152,32 @@ class EUEsefClient:
         return results
 
     def search_company(self, name: str) -> list[dict[str, Any]]:
-        return self.list_companies(query=name)
+        """Search for EU companies -- tries filings first, then entities API."""
+        results = self.list_companies(query=name)
+        if results:
+            return results
+
+        # Fallback: search the /entities endpoint directly
+        try:
+            data = self._get_xbrl("/entities", params={"filter[name]": name, "page[size]": 10})
+            entities = data.get("data", []) if isinstance(data, dict) else []
+            for ent in entities:
+                attrs = ent.get("attributes", {})
+                ent_name = attrs.get("name", "")
+                if name.lower() in ent_name.lower():
+                    results.append({
+                        "ticker": attrs.get("lei", ent.get("id", "")),
+                        "name": ent_name,
+                        "lei": attrs.get("lei", ""),
+                        "cik": attrs.get("lei", str(ent.get("id", ""))),
+                        "country": attrs.get("country", "EU"),
+                        "exchange": "ESEF",
+                        "market_id": self.market_id,
+                    })
+        except Exception as exc:
+            logger.debug("Entity search fallback failed: %s", exc)
+
+        return results
 
     def _get_recent_filings(self) -> list[dict]:
         """Fetch recent ESEF filings from filings.xbrl.org."""

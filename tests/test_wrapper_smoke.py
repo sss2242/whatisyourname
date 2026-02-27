@@ -200,39 +200,30 @@ class TestPITNoKey:
 
     def test_br_cvm_petrobras(self):
         """Brazil CVM: fetch Petrobras profile (no key needed)."""
-        try:
-            from operator1.clients.br_cvm_wrapper import BRCvmClient
-            client = BRCvmClient()
-            result = client.get_profile("PETR4")
-            assert isinstance(result, dict)
-            logger.info(f"br_cvm/PETR4 profile: keys={list(result.keys())[:8]}")
-        except Exception as e:
-            logger.warning(f"br_cvm/PETR4: {e}")
-            pytest.skip(f"BR CVM: {e}")
+        from operator1.clients.br_cvm_wrapper import BRCvmClient
+        client = BRCvmClient()
+        result = client.get_profile("PETROBRAS")
+        assert isinstance(result, dict)
+        assert "name" in result
+        logger.info(f"br_cvm/PETROBRAS profile: name={result.get('name')}")
 
     def test_cl_cmf_sqm(self):
-        """Chile CMF: fetch SQM profile (no key needed)."""
-        try:
-            from operator1.clients.cl_cmf_wrapper import CLCmfClient
-            client = CLCmfClient()
-            result = client.get_profile("SQM")
-            assert isinstance(result, dict)
-            logger.info(f"cl_cmf/SQM profile: keys={list(result.keys())[:8]}")
-        except Exception as e:
-            logger.warning(f"cl_cmf/SQM: {e}")
-            pytest.skip(f"CL CMF: {e}")
+        """Chile CMF: fetch SQM profile (yfinance fallback since CMF API is down)."""
+        from operator1.clients.cl_cmf_wrapper import CLCmfClient
+        client = CLCmfClient()
+        result = client.get_profile("SQM")
+        assert isinstance(result, dict)
+        assert "name" in result
+        logger.info(f"cl_cmf/SQM profile: name={result.get('name')}")
 
     def test_eu_esef_sap(self):
-        """EU ESEF: fetch SAP profile (graceful degradation without pyesef)."""
-        try:
-            from operator1.clients.eu_esef_wrapper import EUEsefClient
-            client = EUEsefClient()
-            result = client.get_profile("SAP")
-            assert isinstance(result, dict)
-            logger.info(f"eu_esef/SAP profile: keys={list(result.keys())[:8]}")
-        except Exception as e:
-            logger.warning(f"eu_esef/SAP: {e}")
-            pytest.skip(f"EU ESEF: {e}")
+        """EU ESEF: fetch SAP SE profile via xbrl.org entity search."""
+        from operator1.clients.eu_esef_wrapper import EUEsefClient
+        client = EUEsefClient()
+        result = client.get_profile("SAP SE")
+        assert isinstance(result, dict)
+        assert "name" in result
+        logger.info(f"eu_esef/SAP SE profile: name={result.get('name')}")
 
 
 # ===========================================================================

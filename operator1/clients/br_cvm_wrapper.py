@@ -84,14 +84,22 @@ class BRCvmClient:
         return "Brazil (B3) -- CVM"
 
     def list_companies(self, query: str = "") -> list[dict[str, Any]]:
+        """Fetch company list from CVM CSV registry (replaces dead /api/v1/)."""
+        import io
+        import csv
+
         try:
-            data = cached_get(
-                f"{_CVM_BASE}/cia_aberta",
-                params={"$top": 500, "$format": "json"},
+            import requests
+            r = requests.get(
+                f"{_CVM_DATASET_BASE}/CAD/DADOS/cad_cia_aberta.csv",
+                timeout=30,
                 headers=self._headers,
             )
-            items = data.get("value", []) if isinstance(data, dict) else []
-        except Exception:
+            r.raise_for_status()
+            reader = csv.DictReader(io.StringIO(r.text), delimiter=";")
+            items = [row for row in reader if row.get("SIT") == "ATIVO"]
+        except Exception as exc:
+            logger.warning("CVM CSV fetch failed: %s", exc)
             items = []
 
         companies = []
