@@ -56,8 +56,8 @@ ixbrl-parse>=0.10.0           # UK iXBRL document parser for Companies House fin
 pycvm>=0.4                 # Brazil CVM data (optional, used for local file parsing)
 
 # Phase 2: Tier 2 market wrappers (optional -- graceful degradation if not installed)
+baostock>=0.8.8              # China OHLCV (SSE/SZSE) -- free, no key, works globally. Replaces akshare.
 # akshare -- REMOVED: Chinese finance APIs (Sina/EastMoney) geo-block non-Chinese IPs.
-# China OHLCV now uses yfinance (.SS/.SZ suffix) as primary.
 # jugaad-data>=0.29         # India NSE/BSE (stock data, RBI rates) -- research: .roo/research/in-bse-2026-02-24.md
 # ixbrl-parse -- already listed above in Phase 1 section
 

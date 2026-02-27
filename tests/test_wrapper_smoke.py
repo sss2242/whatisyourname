@@ -442,20 +442,34 @@ class TestRegionalPIT:
 
 
 # ===========================================================================
-# SECTION 6: OHLCV AKSHARE + ORCHESTRATION LAYERS
+# SECTION 6: CHINA OHLCV (BAOSTOCK) + ORCHESTRATION LAYERS
 # ===========================================================================
 
 class TestOtherFreeWrappers:
-    """akshare OHLCV, pit_registry, equity_provider, canonical_translator, supplement."""
+    """baostock OHLCV, pit_registry, equity_provider, canonical_translator, supplement."""
 
-    def test_yfinance_china_moutai(self):
-        """yfinance: fetch Kweichow Moutai OHLCV (CN .SS suffix, no key)."""
-        from operator1.clients.ohlcv_yfinance import fetch_ohlcv_yfinance
-        df = fetch_ohlcv_yfinance("600519", market_id="cn_sse", years=1)
-        _non_empty_df(df, "yfinance/600519-CN", min_rows=50)
+    def test_baostock_moutai(self):
+        """baostock: fetch Kweichow Moutai OHLCV (CN, no key, works globally)."""
+        from operator1.clients.ohlcv_baostock import fetch_ohlcv_baostock
+        df = fetch_ohlcv_baostock("600519", years=1)
+        _non_empty_df(df, "baostock/600519-Moutai", min_rows=50)
+
+    def test_baostock_ping_an(self):
+        """baostock: fetch Ping An Bank OHLCV (Shenzhen, sz.000001)."""
+        from operator1.clients.ohlcv_baostock import fetch_ohlcv_baostock
+        df = fetch_ohlcv_baostock("000001", years=1)
+        _non_empty_df(df, "baostock/000001-PingAn", min_rows=50)
+
+    def test_baostock_bonus_columns(self):
+        """baostock: verify bonus columns (turn, pct_chg, amount) are present."""
+        from operator1.clients.ohlcv_baostock import fetch_ohlcv_baostock
+        df = fetch_ohlcv_baostock("600519", years=1)
+        _non_empty_df(df, "baostock/bonus-cols", min_rows=50)
+        for col in ["amount", "turn", "pct_chg"]:
+            assert col in df.columns, f"Missing bonus column: {col}"
 
     def test_ohlcv_provider_china(self):
-        """ohlcv_provider: China dispatch (yfinance .SS suffix)."""
+        """ohlcv_provider: China dispatch (baostock primary -> yfinance fallback)."""
         from operator1.clients.ohlcv_provider import fetch_ohlcv
         df = fetch_ohlcv("600519", market_id="cn_sse", years=1)
         _non_empty_df(df, "ohlcv_provider/600519-CN", min_rows=50)
