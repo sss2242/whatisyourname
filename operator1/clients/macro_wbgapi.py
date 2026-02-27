@@ -24,7 +24,9 @@ _COUNTRY_TO_WB: dict[str, str] = {
     "DE": "DEU",
     "JP": "JPN",
     "KR": "KOR",
-    "TW": "CHN",  # Taiwan not in WB, use China
+    # Taiwan is not a World Bank member; no WB code available.
+    # macro_provider will fall through to wbgapi with no match,
+    # returning empty and letting the caller handle it.
     "BR": "BRA",
     "CL": "CHL",
     "CA": "CAN",
