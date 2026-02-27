@@ -31,7 +31,10 @@ _ECB_REST_BASE = "https://data-api.ecb.europa.eu/service"
 _ECB_DIRECT_URLS: dict[str, str] = {
     "exchange_rate": f"{_ECB_REST_BASE}/data/EXR/A.USD.EUR.SP00.A?lastNObservations=10&format=csvdata",
     "interest_rate": f"{_ECB_REST_BASE}/data/FM/M.U2.EUR.RT.MM.EURIBOR3MD_.HSTA?lastNObservations=36&format=csvdata",
-    # GDP and inflation use the sdmx1 library path (complex key structure)
+    # GDP: quarterly nominal level -- we compute YoY growth rate in code
+    "gdp_level": f"{_ECB_REST_BASE}/data/MNA/Q.N.I8.W2.S1.S1.B.B1GQ._Z._Z._Z.EUR.V.N?lastNObservations=24&format=csvdata",
+    "inflation_rate_yoy": f"{_ECB_REST_BASE}/data/ICP/M.U2.N.000000.4.ANR?lastNObservations=36&format=csvdata",
+    "unemployment_rate": f"{_ECB_REST_BASE}/data/LFSI/M.I8.S.UNEHRT.TOTAL0.15_74.T?lastNObservations=36&format=csvdata",
 }
 
 
@@ -111,12 +114,22 @@ def fetch_macro_ecb(
                     if not df.empty and "OBS_VALUE" in df.columns:
                         time_col = "TIME_PERIOD" if "TIME_PERIOD" in df.columns else df.columns[0]
                         series = pd.Series(
-                            df["OBS_VALUE"].values,
+                            pd.to_numeric(df["OBS_VALUE"], errors="coerce").values,
                             index=pd.to_datetime(df[time_col].astype(str)),
                         )
-                        series.name = canonical_name
-                        results[canonical_name] = series
-                        logger.debug("ECB REST %s: %d obs", canonical_name, len(series))
+
+                        # GDP level -> compute YoY growth rate
+                        if canonical_name == "gdp_level":
+                            growth = series.pct_change(periods=4) * 100  # YoY quarterly
+                            growth = growth.dropna()
+                            if not growth.empty:
+                                growth.name = "gdp_growth"
+                                results["gdp_growth"] = growth
+                                logger.debug("ECB REST gdp_growth: %d obs (computed from levels)", len(growth))
+                        else:
+                            series.name = canonical_name
+                            results[canonical_name] = series
+                            logger.debug("ECB REST %s: %d obs", canonical_name, len(series))
             except Exception as exc:
                 logger.debug("ECB REST %s failed: %s", canonical_name, exc)
     except ImportError:
