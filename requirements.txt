@@ -76,5 +76,8 @@ sdmx1>=2.25                # EU/ECB/Bundesbank macro primary (no key) -- researc
 python-bcb>=0.3.3          # Brazil BCB macro primary (no key) -- research: .roo/research/macro-per-region-2026-02-25.md
 banxicoapi>=1.0.2          # Mexico Banxico macro primary (needs BANXICO_TOKEN) -- research: .roo/research/macro-per-region-2026-02-25.md
 
+# Runtime compatibility
+setuptools<81                  # pykrx needs pkg_resources, removed in setuptools 82+
+
 # Testing
 pytest>=7.0
