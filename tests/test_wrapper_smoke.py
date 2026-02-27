@@ -474,8 +474,54 @@ class TestOtherFreeWrappers:
         cmap = get_concept_map("us_sec_edgar")
         logger.info(f"canonical_translator: us_sec_edgar concept_map has {len(cmap)} entries")
 
-    def test_supplement_import(self):
-        """supplement: verify supplementary API module imports."""
-        from operator1.clients import supplement
-        funcs = [f for f in dir(supplement) if not f.startswith('_') and callable(getattr(supplement, f, None))]
-        logger.info(f"supplement functions: {funcs[:8]}")
+    def test_supplement_openfigi(self):
+        """supplement: OpenFIGI search for AAPL (free, no key)."""
+        from operator1.clients.supplement import openfigi_search
+        try:
+            results = openfigi_search("AAPL", exchange_code="US")
+            assert isinstance(results, list)
+            logger.info(f"openfigi/AAPL: {len(results)} results")
+        except Exception as e:
+            logger.warning(f"openfigi: {e}")
+            pytest.skip(f"OpenFIGI: {e}")
+
+    def test_supplement_jpx_enrich(self):
+        """supplement: JPX enrich for Toyota 7203 (free, no key)."""
+        from operator1.clients.supplement import jpx_enrich
+        try:
+            result = jpx_enrich("7203")
+            assert isinstance(result, dict)
+            logger.info(f"jpx_enrich/7203: keys={list(result.keys())[:8]}")
+        except Exception as e:
+            logger.warning(f"jpx_enrich: {e}")
+            pytest.skip(f"JPX: {e}")
+
+    def test_supplement_twse_enrich(self):
+        """supplement: TWSE enrich for TSMC 2330 (free, no key)."""
+        from operator1.clients.supplement import twse_enrich
+        try:
+            result = twse_enrich("2330")
+            assert isinstance(result, dict)
+            logger.info(f"twse_enrich/2330: keys={list(result.keys())[:8]}")
+        except Exception as e:
+            logger.warning(f"twse_enrich: {e}")
+            pytest.skip(f"TWSE: {e}")
+
+    def test_equity_provider_au(self):
+        """equity_provider: create AU ASX PIT client (free, no key)."""
+        from operator1.clients.equity_provider import create_pit_client
+        client = create_pit_client("au_asx")
+        assert client is not None
+        logger.info(f"equity_provider/au_asx: {type(client).__name__}")
+
+    def test_equity_provider_br(self):
+        """equity_provider: create BR CVM PIT client (free, no key)."""
+        from operator1.clients.equity_provider import create_pit_client
+        client = create_pit_client("br_cvm")
+        assert client is not None
+        logger.info(f"equity_provider/br_cvm: {type(client).__name__}")
+
+    def test_pit_base_protocol(self):
+        """pit_base: verify PITClient protocol imports."""
+        from operator1.clients.pit_base import PITClient
+        logger.info(f"pit_base: PITClient protocol imported OK")
