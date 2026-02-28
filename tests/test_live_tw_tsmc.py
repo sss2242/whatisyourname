@@ -86,7 +86,7 @@ class TestTWFullPipeline(unittest.TestCase):
     def test_06_forecasting(self):
         if len(self.__class__._cache) == 0:
             self.skipTest("No cache")
-        self.__class__._forecast = run_forecasting_safe(self.__class__._cache)
+        self.__class__._cache, self.__class__._forecast = run_forecasting_safe(self.__class__._cache)
 
     def test_07_monte_carlo(self):
         if len(self.__class__._cache) == 0:

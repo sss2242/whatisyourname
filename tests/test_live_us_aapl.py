@@ -121,8 +121,9 @@ class TestUSFullPipeline(unittest.TestCase):
         cache = self.__class__._cache
         if len(cache) == 0:
             self.skipTest("No cache built")
-        forecast = run_forecasting_safe(cache)
+        cache, forecast = run_forecasting_safe(cache)
         self.assertIsNotNone(forecast)
+        self.__class__._cache = cache  # updated cache from forecasting
         self.__class__._forecast = forecast
 
     # -- Step 7: Monte Carlo --

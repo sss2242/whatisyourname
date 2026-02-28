@@ -134,8 +134,11 @@ def build_minimal_cache(
     elif not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
 
-    # Take last 7 business days
-    df = df.sort_index().tail(7)
+    # Use all available data (models need 60-100+ rows to fit).
+    # The "7 day" window applies to the freshness of the test, but the
+    # cache must contain enough history for regime detection (60+),
+    # forecasting (100+), etc.  We keep up to 252 rows (1 trading year).
+    df = df.sort_index().tail(252)
 
     # Standardize column names
     col_map = {}
@@ -201,15 +204,40 @@ def run_regime_detection(cache: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_forecasting_safe(cache: pd.DataFrame):
-    """Run forecasting with graceful fallback."""
+    """Run forecasting with graceful fallback.
+
+    Returns (updated_cache, ForecastResult).  The caller should use
+    the updated cache for subsequent stages.
+    """
+    from operator1.models.forecasting import ForecastResult
+
     try:
         from operator1.models.forecasting import run_forecasting
-        return run_forecasting(cache, cache.columns.tolist(), enable_burnout=False)
+
+        # Only pass numeric columns to forecasting (string columns like
+        # regime_label, ticker, country cause isnan errors).
+        numeric_cols = cache.select_dtypes(include=["number"]).columns.tolist()
+
+        # Filter to meaningful financial variables (not helper columns).
+        skip_prefixes = ("is_missing_", "regime_", "structural_")
+        variables = [
+            c for c in numeric_cols
+            if not any(c.startswith(p) for p in skip_prefixes)
+            and c not in ("volume",)  # volume is huge and noisy
+        ]
+
+        if not variables:
+            logger.warning("No numeric variables found for forecasting")
+            return cache, ForecastResult()
+
+        # run_forecasting returns (updated_cache, ForecastResult)
+        updated_cache, result = run_forecasting(
+            cache, variables, enable_burnout=False,
+        )
+        return updated_cache, result
     except Exception as exc:
         logger.warning("Forecasting failed: %s", exc)
-        # Return a minimal ForecastResult
-        from operator1.models.forecasting import ForecastResult
-        return ForecastResult()
+        return cache, ForecastResult()
 
 
 def run_monte_carlo_safe(cache: pd.DataFrame):
