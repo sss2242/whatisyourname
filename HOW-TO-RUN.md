@@ -8,12 +8,12 @@ Step-by-step instructions for running Operator 1 on Linux Mint and Windows.
 
 ### Prerequisites
 
-You need Python 3.10 or newer and git. Linux Mint ships with Python, but you may need to install `pip` and `venv`.
+You need Python 3.12 or newer and git. Linux Mint ships with Python, but you may need to install `pip` and `venv`.
 
 Open a terminal (Ctrl+Alt+T) and run:
 
 ```bash
-# Check your Python version (need 3.10+)
+# Check your Python version (need 3.12+)
 python3 --version
 
 # Install pip and venv if not already present
@@ -25,8 +25,8 @@ sudo apt install python3-pip python3-venv git -y
 
 ```bash
 cd ~
-git clone https://github.com/Abdu2424/Op-1.git
-cd Op-1
+git clone https://github.com/oso0240/githubu-isu-meanu.git
+cd githubu-isu-meanu
 ```
 
 ### Step 2: Create a virtual environment
@@ -54,7 +54,7 @@ If the install stalls or times out, try again with retries:
 pip install --timeout 300 --retries 5 -r requirements.txt
 ```
 
-Some packages (jquants-api-client, pykrx, sdmx1, python-bcb) require Python 3.10+. If you are on Python 3.9, pip will skip those and the pipeline will gracefully fall back to alternative data sources.
+All packages require Python 3.12+. The `.python-version` file in the repo pins Python 3.12.3.
 
 **Lighter install** -- skip deep learning models (LSTM, Transformer) for faster setup:
 
@@ -172,7 +172,7 @@ deactivate
 
 ### Prerequisites
 
-You need Python 3.10 or newer and git.
+You need Python 3.12 or newer and git.
 
 1. **Install Python**: Download from [python.org/downloads](https://www.python.org/downloads/). During installation, check the box that says **"Add Python to PATH"** -- this is important.
 
@@ -184,8 +184,8 @@ You need Python 3.10 or newer and git.
 
 ```cmd
 cd %USERPROFILE%
-git clone https://github.com/Abdu2424/Op-1.git
-cd Op-1
+git clone https://github.com/oso0240/githubu-isu-meanu.git
+cd githubu-isu-meanu
 ```
 
 ### Step 2: Create a virtual environment
@@ -310,7 +310,7 @@ deactivate
 ## Troubleshooting
 
 ### "No module named operator1"
-Make sure you are running the command from inside the `Op-1` directory and that your virtual environment is activated.
+Make sure you are running the command from inside the `githubu-isu-meanu` directory and that your virtual environment is activated.
 
 ### "pip: command not found" (Linux)
 Run `sudo apt install python3-pip -y`.

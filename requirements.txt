@@ -77,7 +77,8 @@ python-bcb>=0.3.3          # Brazil BCB macro primary (no key) -- research: .roo
 banxicoapi>=1.0.2          # Mexico Banxico macro primary (needs BANXICO_TOKEN) -- research: .roo/research/macro-per-region-2026-02-25.md
 
 # Runtime compatibility
-setuptools<81                  # pykrx needs pkg_resources, removed in setuptools 82+
+# setuptools<81 -- only needed on Python 3.9 where pykrx uses pkg_resources removed in setuptools 82+.
+# On Python 3.12+ this constraint is unnecessary; pykrx 1.0.51+ no longer depends on pkg_resources.
 
 # Testing
 pytest>=7.0
