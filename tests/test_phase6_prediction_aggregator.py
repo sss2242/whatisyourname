@@ -1561,6 +1561,59 @@ class TestCausalPropagation(unittest.TestCase):
             agg["debt_to_equity_abs"]["1d"],
         )
 
+    def test_granger_nan_source_forecast_safe(self):
+        """NaN source forecast should not propagate NaN to target."""
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import apply_granger_causal_propagation
+
+        agg = {"a": {"1d": float("nan")}, "b": {"1d": 4.0}}
+        cache = pd.DataFrame({"a": [1.0, 2.0], "b": [3.0, 4.0]})
+        gr = SimpleNamespace(
+            fitted=True,
+            significant_pairs=[{
+                "source": "a", "target": "b", "p_value": 0.01,
+            }],
+        )
+
+        adjusted, n = apply_granger_causal_propagation(agg, gr, cache)
+
+        # Target must NOT become NaN.
+        self.assertFalse(math.isnan(adjusted["b"]["1d"]))
+        self.assertAlmostEqual(adjusted["b"]["1d"], 4.0)
+        self.assertEqual(n, 0)
+
+    def test_granger_circular_links_no_feedback(self):
+        """Circular Granger links (A->B and B->A) should not amplify."""
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import apply_granger_causal_propagation
+
+        agg = {"a": {"1d": 2.0}, "b": {"1d": 4.0}}
+        cache = pd.DataFrame({"a": [1.0, 1.5], "b": [3.0, 3.5]})
+        gr = SimpleNamespace(
+            fitted=True,
+            significant_pairs=[
+                {"source": "a", "target": "b", "p_value": 0.01},
+                {"source": "b", "target": "a", "p_value": 0.01},
+            ],
+        )
+
+        adjusted, n = apply_granger_causal_propagation(agg, gr, cache)
+
+        self.assertEqual(n, 2)
+        # A's adjustment should be based on original B (4.0), not the
+        # already-adjusted B.  Verify by running the same link separately.
+        agg_a_only = {"a": {"1d": 2.0}, "b": {"1d": 4.0}}
+        gr_a = SimpleNamespace(
+            fitted=True,
+            significant_pairs=[
+                {"source": "b", "target": "a", "p_value": 0.01},
+            ],
+        )
+        adjusted_a, _ = apply_granger_causal_propagation(agg_a_only, gr_a, cache)
+        # A should get the same adjustment regardless of whether B was
+        # also adjusted in the same pass.
+        self.assertAlmostEqual(adjusted["a"]["1d"], adjusted_a["a"]["1d"])
+
 
 class TestSHAPAttachment(unittest.TestCase):
     """Test SHAP explanation attachment."""

@@ -970,6 +970,9 @@ def apply_granger_causal_propagation(
         return aggregated, 0
 
     n_adjustments = 0
+    # Use a snapshot of original values for deviation calculation to
+    # prevent feedback amplification when circular links exist (A->B, B->A).
+    original = {var: dict(horizons) for var, horizons in aggregated.items()}
     adjusted = {var: dict(horizons) for var, horizons in aggregated.items()}
 
     for pair in significant_pairs:
@@ -977,7 +980,7 @@ def apply_granger_causal_propagation(
         target = pair.get("target", pair.get("effect", ""))
         p_value = pair.get("p_value", 1.0)
 
-        if source not in adjusted or target not in adjusted:
+        if source not in original or target not in adjusted:
             continue
 
         # Get source's last observed value for baseline.
@@ -993,12 +996,18 @@ def apply_granger_causal_propagation(
         # Strength: stronger for lower p-values.
         link_strength = propagation_strength * (1.0 - min(p_value, 1.0))
 
-        for h_label in adjusted[source]:
+        for h_label in original[source]:
             if h_label not in adjusted[target]:
                 continue
 
-            source_forecast = adjusted[source][h_label]
+            # Always read source forecast from the ORIGINAL snapshot to
+            # avoid circular feedback amplification.
+            source_forecast = original[source][h_label]
             target_forecast = adjusted[target][h_label]
+
+            # Skip NaN forecasts to prevent NaN propagation.
+            if math.isnan(source_forecast) or math.isnan(target_forecast):
+                continue
 
             # Proportional deviation of source from baseline.
             source_deviation = (source_forecast - source_baseline) / abs(source_baseline)
