@@ -187,7 +187,7 @@ def _capital_misallocation(df: pd.DataFrame) -> pd.Series:
 
     Returns 0-100 score; NaN where inputs missing.
     """
-    total_debt = df.get("total_debt_asof",
+    total_debt = df.get("total_debt",
                         pd.Series(np.nan, index=df.index))
     liq_score = df.get("fh_liquidity_score",
                        pd.Series(np.nan, index=df.index))

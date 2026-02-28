@@ -35,14 +35,14 @@ def _make_cache(days: int = 100, **overrides) -> pd.DataFrame:
     rng = np.random.RandomState(42)
 
     base = {
-        "revenue_asof": 1_000_000 + rng.randn(days).cumsum() * 10_000,
-        "research_and_development_asof": rng.uniform(50_000, 200_000, days),
-        "sga_expense_asof": rng.uniform(200_000, 400_000, days),
+        "revenue": 1_000_000 + rng.randn(days).cumsum() * 10_000,
+        "rd_expenses": rng.uniform(50_000, 200_000, days),
+        "sga_expenses": rng.uniform(200_000, 400_000, days),
         "operating_margin": rng.uniform(0.05, 0.25, days),
-        "total_debt_asof": 500_000 + rng.randn(days).cumsum() * 5_000,
+        "total_debt": 500_000 + rng.randn(days).cumsum() * 5_000,
         "fh_liquidity_score": rng.uniform(20, 80, days),
         "fh_solvency_score": rng.uniform(20, 80, days),
-        "dividends_paid_asof": rng.uniform(0, 50_000, days),
+        "dividends_paid": rng.uniform(0, 50_000, days),
         "net_debt_to_ebitda": rng.uniform(1, 6, days),
         "competitive_pressure_index": rng.uniform(0, 1, days),
         "peer_composite_rank": rng.uniform(30, 70, days),
@@ -80,8 +80,8 @@ class TestRnDGrowthMismatch:
         days = 50
         cache = _make_cache(
             days=days,
-            research_and_development_asof=np.full(days, 250_000),
-            revenue_asof=np.linspace(1_000_000, 800_000, days),  # declining
+            rd_expenses=np.full(days, 250_000),
+            revenue=np.linspace(1_000_000, 800_000, days),  # declining
         )
         result = _rnd_growth_mismatch(cache)
         # Last values should have non-zero scores
@@ -93,8 +93,8 @@ class TestRnDGrowthMismatch:
         days = 50
         cache = _make_cache(
             days=days,
-            research_and_development_asof=np.full(days, 10_000),
-            revenue_asof=np.full(days, 1_000_000),
+            rd_expenses=np.full(days, 10_000),
+            revenue=np.full(days, 1_000_000),
         )
         result = _rnd_growth_mismatch(cache)
         valid = result.dropna()
@@ -102,7 +102,7 @@ class TestRnDGrowthMismatch:
 
     def test_missing_inputs_return_nan(self):
         cache = _make_cache(days=10)
-        cache["research_and_development_asof"] = np.nan
+        cache["rd_expenses"] = np.nan
         result = _rnd_growth_mismatch(cache)
         assert result.isna().all()
 
@@ -126,8 +126,8 @@ class TestSGABloatV2:
         days = 50
         cache = _make_cache(
             days=days,
-            sga_expense_asof=np.full(days, 600_000),
-            revenue_asof=np.full(days, 1_000_000),
+            sga_expenses=np.full(days, 600_000),
+            revenue=np.full(days, 1_000_000),
             operating_margin=np.linspace(0.20, 0.05, days),
         )
         result = _sga_bloat_v2(cache)
@@ -136,7 +136,7 @@ class TestSGABloatV2:
 
     def test_missing_sga_returns_nan(self):
         cache = _make_cache(days=10)
-        cache["sga_expense_asof"] = np.nan
+        cache["sga_expenses"] = np.nan
         result = _sga_bloat_v2(cache)
         assert result.isna().all()
 
@@ -160,7 +160,7 @@ class TestCapitalMisallocation:
         days = 50
         cache = _make_cache(
             days=days,
-            total_debt_asof=np.linspace(500_000, 800_000, days),
+            total_debt=np.linspace(500_000, 800_000, days),
             fh_liquidity_score=np.linspace(70, 20, days),
         )
         result = _capital_misallocation(cache)
@@ -172,7 +172,7 @@ class TestCapitalMisallocation:
         days = 50
         cache = _make_cache(
             days=days,
-            dividends_paid_asof=np.full(days, 100_000),
+            dividends_paid=np.full(days, 100_000),
             fh_solvency_score=np.full(days, 15.0),  # critical
         )
         result = _capital_misallocation(cache)
