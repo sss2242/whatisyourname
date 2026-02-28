@@ -1,84 +1,70 @@
-# Operator 1 -- Python dependencies
-# Core
-requests>=2.28
-pandas>=1.5
-numpy>=1.23
-pyarrow>=10.0
-pyyaml>=6.0
-python-dotenv>=1.0  # .env file support for local development
+# Operator 1 -- Python 3.12.3 pinned dependencies
+# All versions verified working on 2026-02-28.
+#
+# RECOMMENDED: Install in stages to avoid timeouts (see install.sh or HOW-TO-RUN.md):
+#   pip install --timeout 300 -r requirements/stage1-core.txt
+#   pip install --timeout 300 -r requirements/stage2-ml.txt
+#   pip install --timeout 300 -r requirements/stage3-deeplearning.txt
+#   pip install --timeout 300 -r requirements/stage4-wrappers.txt
+#
+# Or install everything at once (may timeout on slow connections):
+#   pip install --timeout 300 -r requirements.txt
 
-# Temporal modeling -- Phase 6
-# T6.1: regime detection + causality
-statsmodels>=0.14
-scikit-learn>=1.2
-ruptures>=1.1
-hmmlearn>=0.3
+# --- Stage 1: Core ---
+numpy==2.4.2
+pandas==2.3.3
+pyarrow==23.0.1
+scipy==1.17.1
+requests==2.32.5
+pyyaml==6.0.3
+python-dotenv==1.2.1
+matplotlib==3.10.8
 
-# T6.2: forecasting models (actively used in forecasting.py)
-arch>=6.0
-xgboost>=1.7
-torch>=2.0
+# --- Stage 2: ML / Statistics ---
+scikit-learn==1.8.0
+statsmodels==0.14.6
+xgboost==3.2.0
+ruptures==1.1.10
+hmmlearn==0.3.3
+arch==8.0.0
+shap==0.50.0              # SHAP explainability
+mapie==1.3.0              # Conformal prediction
+dtaidistance==2.4.0       # Dynamic Time Warping
 
-# T6.1: Bayesian change-point detection (used in regime_detector.py)
-pymc>=5.0
+# --- Stage 3: Deep Learning + Bayesian ---
+torch==2.10.0             # ~2 GB download -- skip if bandwidth is limited
+pymc==5.28.0              # Bayesian change-point detection
 
-# Phase F: Advanced modules
-shap>=0.42             # SHAP explainability (F2)
-mapie>=0.8             # Conformal prediction alternative (F1)
+# --- Stage 4: Data Source Wrappers ---
+# US
+edgartools==5.19.1         # US SEC EDGAR (primary)
+sec-edgar-api==1.1.0      # US SEC EDGAR (fallback)
+# Japan
+jquants-api-client==2.0.0 # J-Quants (replaces EDINET)
+# South Korea
+dart-fss==0.4.15           # DART filings
+pykrx==1.0.51              # Korea OHLCV (no key)
+# UK
+ixbrl-parse==0.10.1        # iXBRL parser for Companies House
+# Brazil
+pycvm==0.4.1               # CVM data (optional)
+# China
+baostock==0.8.9            # China OHLCV (no key)
+# India
+nselib==2.4.3              # India OHLCV (no key)
+# Taiwan
+twstock==1.4.0             # Taiwan OHLCV (no key)
+# Global OHLCV fallback
+yfinance==1.2.0            # yfinance (no key)
+# Macro data
+wbgapi==1.0.14             # World Bank (no key)
+fredapi==0.5.2             # US FRED (needs FRED_API_KEY)
+sdmx1==2.25.1              # EU/ECB/Bundesbank (no key)
+python-bcb==0.3.4          # Brazil BCB (no key)
+banxicoapi==1.0.2          # Mexico Banxico (needs BANXICO_TOKEN)
+# News sentiment
+gnews==0.4.3               # Google News scraper (no key)
+feedparser==6.0.12         # RSS parser
 
-# Phase G: DTW and uncertainty
-dtaidistance>=2.3      # Dynamic Time Warping for historical analogs (G1)
-
-# Not yet implemented -- uncomment when adding these modules:
-# SALib>=1.4          # Sobol sensitivity analysis
-# TA-Lib>=0.4         # Candlestick pattern detection
-# deap>=1.4           # Genetic algorithm optimisation
-# pywt>=1.4           # Wavelet decomposition
-
-# Report generation (Phase 7, used in report_generator.py)
-matplotlib>=3.6
-
-# News sentiment (Step 5e, used in news_sentiment.py)
-gnews>=0.4.0               # Google News scraper (no API key) -- primary news source
-feedparser>=6.0            # RSS feed parser (Google News RSS fallback, no key)
-
-# Not yet used:
-# plotly>=5.13
-
-# Phase 1: Unofficial wrappers for core markets
-edgartools>=3.0             # US SEC EDGAR (primary) -- code handles both old cash_flow() and new cashflow_statement() APIs
-sec-edgar-api>=1.0         # US SEC EDGAR (fallback)
-jquants-api-client>=2.0.0  # Japan J-Quants (primary) -- replaces edinet-tools. Free plan via email registration at jpx-jquants.com
-dart-fss>=0.4              # South Korea DART (primary)
-ixbrl-parse>=0.10.0           # UK iXBRL document parser for Companies House financial data
-# pyesef -- REMOVED: library archived 2026-01-03 (graceful degradation in eu_esef_wrapper.py)
-# pycvm -- optional: file-based API, br_cvm_wrapper.py uses direct HTTP as primary path
-pycvm>=0.4                 # Brazil CVM data (optional, used for local file parsing)
-
-# Phase 2: Tier 2 market wrappers (optional -- graceful degradation if not installed)
-baostock>=0.8.8              # China OHLCV (SSE/SZSE) -- free, no key, works globally. Replaces akshare.
-# akshare -- REMOVED: Chinese finance APIs (Sina/EastMoney) geo-block non-Chinese IPs.
-# jugaad-data>=0.29         # India NSE/BSE (stock data, RBI rates) -- research: .roo/research/in-bse-2026-02-24.md
-# ixbrl-parse -- already listed above in Phase 1 section
-
-# Phase 2b: OHLCV per-region wrappers (primary sources, graceful fallback to yfinance)
-yfinance>=1.2.0            # Global OHLCV fallback (no key) -- research: .roo/research/ohlcv-yfinance-2026-02-24.md
-pykrx>=1.0                 # Korea OHLCV primary (no key) -- research: .roo/research/ohlcv-per-region-2026-02-25.md
-twstock>=1.4.0             # Taiwan OHLCV primary (no key) -- research: .roo/research/ohlcv-per-region-2026-02-25.md
-# akshare -- REMOVED (see above)
-nselib>=1.0                # India OHLCV primary (no key, no geo-blocking) -- replaces jugaad-data
-# jugaad-data -- REMOVED: NSE geo-blocks non-Indian IPs, causing infinite hangs.
-
-# Phase 3: Macro data libraries (per-region primary + wbgapi fallback)
-wbgapi>=1.0.13             # Global macro fallback (no key) -- research: .roo/research/macro-wbgapi-2026-02-24.md
-fredapi>=0.5.2             # US FRED macro primary (needs FRED_API_KEY) -- research: .roo/research/macro-per-region-2026-02-25.md
-sdmx1>=2.25                # EU/ECB/Bundesbank macro primary (no key) -- research: .roo/research/macro-per-region-2026-02-25.md
-python-bcb>=0.3.3          # Brazil BCB macro primary (no key) -- research: .roo/research/macro-per-region-2026-02-25.md
-banxicoapi>=1.0.2          # Mexico Banxico macro primary (needs BANXICO_TOKEN) -- research: .roo/research/macro-per-region-2026-02-25.md
-
-# Runtime compatibility
-# setuptools<81 -- only needed on Python 3.9 where pykrx uses pkg_resources removed in setuptools 82+.
-# On Python 3.12+ this constraint is unnecessary; pykrx 1.0.51+ no longer depends on pkg_resources.
-
-# Testing
-pytest>=7.0
+# --- Testing ---
+pytest==9.0.2

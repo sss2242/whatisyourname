@@ -1,0 +1,42 @@
+# Stage 4: Data source wrappers and market libraries (~1-2min)
+# Financial data providers -- each region has a primary wrapper + yfinance/wbgapi fallback.
+
+# US
+edgartools==5.19.1
+sec-edgar-api==1.1.0
+
+# Japan
+jquants-api-client==2.0.0
+
+# South Korea
+dart-fss==0.4.15
+pykrx==1.0.51
+
+# UK
+ixbrl-parse==0.10.1
+
+# Brazil
+pycvm==0.4.1
+
+# China
+baostock==0.8.9
+
+# India
+nselib==2.4.3
+
+# Taiwan
+twstock==1.4.0
+
+# Global OHLCV fallback
+yfinance==1.2.0
+
+# Macro data
+wbgapi==1.0.14
+fredapi==0.5.2
+sdmx1==2.25.1
+python-bcb==0.3.4
+banxicoapi==1.0.2
+
+# News sentiment
+gnews==0.4.3
+feedparser==6.0.12
