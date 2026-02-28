@@ -658,7 +658,8 @@ class TestSavePredictions(unittest.TestCase):
         expected_cols = {
             "variable", "horizon", "point_forecast", "lower_ci",
             "upper_ci", "confidence", "model_used", "ensemble_weight",
-            "survival_adjusted",
+            "survival_adjusted", "interval_source", "analog_forecast",
+            "causal_adjustment", "regime_blend_applied",
         }
         self.assertEqual(set(df.columns), expected_cols)
         self.assertEqual(len(df), 1)
@@ -1229,6 +1230,576 @@ class TestConstants(unittest.TestCase):
     def test_default_volatility(self):
         from operator1.models.prediction_aggregator import DEFAULT_VOLATILITY
         self.assertGreater(DEFAULT_VOLATILITY, 0)
+
+
+# ===========================================================================
+# Phase 1: Conformal interval integration
+# ===========================================================================
+
+
+class TestConformalIntegration(unittest.TestCase):
+    """Test conformal prediction interval integration."""
+
+    def _make_conformal_result(self):
+        """Build a mock ConformalResult-like object."""
+        from types import SimpleNamespace
+
+        ci = SimpleNamespace(
+            point_forecast=1.5,
+            lower=1.3,
+            upper=1.7,
+            coverage_level=0.90,
+            calibration_size=50,
+            interval_width=0.4,
+            is_adaptive=False,
+        )
+        return SimpleNamespace(
+            intervals={"current_ratio": {"1d": ci, "5d": ci}},
+            calibration_scores_count=50,
+            coverage_level=0.90,
+            method="split_conformal",
+        )
+
+    def test_conformal_used_when_available(self):
+        from operator1.models.prediction_aggregator import get_conformal_interval
+
+        cr = self._make_conformal_result()
+        lower, upper, used = get_conformal_interval("current_ratio", "1d", cr)
+
+        self.assertTrue(used)
+        self.assertAlmostEqual(lower, 1.3)
+        self.assertAlmostEqual(upper, 1.7)
+
+    def test_conformal_fallback_when_missing_variable(self):
+        from operator1.models.prediction_aggregator import get_conformal_interval
+
+        cr = self._make_conformal_result()
+        lower, upper, used = get_conformal_interval("nonexistent", "1d", cr)
+
+        self.assertFalse(used)
+        self.assertTrue(math.isnan(lower))
+
+    def test_conformal_fallback_when_none(self):
+        from operator1.models.prediction_aggregator import get_conformal_interval
+
+        lower, upper, used = get_conformal_interval("x", "1d", None)
+        self.assertFalse(used)
+
+    def test_conformal_fallback_low_calibration(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import get_conformal_interval
+
+        ci = SimpleNamespace(lower=1.3, upper=1.7, calibration_size=5)
+        cr = SimpleNamespace(intervals={"x": {"1d": ci}})
+        lower, upper, used = get_conformal_interval("x", "1d", cr)
+
+        self.assertFalse(used)
+
+    def test_full_pipeline_with_conformal(self):
+        from operator1.models.prediction_aggregator import run_prediction_aggregation
+
+        cache = _make_cache()
+        fr = _make_forecast_result()
+        cr = self._make_conformal_result()
+
+        result = run_prediction_aggregation(
+            cache, fr, save_to_cache=False, conformal_result=cr,
+        )
+
+        self.assertTrue(result.fitted)
+        self.assertAlmostEqual(result.conformal_coverage, 0.90)
+
+        # Check that conformal was used for current_ratio 1d.
+        pred_1d = result.predictions.get("current_ratio", {}).get("1d")
+        if pred_1d is not None:
+            self.assertEqual(pred_1d.interval_source, "conformal")
+
+
+# ===========================================================================
+# Phase 2: Regime probability blending
+# ===========================================================================
+
+
+class TestRegimeProbabilityBlending(unittest.TestCase):
+    """Test soft regime probability blending."""
+
+    def _make_dual_regime_result(self):
+        from types import SimpleNamespace
+
+        market_probs = pd.DataFrame({
+            "bull": [0.1, 0.2],
+            "bear": [0.6, 0.5],
+            "high_vol": [0.2, 0.2],
+            "low_vol": [0.1, 0.1],
+        })
+        fund_probs = pd.DataFrame({
+            "healthy": [0.3, 0.4],
+            "stressed": [0.5, 0.4],
+            "distress": [0.2, 0.2],
+        })
+        return SimpleNamespace(
+            market_regime_probs=market_probs,
+            fund_regime_probs=fund_probs,
+            fitted=True,
+        )
+
+    def test_regime_blend_modifies_weights(self):
+        from operator1.models.prediction_aggregator import compute_regime_blended_weights
+
+        base = {"kalman": 0.6, "xgboost": 0.4}
+        drr = self._make_dual_regime_result()
+
+        blended, applied = compute_regime_blended_weights(base, drr)
+
+        self.assertTrue(applied)
+        self.assertAlmostEqual(sum(blended.values()), 1.0, places=6)
+        # In a bear/stressed regime, xgboost should gain relative weight.
+        self.assertGreater(blended["xgboost"], 0.35)
+
+    def test_regime_blend_none_returns_base(self):
+        from operator1.models.prediction_aggregator import compute_regime_blended_weights
+
+        base = {"kalman": 0.7, "ema": 0.3}
+        blended, applied = compute_regime_blended_weights(base, None)
+
+        self.assertFalse(applied)
+        self.assertEqual(blended, base)
+
+    def test_regime_blend_empty_probs(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import compute_regime_blended_weights
+
+        drr = SimpleNamespace(
+            market_regime_probs=pd.DataFrame(),
+            fund_regime_probs=pd.DataFrame(),
+        )
+        base = {"kalman": 1.0}
+        blended, applied = compute_regime_blended_weights(base, drr)
+
+        self.assertFalse(applied)
+
+    def test_full_pipeline_with_regime(self):
+        from operator1.models.prediction_aggregator import run_prediction_aggregation
+
+        cache = _make_cache()
+        fr = _make_forecast_result()
+        drr = self._make_dual_regime_result()
+
+        result = run_prediction_aggregation(
+            cache, fr, save_to_cache=False, dual_regime_result=drr,
+        )
+
+        self.assertTrue(result.fitted)
+        self.assertEqual(result.regime_blend_method, "soft_probability")
+
+
+# ===========================================================================
+# Phase 3: Copula tail risk adjustment
+# ===========================================================================
+
+
+class TestCopulaTailRiskAdjustment(unittest.TestCase):
+    """Test copula tail dependency band widening."""
+
+    def test_no_copula_returns_one(self):
+        from operator1.models.prediction_aggregator import compute_copula_tail_adjustment
+
+        m = compute_copula_tail_adjustment("x", None)
+        self.assertAlmostEqual(m, 1.0)
+
+    def test_low_crisis_no_widening(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import compute_copula_tail_adjustment
+
+        cr = SimpleNamespace(
+            joint_crisis_probability=0.05,
+            tail_dependence={},
+        )
+        m = compute_copula_tail_adjustment("x", cr)
+        self.assertAlmostEqual(m, 1.0)
+
+    def test_high_crisis_widens_bands(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import compute_copula_tail_adjustment
+
+        cr = SimpleNamespace(
+            joint_crisis_probability=0.50,
+            tail_dependence={"x_y": 0.6},
+        )
+        m = compute_copula_tail_adjustment("x", cr)
+        self.assertGreater(m, 1.0)
+
+    def test_full_pipeline_with_copula(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import run_prediction_aggregation
+
+        cache = _make_cache()
+        fr = _make_forecast_result()
+        cr = SimpleNamespace(
+            joint_crisis_probability=0.40,
+            tail_dependence={"current_ratio_debt": 0.5},
+        )
+
+        result = run_prediction_aggregation(
+            cache, fr, save_to_cache=False, copula_result=cr,
+        )
+
+        self.assertTrue(result.fitted)
+        self.assertGreater(result.copula_tail_risk, 0.0)
+
+
+# ===========================================================================
+# Phase 4: DTW analog ensemble channel
+# ===========================================================================
+
+
+class TestDTWAnalogChannel(unittest.TestCase):
+    """Test DTW historical analog integration."""
+
+    def test_no_dtw_returns_none(self):
+        from operator1.models.prediction_aggregator import compute_dtw_analog_forecast
+
+        point, lo, hi = compute_dtw_analog_forecast("x", 100.0, None, "1d")
+        self.assertIsNone(point)
+
+    def test_dtw_with_analogs(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import compute_dtw_analog_forecast
+
+        dtw = SimpleNamespace(
+            available=True,
+            analogs=[SimpleNamespace()],  # at least one analog
+            empirical_return_mean=0.02,
+            empirical_return_p5=-0.05,
+            empirical_return_p95=0.08,
+            forecast_horizon_days=5,
+        )
+        point, lo, hi = compute_dtw_analog_forecast("x", 100.0, dtw, "5d")
+
+        self.assertIsNotNone(point)
+        self.assertAlmostEqual(point, 102.0)
+        self.assertAlmostEqual(lo, 95.0)
+        self.assertAlmostEqual(hi, 108.0)
+
+    def test_dtw_nan_last_value(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import compute_dtw_analog_forecast
+
+        dtw = SimpleNamespace(
+            available=True, analogs=[SimpleNamespace()],
+            empirical_return_mean=0.02, empirical_return_p5=-0.05,
+            empirical_return_p95=0.08, forecast_horizon_days=5,
+        )
+        point, lo, hi = compute_dtw_analog_forecast("x", float("nan"), dtw, "5d")
+        self.assertIsNone(point)
+
+    def test_full_pipeline_with_dtw(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import run_prediction_aggregation
+
+        cache = _make_cache()
+        fr = _make_forecast_result()
+        dtw = SimpleNamespace(
+            available=True,
+            analogs=[SimpleNamespace(), SimpleNamespace()],
+            empirical_return_mean=0.01,
+            empirical_return_p5=-0.03,
+            empirical_return_p95=0.05,
+            forecast_horizon_days=5,
+        )
+
+        result = run_prediction_aggregation(
+            cache, fr, save_to_cache=False, dtw_result=dtw,
+        )
+
+        self.assertTrue(result.fitted)
+        self.assertEqual(result.dtw_analogs_used, 2)
+
+
+# ===========================================================================
+# Phase 5: Causal propagation + SHAP explanations
+# ===========================================================================
+
+
+class TestCausalPropagation(unittest.TestCase):
+    """Test Granger causal propagation."""
+
+    def test_no_granger_returns_unchanged(self):
+        from operator1.models.prediction_aggregator import apply_granger_causal_propagation
+
+        agg = {"x": {"1d": 1.5}}
+        cache = _make_cache()
+        adjusted, n = apply_granger_causal_propagation(agg, None, cache)
+
+        self.assertEqual(n, 0)
+        self.assertEqual(adjusted["x"]["1d"], 1.5)
+
+    def test_granger_propagation(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import apply_granger_causal_propagation
+
+        cache = _make_cache()
+        agg = {
+            "current_ratio": {"1d": 1.6},
+            "debt_to_equity_abs": {"1d": 1.1},
+        }
+        gr = SimpleNamespace(
+            fitted=True,
+            significant_pairs=[{
+                "source": "current_ratio",
+                "target": "debt_to_equity_abs",
+                "p_value": 0.01,
+            }],
+        )
+
+        adjusted, n = apply_granger_causal_propagation(agg, gr, cache)
+
+        self.assertGreater(n, 0)
+        # Target should be adjusted based on source deviation.
+        self.assertNotEqual(
+            adjusted["debt_to_equity_abs"]["1d"],
+            agg["debt_to_equity_abs"]["1d"],
+        )
+
+
+class TestSHAPAttachment(unittest.TestCase):
+    """Test SHAP explanation attachment."""
+
+    def test_no_shap_returns_empty(self):
+        from operator1.models.prediction_aggregator import get_shap_explanation
+
+        narrative, drivers = get_shap_explanation("x", None)
+        self.assertEqual(narrative, "")
+        self.assertEqual(drivers, [])
+
+    def test_shap_with_explanations(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import get_shap_explanation
+
+        expl = SimpleNamespace(
+            narrative="Current ratio driven by working capital",
+            top_features=[("working_capital", 0.3), ("cash", 0.2)],
+        )
+        sr = SimpleNamespace(explanations={"current_ratio": expl})
+
+        narrative, drivers = get_shap_explanation("current_ratio", sr)
+
+        self.assertIn("working capital", narrative)
+        self.assertEqual(len(drivers), 2)
+        self.assertEqual(drivers[0], "working_capital")
+
+    def test_full_pipeline_with_shap(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import run_prediction_aggregation
+
+        cache = _make_cache()
+        fr = _make_forecast_result()
+        expl = SimpleNamespace(
+            narrative="Test narrative",
+            top_features=[("feat1", 0.5)],
+        )
+        sr = SimpleNamespace(explanations={"current_ratio": expl})
+
+        result = run_prediction_aggregation(
+            cache, fr, save_to_cache=False, shap_result=sr,
+        )
+
+        self.assertTrue(result.shap_available)
+        pred = result.predictions.get("current_ratio", {}).get("1d")
+        if pred is not None:
+            self.assertEqual(pred.explanation, "Test narrative")
+
+
+# ===========================================================================
+# Phase 6: Recency-weighted RMSE
+# ===========================================================================
+
+
+class TestRecencyWeightedRMSE(unittest.TestCase):
+    """Test recency-weighted RMSE from walk-forward results."""
+
+    def test_no_walk_forward_returns_nan(self):
+        from operator1.models.prediction_aggregator import compute_recency_weighted_rmse
+
+        rmse = compute_recency_weighted_rmse("x", "kalman", None)
+        self.assertTrue(math.isnan(rmse))
+
+    def test_with_day_errors(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import compute_recency_weighted_rmse
+
+        errors = [
+            SimpleNamespace(variable="x", model_name="kalman", error=0.05)
+            for _ in range(20)
+        ]
+        wfr = SimpleNamespace(day_errors=errors)
+
+        rmse = compute_recency_weighted_rmse("x", "kalman", wfr)
+
+        self.assertFalse(math.isnan(rmse))
+        self.assertGreater(rmse, 0)
+        self.assertAlmostEqual(rmse, 0.05, places=3)
+
+    def test_wrong_variable_returns_nan(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import compute_recency_weighted_rmse
+
+        errors = [
+            SimpleNamespace(variable="y", model_name="kalman", error=0.05)
+            for _ in range(20)
+        ]
+        wfr = SimpleNamespace(day_errors=errors)
+
+        rmse = compute_recency_weighted_rmse("x", "kalman", wfr)
+        self.assertTrue(math.isnan(rmse))
+
+
+# ===========================================================================
+# Full integration: all phases together
+# ===========================================================================
+
+
+class TestFullPotentialIntegration(unittest.TestCase):
+    """Test all phases activated together in a single pipeline run."""
+
+    def test_all_optional_inputs(self):
+        from types import SimpleNamespace
+        from operator1.models.prediction_aggregator import run_prediction_aggregation
+
+        cache = _make_cache()
+        fr = _make_forecast_result()
+        mc = _make_mc_result()
+
+        # Conformal
+        ci = SimpleNamespace(
+            point_forecast=1.5, lower=1.3, upper=1.7,
+            coverage_level=0.90, calibration_size=50,
+            interval_width=0.4, is_adaptive=False,
+        )
+        conformal = SimpleNamespace(
+            intervals={"current_ratio": {"1d": ci}},
+            calibration_scores_count=50, coverage_level=0.90,
+            method="split_conformal",
+        )
+
+        # Dual regime
+        drr = SimpleNamespace(
+            market_regime_probs=pd.DataFrame({
+                "bull": [0.2], "bear": [0.5],
+                "high_vol": [0.2], "low_vol": [0.1],
+            }),
+            fund_regime_probs=pd.DataFrame({
+                "healthy": [0.3], "stressed": [0.5], "distress": [0.2],
+            }),
+            fitted=True,
+        )
+
+        # Copula
+        copula = SimpleNamespace(
+            joint_crisis_probability=0.30,
+            tail_dependence={"current_ratio_debt": 0.4},
+        )
+
+        # DTW
+        dtw = SimpleNamespace(
+            available=True,
+            analogs=[SimpleNamespace()],
+            empirical_return_mean=0.01,
+            empirical_return_p5=-0.03,
+            empirical_return_p95=0.05,
+            forecast_horizon_days=5,
+        )
+
+        # Granger
+        granger = SimpleNamespace(
+            fitted=True,
+            significant_pairs=[{
+                "source": "current_ratio",
+                "target": "debt_to_equity_abs",
+                "p_value": 0.02,
+            }],
+        )
+
+        # SHAP
+        expl = SimpleNamespace(
+            narrative="Test", top_features=[("f1", 0.5)],
+        )
+        shap = SimpleNamespace(explanations={"current_ratio": expl})
+
+        # Walk-forward
+        wf_errors = [
+            SimpleNamespace(variable="current_ratio", model_name="kalman", error=0.04)
+            for _ in range(25)
+        ]
+        wfr = SimpleNamespace(day_errors=wf_errors)
+
+        result = run_prediction_aggregation(
+            cache, fr, mc,
+            save_to_cache=False,
+            conformal_result=conformal,
+            dual_regime_result=drr,
+            copula_result=copula,
+            dtw_result=dtw,
+            granger_result=granger,
+            shap_result=shap,
+            walk_forward_result=wfr,
+        )
+
+        # Core assertions.
+        self.assertTrue(result.fitted)
+        self.assertGreater(len(result.predictions), 0)
+        self.assertGreater(len(result.variables_predicted), 0)
+
+        # Phase 1: conformal.
+        self.assertAlmostEqual(result.conformal_coverage, 0.90)
+
+        # Phase 2: regime blend.
+        self.assertEqual(result.regime_blend_method, "soft_probability")
+
+        # Phase 3: copula.
+        self.assertGreater(result.copula_tail_risk, 0.0)
+
+        # Phase 4: DTW.
+        self.assertEqual(result.dtw_analogs_used, 1)
+
+        # Phase 5: Granger + SHAP.
+        self.assertGreater(result.granger_adjustments_applied, 0)
+        self.assertTrue(result.shap_available)
+
+        # Phase 6: recency RMSE.
+        self.assertTrue(result.recency_weighted_rmse_used)
+
+        # New fields on predictions.
+        pred = result.predictions.get("current_ratio", {}).get("1d")
+        if pred is not None:
+            self.assertTrue(pred.regime_blend_applied)
+            self.assertEqual(pred.explanation, "Test")
+
+    def test_backward_compatible_no_optional_inputs(self):
+        """Existing callers passing no new args still work identically."""
+        from operator1.models.prediction_aggregator import run_prediction_aggregation
+
+        cache = _make_cache()
+        fr = _make_forecast_result()
+
+        result = run_prediction_aggregation(
+            cache, fr, save_to_cache=False,
+        )
+
+        self.assertTrue(result.fitted)
+        self.assertIsNone(result.conformal_coverage)
+        self.assertEqual(result.copula_tail_risk, 0.0)
+        self.assertEqual(result.dtw_analogs_used, 0)
+        self.assertEqual(result.granger_adjustments_applied, 0)
+        self.assertFalse(result.shap_available)
+        self.assertFalse(result.recency_weighted_rmse_used)
+        self.assertEqual(result.regime_blend_method, "hard_label")
+
+        # All predictions should use rmse interval source.
+        for var_preds in result.predictions.values():
+            for pred in var_preds.values():
+                self.assertEqual(pred.interval_source, "rmse")
+                self.assertIsNone(pred.analog_forecast)
 
 
 if __name__ == "__main__":
