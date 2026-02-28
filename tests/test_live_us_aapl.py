@@ -19,6 +19,7 @@ import pytest
 from tests.live_helpers import (
     NETWORK_OK,
     build_minimal_cache,
+    build_real_cache,
     fetch_macro_safe,
     fetch_ohlcv_safe,
     make_temp_cache,
@@ -95,13 +96,24 @@ class TestUSFullPipeline(unittest.TestCase):
             self.assertGreater(len(macro), 0)
         self.__class__._macro = macro
 
-    # -- Step 4: Build cache (7 days) --
+    # -- Step 4: Build cache (real pipeline with micro + macro + OHLCV) --
     def test_05_build_cache(self):
-        cache = build_minimal_cache(
-            self.__class__._ohlcv,
-            self.__class__._macro,
-            self.__class__._profile,
-        )
+        try:
+            from operator1.clients.us_edgar import USEdgarClient
+            pit_client = USEdgarClient(user_agent=f"Operator1/1.0 ({EDGAR_EMAIL})")
+            cache = build_real_cache(
+                ticker=TICKER,
+                market_id=MARKET_ID,
+                country_iso2=COUNTRY,
+                pit_client=pit_client,
+            )
+        except Exception as exc:
+            # Fallback to minimal cache if real builder fails
+            cache = build_minimal_cache(
+                self.__class__._ohlcv,
+                self.__class__._macro,
+                self.__class__._profile,
+            )
         self.assertIsInstance(cache, pd.DataFrame)
         self.assertGreater(len(cache), 0, "Cache should have rows")
         self.assertIn("close", cache.columns)

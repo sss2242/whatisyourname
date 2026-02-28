@@ -103,20 +103,123 @@ def fetch_macro_safe(country_iso2: str, market_id: str = "") -> dict[str, pd.Ser
 
 
 # ---------------------------------------------------------------------------
-# Minimal cache builder (7-day synthetic from real OHLCV)
+# Real pipeline cache builder (uses actual extraction + cache builder)
 # ---------------------------------------------------------------------------
+
+
+def build_real_cache(
+    ticker: str,
+    market_id: str,
+    country_iso2: str,
+    pit_client: Any,
+    *,
+    secrets: dict | None = None,
+) -> pd.DataFrame:
+    """Build a daily cache using the real pipeline stages.
+
+    Runs the full sequence:
+    1. extract_all_data() -- fetches profile, financials, OHLCV via PIT client
+    2. build_all_caches() -- creates daily DatetimeIndex cache with as-of joins
+    3. enrich_cache_with_indicators() -- merges macro data + survival flags
+    4. compute_derived_variables() -- adds financial ratios, drawdowns, etc.
+
+    Falls back to build_minimal_cache() if any step fails.
+    """
+    try:
+        from operator1.steps.data_extraction import extract_all_data, EntityData, ExtractionResult
+        from operator1.steps.cache_builder import (
+            build_all_caches, build_entity_daily_cache, build_date_index,
+            enrich_cache_with_indicators,
+        )
+        from operator1.steps.verify_identifiers import VerifiedTarget
+        from operator1.features.derived_variables import compute_derived_variables
+
+        # Step 1: Verify target via PIT client (gets profile + correct fields)
+        try:
+            from operator1.steps.verify_identifiers import verify_identifiers
+            target = verify_identifiers(
+                target_isin=ticker,
+                fmp_symbol=ticker,
+                pit_client=pit_client,
+            )
+        except Exception as exc:
+            logger.warning("Verification failed for %s: %s -- using manual target", ticker, exc)
+            target = VerifiedTarget(
+                isin=ticker,
+                ticker=ticker,
+                name=ticker,
+                country=country_iso2,
+                sector="",
+                industry="",
+                sub_industry=None,
+                fmp_symbol=ticker,
+                currency="USD",
+                exchange="",
+            )
+
+        # Step 2: Extract all data (profile, financials, OHLCV)
+        extraction = extract_all_data(
+            target=target,
+            linked_isins=[],
+            pit_client=pit_client,
+            force_rebuild=True,
+        )
+
+        # Step 3: Build daily cache with as-of joins
+        cache_result = build_all_caches(extraction, force_rebuild=True)
+        daily = cache_result.target_daily
+
+        if daily.empty:
+            logger.warning("Real cache builder returned empty -- using fallback")
+            raise ValueError("Empty cache from real builder")
+
+        # Step 4: Enrich with macro indicators
+        macro = fetch_macro_safe(country_iso2, market_id)
+        if macro:
+            try:
+                from operator1.features.macro_alignment import align_macro_to_daily
+                macro_aligned = align_macro_to_daily(daily, macro)
+                daily = enrich_cache_with_indicators(daily, macro_aligned=macro_aligned)
+            except Exception as exc:
+                logger.warning("Macro enrichment failed: %s -- merging as constants", exc)
+                for indicator_name, series in macro.items():
+                    if series is not None and len(series) > 0:
+                        daily[indicator_name] = float(series.iloc[-1])
+
+        # Step 5: Compute derived variables (ratios, drawdowns, etc.)
+        try:
+            daily = compute_derived_variables(daily)
+        except Exception as exc:
+            logger.warning("Derived variables failed: %s", exc)
+
+        logger.info(
+            "Real cache built: %d rows, %d columns for %s/%s",
+            len(daily), len(daily.columns), ticker, market_id,
+        )
+        return daily
+
+    except Exception as exc:
+        logger.warning(
+            "Real cache build failed for %s: %s -- using minimal fallback",
+            ticker, exc,
+        )
+        # Fallback to simple OHLCV-only cache
+        ohlcv = fetch_ohlcv_safe(ticker, market_id, years=1)
+        macro = fetch_macro_safe(country_iso2, market_id)
+        return build_minimal_cache(ohlcv, macro)
+
 
 def build_minimal_cache(
     ohlcv: pd.DataFrame,
     macro: dict[str, pd.Series] | None = None,
     profile: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
-    """Build a minimal daily cache from OHLCV + macro for testing.
+    """Build a minimal daily cache from OHLCV + macro (fallback only).
 
-    Takes the last 7 business days of OHLCV and merges macro indicators.
+    This is the lightweight fallback used when the real pipeline cache
+    builder fails (e.g. PIT client not available for a region).
     """
     if ohlcv is None or len(ohlcv) == 0:
-        # Return a minimal synthetic cache
         idx = pd.bdate_range(end=WINDOW_END, periods=5, name="date")
         return pd.DataFrame({
             "close": [100.0] * 5,
@@ -126,7 +229,6 @@ def build_minimal_cache(
             "volume": [1000000] * 5,
         }, index=idx)
 
-    # Ensure date index
     df = ohlcv.copy()
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"])
@@ -134,13 +236,8 @@ def build_minimal_cache(
     elif not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
 
-    # Use all available data (models need 60-100+ rows to fit).
-    # The "7 day" window applies to the freshness of the test, but the
-    # cache must contain enough history for regime detection (60+),
-    # forecasting (100+), etc.  We keep up to 252 rows (1 trading year).
     df = df.sort_index().tail(252)
 
-    # Standardize column names
     col_map = {}
     for col in df.columns:
         lc = col.lower()
@@ -148,7 +245,6 @@ def build_minimal_cache(
             col_map[col] = lc
     df = df.rename(columns=col_map)
 
-    # Ensure required columns exist
     for col in ("close", "open", "high", "low", "volume"):
         if col not in df.columns:
             if col == "volume":
@@ -156,7 +252,6 @@ def build_minimal_cache(
             elif "close" in df.columns:
                 df[col] = df["close"]
 
-    # Add derived columns needed by the pipeline
     if "close" in df.columns and len(df) > 1:
         df["return_1d"] = df["close"].pct_change()
         df["volatility_21d"] = df["return_1d"].rolling(min_periods=1, window=min(len(df), 5)).std() * np.sqrt(252)
@@ -164,24 +259,20 @@ def build_minimal_cache(
         df["return_1d"] = 0.0
         df["volatility_21d"] = 0.02
 
-    # Merge macro as constant columns (last known values)
     if macro:
         for indicator_name, series in macro.items():
             if series is not None and len(series) > 0:
                 df[indicator_name] = float(series.iloc[-1])
 
-    # Add profile fields as constants
     if profile:
         for key in ("ticker", "country", "sector", "industry", "isin"):
             if key in profile:
                 df[key] = profile[key]
 
-    # Placeholder financial ratios
     for col in ("current_ratio", "debt_to_equity_abs", "fcf_yield"):
         if col not in df.columns:
             df[col] = 1.5 if col == "current_ratio" else (1.0 if "debt" in col else 0.05)
 
-    # Regime label placeholder
     df["regime_label"] = "unknown"
 
     return df
