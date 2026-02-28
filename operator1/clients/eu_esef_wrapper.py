@@ -151,8 +151,119 @@ class EUEsefClient:
             results = [c for c in results if q in c["name"].lower() or q in c.get("lei", "").lower()]
         return results
 
+    def _search_entities_api(self, query: str) -> list[dict[str, Any]]:
+        """Search the /api/entities endpoint and direct entity lookup.
+
+        Strategy:
+        1. If query looks like an LEI (20-char alphanumeric), do a direct
+           entity lookup at /api/entities/{lei}.
+        2. Otherwise, fetch a page of entities and do substring matching.
+        3. Also fetch recent filings with include=entity and match against
+           the included entity names.
+        """
+        results: list[dict[str, Any]] = []
+        q = query.strip()
+
+        # Path 1: Direct LEI lookup (LEIs are exactly 20 alphanumeric chars).
+        if len(q) == 20 and q.isalnum():
+            try:
+                data = self._get_xbrl(f"/entities/{q}")
+                ent = data.get("data", {}) if isinstance(data, dict) else {}
+                attrs = ent.get("attributes", {})
+                name = attrs.get("name", "")
+                if name:
+                    results.append({
+                        "ticker": q[:12],
+                        "name": name,
+                        "lei": q,
+                        "cik": q,
+                        "country": attrs.get("country", "EU"),
+                        "exchange": "ESEF",
+                        "market_id": self.market_id,
+                    })
+                    return results
+            except Exception:
+                pass
+
+        # Path 2: Paginated entities search.
+        try:
+            data = self._get_xbrl("/entities", params={"page[size]": 100})
+            entities = data.get("data", []) if isinstance(data, dict) else []
+            q_lower = q.lower()
+            for ent in entities:
+                attrs = ent.get("attributes", {})
+                ent_name = attrs.get("name", "")
+                lei = attrs.get("lei", "")
+                country = attrs.get("country", "")
+
+                if self._country_code and country and country != self._country_code:
+                    continue
+
+                if q_lower in ent_name.lower() or q_lower in lei.lower():
+                    results.append({
+                        "ticker": lei[:12] if lei else "",
+                        "name": ent_name,
+                        "lei": lei,
+                        "cik": lei or str(ent.get("id", "")),
+                        "country": country or "EU",
+                        "exchange": "ESEF",
+                        "market_id": self.market_id,
+                    })
+        except Exception as exc:
+            logger.debug("Entities API search failed: %s", exc)
+
+        if results:
+            return results
+
+        # Path 3: Fetch filings with include=entity to get entity names
+        # from the relationship sideload.
+        try:
+            params = {"page[size]": 100, "include": "entity"}
+            data = self._get_xbrl("/filings", params=params)
+            if isinstance(data, dict):
+                included = data.get("included", [])
+                q_lower = q.lower()
+                seen_ids: set[str] = set()
+                for inc in included:
+                    if inc.get("type") != "entity":
+                        continue
+                    attrs = inc.get("attributes", {})
+                    ent_name = attrs.get("name", "")
+                    lei = attrs.get("lei", "")
+                    ent_id = str(inc.get("id", ""))
+                    country = attrs.get("country", "")
+
+                    if self._country_code and country and country != self._country_code:
+                        continue
+
+                    key = lei or ent_id
+                    if key in seen_ids:
+                        continue
+                    seen_ids.add(key)
+
+                    if q_lower in ent_name.lower() or q_lower in (lei or "").lower():
+                        results.append({
+                            "ticker": lei[:12] if lei else "",
+                            "name": ent_name,
+                            "lei": lei,
+                            "cik": lei or ent_id,
+                            "country": country or "EU",
+                            "exchange": "ESEF",
+                            "market_id": self.market_id,
+                        })
+        except Exception as exc:
+            logger.debug("Filings include=entity search failed: %s", exc)
+
+        return results
+
     def search_company(self, name: str) -> list[dict[str, Any]]:
-        """Search for EU companies -- tries filings first, then entities API."""
+        """Search for EU companies -- tries entities API first, then filings."""
+        # Primary: /api/entities endpoint (comprehensive, all registered filers)
+        results = self._search_entities_api(name)
+        if results:
+            return results
+
+        # Fallback: extract from recent filings
         results = self.list_companies(query=name)
         if results:
             return results
@@ -185,9 +296,10 @@ class EUEsefClient:
         if cache_key in self._filing_cache:
             return self._filing_cache[cache_key]
 
-        params: dict[str, Any] = {"page_size": 100}
+        # filings.xbrl.org uses JSON:API pagination: page[size], not page_size
+        params: dict[str, Any] = {"page[size]": 100}
         if self._country_code:
-            params["country"] = self._country_code
+            params["filter[country]"] = self._country_code
 
         try:
             data = self._get_xbrl("/filings", params=params)
