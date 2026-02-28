@@ -24,8 +24,9 @@ search_budget_global: 50      # max total search calls across all groups
 FORCE_REBUILD: false
 
 # Estimation settings
-# Pass 2 imputer method: "bayesian_ridge" (default, linear) or "vae" (nonlinear)
-estimation_imputer: bayesian_ridge
+# Imputer method: "split" (default, classifies MAR vs MNAR),
+# "bayesian_ridge" (legacy linear), or "vae" (legacy nonlinear)
+estimation_imputer: split
 # VAE hyperparameters (only used when estimation_imputer is "vae")
 vae_latent_dim: 8
 vae_hidden_dim: 32
