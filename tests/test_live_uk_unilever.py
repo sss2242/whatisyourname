@@ -51,9 +51,17 @@ class TestUKFullPipeline(unittest.TestCase):
         try:
             from operator1.clients.eu_esef_wrapper import EUEsefClient
             client = EUEsefClient()
-            profile = client.get_profile("Unilever")
-            self.assertIsInstance(profile, dict)
-            self.__class__._profile = profile
+            # Try LEI first (most reliable), then name search.
+            # Unilever PLC LEI: 549300MKFYEKVRWML317
+            for identifier in ["549300MKFYEKVRWML317", "Unilever"]:
+                try:
+                    profile = client.get_profile(identifier)
+                    if profile and profile.get("name"):
+                        self.__class__._profile = profile
+                        return
+                except Exception:
+                    continue
+            self.skipTest("ESEF: neither LEI nor name search found Unilever")
         except Exception as exc:
             self.skipTest(f"ESEF unavailable: {exc}")
 
