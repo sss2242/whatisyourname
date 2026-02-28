@@ -1,0 +1,6 @@
+# Stage 3: Deep learning and Bayesian (large install, ~5-8min)
+# PyTorch alone is ~2 GB. PyMC pulls in pytensor + arviz.
+# If this stage times out, re-run the same command -- pip will resume from cache.
+# The pipeline works without these (falls back to statistical models).
+torch==2.10.0
+pymc==5.28.0

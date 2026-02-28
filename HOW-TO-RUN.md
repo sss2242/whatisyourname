@@ -8,12 +8,12 @@ Step-by-step instructions for running Operator 1 on Linux Mint and Windows.
 
 ### Prerequisites
 
-You need Python 3.10 or newer and git. Linux Mint ships with Python, but you may need to install `pip` and `venv`.
+You need Python 3.12 or newer and git. Linux Mint ships with Python, but you may need to install `pip` and `venv`.
 
 Open a terminal (Ctrl+Alt+T) and run:
 
 ```bash
-# Check your Python version (need 3.10+)
+# Check your Python version (need 3.12+)
 python3 --version
 
 # Install pip and venv if not already present
@@ -25,8 +25,8 @@ sudo apt install python3-pip python3-venv git -y
 
 ```bash
 cd ~
-git clone https://github.com/Abdu2424/Op-1.git
-cd Op-1
+git clone https://github.com/oso0240/githubu-isu-meanu.git
+cd githubu-isu-meanu
 ```
 
 ### Step 2: Create a virtual environment
@@ -42,24 +42,45 @@ You should see `(venv)` at the beginning of your terminal prompt. Every time you
 
 ### Step 3: Install dependencies
 
+All versions are pinned and verified on Python 3.12.3 (`.python-version`).
+
+**Option A: Staged install (recommended -- avoids timeouts)**
+
 ```bash
-pip install --timeout 300 -r requirements.txt
+chmod +x install.sh
+./install.sh
 ```
 
-This will download and install all required packages. The first run takes **5-10 minutes** because PyTorch is a large download (~2 GB) and some packages compile C extensions. The `--timeout 300` flag prevents pip from timing out on slow connections. If your connection is particularly slow, you can increase it further (e.g. `--timeout 600`).
+This installs in 4 stages. If any stage fails (e.g. slow connection), re-run just that stage:
 
-If the install stalls or times out, try again with retries:
+```bash
+./install.sh 1   # Stage 1: Core libraries (~30s)
+./install.sh 2   # Stage 2: ML and statistics (~1-2min)
+./install.sh 3   # Stage 3: Deep learning + Bayesian (~5-8min, PyTorch is ~2 GB)
+./install.sh 4   # Stage 4: Data source wrappers (~1-2min)
+```
+
+Or run each stage manually with pip:
+
+```bash
+pip install --timeout 300 -r requirements/stage1-core.txt
+pip install --timeout 300 -r requirements/stage2-ml.txt
+pip install --timeout 300 -r requirements/stage3-deeplearning.txt
+pip install --timeout 300 -r requirements/stage4-wrappers.txt
+```
+
+**Option B: All at once** (may timeout on slow connections)
 
 ```bash
 pip install --timeout 300 --retries 5 -r requirements.txt
 ```
 
-Some packages (jquants-api-client, pykrx, sdmx1, python-bcb) require Python 3.10+. If you are on Python 3.9, pip will skip those and the pipeline will gracefully fall back to alternative data sources.
-
-**Lighter install** -- skip deep learning models (LSTM, Transformer) for faster setup:
+**Option C: Lighter install** -- skip deep learning (LSTM, Transformer, Bayesian) for faster setup:
 
 ```bash
-pip install --timeout 300 requests pandas numpy pyarrow pyyaml python-dotenv statsmodels scikit-learn ruptures hmmlearn arch xgboost matplotlib yfinance fredapi wbgapi edgartools ixbrl-parse pytest
+pip install --timeout 300 -r requirements/stage1-core.txt
+pip install --timeout 300 -r requirements/stage2-ml.txt
+pip install --timeout 300 -r requirements/stage4-wrappers.txt
 ```
 
 The pipeline will still work -- it gracefully skips models whose dependencies are missing.
@@ -172,7 +193,7 @@ deactivate
 
 ### Prerequisites
 
-You need Python 3.10 or newer and git.
+You need Python 3.12 or newer and git.
 
 1. **Install Python**: Download from [python.org/downloads](https://www.python.org/downloads/). During installation, check the box that says **"Add Python to PATH"** -- this is important.
 
@@ -184,8 +205,8 @@ You need Python 3.10 or newer and git.
 
 ```cmd
 cd %USERPROFILE%
-git clone https://github.com/Abdu2424/Op-1.git
-cd Op-1
+git clone https://github.com/oso0240/githubu-isu-meanu.git
+cd githubu-isu-meanu
 ```
 
 ### Step 2: Create a virtual environment
@@ -205,11 +226,18 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 ### Step 3: Install dependencies
 
+**Staged install (recommended -- avoids timeouts):**
+
 ```cmd
-pip install --timeout 300 -r requirements.txt
+pip install --timeout 300 -r requirements\stage1-core.txt
+pip install --timeout 300 -r requirements\stage2-ml.txt
+pip install --timeout 300 -r requirements\stage3-deeplearning.txt
+pip install --timeout 300 -r requirements\stage4-wrappers.txt
 ```
 
-This takes **5-10 minutes** on first run (PyTorch is ~2 GB). The `--timeout 300` flag prevents pip from timing out on slow connections. If it stalls, try again with:
+If any stage fails, just re-run that one command. Stage 3 is the largest (~2 GB for PyTorch).
+
+**All at once** (may timeout on slow connections):
 
 ```cmd
 pip install --timeout 300 --retries 5 -r requirements.txt
@@ -218,7 +246,9 @@ pip install --timeout 300 --retries 5 -r requirements.txt
 **Lighter install** -- skip deep learning for faster setup:
 
 ```cmd
-pip install --timeout 300 requests pandas numpy pyarrow pyyaml python-dotenv statsmodels scikit-learn ruptures hmmlearn arch xgboost matplotlib yfinance fredapi wbgapi edgartools ixbrl-parse pytest
+pip install --timeout 300 -r requirements\stage1-core.txt
+pip install --timeout 300 -r requirements\stage2-ml.txt
+pip install --timeout 300 -r requirements\stage4-wrappers.txt
 ```
 
 ### Step 4: Configure API keys (optional)
@@ -310,7 +340,7 @@ deactivate
 ## Troubleshooting
 
 ### "No module named operator1"
-Make sure you are running the command from inside the `Op-1` directory and that your virtual environment is activated.
+Make sure you are running the command from inside the `githubu-isu-meanu` directory and that your virtual environment is activated.
 
 ### "pip: command not found" (Linux)
 Run `sudo apt install python3-pip -y`.

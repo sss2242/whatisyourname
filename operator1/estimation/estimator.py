@@ -1,9 +1,9 @@
 """T5.1 -- Post-cache Sudoku inference (estimation engine).
 
-Two-pass linear-time estimation that fills missing values in the
-full feature table **without** any additional API calls.
+Three-phase estimation that fills missing values in the full feature
+table **without** any additional API calls.
 
-**Pass 1 -- Deterministic identity fill:**
+**Phase 1 -- Deterministic identity fill:**
 Uses accounting identities to solve for missing values when two of
 three related variables are observed:
   - ``total_assets = total_liabilities + total_equity``
@@ -12,26 +12,40 @@ three related variables are observed:
   - ``gross_profit = revenue - cost_of_revenue`` (if available)
   - ``ebit = revenue - operating_expenses`` (if available)
 
-**Pass 2 -- Regime-weighted rolling imputer:**
-For each variable with remaining nulls, trains a model on observed
-data up to day ``t`` (no look-ahead), weighted by the survival
-hierarchy tier the variable belongs to.
+**Phase 2 -- Missingness classification:**
+Classifies remaining NaN values as MAR (Missing At Random) or
+MNAR (Missing Not At Random / hidden data) using peer coverage,
+reporting history, and aggregation heuristics.
 
-Two imputer backends are supported (configured via
-``global_config.yml`` key ``estimation_imputer``):
+**Phase 3 -- Specialized estimation:**
 
-  - ``"bayesian_ridge"`` (default): Per-variable BayesianRidge
-    regression.  Linear, fast, and reliable.
-  - ``"vae"``: Variational Autoencoder that jointly imputes all
-    target variables.  Captures nonlinear cross-variable
-    relationships but adds training overhead.  Requires ``torch``.
+  *MAR/MCAR path* (``missing_data_estimator``):
+    - MICE (Multiple Imputation by Chained Equations)
+    - Gaussian Process regression with posterior uncertainty
+    - Matrix Completion via nuclear norm minimization (Soft-Impute)
+    - Ensemble: confidence-weighted average of the three methods
+
+  *MNAR path* (``hidden_data_estimator``):
+    - Heckman Selection Model (two-stage, corrects selection bias)
+    - Pattern-Mixture Model (separate distributions per pattern)
+    - Sensitivity Bounds (tipping-point analysis)
+    - GAIN adversarial imputation (optional, requires torch)
+    - Ensemble: priority-weighted (Heckman > Pattern > GAIN)
+
+  Legacy backends (``"bayesian_ridge"``, ``"vae"``) are still
+  supported via ``estimation_imputer`` config key for backward
+  compatibility.
 
 Output columns per estimated variable ``x``:
   - ``x_observed``: original observed value (NaN if was missing)
   - ``x_estimated``: model-estimated value (NaN if was observed)
   - ``x_final``: best available (observed preferred over estimated)
-  - ``x_source``: ``"observed"`` or ``"estimated"``
+  - ``x_source``: ``"observed"``, ``"estimated_mar"``, or ``"estimated_mnar"``
   - ``x_confidence``: confidence score in [0, 1]
+  - ``x_missingness_type``: ``"mar"``, ``"mcar"``, ``"mnar"``, or ``"observed"``
+  - ``x_estimation_method``: which model(s) produced the estimate
+  - ``x_sensitivity_lower``: lower bound (MNAR only)
+  - ``x_sensitivity_upper``: upper bound (MNAR only)
 
 Observed values are **never** overwritten.
 """
@@ -457,15 +471,25 @@ def _build_estimation_columns(
     var: str,
     estimated: pd.Series,
     confidence: pd.Series,
+    missingness_type: pd.Series | None = None,
+    estimation_method: str | None = None,
+    sensitivity_lower: pd.Series | None = None,
+    sensitivity_upper: pd.Series | None = None,
 ) -> None:
-    """Add the five estimation output columns for a variable.
+    """Add estimation output columns for a variable.
 
-    Columns:
+    Core columns (always present):
       - ``{var}_observed``: original value
       - ``{var}_estimated``: model estimate (NaN where observed)
       - ``{var}_final``: best available
-      - ``{var}_source``: "observed" or "estimated"
+      - ``{var}_source``: ``"observed"``, ``"estimated_mar"``, or ``"estimated_mnar"``
       - ``{var}_confidence``: [0, 1]
+
+    Extended columns (when split estimator is active):
+      - ``{var}_missingness_type``: ``"mar"``, ``"mcar"``, ``"mnar"``, ``"observed"``
+      - ``{var}_estimation_method``: model(s) that produced the estimate
+      - ``{var}_sensitivity_lower``: pessimistic bound (MNAR only)
+      - ``{var}_sensitivity_upper``: optimistic bound (MNAR only)
     """
     observed = df[var].copy()
 
@@ -474,25 +498,47 @@ def _build_estimation_columns(
     still_missing = final.isna()
     final[still_missing] = estimated[still_missing]
 
-    # Source
+    # Source: distinguish MAR vs MNAR estimates
     source = pd.Series("observed", index=df.index, dtype="object")
-    source[still_missing & estimated.notna()] = "estimated"
-    source[still_missing & estimated.isna()] = "observed"  # still missing
+    estimated_mask = still_missing & estimated.notna()
+    if missingness_type is not None:
+        mar_est = estimated_mask & missingness_type.isin(["mar", "mcar"])
+        mnar_est = estimated_mask & (missingness_type == "mnar")
+        source[mar_est] = "estimated_mar"
+        source[mnar_est] = "estimated_mnar"
+        # Any estimated without classification -> generic
+        other_est = estimated_mask & ~mar_est & ~mnar_est
+        source[other_est] = "estimated"
+    else:
+        source[estimated_mask] = "estimated"
 
     # Confidence: 1.0 for observed, model confidence for estimated
     conf = pd.Series(1.0, index=df.index)
-    conf[still_missing & estimated.notna()] = confidence[still_missing & estimated.notna()]
+    conf[estimated_mask] = confidence[estimated_mask]
     conf[still_missing & estimated.isna()] = 0.0
 
-    # Bulk-assign all new columns at once to avoid DataFrame fragmentation
-    # warnings (PerformanceWarning) when this function is called many times.
-    new_cols = pd.DataFrame({
+    # Build all columns at once for performance
+    cols_dict = {
         f"{var}_observed": observed,
         f"{var}_estimated": estimated,
         f"{var}_final": final,
         f"{var}_source": source,
         f"{var}_confidence": conf,
-    }, index=df.index)
+    }
+
+    # Extended columns
+    if missingness_type is not None:
+        cols_dict[f"{var}_missingness_type"] = missingness_type
+    if estimation_method is not None:
+        method_series = pd.Series("observed", index=df.index, dtype="object")
+        method_series[estimated_mask] = estimation_method
+        cols_dict[f"{var}_estimation_method"] = method_series
+    if sensitivity_lower is not None:
+        cols_dict[f"{var}_sensitivity_lower"] = sensitivity_lower
+    if sensitivity_upper is not None:
+        cols_dict[f"{var}_sensitivity_upper"] = sensitivity_upper
+
+    new_cols = pd.DataFrame(cols_dict, index=df.index)
     df[new_cols.columns] = new_cols
 
 
@@ -664,12 +710,12 @@ def run_estimation(
     hierarchy_config: dict[str, Any] | None = None,
     imputer_method: str | None = None,
 ) -> tuple[pd.DataFrame, EstimationCoverage]:
-    """Run the full two-pass estimation pipeline.
+    """Run the full three-phase estimation pipeline.
 
     Parameters
     ----------
     df:
-        Full feature table.  Modified in-place for Pass 1; a copy is
+        Full feature table.  Modified in-place for Phase 1; a copy is
         returned with estimation columns added.
     variables:
         List of variable names to estimate.  Defaults to
@@ -677,9 +723,14 @@ def run_estimation(
     hierarchy_config:
         Override survival hierarchy config.
     imputer_method:
-        Pass 2 imputer backend: ``"bayesian_ridge"`` (default) or
-        ``"vae"``.  When *None*, reads from ``global_config.yml``
-        key ``estimation_imputer``.
+        Imputer backend.  Options:
+          - ``"split"`` (default): classify missingness, route to
+            MAR estimator (MICE+GP+MatrixCompletion) or MNAR estimator
+            (Heckman+PatternMixture+GAIN).
+          - ``"bayesian_ridge"``: legacy per-variable BayesianRidge.
+          - ``"vae"``: legacy VAE imputer.
+        When *None*, reads from ``global_config.yml`` key
+        ``estimation_imputer``.
 
     Returns
     -------
@@ -696,9 +747,9 @@ def run_estimation(
     if imputer_method is None:
         try:
             global_cfg = load_config("global_config")
-            imputer_method = global_cfg.get("estimation_imputer", "bayesian_ridge")
+            imputer_method = global_cfg.get("estimation_imputer", "split")
         except Exception:
-            imputer_method = "bayesian_ridge"
+            imputer_method = "split"
 
     result = df.copy()
     coverage = EstimationCoverage()
@@ -712,26 +763,23 @@ def run_estimation(
             coverage.coverage_before[var] = 0.0
 
     # ------------------------------------------------------------------
-    # Pass 1: Deterministic identity fill
+    # Phase 1: Deterministic identity fill
     # ------------------------------------------------------------------
-    logger.info("Running Pass 1: Deterministic identity fill ...")
+    logger.info("Running Phase 1: Deterministic identity fill ...")
     p1_result = run_pass1_identity_fill(result)
     coverage.pass1_fills = p1_result.fills
 
     # ------------------------------------------------------------------
-    # Pass 2: Model-based imputer
-    # ------------------------------------------------------------------
     # Build tier membership for weighting
+    # ------------------------------------------------------------------
     tier_membership = _build_tier_membership(hierarchy_config)
-
-    # Build per-tier weight series
     tier_weight_columns: dict[int, str] = {}
     for i in range(1, 6):
         col = f"hierarchy_tier{i}_weight"
         if col in result.columns:
             tier_weight_columns[i] = col
 
-    # Determine which variables actually need imputation
+    # Determine which variables need imputation
     vars_needing_imputation = [
         v for v in variables
         if v in result.columns and result[v].isna().any()
@@ -749,10 +797,21 @@ def run_estimation(
             pd.Series(np.nan, index=result.index),
         )
 
-    # --- VAE imputer path ---
-    if imputer_method == "vae" and vars_needing_imputation:
+    # ------------------------------------------------------------------
+    # Phase 2 + 3: Split estimator (new default)
+    # ------------------------------------------------------------------
+    if imputer_method == "split" and vars_needing_imputation:
+        _run_split_estimation(
+            result, vars_needing_imputation, tier_membership,
+            tier_weight_columns, coverage,
+        )
+
+    # ------------------------------------------------------------------
+    # Legacy paths (backward compatibility)
+    # ------------------------------------------------------------------
+    elif imputer_method == "vae" and vars_needing_imputation:
         logger.info(
-            "Running Pass 2: VAE imputer for %d variables ...",
+            "Running legacy VAE imputer for %d variables ...",
             len(vars_needing_imputation),
         )
         vae_succeeded = _run_pass2_vae(
@@ -760,34 +819,29 @@ def run_estimation(
             tier_weight_columns, coverage,
         )
         if not vae_succeeded:
-            # Fall back to BayesianRidge for any variables the VAE
-            # could not handle
             remaining = [
                 v for v in vars_needing_imputation
                 if f"{v}_final" not in result.columns
             ]
             if remaining:
-                logger.info(
-                    "VAE fallback: running BayesianRidge for %d remaining "
-                    "variables", len(remaining),
-                )
                 _run_pass2_bayesian_ridge(
                     result, remaining, tier_membership,
                     tier_weight_columns, coverage,
                 )
-    else:
-        # --- BayesianRidge imputer path (default) ---
-        if vars_needing_imputation:
-            logger.info(
-                "Running Pass 2: BayesianRidge rolling imputer for %d "
-                "variables ...", len(vars_needing_imputation),
-            )
-            _run_pass2_bayesian_ridge(
-                result, vars_needing_imputation, tier_membership,
-                tier_weight_columns, coverage,
-            )
 
-    # Record post-estimation coverage (using _final columns)
+    elif imputer_method == "bayesian_ridge" and vars_needing_imputation:
+        logger.info(
+            "Running legacy BayesianRidge imputer for %d variables ...",
+            len(vars_needing_imputation),
+        )
+        _run_pass2_bayesian_ridge(
+            result, vars_needing_imputation, tier_membership,
+            tier_weight_columns, coverage,
+        )
+
+    # ------------------------------------------------------------------
+    # Record post-estimation coverage
+    # ------------------------------------------------------------------
     for var in variables:
         final_col = f"{var}_final"
         if final_col in result.columns and n > 0:
@@ -814,12 +868,143 @@ def run_estimation(
             }
 
     logger.info(
-        "Estimation complete: Pass1 filled %d cells, Pass2 estimated %d variables",
+        "Estimation complete: Phase1 filled %d cells, Phase2+3 estimated %d variables",
         p1_result.total_filled,
         len(coverage.pass2_estimates),
     )
 
     return result, coverage
+
+
+# ---------------------------------------------------------------------------
+# Split estimation orchestrator
+# ---------------------------------------------------------------------------
+
+
+def _run_split_estimation(
+    result: pd.DataFrame,
+    variables: list[str],
+    tier_membership: dict[str, int],
+    tier_weight_columns: dict[int, str],
+    coverage: EstimationCoverage,
+) -> None:
+    """Run the split estimator: classify -> route -> merge.
+
+    Phase 2: Classify each NaN as MAR or MNAR.
+    Phase 3a: Route MAR values to missing_data_estimator.
+    Phase 3b: Route MNAR values to hidden_data_estimator.
+    Merge: Combine results into the estimation output columns.
+    """
+    from operator1.estimation.missingness_classifier import classify_missingness
+    from operator1.estimation.missing_data_estimator import estimate_missing_data
+    from operator1.estimation.hidden_data_estimator import estimate_hidden_data
+
+    # --- Phase 2: Classify missingness ---
+    logger.info(
+        "Running Phase 2: Missingness classification for %d variables ...",
+        len(variables),
+    )
+    classification = classify_missingness(result, variables)
+
+    # Split variables by missingness type
+    mar_masks: dict[str, pd.Series] = {}
+    mnar_masks: dict[str, pd.Series] = {}
+    vars_with_mar: list[str] = []
+    vars_with_mnar: list[str] = []
+
+    for var in variables:
+        mar_m = classification.mar_mask(var, result)
+        mnar_m = classification.mnar_mask(var, result)
+
+        if mar_m.any():
+            mar_masks[var] = mar_m
+            vars_with_mar.append(var)
+        if mnar_m.any():
+            mnar_masks[var] = mnar_m
+            vars_with_mnar.append(var)
+
+    logger.info(
+        "Classification result: %d vars with MAR, %d vars with MNAR",
+        len(vars_with_mar), len(vars_with_mnar),
+    )
+
+    # --- Phase 3a: MAR estimation ---
+    mar_result = None
+    if vars_with_mar:
+        logger.info(
+            "Running Phase 3a: MAR estimator (MICE+GP+MatrixCompletion) "
+            "for %d variables ...", len(vars_with_mar),
+        )
+        mar_result = estimate_missing_data(
+            result, vars_with_mar, mar_masks, tier_membership,
+        )
+
+    # --- Phase 3b: MNAR estimation ---
+    mnar_result = None
+    if vars_with_mnar:
+        logger.info(
+            "Running Phase 3b: MNAR estimator (Heckman+Pattern+GAIN) "
+            "for %d variables ...", len(vars_with_mnar),
+        )
+        mnar_result = estimate_hidden_data(
+            result, vars_with_mnar, mnar_masks,
+        )
+
+    # --- Merge results into output columns ---
+    for var in variables:
+        # Combine MAR and MNAR estimates for this variable
+        estimated = pd.Series(np.nan, index=result.index, dtype=float)
+        confidence = pd.Series(np.nan, index=result.index, dtype=float)
+        sensitivity_lower = None
+        sensitivity_upper = None
+        method_name = "none"
+        methods_list = []
+
+        # MAR estimates
+        if mar_result and var in mar_result.estimated_values:
+            mar_est = mar_result.estimated_values[var]
+            mar_conf = mar_result.confidence_scores[var]
+            mar_mask = mar_masks.get(var, pd.Series(False, index=result.index))
+
+            fill_mask = mar_mask & mar_est.notna()
+            estimated[fill_mask] = mar_est[fill_mask]
+            confidence[fill_mask] = mar_conf[fill_mask]
+            methods_list.append(mar_result.methods_used.get(var, "mar"))
+
+        # MNAR estimates
+        if mnar_result and var in mnar_result.estimated_values:
+            mnar_est = mnar_result.estimated_values[var]
+            mnar_conf = mnar_result.confidence_scores[var]
+            mnar_mask = mnar_masks.get(var, pd.Series(False, index=result.index))
+
+            fill_mask = mnar_mask & mnar_est.notna()
+            estimated[fill_mask] = mnar_est[fill_mask]
+            confidence[fill_mask] = mnar_conf[fill_mask]
+            methods_list.append(mnar_result.methods_used.get(var, "mnar"))
+
+            # Sensitivity bounds (MNAR only)
+            if var in mnar_result.sensitivity_lower:
+                sensitivity_lower = mnar_result.sensitivity_lower[var]
+            if var in mnar_result.sensitivity_upper:
+                sensitivity_upper = mnar_result.sensitivity_upper[var]
+
+        method_name = "+".join(methods_list) if methods_list else "none"
+
+        # Track coverage
+        n_estimated = int(estimated.notna().sum())
+        if n_estimated > 0:
+            coverage.pass2_estimates[var] = n_estimated
+
+        # Get missingness type from classifier
+        miss_type = classification.types.get(var)
+
+        _build_estimation_columns(
+            result, var, estimated, confidence,
+            missingness_type=miss_type,
+            estimation_method=method_name,
+            sensitivity_lower=sensitivity_lower,
+            sensitivity_upper=sensitivity_upper,
+        )
 
 
 def save_estimation_coverage(
