@@ -190,7 +190,8 @@ def _run_heckman(
             estimated.loc[mnar_mask] = y_pred.values
 
             # Confidence: based on selection model fit + OLS R-squared
-            probit_accuracy = float((probit_result.predict() > 0.5).astype(float).eq(y_sel).mean())
+            probit_preds = (probit_result.predict() > 0.5).astype(float)
+            probit_accuracy = float(np.mean(probit_preds == y_sel.values))
             ols_r2 = max(0, float(ols_result.rsquared))
             # Selection correction significance
             mills_pval = float(ols_result.pvalues.get("inv_mills_ratio", 1.0))
