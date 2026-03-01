@@ -1166,6 +1166,85 @@ Non-interactive examples:
         logger.warning("News sentiment scoring failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 5.5: Enriched survival timeline (bridge: rule-based + HMM)
+    # ------------------------------------------------------------------
+    # Runs early regime detection (HMM/GMM/PELT/BCP) and combines it
+    # with the rule-based survival flags into a unified state vector.
+    # This gives downstream temporal models a single interface for
+    # regime_state, survival_intensity, and regime_confidence.
+    enriched_timeline_result = None
+    early_regime_result = None
+    regime_detector = None
+
+    if not args.skip_models:
+        logger.info("")
+        logger.info("Step 5.5: Enriched survival timeline...")
+
+        try:
+            from operator1.models.regime_detector import run_early_regime_detection
+            from operator1.analysis.survival_timeline import (
+                compute_enriched_survival_timeline,
+            )
+
+            # Early regime detection: runs HMM/GMM/PELT/BCP and adds regime
+            # columns to cache. This replaces the separate regime detection
+            # that used to run at the start of Step 6.
+            cache, early_regime_result = run_early_regime_detection(cache)
+            if early_regime_result and early_regime_result.fitted:
+                regime_detector = early_regime_result.detector
+                logger.info("Early regime detection complete")
+            else:
+                logger.info(
+                    "Early regime detection did not fit: %s",
+                    getattr(early_regime_result, "error", "unknown"),
+                )
+
+            # Build enriched survival timeline.
+            _regime_labels = (
+                early_regime_result.regime_labels
+                if early_regime_result else None
+            )
+            _regime_confidence = (
+                early_regime_result.regime_confidence
+                if early_regime_result else None
+            )
+            enriched_timeline_result = compute_enriched_survival_timeline(
+                cache,
+                regime_labels=_regime_labels,
+                regime_confidence=_regime_confidence,
+            )
+            if enriched_timeline_result and enriched_timeline_result.fitted:
+                # Merge enriched columns back into cache.
+                _enriched_cols = [
+                    "regime_state", "survival_intensity",
+                    "regime_confidence", "regime_switch",
+                    "regime_transition_prob", "survival_mode",
+                    "survival_mode_code", "switch_point",
+                    "days_in_mode", "stability_score_21d",
+                    "market_regime",
+                ]
+                for col in _enriched_cols:
+                    if col in enriched_timeline_result.timeline.columns:
+                        if col not in cache.columns:
+                            cache[col] = enriched_timeline_result.timeline[col]
+                logger.info(
+                    "Enriched survival timeline: mean_intensity=%.3f, "
+                    "regime_available=%s, states=%s",
+                    enriched_timeline_result.mean_intensity,
+                    enriched_timeline_result.regime_available,
+                    {k: f"{v:.1%}"
+                     for k, v in enriched_timeline_result.combined_state_distribution.items()
+                     if v > 0.01},
+                )
+            else:
+                logger.warning(
+                    "Enriched survival timeline failed: %s",
+                    getattr(enriched_timeline_result, "error", "unknown"),
+                )
+        except Exception as exc:
+            logger.warning("Step 5.5 (enriched survival timeline) failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 6: Temporal modeling (optional)
     # ------------------------------------------------------------------
     forecast_result = None
@@ -1206,6 +1285,7 @@ Non-interactive examples:
         # Collect injected feature columns for temporal model learning.
         # Include linked aggregate columns (competitors_avg_*, suppliers_median_*,
         # etc.) so that temporal models can learn from cross-entity signals.
+        # Also include enriched survival timeline columns.
         _linked_prefixes = (
             "competitors_", "suppliers_", "customers_",
             "financial_institutions_", "sector_peers_", "industry_peers_",
@@ -1214,6 +1294,8 @@ Non-interactive examples:
             c for c in cache.columns
             if (c.startswith("fh_") or c.startswith("sentiment_")
                 or c.startswith("peer_") or c.startswith("macro_")
+                or c in ("survival_intensity", "regime_confidence",
+                         "regime_transition_prob", "stability_score_21d")
                 or any(c.startswith(p) for p in _linked_prefixes))
             and cache[c].dtype in ("float64", "float32", "int64")
             and not c.startswith("is_missing_")
@@ -1221,13 +1303,15 @@ Non-interactive examples:
         if _extra_vars:
             logger.info("Extra variables for temporal models (%d): %s", len(_extra_vars), _extra_vars[:10])
 
-        # Regime detection
-        regime_detector = None
-        try:
-            cache, regime_detector = detect_regimes_and_breaks(cache)
-            logger.info("Regimes detected")
-        except Exception as exc:
-            logger.warning("Regime detection failed: %s", exc)
+        # Regime detection: skip if already run in Step 5.5.
+        if regime_detector is None:
+            try:
+                cache, regime_detector = detect_regimes_and_breaks(cache)
+                logger.info("Regimes detected")
+            except Exception as exc:
+                logger.warning("Regime detection failed: %s", exc)
+        else:
+            logger.info("Regime detection: using results from Step 5.5 (early detection)")
 
         # Dual regime classification
         try:
@@ -1539,7 +1623,7 @@ Non-interactive examples:
             logger.warning("OHLC candlestick prediction failed: %s", exc)
     else:
         logger.info("Step 6: Skipped (--skip-models)")
-        regime_detector = None
+        # regime_detector may have been set in Step 5.5; keep it if so.
 
     # ------------------------------------------------------------------
     # Step 7: Build company profile
@@ -1614,6 +1698,21 @@ Non-interactive examples:
             peer_ranking_result=peer_ranking_result,
             macro_quadrant_result=_to_dict(macro_quadrant_result),
         )
+
+        # Inject enriched survival timeline summary
+        if enriched_timeline_result and enriched_timeline_result.fitted:
+            profile["enriched_survival_timeline"] = {
+                "available": True,
+                "regime_available": enriched_timeline_result.regime_available,
+                "mean_intensity": enriched_timeline_result.mean_intensity,
+                "combined_state_distribution": (
+                    enriched_timeline_result.combined_state_distribution
+                ),
+                "base_n_switches": enriched_timeline_result.base.n_switches,
+                "base_mean_stability": enriched_timeline_result.base.mean_stability,
+            }
+        else:
+            profile["enriched_survival_timeline"] = {"available": False}
 
         # Inject economic plane classification
         try:
