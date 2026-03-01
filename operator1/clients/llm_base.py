@@ -129,23 +129,26 @@ CLAUDE_MODELS: dict[str, dict[str, Any]] = {
 
 
 def get_best_model(provider: str, model_registry: dict[str, dict[str, Any]]) -> str:
-    """Pick the best report-capable model from a provider's registry.
+    """Pick the best cost-effective report-capable model from a provider's registry.
 
-    Prefers models with higher max_output_tokens and stable tier.
+    Prefers stable/balanced tiers over flagship (Opus is $15/$75 per MTok --
+    too expensive for free-tier keys). The "fast" tier (Haiku at $0.25/$1.25)
+    is preferred over "flagship" (Opus) for cost efficiency.
+
     Returns the model name string.
     """
-    # Sort by: report_capable (True first), then max_output_tokens desc
     candidates = [
         (name, info)
         for name, info in model_registry.items()
         if info.get("report_capable", False)
     ]
     if not candidates:
-        # Fallback: just return the first model
         return next(iter(model_registry))
 
-    # Prefer stable/balanced tiers, then by max_output_tokens
-    tier_priority = {"flagship": 0, "balanced": 1, "stable": 2, "fast": 3, "preview": 4}
+    # Cost-aware priority: balanced > stable > fast > preview > flagship
+    # This ensures we pick Sonnet ($3/$15) or Haiku ($0.25/$1.25) over
+    # Opus ($15/$75) by default, saving 5-60x on API costs.
+    tier_priority = {"balanced": 0, "stable": 1, "fast": 2, "preview": 3, "flagship": 4}
     candidates.sort(
         key=lambda x: (
             tier_priority.get(x[1].get("tier", "stable"), 5),
