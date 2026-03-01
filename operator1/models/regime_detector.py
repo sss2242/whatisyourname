@@ -812,6 +812,11 @@ def run_early_regime_detection(
         early.detector = detector
 
         # Extract regime labels as a string Series.
+        # IMPORTANT: The ordering below matters -- astype(str) first converts
+        # NaN to the literal string "nan", then .where() replaces those
+        # positions with "unknown" using the *original* NaN mask.  Do NOT
+        # refactor to labels.fillna("unknown").astype(str) -- that would
+        # skip the mask check and could leak "nan" strings if dtype changes.
         if "regime_label" in cache.columns:
             labels = cache["regime_label"].copy()
             if labels.notna().any():
@@ -820,6 +825,10 @@ def run_early_regime_detection(
                 early.regime_labels = pd.Series("unknown", index=cache.index)
         else:
             early.regime_labels = pd.Series("unknown", index=cache.index)
+
+        # Safety net: replace any lingering "nan" strings that might leak
+        # through unexpected code paths (e.g., mixed-type Series edge cases).
+        early.regime_labels = early.regime_labels.replace("nan", "unknown")
 
         # Extract max HMM posterior as regime confidence.
         prob_cols = [c for c in cache.columns if c.startswith("regime_hmm_prob_")]

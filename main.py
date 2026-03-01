@@ -1214,6 +1214,15 @@ Non-interactive examples:
                 regime_confidence=_regime_confidence,
             )
             if enriched_timeline_result and enriched_timeline_result.fitted:
+                # Item 3: Index length check before merging.
+                _etl = enriched_timeline_result.timeline
+                if len(_etl) != len(cache):
+                    logger.warning(
+                        "Enriched timeline length (%d) differs from cache (%d) "
+                        "-- using reindex to align safely",
+                        len(_etl), len(cache),
+                    )
+
                 # Merge enriched columns back into cache.
                 _enriched_cols = [
                     "regime_state", "survival_intensity",
@@ -1224,9 +1233,16 @@ Non-interactive examples:
                     "market_regime",
                 ]
                 for col in _enriched_cols:
-                    if col in enriched_timeline_result.timeline.columns:
+                    if col in _etl.columns:
                         if col not in cache.columns:
-                            cache[col] = enriched_timeline_result.timeline[col]
+                            # Align by index in case lengths differ.
+                            cache[col] = _etl[col].reindex(cache.index)
+                        else:
+                            # Item 2: Log when a column is skipped due to collision.
+                            logger.debug(
+                                "Enriched column '%s' skipped -- already in cache",
+                                col,
+                            )
                 logger.info(
                     "Enriched survival timeline: mean_intensity=%.3f, "
                     "regime_available=%s, states=%s",
@@ -1303,8 +1319,15 @@ Non-interactive examples:
         if _extra_vars:
             logger.info("Extra variables for temporal models (%d): %s", len(_extra_vars), _extra_vars[:10])
 
-        # Regime detection: skip if already run in Step 5.5.
-        if regime_detector is None:
+        # Item 4: Regime detection -- skip if already run in Step 5.5.
+        # Check both that detector exists AND regime columns are in cache
+        # to guard against partial state from a Step 5.5 exception.
+        _regime_ready = (
+            regime_detector is not None
+            and hasattr(regime_detector, "result")
+            and "regime_label" in cache.columns
+        )
+        if not _regime_ready:
             try:
                 cache, regime_detector = detect_regimes_and_breaks(cache)
                 logger.info("Regimes detected")
@@ -1628,6 +1651,14 @@ Non-interactive examples:
     # ------------------------------------------------------------------
     # Step 7: Build company profile
     # ------------------------------------------------------------------
+    # Item 5: When --skip-models is used, the following variables are None:
+    #   enriched_timeline_result, early_regime_result, regime_detector,
+    #   forecast_result, forward_pass_result, burnout_result, mc_result,
+    #   pred_result, transfer_entropy_result, cycle_result, pattern_result,
+    #   copula_result, conformal_result, dtw_result, shap_result,
+    #   sobol_result, particle_filter_result, transformer_result,
+    #   dual_regime_result, granger_result, ga_result, ohlc_result.
+    # All downstream code must check for None before accessing these.
     logger.info("")
     logger.info("Step 7: Building company profile...")
 

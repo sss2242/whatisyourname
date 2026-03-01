@@ -497,6 +497,9 @@ class EnrichedTimelineResult:
     error: str | None = None
 
 
+_WARNED_UNMAPPED_KEYS: set[tuple[str, str]] = set()
+
+
 def _map_combined_state(
     survival_mode: str,
     market_regime: str,
@@ -508,8 +511,25 @@ def _map_combined_state(
     # Fallback: use the unknown-regime row for the survival mode.
     fallback_key = (survival_mode, "unknown")
     if fallback_key in _COMBINED_STATE_MAP:
+        # Warn once per unmapped key so operators know they might want to
+        # extend _COMBINED_STATE_MAP (e.g., when using n_regimes > 4).
+        if key not in _WARNED_UNMAPPED_KEYS:
+            _WARNED_UNMAPPED_KEYS.add(key)
+            logger.warning(
+                "Unmapped (survival_mode=%r, market_regime=%r) -- "
+                "falling back to 'unknown' regime row. Consider extending "
+                "_COMBINED_STATE_MAP if this regime label is expected.",
+                survival_mode, market_regime,
+            )
         return _COMBINED_STATE_MAP[fallback_key]
-    # Last resort.
+    # Last resort: both survival_mode and regime are unknown.
+    if key not in _WARNED_UNMAPPED_KEYS:
+        _WARNED_UNMAPPED_KEYS.add(key)
+        logger.warning(
+            "Completely unmapped (survival_mode=%r, market_regime=%r) -- "
+            "returning ('unknown', 0.5)",
+            survival_mode, market_regime,
+        )
     return ("unknown", 0.5)
 
 
@@ -614,12 +634,18 @@ def compute_enriched_survival_timeline(
         result.mean_intensity = float(np.nanmean(intensities))
         result.fitted = True
 
+        # Item 7: Log confidence range to help diagnose low-confidence situations.
+        _conf = timeline["regime_confidence"]
         logger.info(
             "Enriched survival timeline: %d days, mean_intensity=%.3f, "
-            "regime_available=%s, states=%s",
+            "regime_available=%s, confidence=[min=%.3f, mean=%.3f, max=%.3f], "
+            "states=%s",
             len(timeline),
             result.mean_intensity,
             result.regime_available,
+            float(_conf.min()),
+            float(_conf.mean()),
+            float(_conf.max()),
             {k: f"{v:.1%}" for k, v in result.combined_state_distribution.items()
              if v > 0.01},
         )
