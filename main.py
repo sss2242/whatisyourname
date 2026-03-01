@@ -628,9 +628,25 @@ Non-interactive examples:
     # a given date is an immutable fact that never changes retroactively.
     if quotes_df.empty and ticker:
         logger.info(
-            "PIT source %s does not provide OHLCV -- price features will be limited.",
+            "PIT source %s does not provide OHLCV -- fetching from regional OHLCV provider...",
             market_info.pit_api_name,
         )
+        try:
+            from operator1.clients.ohlcv_provider import fetch_ohlcv
+            quotes_df = fetch_ohlcv(
+                ticker=ticker,
+                market_id=market_id,
+                years=int(args.years),
+            )
+            if not quotes_df.empty:
+                logger.info(
+                    "OHLCV fetched: %d rows via regional provider (market=%s)",
+                    len(quotes_df), market_id,
+                )
+            else:
+                logger.warning("OHLCV provider returned empty for %s", ticker)
+        except Exception as exc:
+            logger.warning("OHLCV provider fetch failed for %s: %s", ticker, exc)
 
     # Step 3b: Reconcile financial data (normalize fields, validate dates)
     reconciliation_report = {}
@@ -774,8 +790,30 @@ Non-interactive examples:
     if macro_api_info:
         logger.info("")
         logger.info(
-            "Step 4a: Macro data fetching skipped (government macro APIs removed).",
+            "Step 4a: Fetching macro data from regional provider (%s)...",
+            macro_api_info.api_name,
         )
+        try:
+            from operator1.clients.macro_provider import fetch_macro
+            country_code = getattr(macro_api_info, "country_code", "") or (
+                target_profile.get("country", "US")[:2].upper()
+            )
+            macro_data = fetch_macro(
+                country_iso2=country_code,
+                market_id=market_id,
+                secrets=secrets,
+                years=max(10, int(args.years) + 5),
+            )
+            if macro_data:
+                _fetched = [k for k, v in macro_data.items() if v is not None and not v.empty]
+                logger.info(
+                    "Macro data fetched: %d indicators (%s)",
+                    len(_fetched), ", ".join(_fetched),
+                )
+            else:
+                logger.info("Macro provider returned no data for %s", country_code)
+        except Exception as exc:
+            logger.warning("Macro data fetch failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Step 4a-validate: Log what both APIs returned for diagnostics
