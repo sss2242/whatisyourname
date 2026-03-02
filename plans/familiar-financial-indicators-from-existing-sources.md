@@ -181,7 +181,106 @@ Structure reports in two tiers:
 
 ---
 
-## 5. Data Source Coverage Matrix
+## 5. Multi-Horizon Zoomed Prediction Charts
+
+Since we already produce forecasts at 1d, 5d, 21d, and 252d horizons (via [`forecasting.py`](operator1/models/forecasting.py:55) and [`prediction_aggregator.py`](operator1/models/prediction_aggregator.py:1)), and we already render charts (via [`generate_charts()`](operator1/report/report_generator.py:2593)), we should show predicted familiar indicators as **four zoomed chart panels** so users can see both the trajectory and the uncertainty at each time scale.
+
+### 5.1 Chart Layout: "Zoom Ladder"
+
+For each key indicator, generate a 4-panel figure where each panel zooms into a different horizon. Each panel shows:
+
+- **Historical tail** (context): last N trading days of actual data (grey/solid line)
+- **Prediction path** (blue line with confidence band): from today forward to the horizon
+- **Confidence interval** (shaded band): from conformal calibration or RMSE-scaled bands
+
+```
++-------------------------------+-------------------------------+
+|  TOMORROW (1d)                |  NEXT WEEK (5d)               |
+|  [last 10 days] + [1d pred]  |  [last 30 days] + [5d pred]   |
+|  Y-axis: tight zoom           |  Y-axis: medium zoom          |
++-------------------------------+-------------------------------+
+|  NEXT MONTH (21d)             |  NEXT YEAR (252d)             |
+|  [last 63 days] + [21d pred] |  [last 252 days] + [252d pred]|
+|  Y-axis: wider zoom           |  Y-axis: full range           |
++-------------------------------+-------------------------------+
+```
+
+### 5.2 Which Indicators Get Prediction Charts
+
+Not every indicator is forecastable -- only time-series variables that the forecasting models actually predict. The recommended set:
+
+| Indicator | Why It Works as a Chart |
+|---|---|
+| **Close Price** | The indicator everyone looks at first; already charted in `generate_charts()` |
+| **P/E Ratio** | Shows valuation trajectory; derived from predicted EPS + price |
+| **EV/EBITDA** | Enterprise valuation trend; derived from predicted EBITDA + debt + price |
+| **Gross Margin** | Profitability direction; directly forecast by the model suite |
+| **Debt-to-Equity** | Solvency trajectory; directly forecast |
+| **Current Ratio** | Liquidity trend; directly forecast (Tier 1 survival variable) |
+| **FCF Yield** | Cash reality direction; directly forecast |
+| **Volatility (21d)** | Risk outlook; GARCH model specializes in this |
+| **Revenue Growth YoY** | Growth trajectory; derived from predicted revenue TTM |
+| **Altman Z-Score** | Bankruptcy risk path; composed from 5 predicted sub-variables |
+
+### 5.3 Zooming Strategy
+
+Each panel uses a different historical context window and y-axis range:
+
+| Panel | Horizon | Historical Tail | Y-Axis Strategy |
+|---|---|---|---|
+| Tomorrow | 1d | Last 10 trading days | Auto-fit to min/max of visible data +/- 5% padding |
+| Next Week | 5d | Last 30 trading days | Auto-fit with 10% padding |
+| Next Month | 21d | Last 63 trading days (~3 months) | Auto-fit with 15% padding |
+| Next Year | 252d | Last 252 trading days (~1 year) | Auto-fit with 20% padding |
+
+The tight zoom on tomorrow's panel makes even a small predicted move visually clear. The wide zoom on the yearly panel shows the full trajectory with Monte Carlo fan-out.
+
+### 5.4 Confidence Band Rendering
+
+- **1d panel**: narrow band (low uncertainty) -- gives confidence
+- **5d panel**: slightly wider -- still precise
+- **21d panel**: visible cone -- honest about uncertainty
+- **252d panel**: wide fan -- can overlay Monte Carlo path percentiles (p5, p25, p50, p75, p95)
+
+For the 252d panel specifically, we can overlay the Monte Carlo survival probability as a color gradient on the confidence band (green = high survival, red = low survival), connecting the familiar indicator to our unique analysis.
+
+### 5.5 Implementation Approach
+
+This builds on the existing [`generate_charts()`](operator1/report/report_generator.py:2593) function which already:
+- Uses matplotlib with the dark theme (`_CHART_BG`, `_CHART_ACCENT`)
+- Renders at 180 DPI
+- Saves PNGs to the cache directory
+- Handles missing data gracefully
+
+New function signature:
+
+```python
+def generate_prediction_zoom_charts(
+    cache: pd.DataFrame,
+    predictions: dict[str, dict[str, float]],  # from ForecastResult
+    confidence_bands: dict[str, dict[str, tuple[float, float]]],  # from PredictionAggregator
+    mc_result: MonteCarloResult | None = None,
+    output_dir: str = CACHE_DIR,
+    indicators: list[str] | None = None,  # defaults to the 10 above
+) -> list[str]:
+    """Generate 4-panel zoom-ladder charts for each predicted indicator."""
+```
+
+Estimated effort: ~150 lines of matplotlib code, reusing existing chart styling constants.
+
+### 5.6 Why This Works for User Familiarity
+
+1. **People are trained to read these charts.** TradingView, Yahoo Finance, and Bloomberg all show price with forward projections. Showing P/E or Gross Margin the same way is immediately intuitive.
+
+2. **The zoom ladder answers the user's real questions in order:** "What happens tomorrow?" (tight zoom, high confidence) -> "This week?" -> "This month?" -> "This year?" (wide zoom, honest uncertainty). It mirrors how people actually think about time.
+
+3. **The confidence bands set expectations.** Instead of a single point forecast that looks overconfident, the widening bands at longer horizons communicate "we're less certain further out" without requiring statistical literacy.
+
+4. **The 252d Monte Carlo overlay is the bridge** from "indicators I know" to "analysis I can't get elsewhere." The user sees a familiar P/E chart, but with survival-probability-colored uncertainty bands that no other platform offers.
+
+---
+
+## 6. Data Source Coverage Matrix
 
 All indicators above are derived from these already-implemented data pipelines:
 
