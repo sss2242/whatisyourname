@@ -495,6 +495,85 @@ def _compute_volume_avg(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Per-share metrics
+# ---------------------------------------------------------------------------
+
+
+def _compute_per_share(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute per-share metrics.
+
+    Variables: eps_calc, book_value_per_share, revenue_per_share.
+    """
+    shares = df.get("shares_outstanding", pd.Series(np.nan, index=df.index))
+    net_income = df.get("net_income", pd.Series(np.nan, index=df.index))
+    equity = df.get("total_equity", pd.Series(np.nan, index=df.index))
+    revenue = df.get("revenue", pd.Series(np.nan, index=df.index))
+
+    # EPS (already computed internally in _compute_valuation but not exposed)
+    result, ism, inv = safe_ratio(net_income, shares, "eps_calc")
+    _set_ratio_columns(df, "eps_calc", result, ism, inv)
+
+    # Book value per share
+    result, ism, inv = safe_ratio(equity, shares, "book_value_per_share")
+    _set_ratio_columns(df, "book_value_per_share", result, ism, inv)
+
+    # Revenue per share
+    result, ism, inv = safe_ratio(revenue, shares, "revenue_per_share")
+    _set_ratio_columns(df, "revenue_per_share", result, ism, inv)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Technical indicators (familiar from TradingView, Yahoo Finance)
+# ---------------------------------------------------------------------------
+
+
+def _compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute common technical indicators from close price.
+
+    Variables: sma_50, sma_200, rsi_14, macd, macd_signal,
+    bollinger_upper, bollinger_lower.
+    """
+    close = df.get("close", pd.Series(np.nan, index=df.index))
+
+    # Simple Moving Averages (50-day and 200-day)
+    df["sma_50"] = close.rolling(window=50, min_periods=10).mean()
+    df["is_missing_sma_50"] = df["sma_50"].isna().astype(int)
+
+    df["sma_200"] = close.rolling(window=200, min_periods=50).mean()
+    df["is_missing_sma_200"] = df["sma_200"].isna().astype(int)
+
+    # RSI (14-day) -- Relative Strength Index
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.rolling(window=14, min_periods=5).mean()
+    avg_loss = loss.rolling(window=14, min_periods=5).mean()
+    rs = avg_gain / avg_loss.where(avg_loss.abs() > EPSILON, other=np.nan)
+    df["rsi_14"] = 100.0 - (100.0 / (1.0 + rs))
+    df["is_missing_rsi_14"] = df["rsi_14"].isna().astype(int)
+
+    # MACD (12/26/9 standard parameters)
+    ema_12 = close.ewm(span=12, min_periods=8, adjust=False).mean()
+    ema_26 = close.ewm(span=26, min_periods=18, adjust=False).mean()
+    df["macd"] = ema_12 - ema_26
+    df["macd_signal"] = df["macd"].ewm(span=9, min_periods=5, adjust=False).mean()
+    df["is_missing_macd"] = df["macd"].isna().astype(int)
+    df["is_missing_macd_signal"] = df["macd_signal"].isna().astype(int)
+
+    # Bollinger Bands (20-day, 2 standard deviations)
+    sma_20 = close.rolling(window=20, min_periods=5).mean()
+    std_20 = close.rolling(window=20, min_periods=5).std()
+    df["bollinger_upper"] = sma_20 + 2 * std_20
+    df["bollinger_lower"] = sma_20 - 2 * std_20
+    df["is_missing_bollinger_upper"] = df["bollinger_upper"].isna().astype(int)
+    df["is_missing_bollinger_lower"] = df["bollinger_lower"].isna().astype(int)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -510,6 +589,8 @@ _COMPUTE_STAGES = (
     _compute_valuation,
     _compute_ttm_and_growth,
     _compute_volume_avg,
+    _compute_per_share,
+    _compute_technical_indicators,
 )
 
 # All derived variable names (for inspection / downstream reference)
@@ -535,6 +616,11 @@ DERIVED_VARIABLES: tuple[str, ...] = (
     "revenue_growth_yoy", "earnings_growth_yoy",
     # Volume
     "volume_avg_21d",
+    # Per-share
+    "eps_calc", "book_value_per_share", "revenue_per_share",
+    # Technical indicators
+    "sma_50", "sma_200", "rsi_14", "macd", "macd_signal",
+    "bollinger_upper", "bollinger_lower",
 )
 
 

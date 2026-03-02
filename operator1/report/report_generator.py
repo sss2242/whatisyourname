@@ -2,7 +2,7 @@
 
 Consumes the ``company_profile.json`` built by T7.1 and produces:
 
-1. A **Bloomberg-style Markdown report** via Gemini (or a fallback
+1. A **branded Markdown report** via Gemini (or a fallback
    template when Gemini is unavailable).
 2. An **optional set of charts** (matplotlib) saved as PNG files.
 3. An **optional PDF** via ``pandoc`` (skipped gracefully if pandoc
@@ -61,6 +61,27 @@ class ReportTier(str, Enum):
     @property
     def filename(self) -> str:
         return f"{self.value}_report.md"
+
+
+class ReportMode(str, Enum):
+    """Two modes controlling explanation depth.
+
+    LEARN:   Plain-English explanations for financial newcomers.
+             Each indicator gets context: what it means, whether the
+             value is good or bad, and why it matters.
+    RESULTS: Data-forward, minimal prose.  Clean grids and charts
+             for professionals who already know the terminology.
+    """
+
+    LEARN = "learn"
+    RESULTS = "results"
+
+    @property
+    def label(self) -> str:
+        return {
+            "learn": "Learn",
+            "results": "Results",
+        }[self.value]
 
 
 # Sections included in each tier.  Section numbers match the fallback
@@ -2341,8 +2362,106 @@ def _build_portfolio_fit(profile: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _build_fallback_report(profile: dict[str, Any], tier: ReportTier = ReportTier.PREMIUM) -> str:
-    """Build a report using the local template, filtered by tier.
+def _build_key_indicators_table(profile: dict[str, Any], mode: ReportMode = ReportMode.RESULTS) -> str:
+    """Build a Key Financial Indicators summary table.
+
+    In LEARN mode, each indicator includes a plain-English explanation.
+    In RESULTS mode, just the clean data grid.
+    """
+    snapshot = profile.get("current_snapshot", {})
+    fh = profile.get("financial_health", {})
+
+    # Indicator definitions: (label, value_key, format, learn_explanation)
+    _INDICATORS: list[tuple[str, str, str, str]] = [
+        ("P/E Ratio", "pe_ratio_calc", ".1f",
+         "How much investors pay per dollar of earnings. "
+         "Lower than sector average may suggest undervaluation."),
+        ("P/B Ratio", "pb_ratio", ".2f",
+         "Market price relative to book value. "
+         "Below 1.0 means the market values the company below its net assets."),
+        ("EV/EBITDA", "ev_to_ebitda", ".1f",
+         "Enterprise value relative to operating cash earnings. "
+         "Lower values suggest cheaper valuation relative to cash generation."),
+        ("Gross Margin", "gross_margin", ".1%",
+         "Percentage of revenue retained after direct costs. "
+         "Higher is better -- shows pricing power and cost efficiency."),
+        ("Operating Margin", "operating_margin", ".1%",
+         "Percentage of revenue left after all operating expenses. "
+         "Measures core business profitability before interest and taxes."),
+        ("Net Margin", "net_margin", ".1%",
+         "Percentage of revenue that becomes profit. "
+         "The bottom line -- what shareholders actually keep."),
+        ("ROE", "roe", ".1%",
+         "Return on Equity -- profit generated per dollar of shareholder investment. "
+         "Above 15% is generally considered strong."),
+        ("ROA", "roa", ".1%",
+         "Return on Assets -- how efficiently the company uses its total assets "
+         "to generate profit. Higher means better asset utilization."),
+        ("Current Ratio", "current_ratio", ".2f",
+         "Can the company pay its short-term bills? Above 1.0 means yes. "
+         "Below 1.0 means current debts exceed current assets -- a warning sign."),
+        ("Debt-to-Equity", "debt_to_equity_abs", ".2f",
+         "Total debt relative to shareholder equity. "
+         "Above 2.0 means the company is heavily leveraged."),
+        ("Interest Coverage", "interest_coverage", ".1f",
+         "How many times operating profit covers interest payments. "
+         "Below 1.5 means the company struggles to service its debt."),
+        ("FCF Yield", "fcf_yield", ".1%",
+         "Free cash flow relative to market cap. "
+         "Higher means more cash generated per dollar of market value."),
+        ("Revenue Growth YoY", "revenue_growth_yoy", ".1%",
+         "Year-over-year revenue growth rate. "
+         "Shows whether the business is expanding or contracting."),
+        ("Volatility (21d)", "volatility_21d", ".1%",
+         "How much the stock price fluctuates day-to-day. "
+         "Higher volatility means more risk but also more opportunity."),
+        ("Max Drawdown (1Y)", "drawdown_252d", ".1%",
+         "Largest peak-to-trough decline in the past year. "
+         "Shows the worst-case loss an investor would have experienced."),
+    ]
+
+    lines = ["### Key Financial Indicators", ""]
+
+    if mode == ReportMode.RESULTS:
+        lines.append("| Indicator | Value |")
+        lines.append("|-----------|-------|")
+        for label, key, fmt, _ in _INDICATORS:
+            val = snapshot.get(key)
+            lines.append(f"| {label} | {_fmt(val, fmt)} |")
+    else:
+        # LEARN mode: table with explanation column
+        lines.append("| Indicator | Value | What This Means |")
+        lines.append("|-----------|-------|-----------------|")
+        for label, key, fmt, explanation in _INDICATORS:
+            val = snapshot.get(key)
+            lines.append(f"| {label} | {_fmt(val, fmt)} | {explanation} |")
+
+    # Altman Z-Score (always included -- people know this one)
+    z_data = fh.get("altman_z", {})
+    if isinstance(z_data, dict) and z_data.get("available"):
+        z_val = z_data.get("latest_z_score")
+        zone = z_data.get("zone", "unknown")
+        lines.append("")
+        if mode == ReportMode.LEARN:
+            zone_explain = {
+                "safe": "Above 2.99 -- low bankruptcy risk. The company is financially healthy.",
+                "grey": "Between 1.81 and 2.99 -- moderate uncertainty. Worth monitoring.",
+                "distress": "Below 1.81 -- elevated bankruptcy risk. Proceed with caution.",
+            }.get(zone, "")
+            lines.append(f"**Altman Z-Score:** {_fmt(z_val, '.2f')} ({zone}) -- {zone_explain}")
+        else:
+            lines.append(f"**Altman Z-Score:** {_fmt(z_val, '.2f')} ({zone})")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _build_fallback_report(
+    profile: dict[str, Any],
+    tier: ReportTier = ReportTier.PREMIUM,
+    mode: ReportMode = ReportMode.RESULTS,
+) -> str:
+    """Build a report using the local template, filtered by tier and mode.
 
     Parameters
     ----------
@@ -2350,6 +2469,8 @@ def _build_fallback_report(profile: dict[str, Any], tier: ReportTier = ReportTie
         Company profile dict.
     tier:
         Report tier controlling which sections are included.
+    mode:
+        Report mode controlling explanation depth (Learn vs Results).
     """
     # Map section numbers to their rendered content
     _section_builders: dict[int, tuple[str, str]] = {
@@ -2397,6 +2518,14 @@ def _build_fallback_report(profile: dict[str, Any], tier: ReportTier = ReportTie
         "---",
         "",
     ]
+
+    # Key Financial Indicators summary (always first, all tiers)
+    key_indicators = _build_key_indicators_table(profile, mode=mode)
+    if key_indicators.strip():
+        lines.append(key_indicators)
+        lines.append("")
+        lines.append("---")
+        lines.append("")
 
     for section_num in sorted(included):
         heading, content = _section_builders.get(section_num, ("", ""))
@@ -2630,17 +2759,19 @@ def generate_charts(
         logger.warning("matplotlib not installed; skipping chart generation.")
         return chart_paths
 
-    # Bloomberg-style chart theme
-    _CHART_BG = "#1a1a2e"
-    _CHART_FG = "#e0e0e0"
-    _CHART_GRID = "#2d2d44"
-    _CHART_ACCENT = "#00d4ff"
-    _CHART_RED = "#ff4757"
-    _CHART_GREEN = "#2ed573"
-    _CHART_GOLD = "#ffa502"
+    # --- Operator 1 Brand Palette ---
+    # Proton-inspired: warm, clean, trustworthy, distinctive.
+    # Purple accent is our signature -- no other finance product uses it.
+    _CHART_BG = "#1c1b22"       # deep warm charcoal (not cold navy)
+    _CHART_FG = "#eae7e1"       # warm off-white text
+    _CHART_GRID = "#2d2b33"     # subtle warm grid
+    _CHART_ACCENT = "#6d4aff"   # Proton-inspired purple (brand signature)
+    _CHART_RED = "#dc3545"      # clear danger/bearish
+    _CHART_GREEN = "#1ea885"    # teal-green (calmer than neon)
+    _CHART_GOLD = "#e8950a"     # warm amber warning
 
-    def _apply_bloomberg_style(fig, ax, title: str) -> None:
-        """Apply Bloomberg Terminal-inspired dark theme to a chart."""
+    def _apply_brand_style(fig, ax, title: str) -> None:
+        """Apply Operator 1 brand theme to a chart."""
         fig.patch.set_facecolor(_CHART_BG)
         ax.set_facecolor(_CHART_BG)
         ax.set_title(title, color=_CHART_FG, fontsize=14, fontweight="bold", pad=12)
@@ -2667,7 +2798,7 @@ def generate_charts(
         if "close" in cache.columns:
             fig, ax = plt.subplots(figsize=(16, 7))
             ax.plot(cache.index, cache["close"], linewidth=1.5, color=_CHART_ACCENT, zorder=3)
-            _apply_bloomberg_style(fig, ax, f"{company} -- Closing Price (2Y)")
+            _apply_brand_style(fig, ax, f"{company} -- Closing Price (2Y)")
             ax.set_ylabel("Price ($)", color=_CHART_FG)
 
             # Regime shading with professional colors
@@ -2676,7 +2807,7 @@ def generate_charts(
                     "bull": (_CHART_GREEN, "Bull Market"),
                     "bear": (_CHART_RED, "Bear Market"),
                     "high_vol": (_CHART_GOLD, "High Volatility"),
-                    "low_vol": ("#7bed9f", "Low Volatility"),
+                    "low_vol": ("#8b8694", "Low Volatility"),
                 }
                 for regime, (color, label) in regime_colors.items():
                     mask = cache["regime_label"] == regime
@@ -2727,7 +2858,7 @@ def generate_charts(
                 )
             ax.set_yticks(range(len(flag_cols)))
             ax.set_yticklabels([nice_labels.get(c, c) for c in flag_cols], fontsize=10)
-            _apply_bloomberg_style(fig, ax, f"{company} -- Survival Mode Timeline")
+            _apply_brand_style(fig, ax, f"{company} -- Survival Mode Timeline")
             leg = ax.legend(
                 loc="upper right", fontsize=9, facecolor=_CHART_BG,
                 edgecolor=_CHART_GRID, labelcolor=_CHART_FG,
@@ -2752,7 +2883,7 @@ def generate_charts(
                 "Tier 1: Liquidity", "Tier 2: Solvency", "Tier 3: Stability",
                 "Tier 4: Profitability", "Tier 5: Growth",
             ]
-            tier_colors = ["#00d4ff", "#2ed573", "#ffa502", "#ff6348", "#a4b0be"]
+            tier_colors = ["#6d4aff", "#1ea885", "#e8950a", "#dc3545", "#8b8694"]
             fig, ax = plt.subplots(figsize=(16, 5))
             ax.stackplot(
                 cache.index,
@@ -2761,7 +2892,7 @@ def generate_charts(
                 colors=tier_colors[:len(tier_cols)],
                 alpha=0.85,
             )
-            _apply_bloomberg_style(fig, ax, f"{company} -- Risk Hierarchy Weight Allocation")
+            _apply_brand_style(fig, ax, f"{company} -- Risk Hierarchy Weight Allocation")
             ax.set_ylabel("Portfolio Weight", color=_CHART_FG)
             ax.set_ylim(0, 1.05)
             leg = ax.legend(
@@ -2786,7 +2917,7 @@ def generate_charts(
                 alpha=0.3, color=_CHART_RED,
             )
             ax.plot(cache.index, cache["volatility_21d"], linewidth=1.2, color=_CHART_RED)
-            _apply_bloomberg_style(fig, ax, f"{company} -- 21-Day Realized Volatility")
+            _apply_brand_style(fig, ax, f"{company} -- 21-Day Realized Volatility")
             ax.set_ylabel("Annualized Volatility", color=_CHART_FG)
             ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.0%}"))
             fig.tight_layout()
@@ -2809,7 +2940,7 @@ def generate_charts(
                             alpha=0.15, color=_CHART_GREEN)
             ax.fill_between(cache.index, 0, score, where=score < 50,
                             alpha=0.15, color=_CHART_RED)
-            _apply_bloomberg_style(fig, ax, f"{company} -- Financial Health Composite (0-100)")
+            _apply_brand_style(fig, ax, f"{company} -- Financial Health Composite (0-100)")
             ax.set_ylabel("Health Score", color=_CHART_FG)
             ax.set_ylim(0, 100)
             fig.tight_layout()
@@ -2832,7 +2963,7 @@ def generate_charts(
                 ax.plot(cache.index, cache["sentiment_momentum_21d"],
                         linewidth=2, color=_CHART_GOLD, label="21-Day Sentiment Trend")
             ax.axhline(y=0, color=_CHART_FG, linewidth=0.5, alpha=0.5)
-            _apply_bloomberg_style(fig, ax, f"{company} -- Market Sentiment & News Flow")
+            _apply_brand_style(fig, ax, f"{company} -- Market Sentiment & News Flow")
             ax.set_ylabel("Sentiment (-1 Bearish to +1 Bullish)", color=_CHART_FG)
             ax.set_ylim(-1.1, 1.1)
             leg = ax.legend(
@@ -2882,7 +3013,7 @@ def generate_charts(
                 lower = [m - r * (2 - conf) for m, r, conf in zip(mid_prices, ranges, confidences)]
                 ax.fill_between(dates, lower, upper, alpha=0.08, color=_CHART_ACCENT)
 
-                _apply_bloomberg_style(fig, ax, f"{company} -- Predicted Price (Next Month)")
+                _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Month)")
                 ax.set_ylabel("Price ($)", color=_CHART_FG)
                 ax.set_xlabel("Trading Days Ahead", color=_CHART_FG)
 
@@ -2918,7 +3049,7 @@ def generate_charts(
                        color=color, edgecolor=color, alpha=0.85)
                 ax.plot([i, i], [l, h], color=color, linewidth=0.8)
 
-            _apply_bloomberg_style(fig, ax, f"{company} -- Predicted Price (Next Week)")
+            _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Week)")
             ax.set_ylabel("Price ($)", color=_CHART_FG)
             ax.set_xlabel("Trading Days Ahead", color=_CHART_FG)
 
@@ -3007,6 +3138,7 @@ def generate_report(
     generate_pdf: bool = False,
     generate_chart_images: bool = True,
     tier: ReportTier = ReportTier.PREMIUM,
+    mode: ReportMode = ReportMode.RESULTS,
 ) -> dict[str, Any]:
     """Generate an analysis report from a company profile.
 
@@ -3029,6 +3161,10 @@ def generate_report(
     tier:
         Report tier controlling how many sections are included.
         Defaults to PREMIUM (all 22 sections).
+    mode:
+        Report mode controlling explanation depth.
+        LEARN adds plain-English explanations for newcomers.
+        RESULTS (default) is data-forward for professionals.
 
     Returns
     -------
@@ -3038,6 +3174,7 @@ def generate_report(
         - ``chart_paths``: list of chart PNG paths
         - ``pdf_path``: path to PDF (or None)
         - ``tier``: the report tier used
+        - ``mode``: the report mode used
     """
     if output_dir is None:
         output_dir = Path(CACHE_DIR) / "report"
@@ -3063,8 +3200,8 @@ def generate_report(
 
     # Fallback if Gemini produced nothing or tier is not premium
     if not markdown or not markdown.strip():
-        markdown = _build_fallback_report(profile, tier=tier)
-        logger.info("%s generated using local template.", tier.label)
+        markdown = _build_fallback_report(profile, tier=tier, mode=mode)
+        logger.info("%s (%s mode) generated using local template.", tier.label, mode.label)
 
     # Ensure LIMITATIONS section exists (append if Gemini missed it)
     if "LIMITATIONS" not in markdown.upper():
@@ -3109,6 +3246,7 @@ def generate_report(
         "chart_paths": chart_paths,
         "pdf_path": pdf_path,
         "tier": tier.value,
+        "mode": mode.value,
     }
 
 
@@ -3120,6 +3258,7 @@ def generate_all_reports(
     output_dir: str | Path | None = None,
     generate_pdf: bool = False,
     generate_chart_images: bool = True,
+    mode: ReportMode = ReportMode.RESULTS,
 ) -> dict[str, dict[str, Any]]:
     """Generate all three report tiers (Basic, Pro, Premium) at once.
 
@@ -3137,6 +3276,8 @@ def generate_all_reports(
         If True, generate PDF for all three report tiers.
     generate_chart_images:
         If True, generate chart PNGs (premium report only).
+    mode:
+        Report mode (LEARN or RESULTS) applied to all tiers.
 
     Returns
     -------
@@ -3153,6 +3294,7 @@ def generate_all_reports(
             generate_pdf=generate_pdf,
             generate_chart_images=generate_chart_images,
             tier=tier,
+            mode=mode,
         )
 
     logger.info(
