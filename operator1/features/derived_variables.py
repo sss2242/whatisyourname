@@ -554,6 +554,7 @@ def _compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["macd"] = ema_12 - ema_26
     df["macd_signal"] = df["macd"].ewm(span=9, min_periods=5, adjust=False).mean()
     df["is_missing_macd"] = df["macd"].isna().astype(int)
+    df["is_missing_macd_signal"] = df["macd_signal"].isna().astype(int)
 
     # Bollinger Bands (20-day, 2 standard deviations)
     sma_20 = close.rolling(window=20, min_periods=5).mean()
