@@ -109,6 +109,10 @@ def load_secrets() -> dict[str, str]:
     Does NOT validate completeness -- call ``validate_secrets()``
     separately in your entry point (main.py, run.py) to enforce that
     all required keys are present before the pipeline runs.
+
+    **Multi-key support**: For LLM providers (GEMINI_API_KEY,
+    ANTHROPIC_API_KEY), comma-separated values are preserved as-is.
+    Use ``get_key_pool()`` to split them into lists for rotation.
     """
     # Try .env file first (for local development)
     _load_dotenv()
@@ -118,7 +122,44 @@ def load_secrets() -> dict[str, str]:
     if not secrets:
         secrets = _load_from_env()
 
+    # Also collect numbered key variants (e.g. GEMINI_API_KEY_1, _2, _3)
+    for provider_key in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY"):
+        extra_keys = []
+        for i in range(1, 10):
+            numbered = os.environ.get(f"{provider_key}_{i}", "").strip()
+            if numbered:
+                extra_keys.append(numbered)
+        if extra_keys:
+            base = secrets.get(provider_key, "")
+            all_keys = ([base] if base else []) + extra_keys
+            secrets[provider_key] = ",".join(all_keys)
+
     return secrets
+
+
+def get_key_pool(secrets: dict[str, str], key_name: str) -> list[str]:
+    """Split a secret value into a list of keys (for multi-key rotation).
+
+    Supports comma-separated values in a single env var or numbered
+    variants (KEY_1, KEY_2, etc.) which are merged by ``load_secrets()``.
+
+    Parameters
+    ----------
+    secrets:
+        Dict from ``load_secrets()``.
+    key_name:
+        Secret key name (e.g. "GEMINI_API_KEY", "ANTHROPIC_API_KEY").
+
+    Returns
+    -------
+    List of individual API keys (empty list if none found).
+    """
+    raw = secrets.get(key_name, "")
+    if not raw:
+        return []
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    # Filter out obvious placeholders
+    return [k for k in keys if k and not k.startswith("placeholder")]
 
 
 def validate_secrets(secrets: dict[str, str]) -> None:

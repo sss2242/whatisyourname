@@ -747,3 +747,108 @@ def _add_empty_regime_columns(cache: pd.DataFrame, n_regimes: int) -> None:
     cache["breakpoint_method"] = ""
     for r in range(n_regimes):
         cache[f"regime_hmm_prob_{r}"] = np.nan
+
+
+# ---------------------------------------------------------------------------
+# Early regime detection (Step 5.5 bridge)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EarlyRegimeResult:
+    """Lightweight result from early regime detection for the enriched survival timeline."""
+
+    regime_labels: pd.Series | None = None
+    regime_confidence: pd.Series | None = None
+    detector: RegimeDetector | None = None
+    fitted: bool = False
+    error: str | None = None
+
+
+def run_early_regime_detection(
+    cache: pd.DataFrame,
+    *,
+    n_regimes: int = DEFAULT_N_REGIMES,
+    pelt_penalty: float = DEFAULT_PELT_PENALTY,
+    bcp_hazard_lambda: float = 200.0,
+    bcp_threshold: float = 0.5,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, EarlyRegimeResult]:
+    """Run regime detection early in the pipeline (Step 5.5).
+
+    This is a wrapper around ``detect_regimes_and_breaks()`` that also
+    extracts the regime labels and confidence series needed by the
+    enriched survival timeline.
+
+    The full regime columns (``regime_hmm``, ``regime_gmm``, ``regime_label``,
+    ``structural_break``, etc.) are added to the cache by the underlying
+    ``detect_regimes_and_breaks()`` call, so Step 6 does not need to re-run
+    regime detection.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache DataFrame with ``return_1d`` and ``volatility_21d``.
+    n_regimes, pelt_penalty, bcp_hazard_lambda, bcp_threshold, random_state:
+        Passed through to ``detect_regimes_and_breaks()``.
+
+    Returns
+    -------
+    (cache, early_result)
+        The mutated cache and an ``EarlyRegimeResult`` with regime_labels
+        and regime_confidence Series aligned to the cache index.
+    """
+    early = EarlyRegimeResult()
+
+    try:
+        cache, detector = detect_regimes_and_breaks(
+            cache,
+            n_regimes=n_regimes,
+            pelt_penalty=pelt_penalty,
+            bcp_hazard_lambda=bcp_hazard_lambda,
+            bcp_threshold=bcp_threshold,
+            random_state=random_state,
+        )
+        early.detector = detector
+
+        # Extract regime labels as a string Series.
+        # IMPORTANT: The ordering below matters -- astype(str) first converts
+        # NaN to the literal string "nan", then .where() replaces those
+        # positions with "unknown" using the *original* NaN mask.  Do NOT
+        # refactor to labels.fillna("unknown").astype(str) -- that would
+        # skip the mask check and could leak "nan" strings if dtype changes.
+        if "regime_label" in cache.columns:
+            labels = cache["regime_label"].copy()
+            if labels.notna().any():
+                early.regime_labels = labels.astype(str).where(labels.notna(), "unknown")
+            else:
+                early.regime_labels = pd.Series("unknown", index=cache.index)
+        else:
+            early.regime_labels = pd.Series("unknown", index=cache.index)
+
+        # Safety net: replace any lingering "nan" strings that might leak
+        # through unexpected code paths (e.g., mixed-type Series edge cases).
+        early.regime_labels = early.regime_labels.replace("nan", "unknown")
+
+        # Extract max HMM posterior as regime confidence.
+        prob_cols = [c for c in cache.columns if c.startswith("regime_hmm_prob_")]
+        if prob_cols:
+            prob_df = cache[prob_cols]
+            if prob_df.notna().any().any():
+                early.regime_confidence = prob_df.max(axis=1)
+            else:
+                early.regime_confidence = pd.Series(0.5, index=cache.index)
+        else:
+            early.regime_confidence = pd.Series(0.5, index=cache.index)
+
+        early.fitted = True
+        logger.info("Early regime detection complete for enriched survival timeline")
+
+    except Exception as exc:
+        early.error = f"Early regime detection failed: {exc}"
+        logger.warning(early.error)
+        # Provide safe defaults so enriched timeline can still run.
+        early.regime_labels = pd.Series("unknown", index=cache.index)
+        early.regime_confidence = pd.Series(0.5, index=cache.index)
+
+    return cache, early

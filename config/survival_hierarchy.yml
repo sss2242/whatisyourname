@@ -102,3 +102,57 @@ vanity_v2:
   hierarchy_adjustment:
     rising_trend_multiplier: 1.5  # amplify weight shift when trend rising
     threshold: 40              # vanity_score above which adjustment applies
+
+# ---------------------------------------------------------------------------
+# Enriched survival timeline: combined state mapping
+# ---------------------------------------------------------------------------
+# Maps (survival_mode, market_regime) pairs to a combined state label
+# and a continuous survival intensity score [0.0 = safe, 1.0 = extreme crisis].
+#
+# Market regime values come from HMM/GMM: bull, bear, high_vol, low_vol, unknown.
+# Survival modes come from rule-based flags: normal, company_only,
+#   country_protected, country_exposed, both_unprotected, both_protected.
+#
+# These are used by compute_enriched_survival_timeline() in
+# operator1/analysis/survival_timeline.py.  The authoritative mapping is
+# defined in Python code; this section is for documentation and future
+# config-driven overrides.
+combined_state_mapping:
+  # stable states
+  stable_growth:
+    description: "Normal company + bull/low-vol market"
+    intensity_range: [0.0, 0.10]
+  elevated_risk:
+    description: "Normal company + high-vol market"
+    intensity_range: [0.20, 0.30]
+  market_stress:
+    description: "Normal company + bear market"
+    intensity_range: [0.25, 0.35]
+  # company distress
+  company_distress_mild:
+    description: "Company in survival + stable/unknown market"
+    intensity_range: [0.40, 0.55]
+  company_distress_severe:
+    description: "Company in survival + bear/high-vol market"
+    intensity_range: [0.55, 0.75]
+  # country crisis
+  country_crisis_mild:
+    description: "Country exposed + stable market"
+    intensity_range: [0.35, 0.50]
+  country_crisis_severe:
+    description: "Country exposed + bear/high-vol market"
+    intensity_range: [0.55, 0.75]
+  # protected states
+  protected_stress:
+    description: "Country crisis but company is government-protected"
+    intensity_range: [0.10, 0.40]
+  protected_crisis:
+    description: "Both flags active but company is protected"
+    intensity_range: [0.40, 0.70]
+  # extreme
+  crisis:
+    description: "Both flags active, unprotected"
+    intensity_range: [0.65, 0.95]
+  extreme_crisis:
+    description: "Both flags active, unprotected, bear market"
+    intensity_range: [0.90, 1.00]
