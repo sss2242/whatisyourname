@@ -1,197 +1,192 @@
 # Familiar Financial Indicators from Existing Sources
 
-## Summary
+## The question
 
-This plan maps what the codebase **already computes** to the well-known indicators that retail and institutional investors recognize from Bloomberg Terminal, Morningstar, Yahoo Finance, Seeking Alpha, and similar paid/free platforms. The goal is to surface these familiar names in reports so users immediately understand the output without learning new terminology.
+Can we use what we already have to show people indicators they recognize from Bloomberg, Morningstar, Yahoo Finance, and TradingView? Should we? And should we change our report style to do it?
+
+## The short answer
+
+We already compute ~30 of the indicators people pay Bloomberg $24k/year to see. We just don't label them that way in the report. The fix is mostly presentation, not computation. And the Bloomberg-style dark theme we already use is exactly right -- don't change it.
 
 ---
 
-## 1. What We Already Have (and What People Pay For)
+## Part 1: What we already compute vs what people pay for
 
-The table below maps each indicator that people recognize and pay for to the **exact existing source** in our codebase that already produces it.
+The pipeline in `derived_variables.py` (lines 516-538) lists every derived variable. Here's how they map to what people actually look up on paid platforms.
 
-### 1A. Valuation Ratios (Bloomberg, Morningstar, Yahoo Finance)
+### Valuation (Bloomberg, Yahoo Finance, Morningstar)
 
-| Familiar Name | Bloomberg Field | Our Source | Our Column Name |
+| What people call it | Bloomberg field | Our column | Computed in |
 |---|---|---|---|
-| P/E Ratio | `PE_RATIO` | [`derived_variables.py`](operator1/features/derived_variables.py:345) `_compute_valuation()` | `pe_ratio_calc` |
-| Earnings Yield | `EARN_YLD` | [`derived_variables.py`](operator1/features/derived_variables.py:345) `_compute_valuation()` | `earnings_yield_calc` |
-| P/S Ratio | `PX_TO_SALES_RATIO` | [`derived_variables.py`](operator1/features/derived_variables.py:345) `_compute_valuation()` | `ps_ratio_calc` |
-| P/B Ratio | `PX_TO_BOOK_RATIO` | [`derived_variables.py`](operator1/features/derived_variables.py:345) `_compute_valuation()` | `pb_ratio` |
-| EV/EBITDA | `BEST_CUR_EV_TO_EBITDA` | [`derived_variables.py`](operator1/features/derived_variables.py:345) `_compute_valuation()` | `ev_to_ebitda` |
-| Enterprise Value | `CURR_ENTP_VAL` | [`derived_variables.py`](operator1/features/derived_variables.py:345) `_compute_valuation()` | `enterprise_value` |
-| FCF Yield | `FCF_YIELD` | [`derived_variables.py`](operator1/features/derived_variables.py:263) `_compute_cash_reality()` | `fcf_yield` |
+| P/E Ratio | `PE_RATIO` | `pe_ratio_calc` | `_compute_valuation()` line 345 |
+| Earnings Yield | `EARN_YLD` | `earnings_yield_calc` | `_compute_valuation()` line 345 |
+| P/S Ratio | `PX_TO_SALES_RATIO` | `ps_ratio_calc` | `_compute_valuation()` line 345 |
+| P/B Ratio | `PX_TO_BOOK_RATIO` | `pb_ratio` | `_compute_valuation()` line 345 |
+| EV/EBITDA | `BEST_CUR_EV_TO_EBITDA` | `ev_to_ebitda` | `_compute_valuation()` line 345 |
+| Enterprise Value | `CURR_ENTP_VAL` | `enterprise_value` | `_compute_valuation()` line 345 |
+| FCF Yield | `FCF_YIELD` | `fcf_yield` | `_compute_cash_reality()` line 263 |
 
-### 1B. Profitability Metrics (Morningstar, S&P Capital IQ)
+### Profitability (Morningstar, S&P Capital IQ)
 
-| Familiar Name | Our Source | Our Column Name |
+| What people call it | Our column | Computed in |
 |---|---|---|
-| Gross Margin | [`derived_variables.py`](operator1/features/derived_variables.py:298) `_compute_profitability()` | `gross_margin` |
-| Operating Margin | [`derived_variables.py`](operator1/features/derived_variables.py:298) `_compute_profitability()` | `operating_margin` |
-| Net Profit Margin | [`derived_variables.py`](operator1/features/derived_variables.py:298) `_compute_profitability()` | `net_margin` |
-| Return on Equity (ROE) | [`derived_variables.py`](operator1/features/derived_variables.py:298) `_compute_profitability()` | `roe` |
-| Return on Assets (ROA) | [`derived_variables.py`](operator1/features/derived_variables.py:419) `_compute_roa()` | `roa` |
+| Gross Margin | `gross_margin` | `_compute_profitability()` line 298 |
+| Operating Margin | `operating_margin` | `_compute_profitability()` line 298 |
+| Net Profit Margin | `net_margin` | `_compute_profitability()` line 298 |
+| Return on Equity | `roe` | `_compute_profitability()` line 298 |
+| Return on Assets | `roa` | `_compute_roa()` line 419 |
 
-### 1C. Liquidity & Solvency (S&P, Moody's, CreditSights)
+### Solvency & Liquidity (S&P, Moody's, CreditSights)
 
-| Familiar Name | Our Source | Our Column Name |
+| What people call it | Our column | Computed in |
 |---|---|---|
-| Current Ratio | [`derived_variables.py`](operator1/features/derived_variables.py:229) `_compute_liquidity()` | `current_ratio` |
-| Quick Ratio | [`derived_variables.py`](operator1/features/derived_variables.py:229) `_compute_liquidity()` | `quick_ratio` |
-| Cash Ratio | [`derived_variables.py`](operator1/features/derived_variables.py:229) `_compute_liquidity()` | `cash_ratio` |
-| Debt-to-Equity | [`derived_variables.py`](operator1/features/derived_variables.py:186) `_compute_solvency()` | `debt_to_equity_abs` |
-| Net Debt/EBITDA | [`derived_variables.py`](operator1/features/derived_variables.py:186) `_compute_solvency()` | `net_debt_to_ebitda` |
-| Interest Coverage | [`derived_variables.py`](operator1/features/derived_variables.py:398) `_compute_interest_coverage()` | `interest_coverage` |
+| Current Ratio | `current_ratio` | `_compute_liquidity()` line 229 |
+| Quick Ratio | `quick_ratio` | `_compute_liquidity()` line 229 |
+| Cash Ratio | `cash_ratio` | `_compute_liquidity()` line 229 |
+| Debt-to-Equity | `debt_to_equity_abs` | `_compute_solvency()` line 186 |
+| Net Debt/EBITDA | `net_debt_to_ebitda` | `_compute_solvency()` line 186 |
+| Interest Coverage | `interest_coverage` | `_compute_interest_coverage()` line 398 |
 
-### 1D. Risk & Returns (Bloomberg PORT, MSCI, FactSet)
+### Risk & Returns (Bloomberg PORT, MSCI, FactSet)
 
-| Familiar Name | Our Source | Our Column Name |
+| What people call it | Our column | Computed in |
 |---|---|---|
-| Daily Return | [`derived_variables.py`](operator1/features/derived_variables.py:150) `_compute_returns_and_risk()` | `return_1d` |
-| 21-Day Volatility | [`derived_variables.py`](operator1/features/derived_variables.py:150) `_compute_returns_and_risk()` | `volatility_21d` |
-| Max Drawdown (1Y) | [`derived_variables.py`](operator1/features/derived_variables.py:150) `_compute_returns_and_risk()` | `drawdown_252d` |
-| Revenue Growth YoY | [`derived_variables.py`](operator1/features/derived_variables.py:438) `_compute_ttm_and_growth()` | `revenue_growth_yoy` |
-| Earnings Growth YoY | [`derived_variables.py`](operator1/features/derived_variables.py:438) `_compute_ttm_and_growth()` | `earnings_growth_yoy` |
+| Daily Return | `return_1d` | `_compute_returns_and_risk()` line 150 |
+| 21-Day Volatility | `volatility_21d` | `_compute_returns_and_risk()` line 150 |
+| Max Drawdown (1Y) | `drawdown_252d` | `_compute_returns_and_risk()` line 150 |
+| Revenue Growth YoY | `revenue_growth_yoy` | `_compute_ttm_and_growth()` line 438 |
+| Earnings Growth YoY | `earnings_growth_yoy` | `_compute_ttm_and_growth()` line 438 |
 
-### 1E. Proprietary Scores (Altman, Beneish, Piotroski)
+### Proprietary Scores (these are the ones people actually pay for)
 
-| Familiar Name | Who Charges For It | Our Source | Our Column Name |
+| What people call it | Who charges for it | Our column | Computed in |
 |---|---|---|---|
-| Altman Z-Score | S&P Capital IQ, Bloomberg | [`financial_health.py`](operator1/models/financial_health.py:76) | `fh_altman_z_score`, `fh_altman_z_zone` |
-| Beneish M-Score | Forensic accounting tools | [`financial_health.py`](operator1/models/financial_health.py:87) | `fh_beneish_m_score`, `fh_beneish_flag` |
-| Financial Health Composite | Morningstar "Financial Health" | [`financial_health.py`](operator1/models/financial_health.py:1) | `fh_composite_score`, `fh_composite_label` |
-| Cash Runway | Startup analytics (PitchBook) | [`financial_health.py`](operator1/models/financial_health.py:1) | `fh_runway_months` |
+| Altman Z-Score | S&P Capital IQ, Bloomberg | `fh_altman_z_score` | `financial_health.py` line 76 |
+| Beneish M-Score | Forensic accounting tools | `fh_beneish_m_score` | `financial_health.py` line 87 |
+| Financial Health Composite | Morningstar "Financial Health" | `fh_composite_score` | `financial_health.py` line 1 |
+| Cash Runway (months) | PitchBook, startup analytics | `fh_runway_months` | `financial_health.py` line 1 |
 
-### 1F. Technical & Pattern Analysis (TradingView, TC2000)
+### Technical & Pattern Analysis (TradingView, TC2000)
 
-| Familiar Name | Our Source | Our Column Name |
+| What people call it | Our source | Details |
 |---|---|---|
-| Candlestick Patterns | [`pattern_detector.py`](operator1/models/pattern_detector.py:1) | Doji, Hammer, Engulfing, Morning/Evening Star, etc. |
-| Regime Detection (Bull/Bear) | [`regime_detector.py`](operator1/models/regime_detector.py:1) | `regime_hmm`, `regime_label` |
-| Structural Breaks | [`regime_detector.py`](operator1/models/regime_detector.py:1) | `structural_break` |
+| Candlestick Patterns | `pattern_detector.py` | Doji, Hammer, Engulfing, Morning/Evening Star, Three White Soldiers/Black Crows |
+| Bull/Bear Regime | `regime_detector.py` | HMM + GMM regime classification |
+| Structural Breaks | `regime_detector.py` | PELT + Bayesian change point detection |
 
-### 1G. Macro Context (Bloomberg Economics, Trading Economics)
+### Macro, Peer, Sentiment, Portfolio (Bloomberg Economics, FactSet, Refinitiv)
 
-| Familiar Name | Our Source | Our Column |
+| What people call it | Our source | Our column(s) |
 |---|---|---|
-| Macro Quadrant (Goldilocks/Stagflation/etc.) | [`macro_quadrant.py`](operator1/features/macro_quadrant.py:1) | `macro_quadrant`, `macro_quadrant_numeric` |
-| GDP + Inflation alignment | [`macro_alignment.py`](operator1/features/macro_alignment.py) | macro alignment columns |
+| Macro Quadrant | `macro_quadrant.py` | `macro_quadrant`, `macro_quadrant_numeric` |
+| Peer Percentile Rank | `peer_ranking.py` | `peer_rank_<variable>`, `peer_composite_rank` |
+| News Sentiment Score | `news_sentiment.py` | `news_sentiment_score`, `news_sentiment_label` |
+| Marginal VaR Contribution | `portfolio_analysis.py` | `marginal_var_contribution` |
+| Correlation with Portfolio | `portfolio_analysis.py` | `correlation_with_portfolio` |
 
-### 1H. Peer & Sector Analysis (FactSet, S&P Capital IQ)
+### Forecasting & Probability (Bloomberg FCAST, FactSet Estimates)
 
-| Familiar Name | Our Source | Our Column |
+| What people call it | Our source | Details |
 |---|---|---|
-| Peer Percentile Rank | [`peer_ranking.py`](operator1/features/peer_ranking.py:1) | `peer_rank_<variable>`, `peer_composite_rank` |
-| Sector Relative Strength | [`linked_aggregates.py`](operator1/features/linked_aggregates.py:1) | `<group>_mean_<var>`, `<group>_median_<var>` |
-
-### 1I. Sentiment & News (Refinitiv, Bloomberg News)
-
-| Familiar Name | Our Source | Our Column |
-|---|---|---|
-| News Sentiment Score | [`news_sentiment.py`](operator1/features/news_sentiment.py:1) | `news_sentiment_score`, `news_sentiment_label` |
-| Sentiment Momentum | [`news_sentiment.py`](operator1/features/news_sentiment.py:1) | rolling sentiment windows |
-
-### 1J. Portfolio Risk (Bloomberg PORT, Aladdin)
-
-| Familiar Name | Our Source | Our Column |
-|---|---|---|
-| Marginal VaR Contribution | [`portfolio_analysis.py`](operator1/features/portfolio_analysis.py:1) | `marginal_var_contribution` |
-| Institutional Overlap / HHI | [`portfolio_analysis.py`](operator1/features/portfolio_analysis.py:1) | `portfolio_concentration_hhi` |
-| Correlation with Portfolio | [`portfolio_analysis.py`](operator1/features/portfolio_analysis.py:1) | `correlation_with_portfolio` |
-
-### 1K. Forecasting & Probability (Bloomberg FCAST, FactSet Estimates)
-
-| Familiar Name | Our Source | Details |
-|---|---|---|
-| Multi-horizon Point Forecasts | [`forecasting.py`](operator1/models/forecasting.py:1) | 1d, 5d, 21d, 252d horizons |
-| Survival Probability | [`monte_carlo.py`](operator1/models/monte_carlo.py:1) | MC simulation with importance sampling |
-| Prediction Confidence Intervals | [`prediction_aggregator.py`](operator1/models/prediction_aggregator.py:1) | Conformal-calibrated uncertainty bands |
-| SHAP Feature Attribution | [`explainability.py`](operator1/models/explainability.py:1) | Per-prediction "why" explanations |
+| Multi-horizon Forecasts | `forecasting.py` | 1d, 5d, 21d, 252d horizons via Kalman/GARCH/VAR/LSTM/XGB/Baseline |
+| Survival Probability | `monte_carlo.py` | 10k-path MC with importance sampling |
+| Prediction Intervals | `prediction_aggregator.py` | Conformal-calibrated confidence bands |
+| Feature Attribution | `explainability.py` | SHAP values per prediction |
 
 ---
 
-## 2. What We Could Add with Minimal Effort (Low-Hanging Fruit)
+## Part 2: What we can add with minimal effort
 
-These are indicators people recognize that we could derive from data we **already fetch** but don't currently compute:
+These are indicators people recognize that we can derive from data we already fetch but don't currently compute. All live in existing files, no new data sources needed.
 
-| Indicator | Source Data We Have | Implementation Effort |
-|---|---|---|
-| **Sharpe Ratio** | `return_1d` + risk-free rate from macro APIs | ~15 lines in `derived_variables.py` |
-| **Beta (vs market)** | `return_1d` + market index OHLCV (yfinance) | ~25 lines; covariance of returns vs index |
-| **Dividend Yield** | PIT financials (some regions report dividends) | ~20 lines if dividend data present |
-| **Piotroski F-Score** | All 9 inputs already in cache (ROA, CFO, margins, leverage, liquidity, shares) | ~60 lines in `financial_health.py` |
-| **Revenue per Share** | `revenue` + `shares_outstanding` | 5 lines |
-| **Book Value per Share** | `total_equity` + `shares_outstanding` | 5 lines |
-| **EPS (calc)** | Already computed internally in `_compute_valuation` but not exposed | 1 line to expose |
-| **Moving Averages (SMA 50/200)** | `close` price | ~10 lines; SMA crossover signals |
-| **RSI (14-day)** | `return_1d` | ~15 lines |
-| **MACD** | `close` price | ~20 lines |
-| **Bollinger Bands** | `close` + `volatility_21d` | ~10 lines |
+| Indicator | What we need | Where it goes | Lines of code |
+|---|---|---|---|
+| Sharpe Ratio | `return_1d` + risk-free rate from macro APIs (FRED) | `derived_variables.py` | ~15 |
+| Beta (vs market index) | `return_1d` + index OHLCV via yfinance | `derived_variables.py` | ~25 |
+| Piotroski F-Score | All 9 inputs already in cache (ROA, CFO, margins, leverage, liquidity, shares) | `financial_health.py` | ~60 |
+| SMA 50/200 + Golden/Death Cross | `close` price | `derived_variables.py` | ~10 |
+| RSI (14-day) | `return_1d` | `derived_variables.py` | ~15 |
+| MACD | `close` price | `derived_variables.py` | ~20 |
+| Bollinger Bands | `close` + `volatility_21d` | `derived_variables.py` | ~10 |
+| EPS (exposed) | Already computed internally in `_compute_valuation` but not saved as a column | `derived_variables.py` | 1 |
+| Book Value per Share | `total_equity` / `shares_outstanding` | `derived_variables.py` | 5 |
+| Revenue per Share | `revenue` / `shares_outstanding` | `derived_variables.py` | 5 |
+| Dividend Yield | PIT financials (some regions report dividends) | `derived_variables.py` | ~20 |
 
----
-
-## 3. Should We Do This?
-
-**Yes, selectively.** Here is the reasoning:
-
-### Arguments For
-
-1. **Instant credibility**: When a user sees "P/E Ratio: 18.2" or "Altman Z-Score: 2.4 (Grey Zone)", they immediately know what they are looking at. No onboarding friction.
-
-2. **Competitive positioning**: We already compute these -- we just need to surface them with recognizable labels in reports. Bloomberg charges $24k/year for a terminal that shows many of the same ratios.
-
-3. **Trust anchor**: Familiar indicators serve as "sanity check" reference points. If our P/E matches what the user sees on Yahoo Finance, they trust the rest of our analysis (regime detection, survival probability, SHAP explanations) which they cannot get elsewhere.
-
-4. **Low cost**: Most of these indicators are already computed. The work is primarily presentation/labeling, not computation.
-
-### Arguments Against (and Mitigations)
-
-1. **"Why would I pay for what Yahoo gives me free?"** -- Mitigation: The familiar indicators are the anchor, not the product. The product is the survival analysis, regime detection, Monte Carlo simulations, SHAP explanations, and multi-horizon forecasts that Yahoo/Google Finance do not offer.
-
-2. **Accuracy risk if our numbers differ slightly from Bloomberg** -- Mitigation: Always show the data source and methodology. Document that P/E uses trailing EPS from PIT filings, not consensus estimates.
-
-3. **Feature creep** -- Mitigation: Add only the indicators listed in Section 2 that require minimal code. Don't build a Bloomberg clone.
-
-### Recommended Approach: "Familiar Anchors + Unique Value"
-
-Structure reports in two tiers:
-
-1. **Familiar Anchors Section** (top of report) -- Show the 10-15 indicators everyone knows: P/E, P/B, ROE, Debt/Equity, Current Ratio, Gross Margin, Altman Z, Revenue Growth YoY, Volatility, Max Drawdown. Use exact names from Bloomberg/Yahoo. This is the "I recognize this" moment.
-
-2. **Unique Analysis Section** (body of report) -- This is where we differentiate: regime detection, survival probability, Monte Carlo paths, peer percentile ranking, macro quadrant, SHAP explanations, candlestick predictions. These are the things people cannot get from Yahoo Finance.
+Total: ~186 lines. All from data we already fetch.
 
 ---
 
-## 4. Implementation Roadmap
+## Part 3: Should we do this?
 
-### Phase 1: Relabeling (0 new computation, report changes only)
-- Add a "Key Financial Indicators" summary table to the report template in [`report_generator.py`](operator1/report/report_generator.py:1)
-- Map internal column names to standard financial terminology
-- Show latest values for the ~30 indicators already computed
+Yes, selectively. Here's why.
 
-### Phase 2: Quick Adds (~100 lines of new code)
-- Sharpe Ratio, Beta, Piotroski F-Score
-- SMA 50/200, RSI, MACD, Bollinger Bands
-- Expose EPS, Book Value/Share, Revenue/Share
+### The trust anchor problem
 
-### Phase 3: Presentation Polish
-- Add sparkline-style trend indicators (up/down arrows, color coding)
-- Add peer comparison context ("P/E of 18.2 vs sector median of 22.1")
-- Add historical percentile ("Current ratio in 75th percentile of its 5-year range")
+When someone sees "P/E Ratio: 18.2" they instantly know whether that's cheap or expensive for the sector. When they see "fh_composite_score: 72.4" they have no reference point. The familiar indicator is the trust anchor -- if our P/E matches what Yahoo shows, the user trusts the rest of our analysis (regime detection, survival probability, SHAP explanations) which they can't get anywhere else.
+
+### The "why would I pay for this?" problem
+
+If we only show P/E, ROE, and margins, users will say "I can get this on Yahoo for free." The familiar indicators aren't the product. They're the *anchor*. The product is the survival analysis, Monte Carlo simulations, regime detection, Granger causality, SHAP feature attribution, and multi-horizon forecasts. Those don't exist on Yahoo Finance.
+
+### What to actually do
+
+Structure reports in two layers:
+
+1. **Familiar Anchors** (top of report) -- 10-15 indicators everyone knows: P/E, P/B, ROE, Debt/Equity, Current Ratio, Gross Margin, Altman Z, Revenue Growth YoY, Volatility, Drawdown. Standard labels from Bloomberg/Yahoo. This is the "I recognize this" moment.
+
+2. **Unique Analysis** (body of report) -- Regime detection, survival probability, Monte Carlo paths, peer percentile ranking, macro quadrant, SHAP explanations, candlestick predictions. The stuff you can't get from Yahoo.
 
 ---
 
-## 5. Multi-Horizon Zoomed Prediction Charts
+## Part 4: Keep the Bloomberg-style report -- don't change it
 
-Since we already produce forecasts at 1d, 5d, 21d, and 252d horizons (via [`forecasting.py`](operator1/models/forecasting.py:55) and [`prediction_aggregator.py`](operator1/models/prediction_aggregator.py:1)), and we already render charts (via [`generate_charts()`](operator1/report/report_generator.py:2593)), we should show predicted familiar indicators as **four zoomed chart panels** so users can see both the trajectory and the uncertainty at each time scale.
+### What we have now
 
-### 5.1 Chart Layout: "Zoom Ladder"
+The report generator (`report_generator.py`) already uses a Bloomberg Terminal-inspired dark theme:
 
-For each key indicator, generate a 4-panel figure where each panel zooms into a different horizon. Each panel shows:
+```python
+_CHART_BG = "#1a1a2e"      # dark navy background
+_CHART_FG = "#e0e0e0"      # light grey text
+_CHART_GRID = "#2d2d44"    # subtle grid
+_CHART_ACCENT = "#00d4ff"  # Bloomberg cyan accent
+_CHART_RED = "#ff4757"     # danger/bearish
+_CHART_GREEN = "#2ed573"   # positive/bullish
+_CHART_GOLD = "#ffa502"    # warning/neutral
+```
 
-- **Historical tail** (context): last N trading days of actual data (grey/solid line)
-- **Prediction path** (blue line with confidence band): from today forward to the horizon
-- **Confidence interval** (shaded band): from conformal calibration or RMSE-scaled bands
+The `_apply_bloomberg_style()` function (line 2642) applies this consistently across all charts: price history with regime shading, survival timeline, risk hierarchy weights, volatility, financial health composite, sentiment, and OHLC predictions.
+
+The fallback template (line 79) has 22 sections that map to the standard institutional research report format: Executive Summary, Company Overview, Performance, Financial Snapshot, Health Scoring, Survival Analysis, Linked Variables, Temporal Analysis, Predictions, Technical Patterns, Ethical Filters, Supply Chain Risk, Competitive Landscape, Regulatory, Calibration, Sentiment, Peer Comparison, Macro, Advanced Quant, Risk/Limitations, Recommendation, Appendix.
+
+### Why we should keep it
+
+1. **It already looks like what people expect.** The dark theme, cyan accent, red/green color coding -- this is what Bloomberg Terminal users see every day. TradingView uses a similar aesthetic. Our charts already feel "professional" without explanation.
+
+2. **The 22-section structure maps to institutional research.** Goldman Sachs, JP Morgan, and Morgan Stanley equity research reports follow roughly this structure. Users who've read those reports will navigate ours intuitively.
+
+3. **The three-tier system (Basic/Pro/Premium) already handles audience segmentation.** `ReportTier.BASIC` shows 5 sections for quick screening. `ReportTier.PRO` shows 13 sections with peers and macro. `ReportTier.PREMIUM` shows all 22 sections. This is the right way to manage complexity -- not by changing the style, but by controlling the depth.
+
+4. **A new style would break consistency.** We have 8+ chart types all using `_apply_bloomberg_style()`. Changing the style means touching every chart function. The risk/reward is bad.
+
+### What to improve within the current style
+
+Instead of a new style, enhance the existing one:
+
+- Add a **Key Indicators Summary Table** at the top of Section 4 (Current Financial Snapshot) with the ~15 familiar metrics in a Bloomberg-style grid
+- Use the same color coding (`_CHART_GREEN` for strong, `_CHART_RED` for weak, `_CHART_GOLD` for neutral) on the indicator values
+- Add **peer context** inline: "P/E: 18.2 (sector median: 22.1)" -- this is what Bloomberg's COMP function shows
+- Add **historical percentile** inline: "Current Ratio: 1.8 (75th percentile of 5-year range)"
+
+---
+
+## Part 5: Multi-horizon zoomed prediction charts
+
+Since we already produce forecasts at 1d, 5d, 21d, and 252d horizons (via `forecasting.py` line 55 and `prediction_aggregator.py`), and we already render charts (via `generate_charts()` at line 2593), we should show predicted familiar indicators as four zoomed chart panels so users see both the trajectory and the uncertainty at each time scale.
+
+### Chart layout: the "Zoom Ladder"
+
+For each key indicator, generate a 2x2 figure where each panel zooms into a different horizon:
 
 ```
 +-------------------------------+-------------------------------+
@@ -205,92 +200,143 @@ For each key indicator, generate a 4-panel figure where each panel zooms into a 
 +-------------------------------+-------------------------------+
 ```
 
-### 5.2 Which Indicators Get Prediction Charts
+### Which indicators get prediction charts
 
 Not every indicator is forecastable -- only time-series variables that the forecasting models actually predict. The recommended set:
 
-| Indicator | Why It Works as a Chart |
+| Indicator | Why it works as a chart |
 |---|---|
-| **Close Price** | The indicator everyone looks at first; already charted in `generate_charts()` |
-| **P/E Ratio** | Shows valuation trajectory; derived from predicted EPS + price |
-| **EV/EBITDA** | Enterprise valuation trend; derived from predicted EBITDA + debt + price |
-| **Gross Margin** | Profitability direction; directly forecast by the model suite |
-| **Debt-to-Equity** | Solvency trajectory; directly forecast |
-| **Current Ratio** | Liquidity trend; directly forecast (Tier 1 survival variable) |
-| **FCF Yield** | Cash reality direction; directly forecast |
-| **Volatility (21d)** | Risk outlook; GARCH model specializes in this |
-| **Revenue Growth YoY** | Growth trajectory; derived from predicted revenue TTM |
-| **Altman Z-Score** | Bankruptcy risk path; composed from 5 predicted sub-variables |
+| Close Price | What everyone looks at first; already charted |
+| P/E Ratio | Valuation trajectory; derived from predicted EPS + price |
+| EV/EBITDA | Enterprise valuation trend; derived from predicted EBITDA + debt + price |
+| Gross Margin | Profitability direction; directly forecast by the model suite |
+| Debt-to-Equity | Solvency trajectory; directly forecast |
+| Current Ratio | Liquidity trend; directly forecast (Tier 1 survival variable) |
+| FCF Yield | Cash reality direction; directly forecast |
+| Volatility (21d) | Risk outlook; GARCH specializes in this |
+| Revenue Growth YoY | Growth trajectory; derived from predicted revenue TTM |
+| Altman Z-Score | Bankruptcy risk path; composed from 5 predicted sub-variables |
 
-### 5.3 Zooming Strategy
+### Zooming strategy
 
-Each panel uses a different historical context window and y-axis range:
-
-| Panel | Horizon | Historical Tail | Y-Axis Strategy |
+| Panel | Horizon | Historical tail | Y-axis padding |
 |---|---|---|---|
-| Tomorrow | 1d | Last 10 trading days | Auto-fit to min/max of visible data +/- 5% padding |
-| Next Week | 5d | Last 30 trading days | Auto-fit with 10% padding |
-| Next Month | 21d | Last 63 trading days (~3 months) | Auto-fit with 15% padding |
-| Next Year | 252d | Last 252 trading days (~1 year) | Auto-fit with 20% padding |
+| Tomorrow | 1d | Last 10 trading days | 5% |
+| Next Week | 5d | Last 30 trading days | 10% |
+| Next Month | 21d | Last 63 trading days | 15% |
+| Next Year | 252d | Last 252 trading days | 20% |
 
-The tight zoom on tomorrow's panel makes even a small predicted move visually clear. The wide zoom on the yearly panel shows the full trajectory with Monte Carlo fan-out.
+The tight zoom on tomorrow's panel makes even a small predicted move visually clear. The wide zoom on the yearly panel shows the full trajectory.
 
-### 5.4 Confidence Band Rendering
+### Confidence band rendering
 
-- **1d panel**: narrow band (low uncertainty) -- gives confidence
-- **5d panel**: slightly wider -- still precise
-- **21d panel**: visible cone -- honest about uncertainty
-- **252d panel**: wide fan -- can overlay Monte Carlo path percentiles (p5, p25, p50, p75, p95)
+- 1d panel: narrow band (low uncertainty) -- gives confidence
+- 5d panel: slightly wider -- still precise
+- 21d panel: visible cone -- honest about uncertainty
+- 252d panel: wide fan -- overlay Monte Carlo percentiles (p5, p25, p50, p75, p95)
 
-For the 252d panel specifically, we can overlay the Monte Carlo survival probability as a color gradient on the confidence band (green = high survival, red = low survival), connecting the familiar indicator to our unique analysis.
+For the 252d panel, color the confidence band by survival probability (green = high survival, red = low survival). This connects the familiar indicator chart to our unique survival analysis without the user needing to understand what Monte Carlo simulation is.
 
-### 5.5 Implementation Approach
+### Implementation
 
-This builds on the existing [`generate_charts()`](operator1/report/report_generator.py:2593) function which already:
-- Uses matplotlib with the dark theme (`_CHART_BG`, `_CHART_ACCENT`)
-- Renders at 180 DPI
-- Saves PNGs to the cache directory
-- Handles missing data gracefully
-
-New function signature:
+Builds on existing `generate_charts()` infrastructure. Uses the same `_CHART_BG`, `_CHART_ACCENT`, `_CHART_RED`, `_CHART_GREEN` constants and `_apply_bloomberg_style()`. Estimated: ~150 lines of matplotlib code.
 
 ```python
 def generate_prediction_zoom_charts(
     cache: pd.DataFrame,
-    predictions: dict[str, dict[str, float]],  # from ForecastResult
-    confidence_bands: dict[str, dict[str, tuple[float, float]]],  # from PredictionAggregator
+    predictions: dict[str, dict[str, float]],
+    confidence_bands: dict[str, dict[str, tuple[float, float]]],
     mc_result: MonteCarloResult | None = None,
     output_dir: str = CACHE_DIR,
-    indicators: list[str] | None = None,  # defaults to the 10 above
+    indicators: list[str] | None = None,
 ) -> list[str]:
     """Generate 4-panel zoom-ladder charts for each predicted indicator."""
 ```
 
-Estimated effort: ~150 lines of matplotlib code, reusing existing chart styling constants.
+---
 
-### 5.6 Why This Works for User Familiarity
+## Part 6: Data source coverage (current state)
 
-1. **People are trained to read these charts.** TradingView, Yahoo Finance, and Bloomberg all show price with forward projections. Showing P/E or Gross Margin the same way is immediately intuitive.
+Everything above runs on data we already fetch from these pipelines. No new sources needed.
 
-2. **The zoom ladder answers the user's real questions in order:** "What happens tomorrow?" (tight zoom, high confidence) -> "This week?" -> "This month?" -> "This year?" (wide zoom, honest uncertainty). It mirrors how people actually think about time.
+### PIT Financial Statements (Tier 1, $91T+ coverage)
 
-3. **The confidence bands set expectations.** Instead of a single point forecast that looks overconfident, the widening bands at longer horizons communicate "we're less certain further out" without requiring statistical literacy.
+| Market | Client | Coverage | Key needed |
+|---|---|---|---|
+| US | `us_edgar.py` (edgartools + sec-edgar-api) | $50T, NYSE/NASDAQ | No |
+| UK | `uk_ch_wrapper.py` (Companies House) | $3.18T, LSE | No |
+| EU | `eu_esef_wrapper.py` (ESEF/XBRL) | $8-9T, pan-EU | No |
+| Japan | `jp_jquants_wrapper.py` (J-Quants) | $6.5T, TSE | Free key |
+| South Korea | `kr_dart_wrapper.py` (dart-fss) | $2.5T, KOSPI/KOSDAQ | Free key |
+| Taiwan | `tw_mops_wrapper.py` (MOPS) | $1.2T, TWSE | No |
+| Brazil | `br_cvm_wrapper.py` (CVM) | $2.2T, B3 | No |
+| Chile | `cl_cmf_wrapper.py` (CMF) | $0.4T | No |
 
-4. **The 252d Monte Carlo overlay is the bridge** from "indicators I know" to "analysis I can't get elsewhere." The user sees a familiar P/E chart, but with survival-probability-colored uncertainty bands that no other platform offers.
+### OHLCV Price Data
+
+| Market | Primary | Fallback | Key needed |
+|---|---|---|---|
+| China | `ohlcv_akshare.py` (akshare) | yfinance (.SS/.SZ) | No |
+| India | `ohlcv_jugaad.py` (jugaad-data) | yfinance (.NS/.BO) | No |
+| South Korea | `ohlcv_pykrx.py` (pykrx) | yfinance (.KS) | No |
+| Taiwan | `ohlcv_twstock.py` (twstock) | yfinance (.TW) | No |
+| All others | yfinance directly | -- | No |
+
+Dispatcher: `ohlcv_provider.py` routes to per-region primary, falls back to yfinance.
+
+### Macro Data (15+ countries)
+
+| Source | Client | Coverage |
+|---|---|---|
+| FRED | `macro_fredapi.py` | US macro (GDP, CPI, unemployment, rates) |
+| World Bank | `macro_wbgapi.py` | 200+ countries (annual) |
+| SDMX (Eurostat/OECD) | `macro_sdmx.py` | EU, OECD countries |
+| KOSIS | `macro_kosis.py` | South Korea |
+| DGBAS | `macro_dgbas.py` | Taiwan |
+| Banxico | `macro_banxico.py` | Mexico |
+| BCB | `macro_bcb.py` | Brazil |
+| BCCh | `macro_bcch.py` | Chile |
+| ONS | `macro_ons.py` | UK |
+| Eurostat | `macro_estat.py` | EU aggregate |
+
+### Supplementary Data
+
+| Source | Client | Fills |
+|---|---|---|
+| OpenFIGI | `supplement.py` | FIGI, sector classification (global) |
+| Euronext, JPX, TWSE, B3, Bolsa | `supplement.py` | Sector, industry, profile for non-US |
+
+### Estimation (missing data recovery)
+
+| Method | Client | Details |
+|---|---|---|
+| Accounting identity fill | `estimator.py` Pass 1 | A = L + E, FCF = OCF - capex, etc. |
+| BayesianRidge imputer | `estimator.py` Pass 2 (default) | Per-variable rolling imputer |
+| VAE imputer | `vae_imputer.py` Pass 2 (optional) | Nonlinear cross-variable imputation |
+
+### LLM (narrative + entity discovery)
+
+| Provider | Client | Used for |
+|---|---|---|
+| Gemini | `gemini.py` via `llm_base.py` / `llm_factory.py` | Report narrative, linked entity discovery, sentiment scoring |
+| Claude | `claude.py` via `llm_base.py` / `llm_factory.py` | Alternative to Gemini (same interface) |
 
 ---
 
-## 6. Data Source Coverage Matrix
+## Part 7: Implementation roadmap
 
-All indicators above are derived from these already-implemented data pipelines:
+### Phase 1: Relabeling (zero new computation)
 
-| Data Pipeline | Source | Key | Coverage |
-|---|---|---|---|
-| **OHLCV prices** | yfinance (global fallback) + pykrx/twstock/baostock/nselib | Free, no key | 25+ markets |
-| **Financial statements** | SEC EDGAR, Companies House, ESEF, EDINET, DART, MOPS, CVM, CMF | Free PIT APIs | $91T+ market cap |
-| **Macro data** | FRED, World Bank, SDMX, KOSIS, DGBAS, Banxico, BCB, BCCh, ONS, Eurostat | Free | 15+ countries |
-| **Classification** | OpenFIGI | Free | Global |
-| **News** | FMP stock news | Free tier | US-centric, global tickers |
-| **LLM analysis** | Gemini / Claude | API key | Narrative generation |
+Add a "Key Financial Indicators" summary table to the report template. Map internal column names to standard financial terminology. Show latest values for the ~30 indicators already computed. This is a `report_generator.py` change only.
 
-No new data sources are needed. Every familiar indicator listed above can be produced from data we already fetch.
+### Phase 2: Quick adds (~186 lines of new code)
+
+Add Sharpe Ratio, Beta, Piotroski F-Score, SMA 50/200, RSI, MACD, Bollinger Bands. Expose EPS, Book Value/Share, Revenue/Share as named columns. All in `derived_variables.py` and `financial_health.py`.
+
+### Phase 3: Zoom Ladder charts (~150 lines)
+
+Add `generate_prediction_zoom_charts()` to `report_generator.py`. 2x2 panels per indicator, 10 indicators = 10 chart images. Uses existing Bloomberg theme infrastructure.
+
+### Phase 4: Inline context (~50 lines)
+
+Add peer median comparison and historical percentile to the fallback template sections. "P/E: 18.2 (sector: 22.1, 5yr percentile: 35th)". Uses data already in the linked aggregates and cache.
