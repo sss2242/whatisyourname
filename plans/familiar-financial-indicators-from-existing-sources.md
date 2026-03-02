@@ -139,115 +139,110 @@ Structure reports in two layers:
 
 ---
 
-## Part 4: Which visual style should we use?
+## Part 4: Report style, accessibility tiers, and brand coloring
 
-### The three candidates
+### The problem with what we have now
 
-We have three real options for the chart and report coloring. Here's a concrete comparison.
+The current system has three tiers (Basic/Pro/Premium) that control *how many sections* you see:
+- `ReportTier.BASIC`: 5 sections (1, 2, 4, 6, 20)
+- `ReportTier.PRO`: 13 sections (adds peers, macro, sentiment, etc.)
+- `ReportTier.PREMIUM`: all 22 sections
 
-#### Option A: Current Bloomberg-style (what we have now)
+But the content within each section is the same regardless of tier. A Basic user and a Premium user both see "debt_to_equity_abs: 1.47" with no explanation. A finance professional knows what that means. A small business owner or a first-time investor doesn't.
 
-```python
-_CHART_BG = "#1a1a2e"      # dark navy background
-_CHART_FG = "#e0e0e0"      # light grey text
-_CHART_GRID = "#2d2d44"    # subtle grid
-_CHART_ACCENT = "#00d4ff"  # Bloomberg cyan accent
-_CHART_RED = "#ff4757"     # danger/bearish
-_CHART_GREEN = "#2ed573"   # positive/bullish
-_CHART_GOLD = "#ffa502"    # warning/neutral
-```
+The tiers control *depth* but not *understanding*. We need both.
 
-**Who this is for:** Finance professionals, Bloomberg Terminal users, institutional analysts. People who stare at dark terminals all day.
+### Two-axis tier system: Understanding x Detail
 
-**Pros:** Looks like what traders and analysts already use. High information density works on dark backgrounds. The cyan-on-navy color scheme says "this is a professional financial tool."
+The right structure is a 2x3 matrix. Each tier has two report modes:
 
-**Cons:** Can feel intimidating or cold to retail investors. Dense information on dark backgrounds causes eye strain for long reading sessions. Non-finance people (small business owners, casual investors) may feel this "isn't for them."
+**Mode 1: "Learn" reports** -- help people understand what the numbers mean
 
-#### Option B: Proton Mail / Clean Modern style
+| Tier | Sections | What's different in Learn mode |
+|---|---|---|
+| Basic Learn | 5 sections | Each indicator gets a 1-sentence plain-English explanation. "Debt-to-Equity of 1.47 means the company owes $1.47 for every $1 of shareholder money. Above 2.0 is usually concerning." Color-coded green/yellow/red with thresholds explained. No jargon. |
+| Pro Learn | 13 sections | Same explanations, plus "what this means for you" context. "The macro environment is Stagflation (slow growth + high inflation). Historically, companies with high debt struggle in this environment because borrowing costs rise." Peer comparisons with plain language. |
+| Premium Learn | 22 sections | Full institutional depth, but with an expandable "Explain this" block after each technical section. Monte Carlo gets "We simulated 10,000 possible futures. In 87% of them, the company survived the next year." SHAP gets "The model thinks rising debt is the #1 risk factor, contributing 32% to the negative outlook." |
 
-```python
-_CHART_BG = "#f5f0ec"      # warm off-white (Proton's parchment)
-_CHART_FG = "#1b1340"      # deep purple-black text
-_CHART_GRID = "#e0d8d0"    # subtle warm grid
-_CHART_ACCENT = "#6d4aff"  # Proton purple
-_CHART_RED = "#dc3545"     # standard danger red
-_CHART_GREEN = "#1ea885"   # muted teal-green
-_CHART_GOLD = "#ff8c00"    # warm amber
-```
+**Mode 2: "Results" reports** -- show the numbers, skip the explanations
 
-**Who this is for:** Privacy-conscious tech users, modern SaaS consumers, people who trust "clean design." Proton's brand is "we respect you and your data."
+| Tier | Sections | What's different in Results mode |
+|---|---|---|
+| Basic Results | 5 sections | Clean indicator grid, charts, verdict. No prose. Like a Bloomberg COMP screen printout. |
+| Pro Results | 13 sections | Full data tables, all charts, peer rankings as numbers. Designed for scanning. |
+| Premium Results | 22 sections | Everything. Dense. Every model output, every confidence interval, every SHAP waterfall. The institutional analyst's working document. |
 
-**Pros:** Easier on the eyes for reading. The warm off-white background feels less aggressive than pitch-black. The purple accent is distinctive -- nobody else in finance uses it. Strong "trust through clarity" signal. Better for long reports that people actually read cover-to-cover.
+### Implementation
 
-**Cons:** Doesn't scream "finance." A P/E ratio on a lavender background might feel less authoritative to someone who's used to Bloomberg. Charts with many overlapping series are harder to read on light backgrounds.
-
-#### Option C: Discord / App-native dark style
+In `report_generator.py`, the existing `ReportTier` enum gets a companion:
 
 ```python
-_CHART_BG = "#313338"      # Discord dark (softer than Bloomberg navy)
-_CHART_FG = "#dbdee1"      # Discord light text
-_CHART_GRID = "#3f4147"    # subtle grey grid
-_CHART_ACCENT = "#5865f2"  # Discord blurple
-_CHART_RED = "#ed4245"     # Discord red
-_CHART_GREEN = "#57f287"   # Discord green (bright, fun)
-_CHART_GOLD = "#fee75c"    # Discord yellow
+class ReportMode(str, Enum):
+    LEARN = "learn"       # Explanations + context for understanding
+    RESULTS = "results"   # Data-forward, minimal prose
 ```
 
-**Who this is for:** Younger investors (25-40), tech workers, the Robinhood/WeBull generation. People who spend 4+ hours a day in Discord, Slack, or similar apps.
+Each section builder (like `_build_executive_summary()`, `_build_survival_analysis()`, etc.) takes a `mode` parameter and adjusts its output. The Learn mode adds explanation blocks; the Results mode strips them. The underlying data is identical -- only the presentation layer changes.
 
-**Pros:** Feels native to how this generation consumes information. The softer dark grey (#313338 vs our #1a1a2e) is less aggressive than Bloomberg but still dark-mode. The blurple accent is distinctive and modern. The brighter green/red are more visible than our current muted versions. This crowd already trusts this color language.
+Estimated code: ~200 lines total (mostly string templates for the explanation blocks). The actual computation doesn't change at all.
 
-**Cons:** Might feel "casual" to institutional users. The Discord association could undermine seriousness for fund managers or compliance officers.
+### Brand coloring: Proton-inspired as our signature
 
-### The actual recommendation: Discord dark, but keep the Bloomberg structure
+The coloring shouldn't be borrowed from Bloomberg or Discord. It should be *ours*. ProtonMail's approach is the right model: clean, warm, trustworthy, distinctive. Nobody in finance uses this palette, which means it becomes immediately recognizable as our product.
 
-Here's the reasoning:
-
-1. **Our audience is not Bloomberg Terminal users.** Bloomberg users already have a Bloomberg Terminal. They're not looking for another one. Our audience is people who want institutional-quality analysis without the $24k/year price tag. Those people are more likely to be in Discord than on a Bloomberg chat channel.
-
-2. **The Discord dark palette is objectively better for readability.** Our current `#1a1a2e` (very dark navy) has low contrast with `#2d2d44` (grid lines) -- the difference is only ~10% luminance. Discord's `#313338` background vs `#3f4147` grid has better contrast. The brighter accent colors (`#5865f2` blurple, `#57f287` green) pop more on the darker grey.
-
-3. **The structure should stay exactly the same.** The 22-section institutional format, the three-tier system (Basic/Pro/Premium), the chart types -- all of this is correct. Only the *colors* change, not the layout or content hierarchy.
-
-4. **The migration is contained.** We change 7 color constants in `report_generator.py` and the `_apply_bloomberg_style()` function (rename it to `_apply_chart_style()`). That's it. Every chart that calls the function gets the new palette automatically.
-
-### Proposed new palette (Discord-inspired financial)
+#### The Operator 1 brand palette
 
 ```python
-# Modern dark theme -- inspired by Discord/app-native coloring
-# but tuned for financial data readability
-_CHART_BG = "#2b2d31"      # Discord dark-mode background
-_CHART_FG = "#e0e2e6"      # slightly warmer than pure white
-_CHART_GRID = "#3a3c42"    # visible but not distracting
-_CHART_ACCENT = "#5865f2"  # blurple -- our brand color
-_CHART_RED = "#ed4245"     # clear danger/bearish
-_CHART_GREEN = "#57f287"   # clear positive/bullish
-_CHART_GOLD = "#fee75c"    # attention/warning (Discord yellow)
+# --- Operator 1 Brand Palette ---
+# Inspired by Proton's "trust through clarity" aesthetic
+# Warm, clean, readable -- deliberately NOT Bloomberg
 
-# Financial-specific additions
-_CHART_MUTED = "#949ba4"   # for secondary data series
-_CHART_BAND = "#5865f233"  # blurple at 20% opacity for confidence bands
+# Core
+_BRAND_BG = "#1c1b22"          # deep warm charcoal (not cold navy)
+_BRAND_BG_LIGHT = "#f5f0ec"    # warm parchment (for light mode / PDF)
+_BRAND_FG = "#eae7e1"          # warm off-white text
+_BRAND_FG_LIGHT = "#1b1340"    # deep purple-black (for light mode)
+
+# Signature accent -- our purple
+_BRAND_ACCENT = "#6d4aff"      # Proton-inspired purple (our signature)
+_BRAND_ACCENT_MUTED = "#6d4aff33"  # 20% opacity for bands/fills
+
+# Semantic colors (financial meaning)
+_BRAND_POSITIVE = "#1ea885"    # teal-green (calmer than neon green)
+_BRAND_NEGATIVE = "#dc3545"    # clear red (universally understood)
+_BRAND_WARNING = "#e8950a"     # warm amber (not screaming yellow)
+_BRAND_NEUTRAL = "#8b8694"     # muted purple-grey (secondary info)
+
+# Chart-specific
+_BRAND_GRID = "#2d2b33"        # subtle warm grid (dark mode)
+_BRAND_GRID_LIGHT = "#e0d8d0"  # subtle warm grid (light mode)
 ```
 
-This keeps the dark-mode feel that works for charts (data visualization is genuinely better on dark backgrounds) while making it feel modern and approachable instead of intimidating.
+#### Why this works as a brand
 
-### Alternative: offer both as a user preference
+1. **The purple is the signature.** Nobody in finance uses purple as their primary accent. Bloomberg is cyan. Morningstar is navy/orange. Yahoo is purple but their finance product uses blue. Robinhood is green. Our purple is distinctive and ownable.
 
-The cleanest solution might be to make the palette a config option. Define two presets:
+2. **Warm tones, not cold ones.** Bloomberg's `#1a1a2e` is cold navy. Ours is `#1c1b22` -- warm charcoal with a hint of brown/purple. The difference is subtle but it makes the reports feel less clinical and more approachable. Proton does this exact thing.
 
-- `chart_theme: "terminal"` -- current Bloomberg palette (for institutional users)
-- `chart_theme: "modern"` -- Discord-inspired palette (default for new users)
+3. **The teal-green instead of neon green.** Our current `#2ed573` is fun but screams "gaming." The `#1ea885` teal-green is calmer, more confident. It says "this is good" without shouting. Proton uses a similar shade.
 
-The implementation is trivial: load the 7 color values from `global_config.yml` instead of hardcoding them. Cost: ~20 lines in `report_generator.py`.
+4. **Light mode option for PDFs.** Some people will print reports or read them on tablets in daylight. The `_BRAND_BG_LIGHT = "#f5f0ec"` warm parchment background with `_BRAND_FG_LIGHT = "#1b1340"` deep purple-black text gives a distinctive Proton-like reading experience on paper.
+
+#### Migration plan
+
+Rename `_apply_bloomberg_style()` to `_apply_brand_style()` in `report_generator.py`. Replace the 7 color constants with the brand palette above. Add a `dark_mode: bool` parameter that switches between dark and light variants (for screen vs PDF). Every chart that calls the function gets the new palette automatically.
+
+Total code change: ~30 lines in `report_generator.py`. Zero changes to any computation, feature, or model code.
 
 ### What to improve regardless of palette choice
 
 These improvements work with any color scheme:
 
 - Add a **Key Indicators Summary Table** at the top of Section 4 (Current Financial Snapshot) with ~15 familiar metrics in a clean grid
-- Use semantic coloring (`_CHART_GREEN` for strong, `_CHART_RED` for weak, `_CHART_GOLD` for neutral) on indicator values
+- Use semantic coloring (`_BRAND_POSITIVE` for strong, `_BRAND_NEGATIVE` for weak, `_BRAND_WARNING` for neutral) on indicator values
 - Add **peer context** inline: "P/E: 18.2 (sector median: 22.1)"
 - Add **historical percentile** inline: "Current Ratio: 1.8 (75th percentile of 5-year range)"
+- In Learn mode, add explanation tooltips: "P/E of 18.2 means investors pay $18.20 for every $1 of earnings. Lower than sector average of 22.1 suggests this stock may be undervalued."
 
 ---
 
