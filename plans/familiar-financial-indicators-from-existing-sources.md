@@ -139,11 +139,13 @@ Structure reports in two layers:
 
 ---
 
-## Part 4: Keep the Bloomberg-style report -- don't change it
+## Part 4: Which visual style should we use?
 
-### What we have now
+### The three candidates
 
-The report generator (`report_generator.py`) already uses a Bloomberg Terminal-inspired dark theme:
+We have three real options for the chart and report coloring. Here's a concrete comparison.
+
+#### Option A: Current Bloomberg-style (what we have now)
 
 ```python
 _CHART_BG = "#1a1a2e"      # dark navy background
@@ -155,27 +157,96 @@ _CHART_GREEN = "#2ed573"   # positive/bullish
 _CHART_GOLD = "#ffa502"    # warning/neutral
 ```
 
-The `_apply_bloomberg_style()` function (line 2642) applies this consistently across all charts: price history with regime shading, survival timeline, risk hierarchy weights, volatility, financial health composite, sentiment, and OHLC predictions.
+**Who this is for:** Finance professionals, Bloomberg Terminal users, institutional analysts. People who stare at dark terminals all day.
 
-The fallback template (line 79) has 22 sections that map to the standard institutional research report format: Executive Summary, Company Overview, Performance, Financial Snapshot, Health Scoring, Survival Analysis, Linked Variables, Temporal Analysis, Predictions, Technical Patterns, Ethical Filters, Supply Chain Risk, Competitive Landscape, Regulatory, Calibration, Sentiment, Peer Comparison, Macro, Advanced Quant, Risk/Limitations, Recommendation, Appendix.
+**Pros:** Looks like what traders and analysts already use. High information density works on dark backgrounds. The cyan-on-navy color scheme says "this is a professional financial tool."
 
-### Why we should keep it
+**Cons:** Can feel intimidating or cold to retail investors. Dense information on dark backgrounds causes eye strain for long reading sessions. Non-finance people (small business owners, casual investors) may feel this "isn't for them."
 
-1. **It already looks like what people expect.** The dark theme, cyan accent, red/green color coding -- this is what Bloomberg Terminal users see every day. TradingView uses a similar aesthetic. Our charts already feel "professional" without explanation.
+#### Option B: Proton Mail / Clean Modern style
 
-2. **The 22-section structure maps to institutional research.** Goldman Sachs, JP Morgan, and Morgan Stanley equity research reports follow roughly this structure. Users who've read those reports will navigate ours intuitively.
+```python
+_CHART_BG = "#f5f0ec"      # warm off-white (Proton's parchment)
+_CHART_FG = "#1b1340"      # deep purple-black text
+_CHART_GRID = "#e0d8d0"    # subtle warm grid
+_CHART_ACCENT = "#6d4aff"  # Proton purple
+_CHART_RED = "#dc3545"     # standard danger red
+_CHART_GREEN = "#1ea885"   # muted teal-green
+_CHART_GOLD = "#ff8c00"    # warm amber
+```
 
-3. **The three-tier system (Basic/Pro/Premium) already handles audience segmentation.** `ReportTier.BASIC` shows 5 sections for quick screening. `ReportTier.PRO` shows 13 sections with peers and macro. `ReportTier.PREMIUM` shows all 22 sections. This is the right way to manage complexity -- not by changing the style, but by controlling the depth.
+**Who this is for:** Privacy-conscious tech users, modern SaaS consumers, people who trust "clean design." Proton's brand is "we respect you and your data."
 
-4. **A new style would break consistency.** We have 8+ chart types all using `_apply_bloomberg_style()`. Changing the style means touching every chart function. The risk/reward is bad.
+**Pros:** Easier on the eyes for reading. The warm off-white background feels less aggressive than pitch-black. The purple accent is distinctive -- nobody else in finance uses it. Strong "trust through clarity" signal. Better for long reports that people actually read cover-to-cover.
 
-### What to improve within the current style
+**Cons:** Doesn't scream "finance." A P/E ratio on a lavender background might feel less authoritative to someone who's used to Bloomberg. Charts with many overlapping series are harder to read on light backgrounds.
 
-Instead of a new style, enhance the existing one:
+#### Option C: Discord / App-native dark style
 
-- Add a **Key Indicators Summary Table** at the top of Section 4 (Current Financial Snapshot) with the ~15 familiar metrics in a Bloomberg-style grid
-- Use the same color coding (`_CHART_GREEN` for strong, `_CHART_RED` for weak, `_CHART_GOLD` for neutral) on the indicator values
-- Add **peer context** inline: "P/E: 18.2 (sector median: 22.1)" -- this is what Bloomberg's COMP function shows
+```python
+_CHART_BG = "#313338"      # Discord dark (softer than Bloomberg navy)
+_CHART_FG = "#dbdee1"      # Discord light text
+_CHART_GRID = "#3f4147"    # subtle grey grid
+_CHART_ACCENT = "#5865f2"  # Discord blurple
+_CHART_RED = "#ed4245"     # Discord red
+_CHART_GREEN = "#57f287"   # Discord green (bright, fun)
+_CHART_GOLD = "#fee75c"    # Discord yellow
+```
+
+**Who this is for:** Younger investors (25-40), tech workers, the Robinhood/WeBull generation. People who spend 4+ hours a day in Discord, Slack, or similar apps.
+
+**Pros:** Feels native to how this generation consumes information. The softer dark grey (#313338 vs our #1a1a2e) is less aggressive than Bloomberg but still dark-mode. The blurple accent is distinctive and modern. The brighter green/red are more visible than our current muted versions. This crowd already trusts this color language.
+
+**Cons:** Might feel "casual" to institutional users. The Discord association could undermine seriousness for fund managers or compliance officers.
+
+### The actual recommendation: Discord dark, but keep the Bloomberg structure
+
+Here's the reasoning:
+
+1. **Our audience is not Bloomberg Terminal users.** Bloomberg users already have a Bloomberg Terminal. They're not looking for another one. Our audience is people who want institutional-quality analysis without the $24k/year price tag. Those people are more likely to be in Discord than on a Bloomberg chat channel.
+
+2. **The Discord dark palette is objectively better for readability.** Our current `#1a1a2e` (very dark navy) has low contrast with `#2d2d44` (grid lines) -- the difference is only ~10% luminance. Discord's `#313338` background vs `#3f4147` grid has better contrast. The brighter accent colors (`#5865f2` blurple, `#57f287` green) pop more on the darker grey.
+
+3. **The structure should stay exactly the same.** The 22-section institutional format, the three-tier system (Basic/Pro/Premium), the chart types -- all of this is correct. Only the *colors* change, not the layout or content hierarchy.
+
+4. **The migration is contained.** We change 7 color constants in `report_generator.py` and the `_apply_bloomberg_style()` function (rename it to `_apply_chart_style()`). That's it. Every chart that calls the function gets the new palette automatically.
+
+### Proposed new palette (Discord-inspired financial)
+
+```python
+# Modern dark theme -- inspired by Discord/app-native coloring
+# but tuned for financial data readability
+_CHART_BG = "#2b2d31"      # Discord dark-mode background
+_CHART_FG = "#e0e2e6"      # slightly warmer than pure white
+_CHART_GRID = "#3a3c42"    # visible but not distracting
+_CHART_ACCENT = "#5865f2"  # blurple -- our brand color
+_CHART_RED = "#ed4245"     # clear danger/bearish
+_CHART_GREEN = "#57f287"   # clear positive/bullish
+_CHART_GOLD = "#fee75c"    # attention/warning (Discord yellow)
+
+# Financial-specific additions
+_CHART_MUTED = "#949ba4"   # for secondary data series
+_CHART_BAND = "#5865f233"  # blurple at 20% opacity for confidence bands
+```
+
+This keeps the dark-mode feel that works for charts (data visualization is genuinely better on dark backgrounds) while making it feel modern and approachable instead of intimidating.
+
+### Alternative: offer both as a user preference
+
+The cleanest solution might be to make the palette a config option. Define two presets:
+
+- `chart_theme: "terminal"` -- current Bloomberg palette (for institutional users)
+- `chart_theme: "modern"` -- Discord-inspired palette (default for new users)
+
+The implementation is trivial: load the 7 color values from `global_config.yml` instead of hardcoding them. Cost: ~20 lines in `report_generator.py`.
+
+### What to improve regardless of palette choice
+
+These improvements work with any color scheme:
+
+- Add a **Key Indicators Summary Table** at the top of Section 4 (Current Financial Snapshot) with ~15 familiar metrics in a clean grid
+- Use semantic coloring (`_CHART_GREEN` for strong, `_CHART_RED` for weak, `_CHART_GOLD` for neutral) on indicator values
+- Add **peer context** inline: "P/E: 18.2 (sector median: 22.1)"
 - Add **historical percentile** inline: "Current Ratio: 1.8 (75th percentile of 5-year range)"
 
 ---
