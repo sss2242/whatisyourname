@@ -37,11 +37,21 @@ def fetch_ohlcv_twstock(
     """
     try:
         import twstock
+        import twstock.stock as _ts_mod
+        from collections import namedtuple
     except ImportError:
         logger.debug("twstock not installed; falling back to yfinance")
         return pd.DataFrame()
 
     try:
+        # Monkey-patch: TWSE now returns an extra field (shares_traded or similar)
+        # that twstock 1.4.0's DATATUPLE (9 fields) doesn't expect.
+        _old_fields = _ts_mod.DATATUPLE._fields
+        if len(_old_fields) == 9:
+            _new_tuple = namedtuple("Data", list(_old_fields) + ["extra"])
+            _ts_mod.DATATUPLE = _new_tuple
+            logger.debug("Patched twstock DATATUPLE to accept 10 fields (TWSE format change)")
+
         start_year = date.today().year - years
         start_month = date.today().month
 

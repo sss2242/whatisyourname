@@ -628,25 +628,16 @@ Non-interactive examples:
     # a given date is an immutable fact that never changes retroactively.
     if quotes_df.empty and ticker:
         logger.info(
-            "PIT source %s does not provide OHLCV -- fetching from regional OHLCV provider...",
+            "PIT source %s does not provide OHLCV -- fetching from OHLCV provider.",
             market_info.pit_api_name,
         )
         try:
             from operator1.clients.ohlcv_provider import fetch_ohlcv
-            quotes_df = fetch_ohlcv(
-                ticker=ticker,
-                market_id=market_id,
-                years=int(args.years),
-            )
+            quotes_df = fetch_ohlcv(ticker, market_id=args.market)
             if not quotes_df.empty:
-                logger.info(
-                    "OHLCV fetched: %d rows via regional provider (market=%s)",
-                    len(quotes_df), market_id,
-                )
-            else:
-                logger.warning("OHLCV provider returned empty for %s", ticker)
+                logger.info("OHLCV fetched from provider: %d rows", len(quotes_df))
         except Exception as exc:
-            logger.warning("OHLCV provider fetch failed for %s: %s", ticker, exc)
+            logger.warning("OHLCV provider failed: %s", exc)
 
     # Step 3b: Reconcile financial data (normalize fields, validate dates)
     reconciliation_report = {}
@@ -676,6 +667,12 @@ Non-interactive examples:
         for label, stmt_df in [("income", income_df), ("balance", balance_df), ("cashflow", cashflow_df)]:
             if stmt_df.empty:
                 continue
+            logger.debug(
+                "Pivot check for %s: columns=%s, has_canonical=%s, has_value=%s",
+                label, list(stmt_df.columns)[:5],
+                "canonical_name" in stmt_df.columns,
+                "value" in stmt_df.columns,
+            )
             if "canonical_name" in stmt_df.columns and "value" in stmt_df.columns:
                 wide = pivot_to_canonical_wide(stmt_df, date_col="report_date")
                 if not wide.empty:
@@ -748,14 +745,19 @@ Non-interactive examples:
         if stmt_df.empty:
             continue
         try:
-            # Use filing_date for PIT alignment (no look-ahead)
-            date_col = "filing_date" if "filing_date" in stmt_df.columns else "report_date"
+            # Use report_date for alignment (filing_date has duplicates from
+            # multi-period filings like 10-Q containing both Q and YTD data).
+            # The PIT constraint is still satisfied: we forward-fill from the
+            # report_date, which is always <= filing_date.
+            date_col = "report_date" if "report_date" in stmt_df.columns else "filing_date"
             if date_col not in stmt_df.columns:
                 logger.warning("No date column in %s data, skipping merge", label)
                 continue
 
             stmt_df[date_col] = pd.to_datetime(stmt_df[date_col])
             stmt_df = stmt_df.sort_values(date_col)
+            # Deduplicate: keep last row per date (most recent filing)
+            stmt_df = stmt_df.drop_duplicates(subset=[date_col], keep="last")
 
             # Forward-fill financial data onto the daily cache (as-of join)
             numeric_cols = stmt_df.select_dtypes(include=["number"]).columns.tolist()
@@ -765,8 +767,12 @@ Non-interactive examples:
                 continue
 
             stmt_indexed = stmt_df.set_index(date_col)[numeric_cols]
-            # Reindex to cache dates and forward-fill
-            stmt_aligned = stmt_indexed.reindex(cache.index, method="ffill")
+            # Forward-fill financial data onto the daily cache (as-of join).
+            # The quarterly filing dates don't exist in the daily index,
+            # so we union the indices first, then ffill, then select daily dates.
+            combined_idx = cache.index.union(stmt_indexed.index).sort_values()
+            stmt_aligned = stmt_indexed.reindex(combined_idx).ffill()
+            stmt_aligned = stmt_aligned.reindex(cache.index)
 
             # Skip columns already in cache (first statement wins)
             new_cols = [c for c in stmt_aligned.columns if c not in _merged_cols]
@@ -783,37 +789,28 @@ Non-interactive examples:
     # ------------------------------------------------------------------
     # Step 4a: Fetch macro data for survival mode analysis
     # ------------------------------------------------------------------
-    macro_data = {}          # raw dict[str, pd.Series] (macro APIs removed)
-    macro_dataset = None     # MacroDataset for downstream modules
+    macro_data = {}
+    macro_dataset = None
     macro_quadrant_result = None
 
     if macro_api_info:
         logger.info("")
-        logger.info(
-            "Step 4a: Fetching macro data from regional provider (%s)...",
-            macro_api_info.api_name,
-        )
+        logger.info("Step 4a: Fetching macro data from %s...", macro_api_info.api_name)
         try:
             from operator1.clients.macro_provider import fetch_macro
-            country_code = getattr(macro_api_info, "country_code", "") or (
-                target_profile.get("country", "US")[:2].upper()
-            )
             macro_data = fetch_macro(
-                country_iso2=country_code,
-                market_id=market_id,
+                market_info.country_code,
                 secrets=secrets,
-                years=max(10, int(args.years) + 5),
+                years=int(getattr(args, "years", 2)),
             )
             if macro_data:
-                _fetched = [k for k, v in macro_data.items() if v is not None and not v.empty]
-                logger.info(
-                    "Macro data fetched: %d indicators (%s)",
-                    len(_fetched), ", ".join(_fetched),
-                )
+                logger.info("Macro data: %d indicators fetched", len(macro_data))
+                for name, series in macro_data.items():
+                    logger.info("    [OK] %s: %d observations", name, len(series))
             else:
-                logger.info("Macro provider returned no data for %s", country_code)
+                logger.warning("Macro data: no indicators returned (APIs may need keys)")
         except Exception as exc:
-            logger.warning("Macro data fetch failed: %s", exc)
+            logger.warning("Macro data fetch failed (continuing without macro): %s", exc)
 
     # ------------------------------------------------------------------
     # Step 4a-validate: Log what both APIs returned for diagnostics

@@ -108,14 +108,91 @@ def _sentiment_label(score: float) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _fetch_news_gnews(symbol: str) -> pd.DataFrame:
+    """Fetch stock news via GNews (Google News scraper, no API key).
+
+    Uses the gnews library (pip install gnews) to search Google News
+    for recent articles about the given stock symbol/company.
+    Returns a DataFrame with columns: date, title, url, source.
+    """
+    try:
+        from gnews import GNews
+    except ImportError:
+        logger.debug("gnews not installed; trying RSS fallback")
+        return _fetch_news_rss(symbol)
+
+    try:
+        gn = GNews(language="en", country="US", period="6m", max_results=50)
+        articles = gn.get_news(f"{symbol} stock")
+        if not articles:
+            return pd.DataFrame()
+
+        rows = []
+        for art in articles:
+            rows.append({
+                "date": pd.to_datetime(art.get("published date", ""), errors="coerce"),
+                "title": art.get("title", ""),
+                "url": art.get("url", ""),
+                "source": art.get("publisher", {}).get("title", "") if isinstance(art.get("publisher"), dict) else str(art.get("publisher", "")),
+            })
+
+        df = pd.DataFrame(rows)
+        df = df.dropna(subset=["date"])
+        logger.info("GNews fetched %d articles for %s", len(df), symbol)
+        return df
+
+    except Exception as exc:
+        logger.warning("GNews fetch failed for %s: %s; trying RSS", symbol, exc)
+        return _fetch_news_rss(symbol)
+
+
+def _fetch_news_rss(symbol: str) -> pd.DataFrame:
+    """Fetch stock news via Google News RSS (no library needed beyond feedparser).
+
+    Fallback when gnews is not installed. Uses Google News RSS feed
+    which is free and requires no API key.
+    """
+    try:
+        import feedparser
+    except ImportError:
+        logger.debug("feedparser not installed; no news source available")
+        return pd.DataFrame()
+
+    try:
+        import urllib.parse
+        query = urllib.parse.quote(f"{symbol} stock")
+        url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+
+        feed = feedparser.parse(url)
+        if not feed.entries:
+            return pd.DataFrame()
+
+        rows = []
+        for entry in feed.entries[:50]:
+            pub_date = entry.get("published", "")
+            rows.append({
+                "date": pd.to_datetime(pub_date, errors="coerce"),
+                "title": entry.get("title", ""),
+                "url": entry.get("link", ""),
+                "source": entry.get("source", {}).get("title", "") if isinstance(entry.get("source"), dict) else "",
+            })
+
+        df = pd.DataFrame(rows)
+        df = df.dropna(subset=["date"])
+        logger.info("RSS fetched %d articles for %s", len(df), symbol)
+        return df
+
+    except Exception as exc:
+        logger.warning("RSS news fetch failed: %s", exc)
+        return pd.DataFrame()
+
+
 def _fetch_news_alpha_vantage(symbol: str) -> pd.DataFrame:
     """Alpha Vantage news endpoint -- removed (paid/commercial API).
 
-    Returns an empty DataFrame. Previously used Alpha Vantage
-    NEWS_SENTIMENT endpoint.
+    Redirects to GNews/RSS fetcher instead.
     """
-    logger.debug("Alpha Vantage news removed -- returning empty DataFrame")
-    return pd.DataFrame()
+    return _fetch_news_gnews(symbol)
 
 
 # ---------------------------------------------------------------------------

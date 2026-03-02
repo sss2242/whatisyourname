@@ -121,14 +121,40 @@ class CLCmfClient:
         return companies
 
     def search_company(self, name: str) -> list[dict[str, Any]]:
-        return self.list_companies(query=name)
+        results = self.list_companies(query=name)
+        if results:
+            return results
+
+        # Fallback: try yfinance with Santiago exchange suffix
+        try:
+            import yfinance as yf
+            for suffix in ["-B.SN", "-A.SN", ".SN", ""]:
+                ticker = f"{name.upper()}{suffix}"
+                t = yf.Ticker(ticker)
+                info = t.info or {}
+                yf_name = info.get("longName") or info.get("shortName")
+                if yf_name and info.get("country", "").lower() in ("chile", ""):
+                    results.append({
+                        "ticker": ticker,
+                        "name": yf_name,
+                        "rut": "",
+                        "country": info.get("country", "CL"),
+                        "exchange": info.get("exchange", "Santiago"),
+                        "sector": info.get("sector", ""),
+                        "market_id": self.market_id,
+                    })
+                    break
+        except Exception as exc:
+            logger.debug("yfinance fallback failed for CL search: %s", exc)
+
+        return results
 
     def get_profile(self, identifier: str) -> dict[str, Any]:
         cached = self._read_cache(identifier, "profile.json")
         if cached:
             return cached
 
-        matches = self.list_companies(query=identifier)
+        matches = self.search_company(identifier)
         if not matches:
             raise CLCmfError("get_profile", f"Company not found: {identifier}")
 

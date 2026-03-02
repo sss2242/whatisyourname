@@ -161,6 +161,27 @@ def fetch_macro(
         except Exception as exc:
             logger.warning("wbgapi fallback also failed for %s: %s", cc, exc)
 
+    # Secondary fallback: IMF SDMX API (free, no key) for countries
+    # not well covered by wbgapi (e.g. Taiwan)
+    if len(results) < 3:
+        try:
+            from operator1.clients.macro_dgbas import _fetch_imf_series, _IMF_TW_SERIES
+            # IMF uses ISO-2 codes; build URLs dynamically for any country
+            _IMF_BASE = "http://dataservices.imf.org/REST/SDMX_JSON.svc"
+            imf_series = {
+                "gdp_growth": f"{_IMF_BASE}/CompactData/IFS/A.{cc}.NGDP_R_PC_PP_PT",
+                "unemployment_rate": f"{_IMF_BASE}/CompactData/IFS/A.{cc}.LUR_PT",
+            }
+            for key, url in imf_series.items():
+                if key not in results:
+                    s = _fetch_imf_series(url, key, years)
+                    if s is not None:
+                        results[key] = s
+            if results:
+                logger.info("IMF supplemented %s with %d indicators", cc, len(results))
+        except Exception as exc:
+            logger.debug("IMF fallback failed for %s: %s", cc, exc)
+
     if not results:
         logger.warning("No macro data available for %s (market: %s)", cc, market_id)
 

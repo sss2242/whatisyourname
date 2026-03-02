@@ -26,6 +26,8 @@ from operator1.http_utils import cached_get, HTTPError
 logger = logging.getLogger(__name__)
 
 _CH_BASE = "https://api.company-information.service.gov.uk"
+_CH_SANDBOX_BASE = "https://api-sandbox.company-information.service.gov.uk"
+_CH_SANDBOX_TEST_DATA = "https://test-data-sandbox.company-information.service.gov.uk"
 _CACHE_DIR = Path("cache/uk_companies_house")
 
 
@@ -54,9 +56,12 @@ class UKCompaniesHouseClient:
         self,
         api_key: str = "",
         cache_dir: Path | str = _CACHE_DIR,
+        sandbox: bool = False,
     ) -> None:
         self._api_key = api_key or os.environ.get("COMPANIES_HOUSE_API_KEY", "")
         self._cache_dir = Path(cache_dir)
+        self._sandbox = sandbox
+        self._base_url = _CH_SANDBOX_BASE if sandbox else _CH_BASE
 
     def _cache_path(self, identifier: str, filename: str) -> Path:
         safe_id = identifier.replace("/", "_").replace("\\", "_").upper()
@@ -80,7 +85,7 @@ class UKCompaniesHouseClient:
         path.write_text(json.dumps(data, default=str, indent=2), encoding="utf-8")
 
     def _get(self, path: str, params: dict | None = None) -> Any:
-        url = f"{_CH_BASE}{path}"
+        url = f"{self._base_url}{path}"
         headers = {"Accept": "application/json", "User-Agent": "Operator1/1.0"}
         if self._api_key:
             import base64

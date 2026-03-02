@@ -100,6 +100,17 @@ _IFRS_MAP: dict[str, str] = {
     "ifrs-full:CashFlowsFromUsedInFinancingActivities": "financing_cf",
     "ifrs-full:PurchaseOfPropertyPlantAndEquipment": "capex",
     "ifrs-full:DividendsPaid": "dividends_paid",
+    # Additional IFRS concepts for full coverage
+    "ifrs-full:BasicEarningsLossPerShare": "eps_basic",
+    "ifrs-full:DilutedEarningsLossPerShare": "eps_diluted",
+    "ifrs-full:CurrentBorrowings": "short_term_debt",
+    "ifrs-full:ShorttermBorrowings": "short_term_debt",
+    "ifrs-full:Borrowings": "total_debt",
+    "ifrs-full:NoncurrentBorrowings": "long_term_debt",
+    # NOTE: D&A is a *component* of EBITDA, not EBITDA itself.
+    # EBITDA = operating_income + D&A. Mapping removed to avoid injecting
+    # incorrect values. EBITDA is computed downstream when both inputs exist.
+    # free_cash_flow: computed downstream (operating_cash_flow - capex)
 }
 
 # Japan GAAP (JPPFS) concepts (EDINET)
@@ -204,6 +215,15 @@ _CVM_ACCOUNT_MAP: dict[str, str] = {
     "6.02": "investing_cf",
     "6.03": "financing_cf",
     "6.02.01": "capex",
+    # Missing canonical fields -- added for full coverage
+    "6.03.04": "dividends_paid",        # Dividends paid to shareholders
+    "3.09": "ebitda",                    # EBITDA (some CVM filers report this)
+    "3.11.01": "eps_basic",             # Earnings per share (basic)
+    "3.11.02": "eps_diluted",           # Earnings per share (diluted)
+    "3.04": "sga_expenses",             # Selling, general & administrative
+    "3.04.01": "rd_expenses",           # R&D expenses (subset of SGA in CVM)
+    "2.01.04+2.02.01": "total_debt",    # Not a real code; handled via computation
+    # free_cash_flow: computed downstream (operating_cash_flow - capex)
 }
 
 # Chile CMF / FECU concepts -> canonical names
@@ -357,8 +377,8 @@ _CAS_MAP: dict[str, str] = {
     "所得税费用": "taxes",
     "利息支出": "interest_expense",
     "财务费用": "interest_expense",
-    "销售费用": "sga_expenses",
-    "管理费用": "sga_expenses",
+    "销售费用": "sga_selling",       # selling expenses (component of SGA)
+    "管理费用": "sga_admin",         # admin expenses (component of SGA)
     "研发费用": "rd_expenses",
     "毛利润": "gross_profit",
     # Balance sheet (资产负债表)
@@ -439,6 +459,36 @@ _USGAAP_MAP: dict[str, str] = {
     "PaymentsToAcquirePropertyPlantAndEquipment": "capex",
     "PaymentsOfDividends": "dividends_paid",
     "PaymentsForRepurchaseOfCommonStock": "stock_buybacks",
+    # Missing canonical fields -- added for full coverage
+    # ebit (namespaced + bare)
+    "us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxes": "ebit",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxes": "ebit",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest": "ebit",
+    # NOTE: OperatingExpenses != EBITDA. Removed incorrect mapping.
+    # EBITDA is computed downstream (operating_income + depreciation_amortization).
+    # goodwill
+    "us-gaap:Goodwill": "goodwill",
+    "Goodwill": "goodwill",
+    # intangible_assets
+    "us-gaap:IntangibleAssetsNetExcludingGoodwill": "intangible_assets",
+    "IntangibleAssetsNetExcludingGoodwill": "intangible_assets",
+    "FiniteLivedIntangibleAssetsNet": "intangible_assets",
+    # inventory
+    "us-gaap:InventoryNet": "inventory",
+    "InventoryNet": "inventory",
+    # payables
+    "us-gaap:AccountsPayableCurrent": "payables",
+    "AccountsPayableCurrent": "payables",
+    "AccountsPayableAndAccruedLiabilitiesCurrent": "payables",
+    # retained_earnings
+    "us-gaap:RetainedEarningsAccumulatedDeficit": "retained_earnings",
+    "RetainedEarningsAccumulatedDeficit": "retained_earnings",
+    # total_debt
+    "us-gaap:DebtAndCapitalLeaseObligations": "total_debt",
+    "DebtAndCapitalLeaseObligations": "total_debt",
+    "LongTermDebtAndCapitalLeaseObligations": "total_debt",
+    # free_cash_flow -- not a GAAP concept, but some filers report it
+    # We compute it downstream: operating_cash_flow - capex
 }
 
 # Market -> accounting standard label (for cross-standard comparison caveats)
@@ -843,6 +893,19 @@ def pivot_to_canonical_wide(
             aggfunc="first",
         ).reset_index()
         wide = wide.sort_values(date_col, ascending=False)
+
+        # Sum split SGA components (China CAS reports selling + admin separately)
+        if "sga_selling" in wide.columns or "sga_admin" in wide.columns:
+            selling = wide.get("sga_selling", pd.Series(0.0, index=wide.index)).fillna(0)
+            admin = wide.get("sga_admin", pd.Series(0.0, index=wide.index)).fillna(0)
+            if "sga_expenses" not in wide.columns:
+                wide["sga_expenses"] = selling + admin
+            else:
+                # Only fill where sga_expenses is missing
+                missing = wide["sga_expenses"].isna()
+                wide.loc[missing, "sga_expenses"] = selling[missing] + admin[missing]
+            wide = wide.drop(columns=["sga_selling", "sga_admin"], errors="ignore")
+
         return wide
     except Exception as exc:
         logger.warning("Pivot to wide format failed: %s", exc)
@@ -912,3 +975,251 @@ def get_concept_map(market_id: str) -> dict[str, str]:
     Useful for clients that want to do their own mapping.
     """
     return dict(_MARKET_CONCEPT_MAPS.get(market_id, {}))
+
+
+# ---------------------------------------------------------------------------
+# LLM-based fuzzy concept resolver
+# ---------------------------------------------------------------------------
+
+# In-memory cache for LLM concept resolutions (persisted to disk per-session)
+_LLM_CONCEPT_CACHE: dict[str, str] = {}
+_LLM_CACHE_PATH = "cache/llm_concept_map.json"
+
+# Target canonical fields that the LLM should try to resolve unmapped concepts to
+_TARGET_CANONICAL_FIELDS = sorted(
+    CANONICAL_INCOME | CANONICAL_BALANCE | CANONICAL_CASHFLOW
+)
+
+
+def _load_llm_cache() -> None:
+    """Load previously resolved LLM concept mappings from disk."""
+    global _LLM_CONCEPT_CACHE
+    if _LLM_CONCEPT_CACHE:
+        return  # already loaded
+    try:
+        import json
+        from pathlib import Path
+        cache_path = Path(_LLM_CACHE_PATH)
+        if cache_path.exists():
+            _LLM_CONCEPT_CACHE = json.loads(cache_path.read_text())
+            logger.debug("Loaded %d LLM concept mappings from cache", len(_LLM_CONCEPT_CACHE))
+    except Exception as exc:
+        logger.debug("Could not load LLM concept cache: %s", exc)
+
+
+def _save_llm_cache() -> None:
+    """Persist LLM concept resolutions to disk."""
+    try:
+        import json
+        from pathlib import Path
+        cache_path = Path(_LLM_CACHE_PATH)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(_LLM_CONCEPT_CACHE, indent=2))
+    except Exception as exc:
+        logger.debug("Could not save LLM concept cache: %s", exc)
+
+
+def resolve_unmapped_concepts_llm(
+    unmapped_concepts: list[str],
+    market_id: str = "",
+) -> dict[str, str]:
+    """Use the LLM to fuzzy-match unmapped XBRL/API concepts to canonical fields.
+
+    For each unmapped concept, asks the LLM whether it corresponds to one of
+    the canonical financial fields.  Results are cached to avoid repeat calls.
+
+    Parameters
+    ----------
+    unmapped_concepts:
+        List of raw concept names that static mapping could not resolve.
+    market_id:
+        Market identifier for context (e.g. "us_sec_edgar").
+
+    Returns
+    -------
+    Dict mapping raw concept -> canonical field name (only for successful matches).
+    Empty string values mean "no match" (also cached to avoid re-asking).
+    """
+    if not unmapped_concepts:
+        return {}
+
+    _load_llm_cache()
+
+    # Split into cached vs uncached
+    resolved: dict[str, str] = {}
+    to_ask: list[str] = []
+    for concept in unmapped_concepts:
+        cache_key = f"{market_id}::{concept}"
+        if cache_key in _LLM_CONCEPT_CACHE:
+            val = _LLM_CONCEPT_CACHE[cache_key]
+            if val:
+                resolved[concept] = val
+        else:
+            to_ask.append(concept)
+
+    if not to_ask:
+        return resolved
+
+    # Batch into groups of up to 30 concepts per LLM call
+    batch_size = 30
+    for i in range(0, len(to_ask), batch_size):
+        batch = to_ask[i : i + batch_size]
+        batch_result = _ask_llm_for_concepts(batch, market_id)
+        for concept, canonical in batch_result.items():
+            cache_key = f"{market_id}::{concept}"
+            _LLM_CONCEPT_CACHE[cache_key] = canonical
+            if canonical:
+                resolved[concept] = canonical
+
+    _save_llm_cache()
+    if resolved:
+        logger.info(
+            "LLM resolved %d/%d unmapped concepts for %s",
+            len(resolved), len(unmapped_concepts), market_id,
+        )
+    return resolved
+
+
+def _ask_llm_for_concepts(
+    concepts: list[str],
+    market_id: str,
+) -> dict[str, str]:
+    """Send a batch of unmapped concepts to the LLM for resolution.
+
+    Returns a dict of concept -> canonical_name (or "" if no match).
+    """
+    try:
+        from operator1.clients.llm_factory import create_llm_client
+    except ImportError:
+        logger.debug("LLM factory not available; skipping concept resolution")
+        return {c: "" for c in concepts}
+
+    canonical_list = ", ".join(_TARGET_CANONICAL_FIELDS)
+    concept_list = "\n".join(f"  - {c}" for c in concepts)
+
+    prompt = f"""You are a financial data expert. I have XBRL/API concept names from {market_id or 'a financial API'} that I need to map to canonical field names.
+
+The canonical fields are:
+{canonical_list}
+
+The unmapped concepts are:
+{concept_list}
+
+For each concept, respond with ONLY a JSON object mapping each concept to its canonical field name. If a concept does not match any canonical field, map it to an empty string "".
+
+Rules:
+- "InterestExpense", "InterestCostsIncurred", "FinanceCosts" -> "interest_expense"
+- "ShortTermBorrowings", "OtherShortTermBorrowings", "CurrentPortionOfLongTermDebt" -> "short_term_debt"
+- "DebtAndCapitalLeaseObligations", "TotalDebt" -> "total_debt"
+- "Goodwill", "GoodwillNet" -> "goodwill"
+- "IntangibleAssetsNetExcludingGoodwill", "FiniteLivedIntangibleAssetsNet" -> "intangible_assets"
+- Concepts about depreciation, amortization alone are NOT ebitda (ebitda = operating_income + D&A)
+- Be conservative: only map if you are confident the concept matches
+
+Respond with ONLY valid JSON, no markdown formatting."""
+
+    try:
+        client = create_llm_client()
+        response = client.generate(prompt, max_tokens=1024)
+
+        # Parse JSON from response
+        import json
+        # Strip markdown code fences if present
+        text = response.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+            if text.endswith("```"):
+                text = text[:-3]
+        text = text.strip()
+
+        result = json.loads(text)
+        if isinstance(result, dict):
+            # Validate that values are in our canonical set or empty
+            valid_set = set(_TARGET_CANONICAL_FIELDS)
+            validated = {}
+            for k, v in result.items():
+                if k in concepts:
+                    if v in valid_set:
+                        validated[k] = v
+                    else:
+                        validated[k] = ""
+            # Fill in any concepts the LLM didn't respond about
+            for c in concepts:
+                if c not in validated:
+                    validated[c] = ""
+            return validated
+
+    except Exception as exc:
+        logger.debug("LLM concept resolution failed: %s", exc)
+
+    return {c: "" for c in concepts}
+
+
+def translate_with_llm_fallback(
+    df: pd.DataFrame,
+    market_id: str,
+    statement_type: str = "",
+) -> pd.DataFrame:
+    """Translate financials with LLM fallback for unmapped concepts.
+
+    First runs the standard static translation. Then checks for important
+    missing canonical fields and uses the LLM to try resolving unmapped
+    concepts.
+
+    Parameters
+    ----------
+    df:
+        Raw DataFrame from a PIT client.
+    market_id:
+        PIT market identifier.
+    statement_type:
+        Optional: "income", "balance", "cashflow".
+
+    Returns
+    -------
+    Translated DataFrame with potentially more canonical mappings than
+    the static-only path.
+    """
+    # Step 1: Standard static translation
+    result = translate_financials(df, market_id, statement_type)
+
+    if result.empty or "canonical_name" not in result.columns:
+        return result
+
+    # Step 2: Find unmapped concepts (canonical_name is empty)
+    unmapped_mask = result["canonical_name"].astype(str).str.len() == 0
+    if not unmapped_mask.any():
+        return result  # everything mapped, no LLM needed
+
+    # Step 3: Check which important fields are missing
+    mapped_fields = set(
+        result.loc[~unmapped_mask, "canonical_name"].unique()
+    )
+    important_missing = set(_TARGET_CANONICAL_FIELDS) - mapped_fields
+    if not important_missing:
+        return result  # all canonical fields covered
+
+    # Step 4: Collect unmapped concept names
+    if "concept" not in result.columns:
+        return result
+    unmapped_concepts = result.loc[unmapped_mask, "concept"].unique().tolist()
+    if not unmapped_concepts:
+        return result
+
+    # Step 5: Ask LLM to resolve
+    llm_mappings = resolve_unmapped_concepts_llm(unmapped_concepts, market_id)
+    if not llm_mappings:
+        return result
+
+    # Step 6: Apply LLM mappings
+    def _apply_llm(row):
+        if row.get("canonical_name", "") == "" and row.get("concept", "") in llm_mappings:
+            return llm_mappings[row["concept"]]
+        return row.get("canonical_name", "")
+
+    result["canonical_name"] = result.apply(_apply_llm, axis=1)
+
+    # Re-filter empty canonical names
+    result = result[result["canonical_name"].astype(str).str.len() > 0]
+
+    return result

@@ -274,7 +274,7 @@ def run_particle_filter(
     import pandas as pd
 
     if variables is None:
-        variables = ["cash_ratio", "free_cash_flow_ttm", "current_ratio"]
+        variables = ["cash_ratio", "free_cash_flow_ttm_asof", "current_ratio"]
 
     # Filter to available variables
     available = [v for v in variables if v in cache.columns]
