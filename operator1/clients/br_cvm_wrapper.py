@@ -128,6 +128,21 @@ class BRCvmClient:
             return cached
 
         matches = self.list_companies(query=identifier)
+
+        # B3 tickers (e.g. PETR4, VALE3, ITUB4) use a 4-letter base + share
+        # class digit.  CVM registry doesn't store B3 tickers, so strip the
+        # trailing digit(s) and retry as a name search.
+        if not matches and identifier.strip() and identifier[-1].isdigit():
+            import re
+            base = re.sub(r"\d+$", "", identifier).strip()
+            if len(base) >= 3:
+                matches = self.list_companies(query=base)
+                if matches:
+                    logger.info(
+                        "Resolved B3 ticker '%s' -> CVM company '%s' (CD_CVM=%s)",
+                        identifier, matches[0].get("name"), matches[0].get("cik"),
+                    )
+
         if not matches:
             raise BRCvmError("get_profile", f"Company not found: {identifier}")
 
