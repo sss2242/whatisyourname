@@ -3,6 +3,7 @@
 
 # US
 edgartools==5.19.1
+pyrate-limiter<4.0        # sec-edgar-api 1.1 needs pyrate-limiter 3.x
 sec-edgar-api==1.1.0
 
 # Japan

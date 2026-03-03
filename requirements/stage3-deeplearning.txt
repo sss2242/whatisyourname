@@ -3,4 +3,5 @@
 # If this stage times out, re-run the same command -- pip will resume from cache.
 # The pipeline works without these (falls back to statistical models).
 torch==2.10.0
+arviz<1.0                 # pymc 5.28 requires arviz 0.x (1.0 removed InferenceData)
 pymc==5.28.0

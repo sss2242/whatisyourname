@@ -33,11 +33,13 @@ dtaidistance==2.4.0       # Dynamic Time Warping
 
 # --- Stage 3: Deep Learning + Bayesian ---
 torch==2.10.0             # ~2 GB download -- skip if bandwidth is limited
+arviz<1.0                 # pymc 5.28 requires arviz 0.x (1.0 removed InferenceData)
 pymc==5.28.0              # Bayesian change-point detection
 
 # --- Stage 4: Data Source Wrappers ---
 # US
 edgartools==5.19.1         # US SEC EDGAR (primary)
+pyrate-limiter<4.0         # sec-edgar-api 1.1 needs pyrate-limiter 3.x
 sec-edgar-api==1.1.0      # US SEC EDGAR (fallback)
 # Japan
 jquants-api-client==2.0.0 # J-Quants (replaces EDINET)
