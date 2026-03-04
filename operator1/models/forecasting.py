@@ -541,7 +541,7 @@ def _fit_ar1_fallback(
 
         if len(test) > 0:
             preds = result.predict(start=len(train), end=len(train) + len(test) - 1)
-            mae, rmse = _compute_metrics(test, preds.values)
+            mae, rmse = _compute_metrics(test, np.asarray(preds))
         else:
             mae, rmse = float("nan"), float("nan")
 
@@ -563,7 +563,7 @@ def _fit_ar1_fallback(
         metrics.fitted = True
 
         logger.info("AR(1) fallback fit: MAE=%.6f, RMSE=%.6f", mae, rmse)
-        return preds_final.values, metrics
+        return np.asarray(preds_final), metrics
 
     except Exception as exc:
         metrics.error = f"AR(1) fallback failed: {exc}"
