@@ -1,57 +1,52 @@
 #!/usr/bin/env bash
-# Staged dependency installer for Operator 1
-# Installs in 4 stages to avoid pip timeouts on slow connections.
-# Each stage is independent -- if one fails, re-run just that stage.
+# install.sh -- Install all Operator 1 dependencies in 4 stages using Python 3.12
 #
 # Usage:
 #   chmod +x install.sh
 #   ./install.sh
 #
-# Or run individual stages:
-#   ./install.sh 3    # only install stage 3 (deep learning)
+# On Amazon Linux 2023:
+#   sudo dnf install -y python3.12 python3.12-pip python3.12-setuptools
+#
+# On Ubuntu/Debian (deadsnakes PPA):
+#   sudo add-apt-repository ppa:deadsnakes/ppa
+#   sudo apt install -y python3.12 python3.12-venv python3.12-dev
+#
+set -euo pipefail
 
-set -e
+PYTHON="${PYTHON:-python3.12}"
+PIP_TIMEOUT="${PIP_TIMEOUT:-300}"
 
-PIP_TIMEOUT=300
-PIP_RETRIES=3
-
-install_stage() {
-    local stage=$1
-    local file=$2
-    local desc=$3
-    echo ""
-    echo "============================================"
-    echo "  Stage ${stage}: ${desc}"
-    echo "============================================"
-    pip install --timeout ${PIP_TIMEOUT} --retries ${PIP_RETRIES} -r "${file}"
-    echo "  Stage ${stage} complete."
-}
-
-# If a specific stage number is passed, only run that stage
-if [ -n "$1" ]; then
-    case "$1" in
-        1) install_stage 1 requirements/stage1-core.txt "Core libraries (~30s)" ;;
-        2) install_stage 2 requirements/stage2-ml.txt "ML and statistics (~1-2min)" ;;
-        3) install_stage 3 requirements/stage3-deeplearning.txt "Deep learning + Bayesian (~5-8min)" ;;
-        4) install_stage 4 requirements/stage4-wrappers.txt "Data source wrappers (~1-2min)" ;;
-        *) echo "Usage: $0 [1|2|3|4]"; exit 1 ;;
-    esac
-    exit 0
-fi
-
-echo "Installing Operator 1 dependencies in 4 stages..."
-echo "Python: $(python3 --version)"
-echo ""
-
-install_stage 1 requirements/stage1-core.txt "Core libraries (~30s)"
-install_stage 2 requirements/stage2-ml.txt "ML and statistics (~1-2min)"
-install_stage 3 requirements/stage3-deeplearning.txt "Deep learning + Bayesian (~5-8min)"
-install_stage 4 requirements/stage4-wrappers.txt "Data source wrappers (~1-2min)"
+echo "==> Using $($PYTHON --version 2>&1)"
+echo "==> Upgrading pip..."
+$PYTHON -m pip install --upgrade pip
 
 echo ""
-echo "============================================"
-echo "  All stages complete!"
-echo "============================================"
+echo "==> Stage 1/4: Core libraries (numpy, pandas, scipy, etc.)"
+$PYTHON -m pip install --timeout "$PIP_TIMEOUT" -r requirements/stage1-core.txt
+
 echo ""
-echo "Verify with: python3 -c \"import pandas, numpy, torch; print('OK')\""
-echo "Run tests:   python3 -m pytest tests/test_phase1_smoke.py"
+echo "==> Stage 2/4: ML / Statistics (scikit-learn, xgboost, statsmodels, etc.)"
+$PYTHON -m pip install --timeout "$PIP_TIMEOUT" -r requirements/stage2-ml.txt
+
+echo ""
+echo "==> Stage 3/4: Deep Learning + Bayesian (torch ~2 GB, pymc)"
+echo "    If this stage times out, re-run -- pip will resume from cache."
+$PYTHON -m pip install --timeout "$PIP_TIMEOUT" -r requirements/stage3-deeplearning.txt
+
+echo ""
+echo "==> Stage 4/4: Data Source Wrappers (edgartools, yfinance, wbgapi, etc.)"
+$PYTHON -m pip install --timeout "$PIP_TIMEOUT" -r requirements/stage4-wrappers.txt
+
+echo ""
+echo "==> All 4 stages installed successfully."
+$PYTHON -c "
+import numpy, pandas, scipy, sklearn, torch
+print(f'  Python:       {__import__(\"sys\").version.split()[0]}')
+print(f'  NumPy:        {numpy.__version__}')
+print(f'  Pandas:       {pandas.__version__}')
+print(f'  SciPy:        {scipy.__version__}')
+print(f'  scikit-learn: {sklearn.__version__}')
+print(f'  PyTorch:      {torch.__version__}')
+"
+echo "Done."
