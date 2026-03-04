@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,22 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 _CACHE_DIR = Path("cache/jp_jquants")
+
+# J-Quants free plan: ~12 requests/minute.
+# Enforce a 6-second minimum interval between API calls to stay safe.
+_JQUANTS_MIN_INTERVAL = 6.0  # seconds between API calls
+_jquants_last_call: float = 0.0
+
+
+def _jquants_throttle() -> None:
+    """Enforce minimum interval between J-Quants API calls."""
+    global _jquants_last_call
+    elapsed = time.monotonic() - _jquants_last_call
+    if elapsed < _JQUANTS_MIN_INTERVAL:
+        wait = _JQUANTS_MIN_INTERVAL - elapsed
+        logger.debug("J-Quants rate limit: waiting %.1fs", wait)
+        time.sleep(wait)
+    _jquants_last_call = time.monotonic()
 
 # V2 column name -> canonical field mapping (from research log Section 6)
 _V2_INCOME_MAP = {
@@ -128,6 +145,7 @@ class JPJquantsClient:
 
         try:
             # Docs: jquantsapi/client_v2.py get_list() method
+            _jquants_throttle()
             df = self._client.get_list()
             if df.empty:
                 return []
@@ -178,6 +196,7 @@ class JPJquantsClient:
                 code = code + "0"
 
             # Docs: jquantsapi/client_v2.py get_eq_master() method
+            _jquants_throttle()
             df = self._client.get_eq_master(code=code)
             if df.empty:
                 return {}
@@ -239,6 +258,7 @@ class JPJquantsClient:
             start_dt = end_dt - timedelta(days=365 * years)
 
             # Docs: jquantsapi/client_v2.py get_fin_summary_range() method
+            _jquants_throttle()
             df = self._client.get_fin_summary_range(
                 start_dt=start_dt,
                 end_dt=end_dt,
@@ -345,6 +365,7 @@ class JPJquantsClient:
             target_sector = profile["sector"]
 
             # Get all companies and filter by sector
+            _jquants_throttle()
             df = self._client.get_list()
             if df.empty:
                 return []

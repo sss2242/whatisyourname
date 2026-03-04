@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,20 @@ logger = logging.getLogger(__name__)
 
 _DART_BASE = "https://opendart.fss.or.kr/api"
 _CACHE_DIR = Path("cache/kr_dart")
+
+# DART free plan: 10,000 req/day, ~1,000 req/min.
+# We add a small delay between API calls to stay well within limits.
+_DART_MIN_INTERVAL = 0.15  # seconds between API calls
+_dart_last_call: float = 0.0
+
+
+def _dart_throttle() -> None:
+    """Enforce minimum interval between DART API calls."""
+    global _dart_last_call
+    elapsed = time.monotonic() - _dart_last_call
+    if elapsed < _DART_MIN_INTERVAL:
+        time.sleep(_DART_MIN_INTERVAL - elapsed)
+    _dart_last_call = time.monotonic()
 
 
 class KRDartError(Exception):
@@ -132,6 +147,7 @@ class KRDartClient:
         if self._dart_fss_available:
             try:
                 import dart_fss
+                _dart_throttle()
                 corp_list = dart_fss.get_corp_list()
                 results = corp_list.find_by_corp_name(name, exactly=False)
                 if results:
@@ -156,6 +172,7 @@ class KRDartClient:
         if self._dart_fss_available:
             try:
                 import dart_fss
+                _dart_throttle()
                 corp_list = dart_fss.get_corp_list()
                 companies = []
                 for corp in corp_list.corps:
@@ -190,6 +207,7 @@ class KRDartClient:
             params["corp_name"] = query
 
         try:
+            _dart_throttle()
             data = cached_get(f"{_DART_BASE}/list.json", params=params)
             items = data.get("list", []) if isinstance(data, dict) else []
             seen: dict[str, dict] = {}
@@ -229,6 +247,7 @@ class KRDartClient:
         if self._dart_fss_available:
             try:
                 import dart_fss
+                _dart_throttle()
                 corp_list = dart_fss.get_corp_list()
                 # Try stock code first, then name
                 corp = None
@@ -261,6 +280,7 @@ class KRDartClient:
             from operator1.http_utils import cached_get
             try:
                 corp_code = self._resolve_corp_code(identifier)
+                _dart_throttle()
                 data = cached_get(
                     f"{_DART_BASE}/company.json",
                     params={"crtfc_key": self._api_key, "corp_code": corp_code},
@@ -321,6 +341,7 @@ class KRDartClient:
         """Use dart-fss to get structured financial statements."""
         import dart_fss
 
+        _dart_throttle()
         corp_list = dart_fss.get_corp_list()
         corp = None
 
