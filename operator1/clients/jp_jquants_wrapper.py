@@ -48,8 +48,20 @@ def _jquants_throttle() -> None:
         time.sleep(wait)
     _jquants_last_call = time.monotonic()
 
-# V2 column name -> canonical field mapping (from research log Section 6)
+# V2 column name -> canonical field mapping
+# get_eq_master() uses short column names (V2 API): CoName, CoNameEn, S33, S33Nm, Mkt, MktNm
+# get_list() uses full column names: CompanyName, CompanyNameEnglish, Sector33Code, Sector33CodeName
+# get_fin_summary() / get_fins_statements() use: NetSales, OperatingProfit, Profit, TotalAssets, Equity, etc.
+
 _V2_INCOME_MAP = {
+    # get_fin_summary columns (FINS_STATEMENTS format)
+    "NetSales": "revenue",
+    "OperatingProfit": "operating_income",
+    "OrdinaryProfit": "pretax_income",
+    "Profit": "net_income",
+    "EarningsPerShare": "eps",
+    "DilutedEarningsPerShare": "eps_diluted",
+    # Legacy short names (kept for backward compat)
     "Sales": "revenue",
     "OP": "operating_income",
     "OdP": "pretax_income",
@@ -58,6 +70,10 @@ _V2_INCOME_MAP = {
 }
 
 _V2_BALANCE_MAP = {
+    # get_fin_summary columns
+    "TotalAssets": "total_assets",
+    "Equity": "total_equity",
+    # Legacy short names
     "TA": "total_assets",
     "Eq": "total_equity",
     "CashEq": "cash_and_equivalents",
@@ -65,6 +81,7 @@ _V2_BALANCE_MAP = {
 }
 
 _V2_CASHFLOW_MAP = {
+    # Legacy short names (cashflow not in base fin_summary)
     "CFO": "operating_cashflow",
     "CFI": "investing_cashflow",
     "CFF": "financing_cashflow",
@@ -162,11 +179,15 @@ class JPJquantsClient:
 
             results = []
             for _, row in df.head(50).iterrows():
+                # get_list() returns full names: CompanyName, CompanyNameEnglish, Sector33CodeName
+                # get_eq_master() returns short: CoName, CoNameEn, S33Nm
+                name = str(row.get("CompanyNameEnglish", "") or row.get("CoNameEn", "") or row.get("CompanyName", "") or row.get("CoName", ""))
+                sector = str(row.get("Sector33CodeName", "") or row.get("S33Nm", "") or row.get("Sector17CodeName", "") or row.get("S17Nm", ""))
                 results.append({
                     "identifier": str(row.get("Code", ""))[:4],
-                    "name": str(row.get("CompanyNameEnglish", row.get("CompanyName", ""))),
+                    "name": name,
                     "exchange": "TSE",
-                    "sector": str(row.get("S33NmEn", row.get("S17NmEn", ""))),
+                    "sector": sector,
                 })
             return results
 
@@ -202,12 +223,13 @@ class JPJquantsClient:
                 return {}
 
             row = df.iloc[0]
+            # V2 eq_master columns: CoName, CoNameEn, S33, S33Nm, Mkt, MktNm
             return {
-                "name": str(row.get("CompanyNameEnglish", row.get("CompanyName", ""))),
+                "name": str(row.get("CoNameEn", "") or row.get("CoName", "") or row.get("CompanyNameEnglish", "") or row.get("CompanyName", "")),
                 "ticker": str(row.get("Code", ""))[:4],
                 "exchange": "TSE",
-                "sector": str(row.get("S33NmEn", row.get("S17NmEn", ""))),
-                "market_segment": str(row.get("MktNmEn", row.get("Mkt", ""))),
+                "sector": str(row.get("S33Nm", "") or row.get("S33", "") or row.get("Sector33CodeName", "") or row.get("Sector33Code", "")),
+                "market_segment": str(row.get("MktNm", "") or row.get("Mkt", "") or row.get("MarketCodeName", "") or row.get("MarketCode", "")),
                 "country": "Japan",
                 "currency": "JPY",
             }
@@ -267,28 +289,51 @@ class JPJquantsClient:
             if df.empty:
                 return empty
 
-            # Filter to this company
-            code_col = "Code" if "Code" in df.columns else "LocalCode"
-            if code_col in df.columns:
+            # Filter to this company (FINS uses LocalCode, others use Code)
+            code_col = None
+            for cc in ("LocalCode", "Code"):
+                if cc in df.columns:
+                    code_col = cc
+                    break
+            if code_col:
                 df = df[df[code_col].astype(str).str.startswith(code[:4])]
 
             if df.empty:
                 return empty
 
-            # Only keep annual reports (DocType containing "Annual" or FY end)
-            # J-Quants V2: CurPerType field indicates period type
-            if "CurPerType" in df.columns:
-                # Keep FY (full year) entries
-                annual_mask = df["CurPerType"].astype(str).str.contains("FY|Annual|4Q", case=False, na=True)
+            # Only keep annual/4Q reports
+            # FINS_STATEMENTS uses TypeOfCurrentPeriod (e.g. "FY", "1Q", "2Q", "3Q")
+            # Older format may use CurPerType
+            period_col = None
+            for pc in ("TypeOfCurrentPeriod", "CurPerType", "TypeOfDocument"):
+                if pc in df.columns:
+                    period_col = pc
+                    break
+
+            if period_col:
+                annual_mask = df[period_col].astype(str).str.contains("FY|Annual|4Q", case=False, na=True)
                 df_annual = df[annual_mask] if annual_mask.any() else df
-            elif "DocType" in df.columns:
-                df_annual = df
             else:
                 df_annual = df
 
-            # Determine date column for PIT
-            date_col = "DiscDate" if "DiscDate" in df_annual.columns else "DisclosedDate"
-            period_end_col = "CurPerEn" if "CurPerEn" in df_annual.columns else "CurrentPeriodEndDate"
+            # Determine date columns for PIT
+            # FINS_STATEMENTS: DisclosedDate, CurrentPeriodEndDate
+            # Older format: DiscDate, CurPerEn
+            date_col = None
+            for dc in ("DisclosedDate", "DiscDate"):
+                if dc in df_annual.columns:
+                    date_col = dc
+                    break
+            if not date_col:
+                date_col = "DisclosedDate"  # fallback
+
+            period_end_col = None
+            for pec in ("CurrentPeriodEndDate", "CurPerEn"):
+                if pec in df_annual.columns:
+                    period_end_col = pec
+                    break
+            if not period_end_col:
+                period_end_col = "CurrentPeriodEndDate"  # fallback
 
             # Build income statement
             income_rows = []
@@ -370,8 +415,14 @@ class JPJquantsClient:
             if df.empty:
                 return []
 
-            sector_col = "S33NmEn" if "S33NmEn" in df.columns else "S17NmEn"
-            if sector_col in df.columns:
+            # get_list() columns: Sector33CodeName, Sector17CodeName
+            # get_eq_master() columns: S33Nm, S17Nm
+            sector_col = None
+            for sc in ("Sector33CodeName", "S33Nm", "Sector17CodeName", "S17Nm"):
+                if sc in df.columns:
+                    sector_col = sc
+                    break
+            if sector_col:
                 peers_df = df[df[sector_col] == target_sector]
             else:
                 return []
