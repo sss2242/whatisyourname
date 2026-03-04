@@ -295,12 +295,16 @@ def setup_llm_keys() -> dict[str, str]:
     has_claude = "ANTHROPIC_API_KEY" in keys
 
     if has_gemini:
-        _ok(f"GEMINI_API_KEY: {_mask_key(keys['GEMINI_API_KEY'])} (loaded from .env)")
+        n_gemini = len([k for k in keys["GEMINI_API_KEY"].split(",") if k.strip()])
+        key_info = f" ({n_gemini} keys for rotation)" if n_gemini > 1 else ""
+        _ok(f"GEMINI_API_KEY: {_mask_key(keys['GEMINI_API_KEY'].split(',')[0].strip())}{key_info} (loaded from .env)")
     if has_claude:
-        _ok(f"ANTHROPIC_API_KEY: {_mask_key(keys['ANTHROPIC_API_KEY'])} (loaded from .env)")
+        n_claude = len([k for k in keys["ANTHROPIC_API_KEY"].split(",") if k.strip()])
+        key_info = f" ({n_claude} keys for rotation)" if n_claude > 1 else ""
+        _ok(f"ANTHROPIC_API_KEY: {_mask_key(keys['ANTHROPIC_API_KEY'].split(',')[0].strip())}{key_info} (loaded from .env)")
 
     if has_gemini and has_claude:
-        _ok("Both LLM providers available")
+        _ok("Both LLM providers available (cross-provider fallback enabled)")
     elif has_gemini or has_claude:
         _ok("LLM provider available")
     else:
@@ -308,25 +312,33 @@ def setup_llm_keys() -> dict[str, str]:
         print(_dim("  An LLM API key is required for smart market routing and"))
         print(_dim("  AI-generated report narratives."))
         print("")
+        print(_dim("  Tip: You can enter MULTIPLE keys (comma-separated) for automatic"))
+        print(_dim("  key rotation. When one key hits rate limits or credit exhaustion,"))
+        print(_dim("  the system rotates to the next key automatically."))
+        print(_dim("  You can also provide keys for BOTH providers for cross-provider fallback."))
+        print("")
         print(f"    {_bold('1')}. Google Gemini  -- https://aistudio.google.com/apikey")
         print(f"    {_bold('2')}. Anthropic Claude -- https://console.anthropic.com/")
-        print(f"    {_bold('3')}. Skip (limited functionality, template reports only)")
+        print(f"    {_bold('3')}. Both providers (recommended for key rotation)")
+        print(f"    {_bold('4')}. Skip (limited functionality, template reports only)")
         print("")
 
-        llm_choice = _prompt("Choose LLM provider (1/2/3)", "1")
-        if llm_choice == "1":
-            value = _prompt("Enter GEMINI_API_KEY")
+        llm_choice = _prompt("Choose LLM provider (1/2/3/4)", "1")
+        if llm_choice in ("1", "3"):
+            value = _prompt("Enter GEMINI_API_KEY(s) (comma-separate multiple keys)")
             if value:
                 keys["GEMINI_API_KEY"] = value.strip()
                 _save_key_to_env(env_path, "GEMINI_API_KEY", value.strip())
-                _ok("GEMINI_API_KEY saved")
-        elif llm_choice == "2":
-            value = _prompt("Enter ANTHROPIC_API_KEY")
+                n_keys = len([k for k in value.split(",") if k.strip()])
+                _ok(f"GEMINI_API_KEY saved ({n_keys} key{'s' if n_keys > 1 else ''})")
+        if llm_choice in ("2", "3"):
+            value = _prompt("Enter ANTHROPIC_API_KEY(s) (comma-separate multiple keys)")
             if value:
                 keys["ANTHROPIC_API_KEY"] = value.strip()
                 _save_key_to_env(env_path, "ANTHROPIC_API_KEY", value.strip())
-                _ok("ANTHROPIC_API_KEY saved")
-        else:
+                n_keys = len([k for k in value.split(",") if k.strip()])
+                _ok(f"ANTHROPIC_API_KEY saved ({n_keys} key{'s' if n_keys > 1 else ''})")
+        if llm_choice == "4":
             _warn("Skipping LLM setup. Smart routing disabled, template reports only.")
 
     # Determine which LLM provider to use
