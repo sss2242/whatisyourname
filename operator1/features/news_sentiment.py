@@ -1,8 +1,9 @@
 """News Sentiment Scoring -- daily sentiment from stock news.
 
-Fetches stock news from FMP (1 API call), scores sentiment via Gemini
-(1 API call for all headlines), and injects daily sentiment columns
-into the cache for temporal model learning.
+Fetches stock news via GNews (Google News scraper, no API key) or RSS
+fallback, scores sentiment via Gemini (1 API call for all headlines),
+and injects daily sentiment columns into the cache for temporal model
+learning.
 
 Falls back to keyword-based scoring if Gemini is unavailable.
 

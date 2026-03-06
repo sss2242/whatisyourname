@@ -655,6 +655,11 @@ def compute_derived_variables(df: pd.DataFrame) -> pd.DataFrame:
             logger.warning(
                 "Derived variable stage %s failed: %s", stage.__name__, exc,
             )
+    # Defragment after adding ~39 columns one-by-one across stages.
+    # Without this, downstream consumers trigger PerformanceWarning from
+    # pandas 2.x fragmented DataFrame internals.
+    result = result.copy()
+
     logger.info(
         "Derived variables computed: %d new columns",
         len(result.columns) - len(df.columns),

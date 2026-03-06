@@ -614,6 +614,19 @@ Non-interactive examples:
         )
     except Exception as exc:
         logger.warning("Profile fetch failed (continuing with basic info): %s", exc)
+
+    # W7 fix: Enrich profile for non-US markets via OpenFIGI/regional APIs.
+    # This fills sector, industry, and identifier gaps without overwriting
+    # existing data.
+    try:
+        from operator1.clients.supplement import enrich_profile
+        target_profile = enrich_profile(
+            market_id=market_id,
+            ticker=ticker,
+            existing_profile=target_profile,
+        )
+    except Exception as exc:
+        logger.debug("Supplement enrichment skipped: %s", exc)
         target_profile = {
             "name": company_name,
             "ticker": ticker,
@@ -1051,6 +1064,16 @@ Non-interactive examples:
     except Exception as exc:
         logger.warning("Financial health scoring failed: %s", exc)
 
+    # W6 fix: Compute vanity (capital allocation quality) scores.
+    # Profile builder reads vanity_score, vanity_label, vanity_trend, and
+    # 5 component columns -- these were never populated without this call.
+    try:
+        from operator1.analysis.vanity import compute_vanity_score
+        cache = compute_vanity_score(cache)
+        logger.info("Vanity scores computed")
+    except Exception as exc:
+        logger.debug("Vanity scoring skipped: %s", exc)
+
     # Step 5e: Linked entity discovery via Gemini (optional)
     relationships = {}
     graph_risk_result = None
@@ -1109,6 +1132,7 @@ Non-interactive examples:
             game_theory_result = analyze_competitive_dynamics(
                 target_cache=cache,
                 target_name=target_profile.get("name", "target"),
+                competitor_caches=linked_caches if linked_caches else None,
             )
             logger.info(
                 "Game theory: %s, pressure=%.3f",
@@ -1766,9 +1790,17 @@ Non-interactive examples:
                                 pf = getattr(hp_1d, "point_forecast", None)
                                 if pf is not None:
                                     _shap_preds[var] = pf
+                # W9 fix: Extract predict functions from forward pass model states
+                # so SHAP can generate actual explanations instead of returning empty.
+                _shap_predict_fns: dict[str, Any] = {}
+                if forward_pass_result is not None and hasattr(forward_pass_result, "model_states"):
+                    for var, wrapper in forward_pass_result.model_states.items():
+                        if hasattr(wrapper, "predict"):
+                            _shap_predict_fns[var] = wrapper.predict
                 shap_result = compute_shap_explanations(
                     cache,
                     predictions=_shap_preds,
+                    predict_fns=_shap_predict_fns if _shap_predict_fns else None,
                 )
                 logger.info("SHAP explanations computed")
         except Exception as exc:

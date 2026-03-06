@@ -179,11 +179,12 @@ def run_genetic_optimization(
         result.error = "All NaN in validation window"
         return result
 
-    # Build model prediction proxies from cache columns
-    # In production, these would come from stored per-model predictions
+    # Build model prediction proxies from cache columns.
+    # Prefer real forecast_<model>_<var> columns stored by the forecasting
+    # pipeline; fall back to EWM/shifted proxies for models without stored
+    # predictions.
     model_predictions: dict[str, np.ndarray] = {}
 
-    # Use any forecast_* columns or derived proxies
     for model_name in MODEL_NAMES:
         pred_col = f"forecast_{model_name}_{target_col}"
         if pred_col in cache.columns:
@@ -200,6 +201,23 @@ def run_genetic_optimization(
             shifted = cache["return_1d"].shift(1)
             model_predictions["var"] = shifted.values[-validation_window:]
 
+    # Seed initial population with inverse-RMSE weights from forecast_result
+    # so the GA starts from an informed position rather than pure random.
+    _informed_weights: dict[str, float] | None = None
+    if forecast_result is not None:
+        metrics_list = getattr(forecast_result, "metrics", [])
+        if metrics_list:
+            model_rmse: dict[str, float] = {}
+            for met in metrics_list:
+                if met.fitted and np.isfinite(met.rmse) and met.rmse > 0:
+                    name = met.model_name
+                    if name not in model_rmse or met.rmse < model_rmse[name]:
+                        model_rmse[name] = met.rmse
+            if model_rmse:
+                inv_rmse = {k: 1.0 / v for k, v in model_rmse.items()}
+                total = sum(inv_rmse.values())
+                _informed_weights = {k: v / total for k, v in inv_rmse.items()}
+
     if len(model_predictions) < 2:
         # Not enough model predictions, use inverse-RMSE fallback
         result.error = "Insufficient model predictions for GA; need at least 2"
@@ -210,8 +228,25 @@ def run_genetic_optimization(
     active_models = list(model_predictions.keys())
     n_active = len(active_models)
 
-    # Initialize population
-    population = [_random_weights(n_active, rng) for _ in range(population_size)]
+    # Initialize population -- seed half with informed weights (from inverse-RMSE)
+    # and half with random Dirichlet to maintain diversity.
+    population: list[np.ndarray] = []
+    if _informed_weights:
+        # Build a weight vector aligned to active_models
+        seed_vec = np.array([
+            _informed_weights.get(m, 1.0 / n_active) for m in active_models
+        ])
+        seed_vec = seed_vec / seed_vec.sum()
+        # Seed ~half the population with perturbed versions of informed weights
+        n_seeded = population_size // 2
+        for _ in range(n_seeded):
+            perturbed = seed_vec + rng.normal(0, 0.05, n_active)
+            perturbed = np.clip(perturbed, 0, None)
+            total = perturbed.sum()
+            population.append(perturbed / total if total > 0 else seed_vec.copy())
+    # Fill the rest with random weights for diversity
+    while len(population) < population_size:
+        population.append(_random_weights(n_active, rng))
     n_elite = max(1, int(population_size * elite_fraction))
 
     best_ever_fitness = float("-inf")
