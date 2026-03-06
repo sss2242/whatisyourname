@@ -1437,10 +1437,53 @@ def run_forecasting(
     has_volatility = "volatility_21d" in cache.columns
 
     # ------------------------------------------------------------------
-    # GARCH on volatility (special case)
+    # Unified cache-to-model data extraction
+    # ------------------------------------------------------------------
+    # All models consume the same cache DataFrame. This adapter
+    # centralises how data is extracted for each model type, so every
+    # model gets consistent, quality-checked inputs from the pipeline.
+
+    def _extract_series(var: str) -> np.ndarray:
+        """Extract a single variable's values from the cache."""
+        return cache[var].values
+
+    def _extract_multivariate(target: str, max_cols: int = 10) -> pd.DataFrame:
+        """Extract a multivariate DataFrame for VAR from the cache.
+
+        Selects numeric columns with >50% non-NaN coverage to avoid
+        feeding mostly-empty columns into the VAR model.
+        """
+        candidates = [
+            c for c in available_vars
+            if c in cache.columns and cache[c].notna().mean() > 0.5
+        ][:max_cols]
+        if target not in candidates:
+            candidates = [target] + candidates[:max_cols - 1]
+        return cache[candidates].copy()
+
+    def _extract_features(target: str, max_cols: int = 15) -> pd.DataFrame:
+        """Extract a feature DataFrame for tree ensembles from the cache.
+
+        Selects numeric columns with >30% non-NaN coverage, excluding
+        flag columns and the target itself.
+        """
+        feature_cols = [
+            c for c in cache.columns
+            if c != target
+            and not c.startswith("is_missing_")
+            and not c.startswith("invalid_math_")
+            and cache[c].dtype in (np.float64, np.float32, np.int64)
+            and cache[c].notna().mean() > 0.3
+        ][:max_cols]
+        if not feature_cols:
+            return pd.DataFrame()
+        return cache[feature_cols + [target]].copy()
+
+    # ------------------------------------------------------------------
+    # GARCH on volatility (special case -- uses return_1d from cache)
     # ------------------------------------------------------------------
     if has_returns:
-        returns = cache["return_1d"].values
+        returns = _extract_series("return_1d")
         max_horizon = max(HORIZONS.values())
         garch_fcast, garch_met = fit_garch(
             returns, n_forecast=max_horizon,
@@ -1466,7 +1509,7 @@ def run_forecasting(
     tree_attempted = False
 
     for var_name in available_vars:
-        series = cache[var_name].values
+        series = _extract_series(var_name)
         tier = _get_tier_for_variable(var_name, tier_map)
         max_horizon = max(HORIZONS.values())
         best_forecast: np.ndarray | None = None
@@ -1490,14 +1533,7 @@ def run_forecasting(
 
         # --- VAR (if multiple variables available) ---
         if best_forecast is None and len(available_vars) >= 2:
-            # Build a small multivariate frame from available vars.
-            var_subset_cols = [
-                c for c in available_vars
-                if c in cache.columns
-            ][:10]  # Cap at 10 for stability.
-            if var_name not in var_subset_cols:
-                var_subset_cols = [var_name] + var_subset_cols[:9]
-            var_df = cache[var_subset_cols].copy()
+            var_df = _extract_multivariate(var_name)
 
             fcast, met = fit_var(var_df, var_name, n_forecast=max_horizon)
             met.variable = var_name
@@ -1533,13 +1569,8 @@ def run_forecasting(
 
         # --- Tree ensemble on tabular features ---
         if best_forecast is None:
-            feature_cols = [
-                c for c in cache.columns
-                if c != var_name
-                and cache[c].dtype in (np.float64, np.float32, np.int64)
-            ][:15]
-            if feature_cols:
-                feat_df = cache[feature_cols + [var_name]].copy()
+            feat_df = _extract_features(var_name)
+            if not feat_df.empty:
                 fcast, met = fit_tree_ensemble(
                     feat_df,
                     var_name,
