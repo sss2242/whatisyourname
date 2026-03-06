@@ -38,6 +38,9 @@ sdmx1==2.25.1
 python-bcb==0.3.4
 banxicoapi==1.0.2
 
+# Filing extraction
+pdfplumber==0.11.9
+
 # News sentiment
 gnews==0.4.3
 feedparser==6.0.12
