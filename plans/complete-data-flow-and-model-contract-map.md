@@ -163,10 +163,11 @@ report generation, with expected vs actual inputs, outputs, and operations.
 
 | | Expected | Actual | Status |
 |---|----------|--------|--------|
-| **Input** | `target_cache`, `target_name` string | Same | OK |
-| **Output** | `game_theory_result` with `market_structure` (monopoly/oligopoly/competitive), `competitive_pressure` (0-1), strategic interaction analysis | Same | OK |
-| **Operation** | Analyze market structure and competitive dynamics from financial metrics. Classify market concentration. Estimate competitive pressure index. | Same | OK |
-| **Profile** | Stored via `_available_dict(game_theory_result)` | Same | OK |
+| **Input** | `target_cache`, `competitor_caches` dict of linked entity caches, `target_name` | `competitor_caches` is NEVER passed from main.py (always None) | W8 |
+| **Output** | `game_theory_result` with Cournot/Stackelberg analysis, `competitive_pressure`, `market_structure` | Always returns "monopoly" with 0 competitors | W8 |
+| **Operation** | Cournot quantity game, Bertrand price game, Stackelberg leadership, CR4 market structure, competitive pressure index | Only executes the n=0 path (no competitors) | W8 |
+| **Profile** | Stored via `_available_dict(game_theory_result)` | Stored but always shows monopoly | W8 |
+| **Fix** | Pass `competitor_caches=linked_caches` in main.py line 1109 | | |
 
 ### C13. Economic Planes -- `classify_economic_plane()`
 
@@ -375,9 +376,10 @@ report generation, with expected vs actual inputs, outputs, and operations.
 
 | | Expected | Actual | Status |
 |---|----------|--------|--------|
-| **Input** | cache, `predictions` dict (from pred_result) | Same | OK |
-| **Output** | `SHAPResult` with feature importance scores and narratives | Same | OK |
-| **Operation** | Tree-based SHAP values for each predicted variable, identifying top feature drivers | Same | OK |
+| **Input** | cache, `predictions` dict, `tree_models` dict (fitted model objects), `predict_fns` dict | `tree_models` and `predict_fns` are NEVER passed from main.py (both None -> empty dict) | W9 |
+| **Output** | `SHAPResult` with per-variable feature importance, top drivers, narratives | Always returns `available=False`, empty `explanations` dict | W9 |
+| **Operation** | 1. Try TreeExplainer with tree_models (skipped -- no models). 2. Fall back to KernelExplainer with predict_fns (skipped -- no functions). 3. Neither path runs. | Neither explainer path executes. | W9 |
+| **Fix** | Pass fitted tree models from `forecast_result.model_states` or `forward_pass_result.model_states` to `tree_models` parameter | | |
 
 ### F20. Sobol Sensitivity -- `run_sensitivity_analysis()`
 
@@ -527,3 +529,5 @@ existing data).
 | P2 | copula.py:69-74 | NaN from `np.corrcoef` on zero-variance columns | Zero-variance guard + NaN fallback to identity |
 | W6 | vanity.py | Profile builder expects vanity columns but `compute_vanity_scores()` never called | **NOT YET FIXED** -- needs wiring in main.py Step 5 |
 | W7 | supplement.py | Profile enrichment for non-US markets never called | **NOT YET FIXED** -- needs wiring in main.py after Step 2 |
+| W8 | main.py:1109 | `analyze_competitive_dynamics()` never receives `linked_caches` -- always returns "monopoly" with 0 competitors | **NOT YET FIXED** -- pass `competitor_caches=linked_caches` |
+| W9 | main.py:1758 | `compute_shap_explanations()` never receives `tree_models` or `predict_fns` -- explanations always empty | **NOT YET FIXED** -- pass fitted model objects from forecasting |
