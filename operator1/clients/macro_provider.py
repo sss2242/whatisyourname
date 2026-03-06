@@ -26,6 +26,13 @@ _PRIMARY_FETCHERS: dict[str, str] = {
     "IT": "ecb",    # Italy -- eurozone, use ECB
     "CH": "ecb",    # Switzerland -- ECB has CHF series, wbgapi fallback
     "SE": "ecb",    # Sweden -- ECB has SEK series
+    "CA": "fred_country",  # Canada -- FRED has monthly CA series
+    "AU": "fred_country",  # Australia -- FRED has monthly AU series
+    "HK": "fred_country",  # Hong Kong -- FRED has HK series
+    "SG": "fred_country",  # Singapore -- FRED has SG series
+    "ZA": "fred_country",  # South Africa -- FRED has ZA series
+    "CN": "fred_country",  # China -- FRED has CN series
+    "IN": "fred_country",  # India -- FRED has IN series
     "BR": "bcb",
     "MX": "banxico",
     "GB": "ons",       # UK -- ONS (no key needed)
@@ -81,6 +88,17 @@ def fetch_macro(
             )
         except Exception as exc:
             logger.debug("FRED primary failed: %s", exc)
+
+    elif primary == "fred_country":
+        try:
+            from operator1.clients.macro_fredapi import fetch_macro_fred_country
+            results = fetch_macro_fred_country(
+                country_iso2=cc,
+                api_key=secrets.get("FRED_API_KEY", ""),
+                years=years,
+            )
+        except Exception as exc:
+            logger.debug("FRED-country primary failed for %s: %s", cc, exc)
 
     elif primary == "ecb":
         try:

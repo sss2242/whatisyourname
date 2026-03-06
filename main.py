@@ -945,6 +945,37 @@ Non-interactive examples:
         logger.warning("Estimation failed (continuing with raw data): %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 4c: Filing calendar analysis
+    # ------------------------------------------------------------------
+    filing_calendar_result = None
+    try:
+        from operator1.features.filing_calendar import analyze_filing_calendar
+        filing_calendar_result = analyze_filing_calendar(cache, market_id=market_id)
+        logger.info(
+            "Filing calendar: expected=%d, actual=%d (%.0f%%), freq=%s, stale=%s (age=%dd)",
+            filing_calendar_result.expected_filings_2yr,
+            filing_calendar_result.actual_filings_2yr,
+            filing_calendar_result.coverage_ratio * 100,
+            filing_calendar_result.detected_frequency,
+            filing_calendar_result.is_stale,
+            filing_calendar_result.latest_filing_age_days,
+        )
+        if filing_calendar_result.is_stale:
+            logger.warning(
+                "STALE DATA: Latest filing is %d days old (threshold: %d days for %s)",
+                filing_calendar_result.latest_filing_age_days,
+                filing_calendar_result.stale_threshold_days,
+                market_id,
+            )
+        if filing_calendar_result.gaps:
+            logger.warning(
+                "Filing gaps detected: %d gaps in 2-year window",
+                len(filing_calendar_result.gaps),
+            )
+    except Exception as exc:
+        logger.warning("Filing calendar analysis failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 5: Feature engineering
     # ------------------------------------------------------------------
     logger.info("")
@@ -1860,6 +1891,22 @@ Non-interactive examples:
             }
         else:
             profile["enriched_survival_timeline"] = {"available": False}
+
+        # Inject filing calendar analysis
+        if filing_calendar_result is not None:
+            profile["filing_calendar"] = {
+                "available": True,
+                "expected_frequency": filing_calendar_result.expected_frequency,
+                "detected_frequency": filing_calendar_result.detected_frequency,
+                "expected_filings_2yr": filing_calendar_result.expected_filings_2yr,
+                "actual_filings_2yr": filing_calendar_result.actual_filings_2yr,
+                "coverage_ratio": round(filing_calendar_result.coverage_ratio, 3),
+                "latest_filing_age_days": filing_calendar_result.latest_filing_age_days,
+                "is_stale": filing_calendar_result.is_stale,
+                "gaps": filing_calendar_result.gaps,
+            }
+        else:
+            profile["filing_calendar"] = {"available": False}
 
         # Inject economic plane classification
         try:
