@@ -1608,6 +1608,14 @@ def run_forecasting(
     for var, model in result.model_used.items():
         models_used[model] = models_used.get(model, 0) + 1
 
+    # Identify variables that had zero non-NaN observations (all-NaN columns)
+    zero_obs_vars = []
+    for var_name in available_vars:
+        series = cache[var_name].values
+        n_clean = int(np.sum(~np.isnan(series)))
+        if n_clean == 0:
+            zero_obs_vars.append(var_name)
+
     logger.info(
         "Forecasting complete: %d variables forecasted, %d model types failed, "
         "model distribution: %s",
@@ -1615,6 +1623,14 @@ def run_forecasting(
         n_failed,
         models_used,
     )
+
+    if zero_obs_vars:
+        logger.warning(
+            "Forecasting: %d variables had 0 non-NaN observations (all-NaN columns, "
+            "likely missing from data source): %s",
+            len(zero_obs_vars),
+            zero_obs_vars,
+        )
 
     return cache, result
 

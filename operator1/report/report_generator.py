@@ -867,12 +867,26 @@ def _build_limitations(profile: dict[str, Any]) -> str:
     _provider_label = meta.get("data_provider_label", _provider)
     _is_pit = meta.get("pit_source", True)
 
+    _ohlcv_source = meta.get("ohlcv_source", "")
+
     if _is_pit:
         lines.extend([
-            f"- All financial data (statements, filings, prices) is sourced from "
+            f"- Financial statements and filings are sourced from "
             f"**{_provider_label}** -- a free government filing API.",
             "- Filing dates are immutable and used for point-in-time alignment "
             "(no look-ahead bias in historical analysis).",
+        ])
+        if _ohlcv_source and _ohlcv_source != _provider:
+            lines.extend([
+                f"- Price data (OHLCV) is sourced from **{_ohlcv_source}**, "
+                "a separate market data provider. Raw exchange prices are "
+                "inherently point-in-time (immutable historical facts).",
+            ])
+        else:
+            lines.extend([
+                f"- Price data is also sourced from **{_provider_label}**.",
+            ])
+        lines.extend([
             "- Price data may not account for all corporate actions "
             "(splits, dividends) depending on exchange adjustments.",
         ])
