@@ -1008,6 +1008,50 @@ def _build_macro_quadrant_section(
     return section
 
 
+def _build_conflict_risk_profile_section(cache: pd.DataFrame | None) -> dict[str, Any]:
+    """Build conflict risk section for the profile from cache columns.
+
+    Reads the conflict risk columns injected by
+    ``conflict_risk.inject_conflict_risk_into_cache()`` and packages
+    them into the format expected by the report generator's
+    ``_build_geopolitical_risk_section()``.
+    """
+    if cache is None or cache.empty:
+        return {"available": False}
+
+    # Check if conflict columns exist
+    if "country_conflict_flag" not in cache.columns:
+        return {"available": False}
+
+    try:
+        latest = cache.iloc[-1]
+
+        result: dict[str, Any] = {
+            "available": True,
+            "country_iso2": str(latest.get("country", "")),
+            "country_conflict_flag": bool(int(latest.get("country_conflict_flag", 0))),
+            "company_conflict_flag": bool(int(latest.get("company_conflict_flag", 0))),
+            "conflict_intensity_score": float(latest.get("conflict_intensity_score", 0)),
+            "sanctions_flag": bool(int(latest.get("sanctions_flag", 0))),
+            "fragile_state_flag": bool(int(latest.get("fragile_state_flag", 0))),
+            "conflict_type": str(latest.get("conflict_type", "none")),
+        }
+
+        # Optional linked entity conflict columns
+        if "supply_chain_risk_score" in cache.columns:
+            result["supply_chain_risk_score"] = float(latest.get("supply_chain_risk_score", 0))
+        if "revenue_exposure_score" in cache.columns:
+            result["revenue_exposure_score"] = float(latest.get("revenue_exposure_score", 0))
+        if "competitive_advantage_score" in cache.columns:
+            result["competitive_advantage_score"] = float(latest.get("competitive_advantage_score", 0))
+
+        return result
+
+    except Exception as exc:
+        logger.warning("Failed to build conflict risk profile section: %s", exc)
+        return {"available": False, "error": str(exc)}
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -1124,6 +1168,7 @@ def build_company_profile(
         "sentiment": _build_sentiment_section(cache, sentiment_result),
         "peer_ranking": _build_peer_ranking_section(cache, peer_ranking_result),
         "macro_quadrant": _build_macro_quadrant_section(cache, macro_quadrant_result),
+        "conflict_risk": _build_conflict_risk_profile_section(cache),
         "data_quality": _build_data_quality_section(quality_report_path),
         "estimation": _build_estimation_section(estimation_coverage_path),
         "failed_modules": _build_failed_modules_section(
