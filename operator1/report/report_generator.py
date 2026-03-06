@@ -88,8 +88,8 @@ class ReportMode(str, Enum):
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20},
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 7, 11, 14, 16, 17, 18, 20},
-    ReportTier.PREMIUM: set(range(1, 23)),  # all 22 sections
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 7, 11, 14, 16, 17, 18, 195, 20},
+    ReportTier.PREMIUM: set(range(1, 23)) | {195},  # all 22 sections + geopolitical
 }
 
 
@@ -215,6 +215,12 @@ _FALLBACK_TEMPLATE = """\
 ## 19. Advanced Quantitative Insights
 
 {advanced_insights}
+
+---
+
+## 19.5. Geopolitical & Conflict Risk
+
+{geopolitical_risk}
 
 ---
 
@@ -2480,6 +2486,121 @@ def _build_key_indicators_table(profile: dict[str, Any], mode: ReportMode = Repo
     return "\n".join(lines)
 
 
+def _build_geopolitical_risk_section(profile: dict[str, Any]) -> str:
+    """Build Geopolitical & Conflict Risk section from conflict_risk data."""
+    lines: list[str] = []
+
+    conflict = profile.get("conflict_risk", profile.get("geopolitical_risk", {}))
+    if not conflict or not isinstance(conflict, dict):
+        lines.append("No geopolitical risk data available for this market.")
+        lines.append("")
+        return "\n".join(lines)
+
+    country = conflict.get("country_iso2", "")
+    intensity = conflict.get("conflict_intensity_score", 0)
+    conflict_type = conflict.get("conflict_type", "none")
+    country_flag = conflict.get("country_conflict_flag", False)
+    company_flag = conflict.get("company_conflict_flag", False)
+    sanctions = conflict.get("sanctions_flag", False)
+    fragile = conflict.get("fragile_state_flag", False)
+
+    # Status badge
+    if intensity > 0.7:
+        badge = "CRITICAL -- Active Conflict Zone"
+        badge_color = "red"
+    elif intensity > 0.4:
+        badge = "ELEVATED -- Significant Geopolitical Risk"
+        badge_color = "orange"
+    elif intensity > 0.1:
+        badge = "MODERATE -- Some Geopolitical Concerns"
+        badge_color = "yellow"
+    else:
+        badge = "LOW -- Stable Geopolitical Environment"
+        badge_color = "green"
+
+    lines.append(f"**Risk Level:** **{badge}**")
+    lines.append("")
+    lines.append(f"**Conflict Intensity Score:** {_fmt(intensity, '.2f')} / 1.00")
+    lines.append("")
+
+    # Status flags table
+    lines.append("| Risk Factor | Status |")
+    lines.append("|-------------|--------|")
+    lines.append(f"| Country Conflict Flag | {'Yes' if country_flag else 'No'} |")
+    lines.append(f"| Company Directly Affected | {'Yes' if company_flag else 'No'} |")
+    lines.append(f"| International Sanctions | {'Yes' if sanctions else 'No'} |")
+    lines.append(f"| World Bank Fragile State | {'Yes' if fragile else 'No'} |")
+    lines.append(f"| Conflict Classification | {conflict_type.replace('_', ' ').title()} |")
+    lines.append("")
+
+    # Event data
+    events_30 = conflict.get("recent_events_30d", 0)
+    events_90 = conflict.get("recent_events_90d", 0)
+    fatalities_30 = conflict.get("recent_fatalities_30d", 0)
+    trend = conflict.get("conflict_trend", "stable")
+
+    if events_30 > 0 or events_90 > 0:
+        lines.append("### Recent Conflict Events (UCDP)")
+        lines.append("")
+        lines.append(f"- **Last 30 days:** {events_30} events, {fatalities_30} fatalities")
+        lines.append(f"- **Last 90 days:** {events_90} events")
+        lines.append(f"- **Trend:** {trend.replace('_', ' ').title()}")
+        lines.append("")
+
+    # News monitoring
+    news_mentions = conflict.get("news_conflict_mentions_7d", 0)
+    news_tone = conflict.get("news_conflict_tone", 0)
+    if news_mentions > 0:
+        lines.append("### Conflict News Monitoring (GDELT)")
+        lines.append("")
+        tone_desc = "negative" if news_tone < -2 else "neutral" if news_tone < 2 else "positive"
+        lines.append(f"- **Conflict-related articles (7 days):** {news_mentions}")
+        lines.append(f"- **Average tone:** {_fmt(news_tone, '.1f')} ({tone_desc})")
+        lines.append("")
+
+    # Investment implications
+    if country_flag:
+        lines.append("### Investment Implications")
+        lines.append("")
+        if intensity > 0.7:
+            lines.append(
+                "This company operates in an **active conflict zone**. "
+                "Key risks include supply chain disruption, asset destruction, "
+                "capital flight, currency devaluation, and regulatory instability. "
+                "Survival analysis models have been adjusted to prioritize "
+                "liquidity and solvency metrics."
+            )
+        elif sanctions:
+            lines.append(
+                "This company's country is under **international sanctions**. "
+                "Key risks include trade restrictions, frozen assets, SWIFT exclusion, "
+                "reduced FDI, and increased cost of capital. Investors should assess "
+                "sanctions compliance risk for their jurisdiction."
+            )
+        elif fragile:
+            lines.append(
+                "This company operates in a **fragile state** as classified by the "
+                "World Bank. Key risks include institutional weakness, governance gaps, "
+                "and elevated political instability. Due diligence should include "
+                "assessment of operational resilience."
+            )
+        lines.append("")
+    else:
+        lines.append(
+            "No active conflict or sanctions risk detected for this market. "
+            "The geopolitical environment is considered stable for investment purposes."
+        )
+        lines.append("")
+
+    # Data sources
+    sources = conflict.get("data_sources_used", [])
+    if sources:
+        lines.append(f"*Data sources: {', '.join(sources)}*")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def _build_fallback_report(
     profile: dict[str, Any],
     tier: ReportTier = ReportTier.PREMIUM,
@@ -2518,6 +2639,7 @@ def _build_fallback_report(
         17: ("17. Peer Comparison & Relative Valuation", _build_peer_ranking_section(profile)),
         18: ("18. Macroeconomic Environment", _build_macro_quadrant_section(profile)),
         19: ("19. Advanced Quantitative Insights", _build_advanced_insights(profile)),
+        195: ("19.5. Geopolitical & Conflict Risk", _build_geopolitical_risk_section(profile)),
         20: ("20. Risk Factors & Limitations", (
             _build_risk_assessment(profile) + "\n\n### 20.1 LIMITATIONS\n\n" + _build_limitations(profile)
         )),
@@ -3095,7 +3217,154 @@ def generate_charts(
     except Exception as exc:
         logger.warning("Failed to generate predicted week OHLC chart: %s", exc)
 
+    # Chart 9: Conflict Risk Gauge (if conflict data available)
+    try:
+        if "conflict_intensity_score" in cache.columns:
+            intensity = cache["conflict_intensity_score"].iloc[-1] if not cache["conflict_intensity_score"].isna().all() else 0
+            conflict_flag = cache["country_conflict_flag"].iloc[-1] if "country_conflict_flag" in cache.columns else 0
+            sanctions = cache["sanctions_flag"].iloc[-1] if "sanctions_flag" in cache.columns else 0
+
+            fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+            fig.patch.set_facecolor(_CHART_BG)
+
+            # Gauge 1: Conflict Intensity
+            ax = axes[0]
+            ax.set_facecolor(_CHART_BG)
+            theta = intensity * 180  # 0 to 180 degrees
+            colors_gauge = [_CHART_GREEN, _CHART_GOLD, _CHART_RED]
+            # Draw arc background
+            from matplotlib.patches import Wedge
+            for i, (start, end, color) in enumerate([(0, 60, _CHART_GREEN), (60, 120, _CHART_GOLD), (120, 180, _CHART_RED)]):
+                wedge = Wedge((0.5, 0), 0.4, start, end, width=0.12,
+                              facecolor=color, alpha=0.3, transform=ax.transAxes)
+                ax.add_patch(wedge)
+            # Needle
+            import math
+            needle_angle = math.radians(180 - theta)
+            nx = 0.5 + 0.35 * math.cos(needle_angle)
+            ny = 0.35 * math.sin(needle_angle)
+            ax.annotate("", xy=(nx, ny), xytext=(0.5, 0),
+                        arrowprops=dict(arrowstyle="-|>", color=_CHART_FG, lw=2),
+                        xycoords="axes fraction", textcoords="axes fraction")
+            ax.text(0.5, -0.15, f"Intensity: {intensity:.2f}", ha="center",
+                    color=_CHART_FG, fontsize=12, fontweight="bold",
+                    transform=ax.transAxes)
+            ax.set_title("Conflict Intensity", color=_CHART_FG, fontsize=11, fontweight="bold")
+            ax.set_xlim(-0.1, 1.1)
+            ax.set_ylim(-0.3, 0.6)
+            ax.axis("off")
+
+            # Gauge 2: Country Conflict Status
+            ax = axes[1]
+            ax.set_facecolor(_CHART_BG)
+            status_color = _CHART_RED if conflict_flag else _CHART_GREEN
+            status_text = "ACTIVE" if conflict_flag else "CLEAR"
+            circle = plt.Circle((0.5, 0.3), 0.25, color=status_color, alpha=0.3,
+                                transform=ax.transAxes)
+            ax.add_patch(circle)
+            ax.text(0.5, 0.3, status_text, ha="center", va="center",
+                    color=status_color, fontsize=16, fontweight="bold",
+                    transform=ax.transAxes)
+            ax.set_title("Country Conflict", color=_CHART_FG, fontsize=11, fontweight="bold")
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 0.7)
+            ax.axis("off")
+
+            # Gauge 3: Sanctions Status
+            ax = axes[2]
+            ax.set_facecolor(_CHART_BG)
+            sanc_color = _CHART_RED if sanctions else _CHART_GREEN
+            sanc_text = "SANCTIONED" if sanctions else "CLEAR"
+            circle = plt.Circle((0.5, 0.3), 0.25, color=sanc_color, alpha=0.3,
+                                transform=ax.transAxes)
+            ax.add_patch(circle)
+            ax.text(0.5, 0.3, sanc_text, ha="center", va="center",
+                    color=sanc_color, fontsize=16, fontweight="bold",
+                    transform=ax.transAxes)
+            ax.set_title("Sanctions Status", color=_CHART_FG, fontsize=11, fontweight="bold")
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 0.7)
+            ax.axis("off")
+
+            fig.suptitle(f"{company} -- Geopolitical Risk Dashboard",
+                         color=_CHART_FG, fontsize=14, fontweight="bold")
+            fig.tight_layout()
+            path = str(out / "conflict_risk.png")
+            fig.savefig(path, dpi=180, facecolor=_CHART_BG)
+            plt.close(fig)
+            chart_paths.append(path)
+            logger.info("Generated chart: %s", path)
+    except Exception as exc:
+        logger.warning("Failed to generate conflict risk chart: %s", exc)
+
     return chart_paths
+
+
+# ---------------------------------------------------------------------------
+# Chart embedding into Markdown
+# ---------------------------------------------------------------------------
+
+# Maps chart filename -> the report section heading it should appear after.
+_CHART_SECTION_MAP: dict[str, str] = {
+    "price_history.png": "## 3. Historical Performance Analysis",
+    "survival_timeline.png": "## 6. Survival Mode Analysis",
+    "hierarchy_weights.png": "## 4. Current Financial Snapshot",
+    "volatility.png": "## 8. Temporal Analysis",
+    "financial_health.png": "## 5. Financial Health Scoring",
+    "sentiment.png": "## 16. Market Sentiment",
+    "predicted_ohlc_month.png": "## 9. Predictions & Forecasts",
+    "predicted_ohlc_week.png": "## 10. Technical Patterns",
+    "conflict_risk.png": "## 19.5. Geopolitical",
+}
+
+
+def _embed_charts_in_markdown(
+    markdown: str,
+    chart_paths: list[str],
+    chart_dir_relative: str = "charts",
+) -> str:
+    """Embed chart image references into the report markdown.
+
+    For each generated chart, inserts a markdown image tag
+    ``![title](charts/filename.png)`` after the matching section heading.
+
+    Parameters
+    ----------
+    markdown:
+        The full report markdown text.
+    chart_paths:
+        List of absolute/relative chart PNG paths from ``generate_charts()``.
+    chart_dir_relative:
+        Relative path from the report markdown file to the charts directory.
+
+    Returns
+    -------
+    Updated markdown with embedded chart references.
+    """
+    if not chart_paths:
+        return markdown
+
+    for chart_path in chart_paths:
+        filename = os.path.basename(chart_path)
+        section_prefix = _CHART_SECTION_MAP.get(filename, "")
+
+        if not section_prefix:
+            continue
+
+        # Build the image markdown
+        title = filename.replace(".png", "").replace("_", " ").title()
+        image_tag = f"\n\n![{title}]({chart_dir_relative}/{filename})\n"
+
+        # Find the section heading in the markdown and insert after it
+        for line_idx, line in enumerate(markdown.split("\n")):
+            if line.strip().startswith(section_prefix.split(".")[0][:10]) and section_prefix.split(".")[-1].strip()[:8].lower() in line.lower():
+                # Insert after the heading line + one blank line
+                parts = markdown.split(line, 1)
+                if len(parts) == 2:
+                    markdown = parts[0] + line + image_tag + parts[1]
+                break
+
+    return markdown
 
 
 # ---------------------------------------------------------------------------
@@ -3253,11 +3522,19 @@ def generate_report(
         fh.write(markdown)
     logger.info("Markdown report saved to %s", md_path)
 
-    # Step 3: Generate charts (only for premium)
+    # Step 3: Generate charts (for Pro and Premium tiers)
     chart_paths: list[str] = []
-    if generate_chart_images and tier == ReportTier.PREMIUM:
+    if generate_chart_images and tier in (ReportTier.PRO, ReportTier.PREMIUM):
         chart_dir = out / "charts"
         chart_paths = generate_charts(cache, profile, chart_dir)
+
+    # Step 3b: Embed chart images into the markdown report
+    if chart_paths:
+        markdown = _embed_charts_in_markdown(markdown, chart_paths, "charts")
+        # Re-save the markdown with embedded charts
+        with open(md_path, "w", encoding="utf-8") as fh:
+            fh.write(markdown)
+        logger.info("Embedded %d charts into report.", len(chart_paths))
 
     # Step 4: Optional PDF (all tiers)
     pdf_path: str | None = None
