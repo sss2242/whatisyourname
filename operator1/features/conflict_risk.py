@@ -173,12 +173,15 @@ _ISO2_TO_UCDP_ID: dict[str, int] = {
     "UA": 369, "RU": 365, "IL": 666, "PS": 6661, "ET": 530,
     "SD": 625, "SS": 626, "MM": 775, "SO": 520, "NG": 475,
     "ML": 432, "BF": 439, "CD": 490, "CF": 482, "MZ": 541,
-    "CO": 100, "MX": 70,
+    "CO": 100,
     # Tier 1+2 market countries (expected low/zero conflict)
     "US": 2, "GB": 200, "JP": 740, "KR": 732, "TW": 713,
     "BR": 140, "CL": 155, "IN": 750, "CN": 710, "HK": 7101,
     "AU": 900, "SG": 830, "ZA": 560, "SA": 670, "AE": 696,
     "DE": 255, "FR": 220, "CA": 20, "CH": 225, "MX": 70,
+    # EU ESEF market countries
+    "ES": 230, "IT": 325, "NL": 210, "SE": 380,
+    "EU": 2551,  # EU aggregate (uses DE as proxy)
 }
 
 # ISO-2 to country name for GDELT queries
@@ -192,7 +195,10 @@ _ISO2_TO_NAME: dict[str, str] = {
     "IN": "India", "CN": "China", "HK": "Hong Kong", "AU": "Australia",
     "SG": "Singapore", "ZA": "South Africa", "SA": "Saudi Arabia",
     "AE": "UAE", "DE": "Germany", "FR": "France", "CA": "Canada",
-    "CH": "Switzerland", "MX": "Mexico", "BF": "Burkina Faso",
+    "CH": "Switzerland", "MX": "Mexico",
+    "ES": "Spain", "IT": "Italy", "NL": "Netherlands", "SE": "Sweden",
+    "EU": "European Union",
+    "BF": "Burkina Faso",
     "CD": "Congo", "CF": "Central African Republic", "MZ": "Mozambique",
     "VE": "Venezuela", "IR": "Iran", "KP": "North Korea", "CU": "Cuba",
     "BY": "Belarus", "LB": "Lebanon", "HT": "Haiti",
@@ -664,9 +670,162 @@ def assess_conflict_risk(
 # Cache injection helper
 # ---------------------------------------------------------------------------
 
+def assess_linked_entity_conflict(
+    linked_entities: dict[str, list[dict[str, Any]]],
+    target_conflict: ConflictRiskResult,
+) -> dict[str, Any]:
+    """Assess conflict risk propagation from linked entities.
+
+    For each linked entity group (suppliers, customers, competitors, etc.),
+    checks whether entities operate in conflict zones and computes the
+    impact on the target company.
+
+    Logic:
+      - Supplier in conflict zone -> RISK: supply chain disruption
+      - Customer in conflict zone -> RISK: revenue loss
+      - Competitor in conflict zone -> BENEFIT: competitive advantage
+      - Financial institution in conflict zone -> RISK: credit/funding risk
+
+    Parameters
+    ----------
+    linked_entities:
+        Dict from entity discovery: {group_name: [entity_dict, ...]}.
+        Each entity dict should have at minimum 'country' (ISO-2).
+    target_conflict:
+        The target company's own ConflictRiskResult.
+
+    Returns
+    -------
+    Dict with linked entity conflict analysis:
+      - supply_chain_risk_score (0-1)
+      - revenue_exposure_score (0-1)
+      - competitive_advantage_score (0-1)
+      - linked_entities_in_conflict (list of affected entities)
+      - linked_conflict_summary (human-readable text)
+    """
+    if not linked_entities:
+        return {
+            "supply_chain_risk_score": 0.0,
+            "revenue_exposure_score": 0.0,
+            "competitive_advantage_score": 0.0,
+            "linked_entities_in_conflict": [],
+            "linked_conflict_summary": "No linked entities available for conflict analysis.",
+        }
+
+    # Risk weights by relationship group
+    _GROUP_RISK_TYPE = {
+        "suppliers": "supply_chain",
+        "customers": "revenue",
+        "competitors": "competitive_advantage",
+        "financial_institutions": "credit",
+        "logistics": "supply_chain",
+        "regulators": "regulatory",
+    }
+
+    supply_chain_risks = []
+    revenue_risks = []
+    competitive_advantages = []
+    affected_entities = []
+
+    for group_name, entities in linked_entities.items():
+        risk_type = _GROUP_RISK_TYPE.get(group_name, "other")
+
+        for entity in entities:
+            entity_country = (entity.get("country") or "").upper()
+            entity_name = entity.get("name", entity.get("ticker", "unknown"))
+
+            if not entity_country:
+                continue
+
+            # Quick conflict check using static lists (no API calls)
+            is_war = entity_country in ACTIVE_WAR_COUNTRIES
+            is_sanctioned = entity_country in SANCTIONED_COUNTRIES
+            is_fragile = entity_country in FRAGILE_CONFLICT_STATES
+            is_affected = is_war or is_sanctioned or is_fragile
+
+            if not is_affected:
+                continue
+
+            # Determine severity
+            if is_war:
+                severity = 1.0
+                reason = "active armed conflict"
+            elif is_sanctioned:
+                severity = 0.7
+                reason = "international sanctions"
+            else:
+                severity = 0.3
+                reason = "fragile state"
+
+            affected_entities.append({
+                "name": entity_name,
+                "country": entity_country,
+                "group": group_name,
+                "risk_type": risk_type,
+                "severity": severity,
+                "reason": reason,
+            })
+
+            if risk_type == "supply_chain":
+                supply_chain_risks.append(severity)
+            elif risk_type == "revenue":
+                revenue_risks.append(severity)
+            elif risk_type == "competitive_advantage":
+                competitive_advantages.append(severity)
+            elif risk_type == "credit":
+                supply_chain_risks.append(severity * 0.5)  # credit risk is indirect
+
+    # Compute aggregate scores (max severity across affected entities)
+    supply_chain_score = max(supply_chain_risks) if supply_chain_risks else 0.0
+    revenue_score = max(revenue_risks) if revenue_risks else 0.0
+    competitive_score = max(competitive_advantages) if competitive_advantages else 0.0
+
+    # Build summary
+    summary_parts = []
+    if supply_chain_risks:
+        count = len(supply_chain_risks)
+        summary_parts.append(
+            f"{count} supplier/logistics {'partner' if count == 1 else 'partners'} "
+            f"in conflict zones (supply chain risk: {supply_chain_score:.0%})"
+        )
+    if revenue_risks:
+        count = len(revenue_risks)
+        summary_parts.append(
+            f"{count} {'customer' if count == 1 else 'customers'} "
+            f"in conflict zones (revenue exposure: {revenue_score:.0%})"
+        )
+    if competitive_advantages:
+        count = len(competitive_advantages)
+        summary_parts.append(
+            f"{count} {'competitor' if count == 1 else 'competitors'} "
+            f"in conflict zones (potential competitive advantage)"
+        )
+
+    summary = "; ".join(summary_parts) if summary_parts else "No linked entities in conflict zones."
+
+    logger.info(
+        "Linked entity conflict: %d affected (%d supply chain, %d revenue, %d competitors)",
+        len(affected_entities), len(supply_chain_risks), len(revenue_risks),
+        len(competitive_advantages),
+    )
+
+    return {
+        "supply_chain_risk_score": round(supply_chain_score, 3),
+        "revenue_exposure_score": round(revenue_score, 3),
+        "competitive_advantage_score": round(competitive_score, 3),
+        "linked_entities_in_conflict": affected_entities,
+        "linked_conflict_summary": summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cache injection helper
+# ---------------------------------------------------------------------------
+
 def inject_conflict_risk_into_cache(
     cache: "pd.DataFrame",
     conflict_result: ConflictRiskResult,
+    linked_conflict: dict[str, Any] | None = None,
 ) -> "pd.DataFrame":
     """Add conflict risk columns to the daily cache DataFrame.
 
@@ -688,5 +847,11 @@ def inject_conflict_risk_into_cache(
     cache["sanctions_flag"] = int(conflict_result.sanctions_flag)
     cache["fragile_state_flag"] = int(conflict_result.fragile_state_flag)
     cache["conflict_type"] = conflict_result.conflict_type
+
+    # Linked entity conflict propagation columns
+    if linked_conflict is not None:
+        cache["supply_chain_risk_score"] = linked_conflict.get("supply_chain_risk_score", 0.0)
+        cache["revenue_exposure_score"] = linked_conflict.get("revenue_exposure_score", 0.0)
+        cache["competitive_advantage_score"] = linked_conflict.get("competitive_advantage_score", 0.0)
 
     return cache

@@ -19,6 +19,7 @@ from operator1.features.conflict_risk import (
     SANCTIONED_COUNTRIES,
     ConflictRiskResult,
     assess_conflict_risk,
+    assess_linked_entity_conflict,
     inject_conflict_risk_into_cache,
     _analyze_ucdp_events,
     _compute_intensity_score,
@@ -337,3 +338,120 @@ class TestCacheInjection:
         assert cache["company_conflict_flag"].iloc[0] == 1
         assert cache["conflict_intensity_score"].iloc[0] == 0.85
         assert cache["conflict_type"].iloc[0] == "interstate_war"
+
+    def test_inject_with_linked_conflict(self):
+        """Test injection includes linked entity conflict scores."""
+        cache = pd.DataFrame(
+            {"close": [100.0]},
+            index=pd.bdate_range("2025-01-01", periods=1),
+        )
+        result = ConflictRiskResult(country_iso2="US")
+        linked = {
+            "supply_chain_risk_score": 0.7,
+            "revenue_exposure_score": 0.3,
+            "competitive_advantage_score": 0.5,
+        }
+        cache = inject_conflict_risk_into_cache(cache, result, linked_conflict=linked)
+
+        assert cache["supply_chain_risk_score"].iloc[0] == 0.7
+        assert cache["revenue_exposure_score"].iloc[0] == 0.3
+        assert cache["competitive_advantage_score"].iloc[0] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Linked entity conflict propagation tests
+# ---------------------------------------------------------------------------
+
+class TestLinkedEntityConflict:
+    """Test conflict risk propagation from linked entities."""
+
+    def test_supplier_in_war_zone(self):
+        """Supplier in active war zone creates supply chain risk."""
+        linked = {
+            "suppliers": [
+                {"name": "Ukrainian Steel Co", "country": "UA", "ticker": "UKRS"},
+            ],
+        }
+        target = ConflictRiskResult(country_iso2="DE")
+        result = assess_linked_entity_conflict(linked, target)
+
+        assert result["supply_chain_risk_score"] == 1.0  # UA is active war
+        assert len(result["linked_entities_in_conflict"]) == 1
+        assert result["linked_entities_in_conflict"][0]["risk_type"] == "supply_chain"
+        assert "supply" in result["linked_conflict_summary"].lower()
+
+    def test_customer_in_sanctioned_country(self):
+        """Customer in sanctioned country creates revenue risk."""
+        linked = {
+            "customers": [
+                {"name": "Russian Energy Corp", "country": "RU"},
+            ],
+        }
+        target = ConflictRiskResult(country_iso2="DE")
+        result = assess_linked_entity_conflict(linked, target)
+
+        assert result["revenue_exposure_score"] == 0.7  # RU is sanctioned (0.7)
+        assert result["linked_entities_in_conflict"][0]["risk_type"] == "revenue"
+
+    def test_competitor_in_war_zone(self):
+        """Competitor in war zone creates competitive advantage."""
+        linked = {
+            "competitors": [
+                {"name": "Myanmar Metals", "country": "MM"},
+            ],
+        }
+        target = ConflictRiskResult(country_iso2="AU")
+        result = assess_linked_entity_conflict(linked, target)
+
+        assert result["competitive_advantage_score"] > 0
+        assert "competitor" in result["linked_conflict_summary"].lower()
+
+    def test_no_linked_entities(self):
+        """Empty linked entities returns zeros."""
+        target = ConflictRiskResult(country_iso2="US")
+        result = assess_linked_entity_conflict({}, target)
+
+        assert result["supply_chain_risk_score"] == 0.0
+        assert result["revenue_exposure_score"] == 0.0
+        assert result["competitive_advantage_score"] == 0.0
+
+    def test_all_peaceful_linked_entities(self):
+        """Linked entities in peaceful countries produce no risk."""
+        linked = {
+            "suppliers": [
+                {"name": "Japan Steel", "country": "JP"},
+                {"name": "US Materials", "country": "US"},
+            ],
+            "competitors": [
+                {"name": "German Auto", "country": "DE"},
+            ],
+        }
+        target = ConflictRiskResult(country_iso2="GB")
+        result = assess_linked_entity_conflict(linked, target)
+
+        assert result["supply_chain_risk_score"] == 0.0
+        assert result["revenue_exposure_score"] == 0.0
+        assert result["competitive_advantage_score"] == 0.0
+        assert len(result["linked_entities_in_conflict"]) == 0
+
+    def test_mixed_linked_entities(self):
+        """Mix of conflict and peaceful entities."""
+        linked = {
+            "suppliers": [
+                {"name": "Safe Supplier", "country": "JP"},
+                {"name": "Risky Supplier", "country": "SY"},  # Syria (war + sanctions)
+            ],
+            "customers": [
+                {"name": "Normal Customer", "country": "US"},
+            ],
+            "competitors": [
+                {"name": "Struggling Rival", "country": "UA"},  # Active war
+            ],
+        }
+        target = ConflictRiskResult(country_iso2="GB")
+        result = assess_linked_entity_conflict(linked, target)
+
+        assert result["supply_chain_risk_score"] == 1.0  # SY is active war
+        assert result["revenue_exposure_score"] == 0.0    # US customer is fine
+        assert result["competitive_advantage_score"] == 1.0  # UA competitor impaired
+        assert len(result["linked_entities_in_conflict"]) == 2

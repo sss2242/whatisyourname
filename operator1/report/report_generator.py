@@ -2592,6 +2592,48 @@ def _build_geopolitical_risk_section(profile: dict[str, Any]) -> str:
         )
         lines.append("")
 
+    # Linked entity conflict propagation
+    linked_conflict = profile.get("linked_conflict", conflict.get("linked_conflict", {}))
+    if linked_conflict and isinstance(linked_conflict, dict):
+        affected = linked_conflict.get("linked_entities_in_conflict", [])
+        if affected:
+            lines.append("### Linked Entity Conflict Exposure")
+            lines.append("")
+            lines.append("| Entity | Country | Relationship | Risk Type | Severity | Reason |")
+            lines.append("|--------|---------|-------------|-----------|----------|--------|")
+            for e in affected:
+                lines.append(
+                    f"| {e.get('name', 'N/A')} | {e.get('country', '')} | "
+                    f"{e.get('group', '')} | {e.get('risk_type', '')} | "
+                    f"{_fmt(e.get('severity'), '.0%')} | {e.get('reason', '')} |"
+                )
+            lines.append("")
+
+            sc_risk = linked_conflict.get("supply_chain_risk_score", 0)
+            rev_risk = linked_conflict.get("revenue_exposure_score", 0)
+            comp_adv = linked_conflict.get("competitive_advantage_score", 0)
+
+            if sc_risk > 0:
+                lines.append(f"**Supply Chain Risk:** {_fmt(sc_risk, '.0%')} -- "
+                             "linked suppliers or logistics partners operate in conflict zones. "
+                             "Disruption to raw materials, components, or shipping is probable.")
+                lines.append("")
+            if rev_risk > 0:
+                lines.append(f"**Revenue Exposure:** {_fmt(rev_risk, '.0%')} -- "
+                             "linked customers operate in conflict zones. "
+                             "Demand contraction, payment delays, or market exit risk.")
+                lines.append("")
+            if comp_adv > 0:
+                lines.append(f"**Competitive Advantage:** {_fmt(comp_adv, '.0%')} -- "
+                             "competitors are impaired by conflict. "
+                             "Potential market share gains if supply chains are diversified.")
+                lines.append("")
+
+        summary = linked_conflict.get("linked_conflict_summary", "")
+        if summary:
+            lines.append(f"*{summary}*")
+            lines.append("")
+
     # Data sources
     sources = conflict.get("data_sources_used", [])
     if sources:
