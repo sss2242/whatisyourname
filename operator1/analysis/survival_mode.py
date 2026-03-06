@@ -8,6 +8,8 @@ Computes three daily boolean flags:
     - ``debt_to_equity_abs > 3.0``
     - ``fcf_yield < 0``
     - ``drawdown_252d < -0.40``
+    - ``conflict_intensity_score > 0.7`` (geopolitical conflict)
+    - ``sanctions_flag == 1`` (international sanctions)
 
 - **country_survival_mode_flag**: triggered when ANY config-driven
   macro threshold is breached (credit spread, unemployment, yield
@@ -90,6 +92,17 @@ def compute_company_survival_flag(
     if "drawdown_252d" in df.columns:
         dd = df["drawdown_252d"]
         conditions.append(dd.notna() & (dd < t.get("drawdown_252d_lt", -0.40)))
+
+    # Geopolitical conflict: country_conflict_flag OR intensity > 0.7 OR sanctions
+    if "country_conflict_flag" in df.columns:
+        cf = df["country_conflict_flag"]
+        conditions.append(cf.notna() & (cf == 1))
+    elif "conflict_intensity_score" in df.columns:
+        ci = df["conflict_intensity_score"]
+        conditions.append(ci.notna() & (ci > t.get("conflict_intensity_gt", 0.7)))
+    if "sanctions_flag" in df.columns:
+        sf = df["sanctions_flag"]
+        conditions.append(sf.notna() & (sf == 1))
 
     if not conditions:
         logger.warning("No company survival trigger columns found -- defaulting to 0")

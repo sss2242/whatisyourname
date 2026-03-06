@@ -203,7 +203,7 @@ _ISO2_TO_NAME: dict[str, str] = {
 # UCDP GED API client (free, no key required)
 # ---------------------------------------------------------------------------
 
-_UCDP_BASE = "https://ucdpapi.pcr.uu.se/api/gedevents/25.0.0"
+_UCDP_BASE = "https://ucdpapi.pcr.uu.se/api/gedevents/24.0.10"
 
 
 def _fetch_ucdp_events(
@@ -211,6 +211,12 @@ def _fetch_ucdp_events(
     days: int = 365,
 ) -> list[dict[str, Any]]:
     """Fetch recent conflict events from UCDP GED API.
+
+    Note: The UCDP API may require authentication in newer versions.
+    If the API returns 401, we fall back to static lists only.
+    This is acceptable because the static lists (ACTIVE_WAR_COUNTRIES,
+    SANCTIONED_COUNTRIES, FRAGILE_CONFLICT_STATES) provide reliable
+    baseline conflict classification for all countries.
 
     Parameters
     ----------
@@ -242,6 +248,12 @@ def _fetch_ucdp_events(
             headers={"Accept": "application/json"},
             timeout=15,
         )
+        if resp.status_code == 401:
+            logger.info(
+                "UCDP API requires authentication (401). "
+                "Using static conflict lists as fallback."
+            )
+            return []
         resp.raise_for_status()
         data = resp.json()
         return data.get("Result", [])
@@ -335,6 +347,10 @@ def _analyze_ucdp_events(events: list[dict]) -> dict[str, Any]:
 
 _GDELT_BASE = "https://api.gdeltproject.org/api/v2/doc/doc"
 
+# Rate limiting: GDELT has aggressive rate limits (~1 req/5s for free tier)
+_gdelt_last_call: float = 0.0
+_GDELT_MIN_INTERVAL: float = 5.0  # seconds between calls
+
 
 def _fetch_gdelt_conflict_news(
     country_name: str,
@@ -342,10 +358,23 @@ def _fetch_gdelt_conflict_news(
 ) -> dict[str, Any]:
     """Query GDELT for recent conflict/war news about a country.
 
+    Includes rate limiting (5s between calls) to avoid GDELT's 429 responses.
+
     Returns dict with: mentions_count, avg_tone.
     """
+    global _gdelt_last_call
+
     if not country_name:
         return {"mentions_count": 0, "avg_tone": 0.0}
+
+    # Rate limiting
+    import time
+    now = time.time()
+    elapsed = now - _gdelt_last_call
+    if elapsed < _GDELT_MIN_INTERVAL:
+        sleep_time = _GDELT_MIN_INTERVAL - elapsed
+        logger.debug("GDELT rate limit: sleeping %.1fs", sleep_time)
+        time.sleep(sleep_time)
 
     query = f'"{country_name}" (war OR conflict OR military OR bombing OR attack)'
 
@@ -360,8 +389,14 @@ def _fetch_gdelt_conflict_news(
                 "timespan": f"{days}days",
             },
             headers={"User-Agent": "Operator1/1.0"},
-            timeout=10,
+            timeout=15,
         )
+        _gdelt_last_call = time.time()
+
+        if resp.status_code == 429:
+            logger.info("GDELT rate limited (429). Skipping news data.")
+            return {"mentions_count": 0, "avg_tone": 0.0}
+
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
@@ -372,12 +407,24 @@ def _fetch_gdelt_conflict_news(
     if not articles:
         return {"mentions_count": 0, "avg_tone": 0.0}
 
-    # Compute average tone (GDELT provides tone as a float, negative = bad)
+    # GDELT ArtList mode provides tone as a float in each article.
+    # Negative = negative sentiment, positive = positive sentiment.
+    # If tone is missing, estimate from title keywords.
     tones = []
+    negative_keywords = {"war", "attack", "kill", "bomb", "death", "destroy",
+                         "invasion", "missile", "casualt", "strike", "combat"}
     for article in articles:
-        tone = article.get("tone", 0.0)
-        if isinstance(tone, (int, float)):
+        tone = article.get("tone")
+        if tone is not None and isinstance(tone, (int, float)):
             tones.append(float(tone))
+        else:
+            # Estimate tone from title keywords
+            title = (article.get("title") or "").lower()
+            neg_count = sum(1 for kw in negative_keywords if kw in title)
+            if neg_count > 0:
+                tones.append(-2.0 * neg_count)
+            else:
+                tones.append(0.0)
 
     avg_tone = sum(tones) / len(tones) if tones else 0.0
 
