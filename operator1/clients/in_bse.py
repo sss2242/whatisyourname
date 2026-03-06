@@ -183,16 +183,43 @@ class INBseClient:
     # -- Financial statements ------------------------------------------------
 
     def get_income_statement(self, identifier: str) -> pd.DataFrame:
-        """Fetch income statements via yfinance."""
-        return self._fetch_financials_yf(identifier, "income")
+        """Fetch income statements via BSE filing discovery + LLM, yfinance fallback."""
+        return self._fetch_financials(identifier, "income")
 
     def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
-        """Fetch balance sheets via yfinance."""
-        return self._fetch_financials_yf(identifier, "balance")
+        """Fetch balance sheets via BSE filing discovery + LLM, yfinance fallback."""
+        return self._fetch_financials(identifier, "balance")
 
     def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
-        """Fetch cash flow statements via yfinance."""
-        return self._fetch_financials_yf(identifier, "cashflow")
+        """Fetch cash flow statements via BSE filing discovery + LLM, yfinance fallback."""
+        return self._fetch_financials(identifier, "cashflow")
+
+    def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
+        """Try BSE filing discovery first, fall back to yfinance.
+
+        The filing discoverer finds actual PDF filings from BSE's
+        disclosure system and extracts structured data via LLM. This
+        provides true Point-in-Time data with accurate filing dates.
+        """
+        # Try BSE filing discovery + LLM extraction first
+        try:
+            from operator1.clients.filing_discoverer import try_filing_extraction
+            df = try_filing_extraction(
+                ticker=identifier,
+                market_id=self.market_id,
+                statement_type=statement_type,
+            )
+            if df is not None and not df.empty:
+                logger.info(
+                    "BSE filing extraction succeeded for %s/%s: %d records",
+                    identifier, statement_type, len(df),
+                )
+                return df
+        except Exception as exc:
+            logger.debug("BSE filing extraction failed for %s: %s", identifier, exc)
+
+        # Fallback to yfinance
+        return self._fetch_financials_yf(identifier, statement_type)
 
     def _fetch_financials_yf(self, identifier: str, statement_type: str) -> pd.DataFrame:
         """Fetch financial statements via yfinance Ticker object."""

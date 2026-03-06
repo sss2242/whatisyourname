@@ -109,6 +109,17 @@ PROTECTION_SCORE_FIELDS = (
     "sector_strategicness",
 )
 
+# Conflict / geopolitical risk columns persisted in the daily cache
+# so survival models can incorporate war and sanctions risk.
+CONFLICT_RISK_FIELDS = (
+    "country_conflict_flag",
+    "company_conflict_flag",
+    "conflict_intensity_score",
+    "sanctions_flag",
+    "fragile_state_flag",
+    "conflict_type",
+)
+
 
 # ---------------------------------------------------------------------------
 # Date index
