@@ -167,6 +167,21 @@ ACTIVE_WAR_COUNTRIES: set[str] = {
     "SO",  # Somalia -- Al-Shabaab insurgency
 }
 
+# Conflict start dates for time-varying historical flags.
+# Before these dates, the country was relatively peaceful and the
+# conflict flag should be 0 in the daily cache.
+CONFLICT_START_DATES: dict[str, str] = {
+    "UA": "2022-02-24",   # Russia-Ukraine full-scale invasion
+    "PS": "2023-10-07",   # Israel-Palestine escalation
+    "IL": "2023-10-07",   # Israel military operations post Oct 7
+    "SD": "2023-04-15",   # Sudan RSF vs SAF civil war
+    "MM": "2021-02-01",   # Myanmar military coup + civil war
+    "ET": "2020-11-04",   # Tigray war start (Amhara ongoing)
+    "SY": "2011-03-15",   # Syrian civil war (long-running)
+    "YE": "2014-09-21",   # Houthi takeover of Sana'a
+    "SO": "2006-12-24",   # Al-Shabaab insurgency (long-running)
+}
+
 # ISO-2 to UCDP country ID mapping (for major markets).
 _ISO2_TO_UCDP_ID: dict[str, int] = {
     "AF": 700, "IQ": 645, "SY": 652, "YE": 679, "LY": 620,
@@ -853,5 +868,63 @@ def inject_conflict_risk_into_cache(
         cache["supply_chain_risk_score"] = linked_conflict.get("supply_chain_risk_score", 0.0)
         cache["revenue_exposure_score"] = linked_conflict.get("revenue_exposure_score", 0.0)
         cache["competitive_advantage_score"] = linked_conflict.get("competitive_advantage_score", 0.0)
+
+    # Apply time-varying conflict flags for historical accuracy
+    cache = _apply_time_varying_conflict(cache, conflict_result)
+
+    return cache
+
+
+def _apply_time_varying_conflict(
+    cache: "pd.DataFrame",
+    conflict_result: ConflictRiskResult,
+) -> "pd.DataFrame":
+    """Set conflict flags to 0 before the conflict start date.
+
+    For countries with known conflict start dates, the daily cache
+    should show flag=0 (peaceful) before the war started, not the
+    current conflict status for the entire 2-year window.
+
+    This gives temporal models accurate historical context:
+    a company in Ukraine was NOT in survival mode before Feb 2022.
+    """
+    import pandas as pd
+
+    cc = conflict_result.country_iso2.upper()
+    start_str = CONFLICT_START_DATES.get(cc)
+
+    if not start_str or not conflict_result.country_conflict_flag:
+        return cache
+
+    try:
+        start_ts = pd.Timestamp(start_str)
+    except Exception:
+        return cache
+
+    if not hasattr(cache.index, 'dtype') or cache.index.empty:
+        return cache
+
+    pre_conflict = cache.index < start_ts
+
+    if not pre_conflict.any():
+        return cache  # all dates are after the conflict start
+
+    # Zero out conflict flags for pre-conflict period
+    conflict_cols = [
+        "country_conflict_flag", "company_conflict_flag",
+        "conflict_intensity_score",
+    ]
+    for col in conflict_cols:
+        if col in cache.columns:
+            cache.loc[pre_conflict, col] = 0
+
+    # Keep sanctions and fragile state flags unchanged (they may predate the war)
+
+    n_pre = pre_conflict.sum()
+    n_post = (~pre_conflict).sum()
+    logger.info(
+        "Time-varying conflict for %s: %d days peaceful (before %s), %d days conflict",
+        cc, n_pre, start_str, n_post,
+    )
 
     return cache
