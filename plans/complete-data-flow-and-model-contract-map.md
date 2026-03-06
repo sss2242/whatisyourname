@@ -163,11 +163,10 @@ report generation, with expected vs actual inputs, outputs, and operations.
 
 | | Expected | Actual | Status |
 |---|----------|--------|--------|
-| **Input** | `target_cache`, `competitor_caches` dict of linked entity caches, `target_name` | `competitor_caches` is NEVER passed from main.py (always None) | W8 |
-| **Output** | `game_theory_result` with Cournot/Stackelberg analysis, `competitive_pressure`, `market_structure` | Always returns "monopoly" with 0 competitors | W8 |
-| **Operation** | Cournot quantity game, Bertrand price game, Stackelberg leadership, CR4 market structure, competitive pressure index | Only executes the n=0 path (no competitors) | W8 |
-| **Profile** | Stored via `_available_dict(game_theory_result)` | Stored but always shows monopoly | W8 |
-| **Fix** | Pass `competitor_caches=linked_caches` in main.py line 1109 | | |
+| **Input** | `target_cache`, `competitor_caches` dict of linked entity caches, `target_name` | Same -- now passes `competitor_caches=linked_caches` | OK |
+| **Output** | `game_theory_result` with Cournot/Stackelberg analysis, `competitive_pressure`, `market_structure` | Same | OK |
+| **Operation** | Cournot quantity game, Bertrand price game, Stackelberg leadership, CR4 market structure, competitive pressure index | Same | OK |
+| **Profile** | Stored via `_available_dict(game_theory_result)` | Same | OK |
 
 ### C13. Economic Planes -- `classify_economic_plane()`
 
@@ -376,10 +375,9 @@ report generation, with expected vs actual inputs, outputs, and operations.
 
 | | Expected | Actual | Status |
 |---|----------|--------|--------|
-| **Input** | cache, `predictions` dict, `tree_models` dict (fitted model objects), `predict_fns` dict | `tree_models` and `predict_fns` are NEVER passed from main.py (both None -> empty dict) | W9 |
-| **Output** | `SHAPResult` with per-variable feature importance, top drivers, narratives | Always returns `available=False`, empty `explanations` dict | W9 |
-| **Operation** | 1. Try TreeExplainer with tree_models (skipped -- no models). 2. Fall back to KernelExplainer with predict_fns (skipped -- no functions). 3. Neither path runs. | Neither explainer path executes. | W9 |
-| **Fix** | Pass fitted tree models from `forecast_result.model_states` or `forward_pass_result.model_states` to `tree_models` parameter | | |
+| **Input** | cache, `predictions` dict, `tree_models` dict (fitted model objects), `predict_fns` dict | Same -- now extracts `predict_fns` from `forward_pass_result.model_states` | OK |
+| **Output** | `SHAPResult` with per-variable feature importance, top drivers, narratives | Same | OK |
+| **Operation** | 1. Try TreeExplainer with tree_models. 2. Fall back to KernelExplainer with predict_fns. | Same | OK |
 
 ### F20. Sobol Sensitivity -- `run_sensitivity_analysis()`
 
@@ -435,58 +433,112 @@ report generation, with expected vs actual inputs, outputs, and operations.
 
 ---
 
+## Phase F-extra-2: Geopolitical Risk Assessment
+
+### Fx4. Conflict Risk Assessment -- `assess_conflict_risk()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `country_iso2` (ISO-2 code from VerifiedTarget), optional `company_name` | Same | OK |
+| **Output** | `ConflictRiskResult` with `country_conflict_flag`, `company_conflict_flag`, `conflict_intensity_score` (0-1), `sanctions_flag`, `fragile_state_flag`, `conflict_type`, `recent_events_30d/90d`, `recent_fatalities_30d`, `conflict_trend`, `news_conflict_mentions_7d`, `news_conflict_tone`, `data_sources_used`, `confidence` | Same | OK |
+| **Operation** | 1. Check static lists (World Bank FCS: 31 countries, OFAC/EU sanctions: 13 countries, active wars: 9 countries). 2. Fetch UCDP GED events (free, no key -- currently returns 401, falls back gracefully). 3. Query GDELT news (free, no key, 5s rate limiting). 4. Compute weighted intensity score (40% events + 20% fatalities + 25% flags + 15% news). 5. Set country/company conflict flags. | Same | OK |
+| **Location** | `operator1/features/conflict_risk.py` | | |
+| **Data sources** | UCDP GED API (auth required since 2025), GDELT (rate-limited), static lists (always available) | | |
+
+### Fx5. Linked Entity Conflict Propagation -- `assess_linked_entity_conflict()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `linked_entities` dict from entity discovery (`{group_name: [entity_dict, ...]}`), `target_conflict` (ConflictRiskResult) | Same | OK |
+| **Output** | Dict with `supply_chain_risk_score` (0-1), `revenue_exposure_score` (0-1), `competitive_advantage_score` (0-1), `linked_entities_in_conflict` (list), `linked_conflict_summary` (str) | Same | OK |
+| **Operation** | For each linked entity group: check entity country against static conflict lists. Supplier/logistics in war zone -> supply chain risk. Customer in conflict -> revenue risk. Competitor in conflict -> competitive advantage. Financial institution -> credit risk (0.5x weight). Max severity per category. | Same | OK |
+| **Location** | `operator1/features/conflict_risk.py` | | |
+
+### Fx6. Conflict Risk Cache Injection -- `inject_conflict_risk_into_cache()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `cache` DataFrame, `ConflictRiskResult`, optional `linked_conflict` dict | Same | OK |
+| **Output** | cache + columns: `country_conflict_flag`, `company_conflict_flag`, `conflict_intensity_score`, `sanctions_flag`, `fragile_state_flag`, `conflict_type`. Optional: `supply_chain_risk_score`, `revenue_exposure_score`, `competitive_advantage_score` | Same | OK |
+| **Operation** | Set daily columns from conflict assessment result. All values are constant across the daily index (conflict status doesn't change day-to-day within a pipeline run). | Same | OK |
+| **Downstream** | Consumed by `compute_company_survival_flag()` in `survival_mode.py` (conflict flag + sanctions flag are new survival triggers). Consumed by `_build_conflict_risk_profile_section()` in `profile_builder.py`. | Same | OK |
+
+---
+
+## Phase F-extra-3: Filing Discovery for Tier 2 Markets
+
+### Fx7. BSE India Filing Discoverer -- `BSEFilingDiscoverer.discover_filings()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | BSE scrip code (e.g. `500325`), `years` lookback | Same | OK |
+| **Output** | `FilingDiscovery` with list of `FilingMetadata` objects (title, filing_date, report_date, document_url, filing_type) | Same | OK |
+| **Operation** | Query `api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w` with `strCat=Result`. Parse subject lines for fiscal period dates. Classify as annual/quarterly/interim. Construct PDF URLs from attachment UUIDs. | Same | OK |
+| **Location** | `operator1/clients/filing_discoverer.py` | | |
+| **Rate limit** | No documented limit; Referer header required | | |
+
+### Fx8. BSE Filing PDF Download -- `BSEFilingDiscoverer.download_filing()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `FilingMetadata` with `document_url` | Same | OK |
+| **Output** | Raw PDF bytes (validated: first 4 bytes must be `%PDF`) | Same | OK |
+| **Operation** | HTTP GET to `bseindia.com/xml-data/corpfiling/AttachLive/{uuid}.pdf`. Validates PDF magic bytes. Rejects non-PDF content. | Same -- tested with Reliance 4.7MB PDF | OK |
+
+### Fx9. ASX Filing Discoverer -- `ASXFilingDiscoverer.discover_filings()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | ASX ticker (e.g. `BHP`), `years` lookback | Same | OK |
+| **Output** | `FilingDiscovery` with announcement metadata (headline, date, documentKey, filing_type) | Same | OK |
+| **Operation** | Query `asx.api.markitdigital.com/asx-research/1.0/companies/{ticker}/announcements`. Filter by announcement type (PERIODIC REPORTS, ANNUAL REPORT) or headline keywords. | Same | OK |
+| **Note** | Document download returns 404 for the MarkitDigital endpoint. Discovery-only for now. | Same | OK |
+
+### Fx10. Filing Extraction Pipeline -- `try_filing_extraction()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `ticker`, `market_id`, `statement_type` (income/balance/cashflow), optional `llm_client` | Same | OK |
+| **Output** | Canonical long-format DataFrame (columns: canonical_name, value, report_date, filing_date) filtered to the requested statement type | Same | OK |
+| **Operation** | 1. Check per-ticker extraction cache (avoids redundant calls). 2. Get discoverer from registry. 3. Discover filings. 4. Download PDFs. 5. Extract via LLMFilingExtractor. 6. Cache combined result. 7. Filter by statement_type using canonical field name sets. | Same | OK |
+| **Caching** | Module-level `_extraction_cache` keyed by `market_id:ticker`. First call does full pipeline; subsequent calls (income/balance/cashflow) return cached+filtered result. | Same | OK |
+| **Location** | `operator1/clients/filing_discoverer.py` | | |
+| **Wired in** | `operator1/clients/in_bse.py` -- tried before yfinance fallback in `_fetch_financials()` | Same | OK |
+
+---
+
 ## Unwired Modules -- Investigation Results
 
-### W6: `vanity.py` -- SHOULD BE WIRED (profile builder expects it)
+### W6: `vanity.py` -- WIRED
 
-**Severity:** Medium (wiring gap -- module is complete, tested, but never called)
+**Status:** FIXED
 **Location:** `operator1/analysis/vanity.py` (637 lines)
 **Tests:** `tests/test_vanity_v2.py` (dedicated), referenced in `test_phase4_analysis.py`, `test_phase7_report.py`
-**Problem:** The profile builder at `profile_builder.py:333` has `_build_vanity_section(cache)` that reads columns:
-`vanity_score`, `vanity_label`, `vanity_trend`, `vanity_score_21d`,
-`vanity_rnd_mismatch`, `vanity_sga_bloat_v2`, `vanity_capital_misallocation`,
-`vanity_competitive_decay`, `vanity_sentiment_gap`.
-
-But `compute_vanity_scores()` from `vanity.py` is NEVER called in `main.py` to populate these columns.
-The vanity section in every profile will always show as unavailable.
-
-**Fix:** Add a call to `compute_vanity_scores(cache)` in `main.py` Step 5 (feature engineering),
-after financial health and before entity discovery. Requires: cache with derived variables,
-financial health scores, sentiment scores (optional), peer ranking (optional).
 
 | | Expected | Actual | Status |
 |---|----------|--------|--------|
-| **Input** | cache with derived vars, fh_* scores, sentiment (optional), peer_ranking (optional) | Never called | NOT WIRED |
-| **Output** | cache + `vanity_score`, `vanity_label`, `vanity_trend`, 5 component columns | Never computed | NOT WIRED |
-| **Operation** | 5-component composite: R&D mismatch, SGA bloat, capital misallocation, competitive decay, sentiment gap | Never runs | NOT WIRED |
+| **Input** | cache with derived vars, fh_* scores, sentiment (optional), peer_ranking (optional) | Same -- wired in main.py Step 5d after financial health | OK |
+| **Output** | cache + `vanity_score`, `vanity_label`, `vanity_trend`, 5 component columns | Same | OK |
+| **Operation** | 5-component composite: R&D mismatch, SGA bloat, capital misallocation, competitive decay, sentiment gap | Same | OK |
 
-### W7: `supplement.py` -- SHOULD BE WIRED (fills profile gaps for non-US markets)
+### W7: `supplement.py` -- WIRED
 
-**Severity:** Medium (wiring gap -- enrichment available but never called)
+**Status:** FIXED
 **Location:** `operator1/clients/supplement.py` (549 lines)
 **Tests:** `tests/test_supplement_and_translator.py`
-**Problem:** For non-US markets (EU, Japan, Taiwan, Brazil, Chile), PIT filing APIs often return
-profiles missing sector, industry, and market classification. `supplement.py` provides
-`enrich_profile()` which fills these gaps via OpenFIGI (free, no key) and regional APIs.
-This function is never called from `main.py` even though the pipeline would benefit from it
-for every non-US company.
-
-**Fix:** Add a call to `enrich_profile()` in `main.py` after Step 2 (profile fetch),
-passing the market_id and ticker. This is a safe additive enrichment (never overwrites
-existing data).
 
 | | Expected | Actual | Status |
 |---|----------|--------|--------|
-| **Input** | `profile` dict, `ticker`, `market_id` | Never called | NOT WIRED |
-| **Output** | Enriched profile with sector, industry, identifiers filled from OpenFIGI/regional APIs | Profiles stay incomplete for non-US markets | NOT WIRED |
-| **Operation** | OpenFIGI lookup + per-region enrichers (Euronext, JPX, TWSE, B3, Santiago) | Never runs | NOT WIRED |
+| **Input** | `profile` dict, `ticker`, `market_id` | Same -- wired in main.py after Step 2 profile fetch | OK |
+| **Output** | Enriched profile with sector, industry, identifiers filled from OpenFIGI/regional APIs | Same | OK |
+| **Operation** | OpenFIGI lookup + per-region enrichers (Euronext, JPX, TWSE, B3, Santiago) | Same | OK |
 
 ### Genuinely Unwired (Planned Features / Legacy)
 
 | Module | Location | Lines | Tests | Status | Assessment |
 |--------|----------|-------|-------|--------|------------|
 | `portfolio_analysis.py` | `features/` | 283 | None | Not wired | **Planned feature.** Needs institutional holder data most PIT APIs don't provide. Awaiting data source. |
-| `llm_filing_extractor.py` | `clients/` | 571 | Used in `live_helpers.py` only | Not wired | **Planned feature.** LLM-based PDF/HTML/iXBRL extraction for raw-filing markets (AU, HK, SG, SA, etc.). Awaiting integration. |
+| `llm_filing_extractor.py` | `clients/` | 571 | Used in `live_helpers.py` + `filing_discoverer.py` | **Wired** | Now integrated via `try_filing_extraction()` in `filing_discoverer.py`. BSE India discoverer downloads PDFs and feeds them to `extract_from_pdf()`. ASX discoverer provides announcement metadata (PDF download TBD). |
 | `data_extraction.py` | `steps/` | 392 | Referenced by `cache_builder.py` for types | Not wired | **Legacy code.** Superseded by `main.py` inline extraction logic. Only used for `EntityData` type import by `cache_builder.py`. |
 | `verify_identifiers.py` | `steps/` | 129 | None direct | Not wired | **Legacy code.** Superseded by `main.py` inline verification. Only imported by `data_extraction.py` for `VerifiedTarget` type. |
 
@@ -498,9 +550,9 @@ existing data).
 
 | | Expected | Actual | Status |
 |---|----------|--------|--------|
-| **Input** | `target_profile`, cache, `linked_aggregates`, all model results (regime, forecast, MC, prediction, estimation, graph_risk, game_theory, fuzzy, financial_health, sentiment, peer_ranking, macro_quadrant) | Same -- now also includes burnout_result and full transfer_entropy_result | FIXED |
-| **Output** | `profile` dict with all sections: identity, financials, survival, models, extended_models, meta | Same | OK |
-| **Operation** | Assemble all model outputs into a single JSON-serializable profile dict | Same | OK |
+| **Input** | `target_profile`, cache, `linked_aggregates`, all model results (regime, forecast, MC, prediction, estimation, graph_risk, game_theory, fuzzy, financial_health, sentiment, peer_ranking, macro_quadrant) | Same -- now also includes burnout_result, transfer_entropy_result, and conflict_risk | OK |
+| **Output** | `profile` dict with all sections: identity, financials, survival, models, extended_models, conflict_risk, meta | Same -- `conflict_risk` section added via `_build_conflict_risk_profile_section(cache)` | OK |
+| **Operation** | Assemble all model outputs into a single JSON-serializable profile dict. Conflict risk is built from cache columns: `country_conflict_flag`, `conflict_intensity_score`, `sanctions_flag`, `fragile_state_flag`, `conflict_type`, plus optional linked entity scores. | Same | OK |
 
 ---
 
@@ -511,8 +563,10 @@ existing data).
 | | Expected | Actual | Status |
 |---|----------|--------|--------|
 | **Input** | `profile` dict, `gemini_client` (LLM), cache, `output_dir` | Same | OK |
-| **Output** | Basic + Pro + Premium markdown reports, optional PDF | Same | OK |
-| **Operation** | 1. Extract key metrics from profile. 2. Generate narrative via LLM (or template fallback). 3. Include charts, survival analysis, model diagnostics. 4. Three tiers with increasing detail. | Same | OK |
+| **Output** | Basic + Pro + Premium markdown reports, optional PDF, embedded chart images | Same | OK |
+| **Operation** | 1. Extract key metrics from profile. 2. Generate narrative via LLM (or template fallback). 3. Generate charts (now for Pro + Premium tiers). 4. Embed chart `![](charts/filename.png)` references into markdown. 5. Three tiers with increasing detail. 6. New section 19.5: Geopolitical & Conflict Risk (Pro + Premium). 7. New Chart 9: Conflict Risk Dashboard (intensity gauge + status indicators). | Same | OK |
+| **Chart embedding** | `_embed_charts_in_markdown()` maps 9 chart filenames to section headings and inserts image tags after matching headings. Charts generated for Pro and Premium tiers (was Premium-only). | Same | OK |
+| **Section 19.5** | `_build_geopolitical_risk_section(profile)` renders status badge (CRITICAL/ELEVATED/MODERATE/LOW), risk factor table, UCDP event counts, GDELT news tone, linked entity conflict exposure table, investment implications narrative. Included in `TIER_SECTIONS` for Pro (section 195) and Premium. | Same | OK |
 
 ---
 
