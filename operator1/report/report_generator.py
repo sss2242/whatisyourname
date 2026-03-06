@@ -2382,7 +2382,17 @@ def _build_key_indicators_table(profile: dict[str, Any], mode: ReportMode = Repo
     In LEARN mode, each indicator includes a plain-English explanation.
     In RESULTS mode, just the clean data grid.
     """
-    snapshot = profile.get("current_snapshot", {})
+    # The profile stores current state under "current_state" with values
+    # nested inside tier sub-dicts (tier1_liquidity, tier2_solvency, etc.).
+    # Flatten all tier sub-dicts into a single lookup dict.
+    cs = profile.get("current_state", {})
+    snapshot: dict[str, Any] = {}
+    for key, val in cs.items():
+        if isinstance(val, dict):
+            # Flatten tier sub-dicts (e.g. tier1_liquidity: {cash_ratio: 0.5})
+            snapshot.update(val)
+        else:
+            snapshot[key] = val
     fh = profile.get("financial_health", {})
 
     # Indicator definitions: (label, value_key, format, learn_explanation)
