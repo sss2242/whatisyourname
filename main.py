@@ -859,6 +859,38 @@ Non-interactive examples:
         except Exception as exc:
             logger.warning("Macro data fetch failed (continuing without macro): %s", exc)
 
+    # Build MacroDataset from raw macro dict (structured container for downstream)
+    if macro_data:
+        try:
+            from operator1.steps.macro_mapping import fetch_macro_data as _build_macro_ds
+            macro_dataset = _build_macro_ds(
+                country_iso2=market_info.country_code,
+                macro_raw=macro_data,
+            )
+            logger.info(
+                "MacroDataset built: %d indicators, %d missing",
+                len(macro_dataset.indicators),
+                len(macro_dataset.missing),
+            )
+        except Exception as exc:
+            logger.warning("MacroDataset construction failed: %s", exc)
+
+    # Compute macro quadrant classification
+    if macro_data:
+        try:
+            from operator1.features.macro_quadrant import compute_macro_quadrant
+            cache, macro_quadrant_result = compute_macro_quadrant(
+                cache,
+                macro_data=macro_dataset,
+            )
+            logger.info(
+                "Macro quadrant: %s, stability=%.3f",
+                getattr(macro_quadrant_result, "latest_quadrant", "N/A"),
+                getattr(macro_quadrant_result, "stability_score", 0.0),
+            )
+        except Exception as exc:
+            logger.warning("Macro quadrant classification failed: %s", exc)
+
     # ------------------------------------------------------------------
     # Step 4a-validate: Log what both APIs returned for diagnostics
     # ------------------------------------------------------------------
@@ -911,6 +943,37 @@ Non-interactive examples:
             logger.info("Estimation coverage saved: %s", coverage_path)
     except Exception as exc:
         logger.warning("Estimation failed (continuing with raw data): %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 4c: Filing calendar analysis
+    # ------------------------------------------------------------------
+    filing_calendar_result = None
+    try:
+        from operator1.features.filing_calendar import analyze_filing_calendar
+        filing_calendar_result = analyze_filing_calendar(cache, market_id=market_id)
+        logger.info(
+            "Filing calendar: expected=%d, actual=%d (%.0f%%), freq=%s, stale=%s (age=%dd)",
+            filing_calendar_result.expected_filings_2yr,
+            filing_calendar_result.actual_filings_2yr,
+            filing_calendar_result.coverage_ratio * 100,
+            filing_calendar_result.detected_frequency,
+            filing_calendar_result.is_stale,
+            filing_calendar_result.latest_filing_age_days,
+        )
+        if filing_calendar_result.is_stale:
+            logger.warning(
+                "STALE DATA: Latest filing is %d days old (threshold: %d days for %s)",
+                filing_calendar_result.latest_filing_age_days,
+                filing_calendar_result.stale_threshold_days,
+                market_id,
+            )
+        if filing_calendar_result.gaps:
+            logger.warning(
+                "Filing gaps detected: %d gaps in 2-year window",
+                len(filing_calendar_result.gaps),
+            )
+    except Exception as exc:
+        logger.warning("Filing calendar analysis failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Step 5: Feature engineering
@@ -1108,20 +1171,25 @@ Non-interactive examples:
                             )
                         )
 
-                    # Merge statements (same logic as target cache, simplified)
+                    # Merge statements (same logic as target cache)
                     for _lbl, _sdf in [("inc", _inc), ("bal", _bal), ("cf", _cf)]:
                         if _sdf.empty:
                             continue
-                        _dcol = "filing_date" if "filing_date" in _sdf.columns else "report_date"
+                        # Use report_date first (consistent with target cache merge)
+                        _dcol = "report_date" if "report_date" in _sdf.columns else "filing_date"
                         if _dcol not in _sdf.columns:
                             continue
                         _sdf[_dcol] = pd.to_datetime(_sdf[_dcol])
                         _sdf = _sdf.sort_values(_dcol)
+                        _sdf = _sdf.drop_duplicates(subset=[_dcol], keep="last")
                         _ncols = _sdf.select_dtypes(include=["number"]).columns.tolist()
                         _ncols = [c for c in _ncols if c != _dcol and "date" not in c.lower()]
                         if _ncols:
                             _si = _sdf.set_index(_dcol)[_ncols]
-                            _sa = _si.reindex(_ent_cache.index, method="ffill")
+                            # Union+ffill+reindex (same as target cache merge)
+                            _combined = _ent_cache.index.union(_si.index).sort_values()
+                            _sa = _si.reindex(_combined).ffill()
+                            _sa = _sa.reindex(_ent_cache.index)
                             _new = [c for c in _sa.columns if c not in _ent_cache.columns]
                             if _new:
                                 _ent_cache = _ent_cache.join(_sa[_new], how="left")
@@ -1610,7 +1678,43 @@ Non-interactive examples:
         except Exception as exc:
             logger.warning("Particle filter failed: %s", exc)
 
-        # Prediction aggregation
+        # Conformal prediction (before aggregation so results feed in)
+        try:
+            from operator1.models.conformal import ConformalCalibrator, build_conformal_result
+            if forecast_result is not None:
+                calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
+                if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
+                    for r in forecast_result.residuals:
+                        calibrator.update(r)
+                # Build point forecasts from forecast_result directly
+                _point_forecasts: dict[str, float] = {}
+                if hasattr(forecast_result, "forecasts"):
+                    for var, horizons_dict in forecast_result.forecasts.items():
+                        if isinstance(horizons_dict, dict):
+                            for h, val in horizons_dict.items():
+                                if val is not None:
+                                    try:
+                                        _point_forecasts[f"{var}_{h}"] = float(val)
+                                    except (TypeError, ValueError):
+                                        pass
+                conformal_result = build_conformal_result(
+                    calibrator,
+                    forecasts=_point_forecasts,
+                    horizons={"1d": 1, "5d": 5, "21d": 21, "252d": 252},
+                )
+                logger.info("Conformal prediction intervals computed")
+        except Exception as exc:
+            logger.warning("Conformal prediction failed: %s", exc)
+
+        # DTW analogs (before aggregation so results feed in)
+        try:
+            from operator1.models.dtw_analogs import find_historical_analogs
+            dtw_result = find_historical_analogs(cache)
+            logger.info("DTW analogs complete")
+        except Exception as exc:
+            logger.warning("DTW historical analogs failed: %s", exc)
+
+        # Prediction aggregation (now receives conformal + DTW results)
         if forecast_result is not None:
             try:
                 pred_result = run_prediction_aggregation(
@@ -1631,40 +1735,7 @@ Non-interactive examples:
             except Exception as exc:
                 logger.warning("Prediction aggregation failed: %s", exc)
 
-        # Conformal prediction
-        try:
-            from operator1.models.conformal import ConformalCalibrator, build_conformal_result
-            if forecast_result is not None and pred_result is not None:
-                calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
-                if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
-                    for r in forecast_result.residuals:
-                        calibrator.update(r)
-                _point_forecasts: dict[str, float] = {}
-                if hasattr(pred_result, "predictions"):
-                    for var, horizons_dict in pred_result.predictions.items():
-                        if isinstance(horizons_dict, dict):
-                            for h, hp in horizons_dict.items():
-                                pf = getattr(hp, "point_forecast", None)
-                                if pf is not None:
-                                    _point_forecasts[f"{var}_{h}"] = pf
-                conformal_result = build_conformal_result(
-                    calibrator,
-                    forecasts=_point_forecasts,
-                    horizons={"1d": 1, "5d": 5, "21d": 21, "252d": 252},
-                )
-                logger.info("Conformal prediction intervals computed")
-        except Exception as exc:
-            logger.warning("Conformal prediction failed: %s", exc)
-
-        # DTW analogs
-        try:
-            from operator1.models.dtw_analogs import find_historical_analogs
-            dtw_result = find_historical_analogs(cache)
-            logger.info("DTW analogs complete")
-        except Exception as exc:
-            logger.warning("DTW historical analogs failed: %s", exc)
-
-        # SHAP explainability
+        # SHAP explainability (after aggregation -- needs pred_result)
         try:
             from operator1.models.explainability import compute_shap_explanations
             if pred_result is not None:
@@ -1820,6 +1891,22 @@ Non-interactive examples:
             }
         else:
             profile["enriched_survival_timeline"] = {"available": False}
+
+        # Inject filing calendar analysis
+        if filing_calendar_result is not None:
+            profile["filing_calendar"] = {
+                "available": True,
+                "expected_frequency": filing_calendar_result.expected_frequency,
+                "detected_frequency": filing_calendar_result.detected_frequency,
+                "expected_filings_2yr": filing_calendar_result.expected_filings_2yr,
+                "actual_filings_2yr": filing_calendar_result.actual_filings_2yr,
+                "coverage_ratio": round(filing_calendar_result.coverage_ratio, 3),
+                "latest_filing_age_days": filing_calendar_result.latest_filing_age_days,
+                "is_stale": filing_calendar_result.is_stale,
+                "gaps": filing_calendar_result.gaps,
+            }
+        else:
+            profile["filing_calendar"] = {"available": False}
 
         # Inject economic plane classification
         try:

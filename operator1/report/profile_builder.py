@@ -28,7 +28,7 @@ import logging
 import math
 import os
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1097,7 +1097,7 @@ def build_company_profile(
     # Assemble profile
     profile: dict[str, Any] = {
         "meta": {
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": datetime.now(timezone.utc).isoformat() + "Z",
             "pipeline_version": "1.0.0",
             "date_range": {
                 "start": DATE_START.isoformat(),

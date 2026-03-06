@@ -234,13 +234,8 @@ class INBseClient:
     # -- Price data -----------------------------------------------------------
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:
-        """Fetch OHLCV price data via nselib (delegates to ohlcv_provider)."""
-        try:
-            from operator1.clients.ohlcv_provider import fetch_ohlcv
-            return fetch_ohlcv(identifier, market_id=self.market_id, years=2)
-        except Exception as exc:
-            logger.debug("OHLCV fetch failed for %s: %s", identifier, exc)
-            return pd.DataFrame()
+        """BSE does not provide OHLCV data. Handled by ohlcv_provider."""
+        return pd.DataFrame()
 
     # -- Peers / related entities --------------------------------------------
 

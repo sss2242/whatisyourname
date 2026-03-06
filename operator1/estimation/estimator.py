@@ -873,6 +873,10 @@ def run_estimation(
         len(coverage.pass2_estimates),
     )
 
+    # Defragment the DataFrame after adding many estimation columns.
+    # This eliminates PerformanceWarning from downstream consumers.
+    result = result.copy()
+
     return result, coverage
 
 
