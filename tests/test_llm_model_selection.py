@@ -29,8 +29,10 @@ class TestGetAvailableModels(unittest.TestCase):
 
         models = get_available_models("claude")
         tiers = [m["tier"] for m in models]
-        # flagship should come before balanced, balanced before stable, etc.
-        tier_order = {"flagship": 0, "balanced": 1, "stable": 2, "fast": 3, "preview": 4}
+        # Cost-aware ordering: balanced (cost-effective) first, flagship last.
+        # This matches llm_factory.get_available_models() which prioritizes
+        # cost-effective models for free-tier optimization.
+        tier_order = {"balanced": 0, "stable": 1, "fast": 2, "preview": 3, "flagship": 4}
         tier_indices = [tier_order.get(t, 99) for t in tiers]
         self.assertEqual(tier_indices, sorted(tier_indices))
 
