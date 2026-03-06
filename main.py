@@ -1415,6 +1415,7 @@ Non-interactive examples:
     # ------------------------------------------------------------------
     forecast_result = None
     forward_pass_result = None
+    walk_forward_result = None
     burnout_result = None
     mc_result = None
     pred_result = None
@@ -1617,6 +1618,23 @@ Non-interactive examples:
         except Exception as exc:
             logger.warning("Burn-out failed: %s", exc)
 
+        # Walk-forward evaluation (produces WalkForwardResult for recency-weighted RMSE)
+        try:
+            from operator1.models.walk_forward import run_walk_forward
+            from operator1.analysis.survival_timeline import compute_survival_timeline
+            _wf_timeline = compute_survival_timeline(cache)
+            walk_forward_result = run_walk_forward(cache, _wf_timeline)
+            if walk_forward_result and walk_forward_result.fitted:
+                logger.info(
+                    "Walk-forward: %d days evaluated, best=%s (MAE=%.6f)",
+                    walk_forward_result.total_days_evaluated,
+                    walk_forward_result.overall_best_model,
+                    walk_forward_result.overall_mae
+                    if not pd.isna(walk_forward_result.overall_mae) else 0.0,
+                )
+        except Exception as exc:
+            logger.warning("Walk-forward evaluation failed: %s", exc)
+
         # Monte Carlo
         try:
             mc_result = run_monte_carlo(cache)
@@ -1725,7 +1743,7 @@ Non-interactive examples:
                     dtw_result=dtw_result,
                     granger_result=granger_result,
                     shap_result=shap_result,
-                    walk_forward_result=forward_pass_result,
+                    walk_forward_result=walk_forward_result,
                 )
                 logger.info("Predictions aggregated (with %d sibling module results)",
                     sum(1 for r in [conformal_result, dual_regime_result,
@@ -1960,7 +1978,7 @@ Non-interactive examples:
             profile["extended_models"] = {}
 
         if transfer_entropy_result is not None:
-            profile["extended_models"]["transfer_entropy"] = {"available": True}
+            profile["extended_models"]["transfer_entropy"] = _available_dict(transfer_entropy_result)
         if cycle_result is not None:
             profile["extended_models"]["cycle_decomposition"] = _available_dict(cycle_result)
         if pattern_result is not None:
@@ -2037,6 +2055,14 @@ Non-interactive examples:
                     if dual_regime_result.fund_regime_labels is not None
                     else {}
                 ),
+            }
+
+        # Burn-out results
+        if burnout_result is not None:
+            profile["extended_models"]["burnout"] = {
+                "available": True,
+                "iterations_completed": burnout_result.iterations_completed,
+                "converged": burnout_result.converged,
             }
 
         # GA optimization
