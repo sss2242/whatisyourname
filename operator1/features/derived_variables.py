@@ -537,12 +537,16 @@ def _compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     close = df.get("close", pd.Series(np.nan, index=df.index))
 
-    # Simple Moving Averages (50-day and 200-day)
-    df["sma_50"] = close.rolling(window=50, min_periods=10).mean()
-    df["is_missing_sma_50"] = df["sma_50"].isna().astype(int)
+    # Collect all new columns in a dict to avoid DataFrame fragmentation
+    # (repeated df["col"] = ... triggers PerformanceWarning).
+    _new: dict[str, pd.Series] = {}
 
-    df["sma_200"] = close.rolling(window=200, min_periods=50).mean()
-    df["is_missing_sma_200"] = df["sma_200"].isna().astype(int)
+    # Simple Moving Averages (50-day and 200-day)
+    _new["sma_50"] = close.rolling(window=50, min_periods=10).mean()
+    _new["is_missing_sma_50"] = _new["sma_50"].isna().astype(int)
+
+    _new["sma_200"] = close.rolling(window=200, min_periods=50).mean()
+    _new["is_missing_sma_200"] = _new["sma_200"].isna().astype(int)
 
     # RSI (14-day) -- Relative Strength Index
     delta = close.diff()
@@ -551,24 +555,27 @@ def _compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     avg_gain = gain.rolling(window=14, min_periods=5).mean()
     avg_loss = loss.rolling(window=14, min_periods=5).mean()
     rs = avg_gain / avg_loss.where(avg_loss.abs() > EPSILON, other=np.nan)
-    df["rsi_14"] = 100.0 - (100.0 / (1.0 + rs))
-    df["is_missing_rsi_14"] = df["rsi_14"].isna().astype(int)
+    _new["rsi_14"] = 100.0 - (100.0 / (1.0 + rs))
+    _new["is_missing_rsi_14"] = _new["rsi_14"].isna().astype(int)
 
     # MACD (12/26/9 standard parameters)
     ema_12 = close.ewm(span=12, min_periods=8, adjust=False).mean()
     ema_26 = close.ewm(span=26, min_periods=18, adjust=False).mean()
-    df["macd"] = ema_12 - ema_26
-    df["macd_signal"] = df["macd"].ewm(span=9, min_periods=5, adjust=False).mean()
-    df["is_missing_macd"] = df["macd"].isna().astype(int)
-    df["is_missing_macd_signal"] = df["macd_signal"].isna().astype(int)
+    _new["macd"] = ema_12 - ema_26
+    _new["macd_signal"] = _new["macd"].ewm(span=9, min_periods=5, adjust=False).mean()
+    _new["is_missing_macd"] = _new["macd"].isna().astype(int)
+    _new["is_missing_macd_signal"] = _new["macd_signal"].isna().astype(int)
 
     # Bollinger Bands (20-day, 2 standard deviations)
     sma_20 = close.rolling(window=20, min_periods=5).mean()
     std_20 = close.rolling(window=20, min_periods=5).std()
-    df["bollinger_upper"] = sma_20 + 2 * std_20
-    df["bollinger_lower"] = sma_20 - 2 * std_20
-    df["is_missing_bollinger_upper"] = df["bollinger_upper"].isna().astype(int)
-    df["is_missing_bollinger_lower"] = df["bollinger_lower"].isna().astype(int)
+    _new["bollinger_upper"] = sma_20 + 2 * std_20
+    _new["bollinger_lower"] = sma_20 - 2 * std_20
+    _new["is_missing_bollinger_upper"] = _new["bollinger_upper"].isna().astype(int)
+    _new["is_missing_bollinger_lower"] = _new["bollinger_lower"].isna().astype(int)
+
+    # Assign all columns at once to avoid fragmentation
+    df = pd.concat([df, pd.DataFrame(_new, index=df.index)], axis=1)
 
     return df
 

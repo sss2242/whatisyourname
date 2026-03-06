@@ -32,10 +32,21 @@ class TestMacroBanxico:
     def test_fetch_with_mock(self):
         from operator1.clients.macro_banxico import fetch_macro_banxico
 
-        mock_data = {"2023-01-01": 11.25, "2023-02-01": 11.25, "2023-03-01": 11.0}
+        # Mock the banxicoapi.BanxicoApi.get() response format:
+        # Returns a list of dicts with "idSerie" and "datos" keys.
+        mock_api_response = [
+            {
+                "idSerie": "SF61745",
+                "datos": [
+                    {"fecha": "01/01/2023", "dato": "11.25"},
+                    {"fecha": "01/02/2023", "dato": "11.25"},
+                    {"fecha": "01/03/2023", "dato": "11.00"},
+                ],
+            }
+        ]
 
         mock_api = MagicMock()
-        mock_api.get_series_data.return_value = mock_data
+        mock_api.get.return_value = mock_api_response
 
         mock_banxicoapi = MagicMock()
         mock_banxicoapi.BanxicoApi.return_value = mock_api

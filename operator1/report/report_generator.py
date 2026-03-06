@@ -25,7 +25,7 @@ import logging
 import os
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -2528,7 +2528,7 @@ def _build_fallback_report(
     included = TIER_SECTIONS.get(tier, TIER_SECTIONS[ReportTier.PREMIUM])
 
     generated_at = profile.get("meta", {}).get(
-        "generated_at", datetime.utcnow().isoformat(),
+        "generated_at", datetime.now(timezone.utc).isoformat(),
     )
     identity = profile.get("identity", {})
     company_name = identity.get("name", "Unknown Company")
