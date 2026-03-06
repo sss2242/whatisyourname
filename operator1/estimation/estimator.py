@@ -539,7 +539,9 @@ def _build_estimation_columns(
         cols_dict[f"{var}_sensitivity_upper"] = sensitivity_upper
 
     new_cols = pd.DataFrame(cols_dict, index=df.index)
-    df[new_cols.columns] = new_cols
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*DataFrame is highly fragmented.*")
+        df[new_cols.columns] = new_cols
 
 
 # ---------------------------------------------------------------------------

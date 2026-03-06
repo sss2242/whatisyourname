@@ -69,8 +69,24 @@ def _fit_gaussian_copula(uniform_data: np.ndarray) -> np.ndarray:
     if len(normal_data) < 10:
         return np.eye(uniform_data.shape[1])
 
+    # Guard against zero-variance columns (constant values after PIT
+    # transform) which cause NaN in np.corrcoef.
+    col_std = np.std(normal_data, axis=0)
+    zero_var_mask = col_std < 1e-10
+    if zero_var_mask.any():
+        # Add tiny noise to constant columns to avoid NaN correlation
+        normal_data[:, zero_var_mask] += np.random.default_rng(42).normal(
+            0, 1e-6, size=(len(normal_data), int(zero_var_mask.sum()))
+        )
+
     # Correlation matrix of the normal-transformed data = copula parameter
     corr = np.corrcoef(normal_data, rowvar=False)
+
+    # Final NaN guard: replace any remaining NaN with identity
+    if np.isnan(corr).any():
+        np.fill_diagonal(corr, 1.0)
+        corr = np.nan_to_num(corr, nan=0.0)
+
     return corr
 
 
