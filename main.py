@@ -1615,25 +1615,19 @@ Non-interactive examples:
             try:
                 pred_result = run_prediction_aggregation(
                     cache, forecast_result, mc_result,
+                    conformal_result=conformal_result,
+                    dual_regime_result=dual_regime_result,
+                    copula_result=copula_result,
+                    dtw_result=dtw_result,
+                    granger_result=granger_result,
+                    shap_result=shap_result,
+                    walk_forward_result=forward_pass_result,
                 )
-                logger.info("Predictions aggregated")
-
-                # Copula tail adjustment
-                if (
-                    copula_result is not None
-                    and hasattr(copula_result, "tail_dependence")
-                    and copula_result.tail_dependence > 0.2
-                    and pred_result is not None
-                    and pred_result.fitted
-                ):
-                    _tail_mult = 1.0 + copula_result.tail_dependence
-                    for var_preds in pred_result.predictions.values():
-                        for hp in var_preds.values():
-                            if not (hp.lower_ci != hp.lower_ci):
-                                mid = hp.point_forecast
-                                hp.lower_ci = mid - (mid - hp.lower_ci) * _tail_mult
-                                hp.upper_ci = mid + (hp.upper_ci - mid) * _tail_mult
-                    logger.info("Copula tail adjustment applied")
+                logger.info("Predictions aggregated (with %d sibling module results)",
+                    sum(1 for r in [conformal_result, dual_regime_result,
+                        copula_result, dtw_result, granger_result,
+                        shap_result, forward_pass_result] if r is not None)
+                )
             except Exception as exc:
                 logger.warning("Prediction aggregation failed: %s", exc)
 
