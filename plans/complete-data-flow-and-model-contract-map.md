@@ -405,6 +405,51 @@ report generation, with expected vs actual inputs, outputs, and operations.
 
 ---
 
+## Phase F-extra: Modules Called Indirectly
+
+### Fx1. PID Controller -- `compute_pid_adjustment()` (called inside forward pass)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | Per-tier prediction error history | Same -- receives errors from forward pass loop | OK |
+| **Output** | Adaptive learning rate multiplier per tier | Same | OK |
+| **Operation** | PID (Proportional-Integral-Derivative) control loop that adjusts model learning rates based on prediction error trends. Prevents overshoot and oscillation during the forward pass. | Same | OK |
+
+### Fx2. Macro Alignment -- `align_yearly_series_to_daily()` (called inside macro_quadrant)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | Yearly or quarterly macro Series, daily DatetimeIndex | Same -- called from macro_quadrant.py | OK |
+| **Output** | Daily-frequency Series with forward-filled macro values | Same | OK |
+| **Operation** | Reindex a low-frequency macro series onto a daily business day index using forward-fill. Handles timezone and frequency mismatches. | Same | OK |
+
+### Fx3. Ethical Filters -- `compute_all_ethical_filters()` (called inside profile_builder)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache DataFrame | Same -- called from profile_builder.py line 762 | OK |
+| **Output** | Ethical filter results: manipulation signals, quality flags | Same | OK |
+| **Operation** | Scan financial data for signs of earnings manipulation, aggressive accounting, or data quality red flags. Complements Beneish M-Score from financial_health. | Same | OK |
+
+---
+
+## Modules That Exist But Are NOT Wired Into The Pipeline
+
+These modules exist in the codebase but are **not called** from `main.py`
+or from any module that `main.py` calls. They may be planned features,
+legacy code, or utilities awaiting integration:
+
+| Module | Location | Purpose | Status |
+|--------|----------|---------|--------|
+| `vanity.py` | `analysis/vanity.py` | Vanity metric detection | Not wired |
+| `portfolio_analysis.py` | `features/portfolio_analysis.py` | Portfolio-level analysis | Not wired |
+| `data_extraction.py` | `steps/data_extraction.py` | Legacy data extraction (replaced by inline main.py logic) | Not wired |
+| `verify_identifiers.py` | `steps/verify_identifiers.py` | Legacy identifier verification (imported by data_extraction only) | Not wired |
+| `supplement.py` | `clients/supplement.py` | Supplementary data provider | Not wired |
+| `llm_filing_extractor.py` | `clients/llm_filing_extractor.py` | LLM-based filing field extraction | Not wired |
+
+---
+
 ## Phase G: Profile Building
 
 ### G1. Profile Builder -- `build_company_profile()`
