@@ -141,6 +141,51 @@ report generation, with expected vs actual inputs, outputs, and operations.
 | **Output** | cache + `sentiment_*` columns, `sentiment_result` | Same | OK |
 | **Operation** | 1. Fetch news via gnews/feedparser. 2. Score sentiment via LLM (if available) or keyword fallback. 3. Write daily sentiment score to cache. | Same | OK |
 
+### C10. Filing Calendar -- `analyze_filing_calendar()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache, `market_id` string | Same | OK |
+| **Output** | `filing_calendar_result` with `expected_frequency`, `detected_frequency`, `expected_filings_2yr`, `actual_filings_2yr`, `coverage_ratio`, `latest_filing_age_days`, `is_stale`, `stale_threshold_days`, `gaps` list | Same | OK |
+| **Operation** | 1. Detect filing frequency from cache date patterns (quarterly, semi-annual, annual). 2. Count expected vs actual filings in 2-year window. 3. Compute coverage ratio. 4. Detect staleness (latest filing age vs market-specific threshold). 5. Identify filing gaps. | Same | OK |
+| **Profile** | Stored in `profile["filing_calendar"]` with all fields | Same | OK |
+
+### C11. Graph Risk -- `compute_graph_risk_metrics()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `target_isin` (or ticker), `relationships` dict from entity discovery | Same | OK |
+| **Output** | `graph_risk_result` with `n_nodes`, `target_degree_centrality`, network topology metrics | Same | OK |
+| **Operation** | Build network graph from entity relationships. Compute degree centrality, betweenness centrality, clustering coefficient for the target node. Identify systemically important connections. | Same | OK |
+| **Profile** | Stored via `_available_dict(graph_risk_result)` | Same | OK |
+
+### C12. Game Theory -- `analyze_competitive_dynamics()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `target_cache`, `target_name` string | Same | OK |
+| **Output** | `game_theory_result` with `market_structure` (monopoly/oligopoly/competitive), `competitive_pressure` (0-1), strategic interaction analysis | Same | OK |
+| **Operation** | Analyze market structure and competitive dynamics from financial metrics. Classify market concentration. Estimate competitive pressure index. | Same | OK |
+| **Profile** | Stored via `_available_dict(game_theory_result)` | Same | OK |
+
+### C13. Economic Planes -- `classify_economic_plane()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `sector` string, `industry` string | Same | OK |
+| **Output** | Dict with `primary_plane` (one of 5 planes), `secondary_planes` list | Same | OK |
+| **Operation** | Map sector/industry to one of 5 economic planes from the Sudoku framework: Real Economy, Financial, Technology, Resources, Services. Used for plane-aware model weighting in pre-forecasting synergies. | Same | OK |
+| **Profile** | Stored in `profile["economic_plane"]` | Same | OK |
+
+### C14. OHLCV Provider (fallback) -- `fetch_ohlcv()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `ticker` string, `market_id` string | Same | OK |
+| **Output** | `quotes_df` DataFrame with date, open, high, low, close, volume columns | Same | OK |
+| **Operation** | When the PIT filing API does not provide price data (most don't -- SEC EDGAR, DART, etc.), fetch OHLCV from a free-tier source: yfinance (global fallback), or per-region wrappers (pykrx for Korea, baostock for China, twstock for Taiwan, nselib for India). | Same | OK |
+| **Note** | OHLCV source is tracked separately in `profile["meta"]["ohlcv_source"]` | Same | OK |
+
 ---
 
 ## Phase D: Estimation Engine
