@@ -100,6 +100,11 @@ class ModelMetrics:
     fitted: bool = False
     error: str | None = None
 
+    # Actual validation residuals (predicted - actual) from train/test split.
+    # Used by ConformalCalibrator for distribution-free interval estimation.
+    # If None, the calibrator falls back to synthetic +/-RMSE pairs.
+    test_residuals: list[float] | None = None
+
 
 @dataclass
 class ForecastResult:
@@ -154,6 +159,24 @@ def _compute_metrics(
     mae = float(np.mean(np.abs(yt - yp)))
     rmse = float(np.sqrt(np.mean((yt - yp) ** 2)))
     return mae, rmse
+
+
+def _compute_residuals(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> list[float]:
+    """Return list of (actual - predicted) residuals for non-NaN pairs.
+
+    Used to feed the ConformalCalibrator with actual validation residuals
+    instead of synthetic +/-RMSE pairs.
+    """
+    y_true = np.asarray(y_true, dtype=float).ravel()
+    y_pred = np.asarray(y_pred, dtype=float).ravel()
+    n = min(len(y_true), len(y_pred))
+    if n == 0:
+        return []
+    mask = ~(np.isnan(y_true[:n]) | np.isnan(y_pred[:n]))
+    return (y_true[:n][mask] - y_pred[:n][mask]).tolist()
 
 
 def _split_train_test(
@@ -259,6 +282,7 @@ def fit_kalman(
             forecast_obj = result.get_forecast(steps=len(test))
             preds = forecast_obj.predicted_mean
             mae, rmse = _compute_metrics(test, preds)
+            metrics.test_residuals = _compute_residuals(test, preds)
         else:
             mae, rmse = float("nan"), float("nan")
 
@@ -707,6 +731,7 @@ def fit_lstm(
                 preds_test_denorm = preds_test * std_val + mean_val
                 y_test_denorm = y_test * std_val + mean_val
                 mae, rmse = _compute_metrics(y_test_denorm, preds_test_denorm)
+                metrics.test_residuals = _compute_residuals(y_test_denorm, preds_test_denorm)
             else:
                 mae, rmse = float("nan"), float("nan")
 
@@ -1048,6 +1073,7 @@ def _fit_linear_fallback(
         if len(X_test) > 0:
             preds = model.predict(X_test)
             mae, rmse = _compute_metrics(y_test, preds)
+            metrics.test_residuals = _compute_residuals(y_test, preds)
         else:
             mae, rmse = float("nan"), float("nan")
 
@@ -1147,6 +1173,7 @@ def fit_tree_ensemble(
         if len(X_test) > 0:
             preds = model_obj.predict(X_test)
             mae, rmse = _compute_metrics(y_test, preds)
+            metrics.test_residuals = _compute_residuals(y_test, preds)
         else:
             mae, rmse = float("nan"), float("nan")
 
@@ -1287,6 +1314,7 @@ def fit_baseline(
         metrics.rmse = rmse
         metrics.n_train = split
         metrics.n_test = len(test)
+        metrics.test_residuals = _compute_residuals(test, preds)
 
     logger.info(
         "Baseline (%s) forecast: %.6f (n_forecast=%d)",
@@ -1676,19 +1704,24 @@ def run_forecasting(
         )
 
     # Collect validation residuals from fitted models for conformal calibration.
-    # Each metric with a finite RMSE contributed a train/test split; we use the
-    # RMSE values as representative residual magnitudes.  The conformal
-    # calibrator in main.py uses these to produce distribution-free intervals.
+    # Prefer actual test residuals stored per-metric (distribution-free).
+    # Fall back to synthetic +/-RMSE pairs if no real residuals available.
     _residuals: list[float] = []
+    _has_real = False
     for met in result.metrics:
-        if met.fitted and np.isfinite(met.rmse) and met.rmse > 0:
-            # Synthesise representative residuals from RMSE:
-            # +/- RMSE covers 68% of errors under Gaussian assumption.
+        if met.fitted and met.test_residuals:
+            _residuals.extend(met.test_residuals)
+            _has_real = True
+        elif met.fitted and np.isfinite(met.rmse) and met.rmse > 0:
+            # Synthetic fallback: +/- RMSE (Gaussian assumption).
             _residuals.append(met.rmse)
             _residuals.append(-met.rmse)
     if _residuals:
         result.residuals = _residuals
-        logger.info("Collected %d residual samples for conformal calibration", len(_residuals))
+        logger.info(
+            "Collected %d %s residual samples for conformal calibration",
+            len(_residuals), "real" if _has_real else "synthetic",
+        )
 
     return cache, result
 
