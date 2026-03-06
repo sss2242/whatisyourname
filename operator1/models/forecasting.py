@@ -1444,18 +1444,24 @@ def run_forecasting(
     # model gets consistent, quality-checked inputs from the pipeline.
 
     def _extract_series(var: str) -> np.ndarray:
-        """Extract a single variable's values from the cache."""
+        """Extract a single variable's values from the cache.
+
+        The pipeline's estimation step (Step 4b) fills missing values
+        before forecasting runs. This function simply extracts whatever
+        the estimator produced -- observed, estimated, or still NaN.
+        """
         return cache[var].values
 
     def _extract_multivariate(target: str, max_cols: int = 10) -> pd.DataFrame:
         """Extract a multivariate DataFrame for VAR from the cache.
 
-        Selects numeric columns with >50% non-NaN coverage to avoid
-        feeding mostly-empty columns into the VAR model.
+        Selects numeric variables that have at least some non-NaN values.
+        Columns that are entirely NaN (not even the estimator could fill
+        them) are excluded since VAR needs at least some observations.
         """
         candidates = [
             c for c in available_vars
-            if c in cache.columns and cache[c].notna().mean() > 0.5
+            if c in cache.columns and cache[c].notna().any()
         ][:max_cols]
         if target not in candidates:
             candidates = [target] + candidates[:max_cols - 1]
@@ -1464,8 +1470,10 @@ def run_forecasting(
     def _extract_features(target: str, max_cols: int = 15) -> pd.DataFrame:
         """Extract a feature DataFrame for tree ensembles from the cache.
 
-        Selects numeric columns with >30% non-NaN coverage, excluding
-        flag columns and the target itself.
+        Excludes metadata flag columns (is_missing_*, invalid_math_*)
+        which describe data quality rather than financial state. All
+        substantive financial columns are kept -- the estimator should
+        have already filled missing values in Step 4b.
         """
         feature_cols = [
             c for c in cache.columns
@@ -1473,7 +1481,7 @@ def run_forecasting(
             and not c.startswith("is_missing_")
             and not c.startswith("invalid_math_")
             and cache[c].dtype in (np.float64, np.float32, np.int64)
-            and cache[c].notna().mean() > 0.3
+            and cache[c].notna().any()  # exclude entirely empty columns
         ][:max_cols]
         if not feature_cols:
             return pd.DataFrame()
