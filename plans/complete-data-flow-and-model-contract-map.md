@@ -531,3 +531,5 @@ existing data).
 | W7 | supplement.py | Profile enrichment for non-US markets never called | **NOT YET FIXED** -- needs wiring in main.py after Step 2 |
 | W8 | main.py:1109 | `analyze_competitive_dynamics()` never receives `linked_caches` -- always returns "monopoly" with 0 competitors | **NOT YET FIXED** -- pass `competitor_caches=linked_caches` |
 | W9 | main.py:1758 | `compute_shap_explanations()` never receives `tree_models` or `predict_fns` -- explanations always empty | **NOT YET FIXED** -- pass fitted model objects from forecasting |
+| P3 | derived_variables.py:662 | PerformanceWarning from 39 column-by-column insertions across compute stages | Added `result.copy()` defragmentation before return |
+| S2 | genetic_optimizer.py:182 | GA uses EWM/shifted proxy predictions instead of actual per-model forecast arrays | **DESIGN LIMITATION** -- comment at line 183 acknowledges "in production, these would come from stored per-model predictions" |
