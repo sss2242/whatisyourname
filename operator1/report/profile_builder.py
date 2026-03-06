@@ -813,12 +813,25 @@ def _build_failed_modules_section(
             "lstm": "LSTM",
             "tree": "RF/GBM/XGB",
         }
+        # Collect variables that fell through to baseline_zero (all-NaN data)
+        model_used = forecast_result.get("model_used", {})
+        zero_vars = [v for v, m in model_used.items() if m == "baseline_zero"]
+
         for key, name in model_names.items():
             if forecast_result.get(f"model_failed_{key}", False):
                 error = forecast_result.get(f"{key}_error", "")
+                # Add context about which variables were affected
+                affected_note = ""
+                if zero_vars and key in ("kalman", "var", "lstm", "tree"):
+                    affected_note = (
+                        f" Affected variables with no data: "
+                        f"{', '.join(zero_vars[:5])}"
+                        f"{'...' if len(zero_vars) > 5 else ''}"
+                        f" ({len(zero_vars)} total)."
+                    )
                 failed.append({
                     "module": f"Forecasting ({name})",
-                    "error": error or "model failed",
+                    "error": (error or "model failed") + affected_note,
                     "mitigation": (
                         "Forecasts produced by next model in fallback "
                         "chain; baseline (last-value/EMA) always succeeds."

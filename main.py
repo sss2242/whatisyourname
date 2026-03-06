@@ -42,11 +42,56 @@ import pandas as pd
 # Early setup: configure logging before any operator1 imports
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
+_LOG_DIR = Path("cache")
+_LOG_FILE = _LOG_DIR / "pipeline_run.md"
+
+
+def _setup_logging() -> None:
+    """Configure logging to both console and a markdown log file.
+
+    The markdown log is saved to ``cache/pipeline_run.md`` so that users
+    can review the full pipeline output after the run completes.
+    """
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    # Console handler
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    root_logger.addHandler(console)
+
+    # Markdown file handler -- writes a fenced code block for easy reading
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(_LOG_FILE, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    root_logger.addHandler(file_handler)
+
+    # Write markdown header
+    with open(_LOG_FILE, "w", encoding="utf-8") as f:
+        f.write("# Operator 1 -- Pipeline Run Log\n\n")
+        f.write(f"**Started:** {date.today().isoformat()}\n\n")
+        f.write("```\n")
+
+
+def _finalize_log() -> None:
+    """Close the markdown fenced code block in the log file."""
+    try:
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("```\n\n")
+            f.write(f"**Log saved to:** `{_LOG_FILE}`\n")
+    except Exception:
+        pass
+
+
+_setup_logging()
 logger = logging.getLogger("operator1.main")
 
 
@@ -626,6 +671,7 @@ Non-interactive examples:
     # OHLCV source (Alpha Vantage or exchange-specific APIs).
     # Raw exchange OHLCV is inherently PIT: a trade at a given price on
     # a given date is an immutable fact that never changes retroactively.
+    _ohlcv_source_label = market_info.pit_api_name  # default: same as PIT source
     if quotes_df.empty and ticker:
         logger.info(
             "PIT source %s does not provide OHLCV -- fetching from OHLCV provider.",
@@ -635,7 +681,8 @@ Non-interactive examples:
             from operator1.clients.ohlcv_provider import fetch_ohlcv
             quotes_df = fetch_ohlcv(ticker, market_id=args.market)
             if not quotes_df.empty:
-                logger.info("OHLCV fetched from provider: %d rows", len(quotes_df))
+                _ohlcv_source_label = "yfinance (Yahoo Finance)"
+                logger.info("OHLCV fetched from yfinance provider: %d rows", len(quotes_df))
         except Exception as exc:
             logger.warning("OHLCV provider failed: %s", exc)
 
@@ -1568,25 +1615,19 @@ Non-interactive examples:
             try:
                 pred_result = run_prediction_aggregation(
                     cache, forecast_result, mc_result,
+                    conformal_result=conformal_result,
+                    dual_regime_result=dual_regime_result,
+                    copula_result=copula_result,
+                    dtw_result=dtw_result,
+                    granger_result=granger_result,
+                    shap_result=shap_result,
+                    walk_forward_result=forward_pass_result,
                 )
-                logger.info("Predictions aggregated")
-
-                # Copula tail adjustment
-                if (
-                    copula_result is not None
-                    and hasattr(copula_result, "tail_dependence")
-                    and copula_result.tail_dependence > 0.2
-                    and pred_result is not None
-                    and pred_result.fitted
-                ):
-                    _tail_mult = 1.0 + copula_result.tail_dependence
-                    for var_preds in pred_result.predictions.values():
-                        for hp in var_preds.values():
-                            if not (hp.lower_ci != hp.lower_ci):
-                                mid = hp.point_forecast
-                                hp.lower_ci = mid - (mid - hp.lower_ci) * _tail_mult
-                                hp.upper_ci = mid + (hp.upper_ci - mid) * _tail_mult
-                    logger.info("Copula tail adjustment applied")
+                logger.info("Predictions aggregated (with %d sibling module results)",
+                    sum(1 for r in [conformal_result, dual_regime_result,
+                        copula_result, dtw_result, granger_result,
+                        shap_result, forward_pass_result] if r is not None)
+                )
             except Exception as exc:
                 logger.warning("Prediction aggregation failed: %s", exc)
 
@@ -1803,6 +1844,11 @@ Non-interactive examples:
         profile["meta"]["pit_source"] = True
         profile["meta"]["using_pit_only"] = True
 
+        # Track the actual OHLCV source separately from the filing source.
+        # SEC EDGAR and most PIT filing APIs don't provide price data --
+        # OHLCV typically comes from yfinance or a per-region wrapper.
+        profile["meta"]["ohlcv_source"] = _ohlcv_source_label
+
         # Inject macro data summary
         if macro_api_info:
             profile["meta"]["macro_source"] = macro_api_info.api_name
@@ -2011,4 +2057,8 @@ def _generate_report_only(args: argparse.Namespace, secrets: dict) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        exit_code = main()
+    finally:
+        _finalize_log()
+    sys.exit(exit_code)

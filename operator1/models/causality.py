@@ -62,6 +62,12 @@ def compute_granger_causality(
 ) -> pd.DataFrame:
     """Compute pairwise Granger-causality matrix.
 
+    .. deprecated::
+        This is a backward-compatible wrapper. The canonical implementation
+        lives in :mod:`operator1.models.granger_causality` and returns a
+        ``GrangerResult`` dataclass.  This wrapper converts the result to a
+        DataFrame matrix for backward compatibility with existing callers.
+
     Parameters
     ----------
     cache:
@@ -80,7 +86,12 @@ def compute_granger_causality(
         entry ``[y, x]`` is 1 if ``x`` Granger-causes ``y`` at the
         given significance level, else 0.
     """
-    # Filter to available columns first (before dependency check).
+    from operator1.models.granger_causality import (
+        compute_granger_causality as _canonical_granger,
+    )
+
+    # Filter to columns actually present in the cache (backward compat --
+    # the old implementation silently dropped missing columns).
     available = [v for v in variables if v in cache.columns]
     missing = set(variables) - set(available)
     if missing:
@@ -90,94 +101,25 @@ def compute_granger_causality(
             sorted(missing)[:5],
         )
 
-    try:
-        from statsmodels.tsa.stattools import grangercausalitytests  # type: ignore[import-untyped]
-    except ImportError:
-        logger.warning(
-            "statsmodels not installed -- returning empty causality matrix"
-        )
-        return pd.DataFrame(
-            np.zeros((len(available), len(available))),
-            index=available,
-            columns=available,
-        )
-    if len(available) < 2:
-        logger.warning("Need at least 2 variables for Granger test")
-        return pd.DataFrame(
-            np.zeros((len(available), len(available))),
-            index=available,
-            columns=available,
-        )
-
-    # Prepare clean data.
-    data = cache[available].dropna()
-
-    if len(data) < max_lag + 5:
-        logger.warning(
-            "Insufficient observations (%d) for Granger test (need > %d)",
-            len(data),
-            max_lag + 5,
-        )
-        return pd.DataFrame(
-            np.zeros((len(available), len(available))),
-            index=available,
-            columns=available,
-        )
-
-    logger.info(
-        "Computing Granger causality: %d variables, %d observations, max_lag=%d",
-        len(available),
-        len(data),
-        max_lag,
+    # Delegate to the canonical implementation
+    result = _canonical_granger(
+        cache,
+        variables=available,
+        max_lag=max_lag,
+        significance_level=significance,
     )
-
     matrix = pd.DataFrame(
         np.zeros((len(available), len(available))),
         index=available,
         columns=available,
     )
 
-    n_tests = 0
-    n_significant = 0
-
-    for y_var in available:
-        for x_var in available:
-            if y_var == x_var:
-                continue
-
-            try:
-                # grangercausalitytests expects [y, x] column order.
-                test_result = grangercausalitytests(
-                    data[[y_var, x_var]],
-                    maxlag=max_lag,
-                    verbose=False,
-                )
-
-                # Get minimum p-value across all tested lags.
-                p_values = []
-                for lag in range(1, max_lag + 1):
-                    if lag in test_result:
-                        p_val = test_result[lag][0]["ssr_ftest"][1]
-                        p_values.append(p_val)
-
-                if p_values:
-                    min_p = min(p_values)
-                    if min_p < significance:
-                        matrix.loc[y_var, x_var] = 1
-                        n_significant += 1
-
-                n_tests += 1
-
-            except Exception:
-                # Singular matrix, constant series, etc. -- skip pair.
-                pass
-
-    logger.info(
-        "Granger causality: %d pairs tested, %d significant (%.1f%%)",
-        n_tests,
-        n_significant,
-        100 * n_significant / max(n_tests, 1),
-    )
+    if result.fitted and result.significant_pairs:
+        for pair in result.significant_pairs:
+            source = pair.get("source", "")
+            target = pair.get("target", "")
+            if source in matrix.columns and target in matrix.index:
+                matrix.loc[target, source] = 1
 
     return matrix
 

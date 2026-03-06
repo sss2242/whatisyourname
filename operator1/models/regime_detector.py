@@ -178,42 +178,63 @@ class RegimeDetector:
             self._result.hmm_error = msg
             return None, None
 
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                model = GaussianHMM(
-                    n_components=self.n_regimes,
-                    covariance_type="full",
-                    n_iter=200,
-                    random_state=self.random_state,
-                    verbose=False,
+        # Add small regularization to prevent singular covariance matrices.
+        # Near-zero variance in one feature (e.g., very low-vol regime)
+        # can cause 'covars must be symmetric, positive-definite' errors.
+        _epsilon = 1e-6
+        X_clean = X_clean + np.random.default_rng(self.random_state).normal(
+            0, _epsilon, size=X_clean.shape
+        )
+
+        # Try full covariance first, fall back to diagonal if singular.
+        for cov_type in ("full", "diag"):
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    model = GaussianHMM(
+                        n_components=self.n_regimes,
+                        covariance_type=cov_type,
+                        n_iter=200,
+                        random_state=self.random_state,
+                        verbose=False,
+                    )
+                    model.fit(X_clean)
+
+                regimes = model.predict(X_clean)
+                probs = model.predict_proba(X_clean)
+
+                self._hmm_model = model
+                self._result.hmm_regimes = regimes
+                self._result.hmm_probs = probs
+                self._result.hmm_fitted = True
+
+                monitor = getattr(model, "monitor_", None)
+                converged = getattr(monitor, "converged", "unknown") if monitor is not None else "unknown"
+                logger.info(
+                    "HMM fit: %d regimes, %d observations, cov=%s, converged=%s",
+                    self.n_regimes,
+                    len(X_clean),
+                    cov_type,
+                    converged,
                 )
-                model.fit(X_clean)
+                return regimes, probs
 
-            regimes = model.predict(X_clean)
-            probs = model.predict_proba(X_clean)
+            except Exception as exc:
+                if cov_type == "full":
+                    logger.info(
+                        "HMM full covariance failed (%s), retrying with diagonal covariance",
+                        exc,
+                    )
+                    continue
+                msg = f"HMM fitting failed: {exc}"
+                logger.warning(msg)
+                self._result.hmm_error = msg
+                return None, None
 
-            self._hmm_model = model
-            self._result.hmm_regimes = regimes
-            self._result.hmm_probs = probs
-            self._result.hmm_fitted = True
-
-            # ConvergenceMonitor is an object, not a dict; use getattr.
-            monitor = getattr(model, "monitor_", None)
-            converged = getattr(monitor, "converged", "unknown") if monitor is not None else "unknown"
-            logger.info(
-                "HMM fit: %d regimes, %d observations, converged=%s",
-                self.n_regimes,
-                len(X_clean),
-                converged,
-            )
-            return regimes, probs
-
-        except Exception as exc:
-            msg = f"HMM fitting failed: {exc}"
-            logger.warning(msg)
-            self._result.hmm_error = msg
-            return None, None
+        msg = "HMM fitting failed: all covariance types exhausted"
+        logger.warning(msg)
+        self._result.hmm_error = msg
+        return None, None
 
     # ------------------------------------------------------------------
     # GMM
