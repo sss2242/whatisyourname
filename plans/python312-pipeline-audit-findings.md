@@ -205,10 +205,346 @@ future setuptools versions.
 
 ---
 
+---
+
+## Skipped Tests Investigation
+
+5 tests were skipped due to missing API keys. After setting the keys:
+
+| Test | API Key | Result |
+|------|---------|--------|
+| `test_fredapi_us` | FRED_API_KEY | PASSED |
+| `test_banxico_mexico` | BANXICO_TOKEN | PASSED |
+| `test_uk_ch_hsbc` | COMPANIES_HOUSE_API_KEY | PASSED |
+| `test_dart_fss_samsung` | DART_API_KEY | Deferred (slow rate limit 0.15s/call) |
+| `test_jquants_toyota` | JQUANTS_REFRESH_TOKEN | Deferred (slow rate limit 6s/call) |
+
+Both DART and J-Quants wrappers have proper rate limiting built into their
+production code (`_dart_throttle()` at 0.15s intervals, `_jquants_throttle()`
+at 6.0s intervals). Every API method calls the throttle before making requests.
+
+---
+
+## Full Data Flow Map (Input/Output per Model)
+
+### Step 1-3: Data Ingestion
+
+```
+PIT client
+  IN:  market_id, company identifier, secrets
+  OUT: profile dict, income_df, balance_df, cashflow_df, quotes_df
+
+OHLCV provider (fallback when PIT has no prices)
+  IN:  ticker, market_id
+  OUT: quotes_df
+
+Data reconciliation
+  IN:  income_df, balance_df, cashflow_df
+  OUT: cleaned income_df, balance_df, cashflow_df, reconciliation_report
+
+Canonical translator (pivot_to_canonical_wide)
+  IN:  long-format statement DataFrames
+  OUT: wide-format DataFrames (one row per date, columns = canonical field names)
+```
+
+### Step 4: Cache Building
+
+```
+Cache builder (main.py inline)
+  IN:  quotes_df, income_df, balance_df, cashflow_df
+  OUT: cache DataFrame (daily OHLCV spine + forward-filled financials)
+
+Macro provider
+  IN:  country_code, secrets, years
+  OUT: macro_data dict {indicator_name: pd.Series}
+
+Macro mapping (fetch_macro_data)
+  IN:  country_iso2, macro_raw dict
+  OUT: MacroDataset object
+
+Macro quadrant (compute_macro_quadrant)
+  IN:  cache, macro_data (MacroDataset)
+  OUT: cache (+ macro_quadrant columns), macro_quadrant_result
+
+Estimator (run_estimation)
+  IN:  cache, imputer_method
+  OUT: cache (+ estimation columns), estimation_coverage
+
+Filing calendar (analyze_filing_calendar)
+  IN:  cache, market_id
+  OUT: filing_calendar_result
+```
+
+### Step 5: Feature Engineering
+
+```
+Derived variables (compute_derived_variables)
+  IN:  cache
+  OUT: cache (+ ~25 derived columns: return_1d, volatility_21d, drawdown_252d, ratios, etc.)
+
+Survival mode (compute_company_survival_flag)
+  IN:  cache (needs current_ratio, debt_to_equity_abs, fcf_yield, drawdown_252d)
+  OUT: cache["company_survival_mode_flag"]
+
+Hierarchy weights (compute_hierarchy_weights)
+  IN:  cache
+  OUT: cache (+ hierarchy_tier*_weight columns), weights dict
+
+Fuzzy protection (compute_fuzzy_protection)
+  IN:  cache, sector, gdp
+  OUT: cache (+ fuzzy_protection_degree, fuzzy_sector_score, fuzzy_protection_label)
+
+Financial health (compute_financial_health)
+  IN:  cache, hierarchy_weights
+  OUT: cache (+ fh_* columns), fh_result (FinancialHealthResult)
+
+LLM entity discovery (discover_linked_entities)
+  IN:  target_profile, gemini_client, pit_client, secrets
+  OUT: relationships dict
+
+Graph risk (compute_graph_risk_metrics)
+  IN:  target_isin, relationships
+  OUT: graph_risk_result
+
+Game theory (analyze_competitive_dynamics)
+  IN:  target_cache, target_name
+  OUT: game_theory_result
+
+Linked entity fetch (parallel)
+  IN:  pit_client, entity IDs
+  OUT: linked_caches dict {entity_id: DataFrame}
+
+Linked aggregates (compute_linked_aggregates)
+  IN:  target_daily cache, linked_daily caches, entity_groups
+  OUT: linked_agg_df -> merged into cache
+
+Peer ranking (compute_peer_ranking)
+  IN:  cache, linked_caches
+  OUT: cache (+ peer_* columns), peer_ranking_result
+
+News sentiment (compute_news_sentiment)
+  IN:  cache, gemini_client, symbol
+  OUT: cache (+ sentiment_* columns), sentiment_result
+```
+
+### Step 5.5: Enriched Survival Timeline
+
+```
+Early regime detection (run_early_regime_detection)
+  IN:  cache
+  OUT: cache (+ regime_hmm, regime_gmm, regime_label, structural_break columns),
+       early_regime_result, regime_detector
+
+Enriched survival timeline (compute_enriched_survival_timeline)
+  IN:  cache, regime_labels, regime_confidence
+  OUT: enriched_timeline_result -> merged into cache
+       (regime_state, survival_intensity, regime_confidence, regime_switch, etc.)
+```
+
+### Step 6: Temporal Modeling
+
+```
+Regime detector (detect_regimes_and_breaks) -- SKIP if done in 5.5
+  IN:  cache
+  OUT: cache (+ regime columns), regime_detector
+
+Dual regime mixer (compute_dual_regimes)
+  IN:  cache
+  OUT: dual_regime_result
+
+Granger causality (compute_granger_causality)
+  IN:  cache, variables
+  OUT: granger_result -> prunes _extra_vars list
+
+Transfer entropy (compute_transfer_entropy)
+  IN:  cache, variables
+  OUT: transfer_entropy_result
+
+Cycle decomposition (run_cycle_decomposition)
+  IN:  cache, variable="close"
+  OUT: cycle_result
+
+Pattern detector (detect_patterns)
+  IN:  cache
+  OUT: pattern_result
+
+Economic planes (classify_economic_plane)
+  IN:  sector, industry
+  OUT: _economic_plane
+
+Pre-forecasting synergies (apply_pre_forecasting_synergies)
+  IN:  cache, cycle_result, granger_result, transfer_entropy_result,
+       linked_caches, extra_variables, economic_plane
+  OUT: cache (+ synergy features), _extra_vars (updated), _synergy_meta
+
+Forecasting (run_forecasting)
+  IN:  cache, extra_variables
+  OUT: cache, forecast_result (ForecastResult)
+
+Forward pass (run_forward_pass)
+  IN:  cache, hierarchy_weights, regime_labels, extra_variables
+  OUT: forward_pass_result (ForwardPassResult)
+
+Burn-out (run_burnout)
+  IN:  cache, hierarchy_weights, regime_labels, extra_variables
+  OUT: burnout_result (BurnoutResult)
+
+Monte Carlo (run_monte_carlo)
+  IN:  cache
+  OUT: mc_result (MonteCarloResult)
+
+Copula (run_copula_analysis)
+  IN:  cache
+  OUT: copula_result
+
+Transformer (train_transformer)
+  IN:  cache, variables
+  OUT: transformer_result -> forecasts injected into forecast_result
+
+Particle filter (run_particle_filter)
+  IN:  cache, variables
+  OUT: particle_filter_result
+
+Conformal (build_conformal_result)
+  IN:  calibrator, forecasts, horizons
+  OUT: conformal_result
+
+DTW analogs (find_historical_analogs)
+  IN:  cache
+  OUT: dtw_result
+
+Prediction aggregator (run_prediction_aggregation)
+  IN:  cache, forecast_result, mc_result, conformal_result,
+       dual_regime_result, copula_result, dtw_result,
+       granger_result, shap_result, walk_forward_result(!)
+  OUT: pred_result (PredictionAggregatorResult)
+
+SHAP explainability (compute_shap_explanations)
+  IN:  cache, predictions (from pred_result)
+  OUT: shap_result
+
+Sobol sensitivity (run_sensitivity_analysis)
+  IN:  cache, target_variable
+  OUT: sobol_result
+
+Genetic optimizer (run_genetic_optimization)
+  IN:  cache, forecast_result
+  OUT: ga_result
+
+OHLC predictor (predict_ohlc_series)
+  IN:  cache, forecast_result, mc_result, pattern_drift_multiplier
+  OUT: ohlc_result
+```
+
+### Step 7-8: Profile & Report
+
+```
+Profile builder (build_company_profile)
+  IN:  target_profile, cache, linked_aggregates, all model results
+  OUT: profile dict -> saved as JSON
+
+Report generator (generate_all_reports)
+  IN:  profile, llm_client, cache, output_dir
+  OUT: markdown + optional PDF reports
+```
+
+---
+
+## Wiring Issues Found
+
+### W1: `ForwardPassResult` passed as `WalkForwardResult` (Type Mismatch)
+
+**Severity:** Medium (silent feature degradation)
+**Location:** `main.py:1728`
+**Issue:** `forward_pass_result` (type `ForwardPassResult` from `forecasting.py`)
+is passed to `run_prediction_aggregation()` as the `walk_forward_result` parameter,
+which expects a `WalkForwardResult` (from `walk_forward.py`).
+
+`ForwardPassResult` has: `errors_by_tier`, `errors_by_regime`, `model_states`,
+`predictions_log`, `total_days`, `warmup_days`, `pid_summary`.
+
+`WalkForwardResult` has: `day_errors`, `mode_scores`, `best_model_by_mode`,
+`retrain_dates`, `total_days_evaluated`, `total_predictions`, `n_retrains`,
+`overall_best_model`, `overall_mae`.
+
+The prediction aggregator tries to access `day_errors` via
+`getattr(walk_forward_result, "day_errors", [])` which always returns `[]`
+because `ForwardPassResult` doesn't have this attribute. As a result,
+**recency-weighted RMSE is always NaN**, silently degrading ensemble weighting.
+
+### W2: `run_walk_forward()` is Never Called
+
+**Severity:** Medium (dead code / missing feature)
+**Location:** `operator1/models/walk_forward.py`
+**Issue:** The `run_walk_forward()` function and `WalkForwardResult` dataclass
+are defined in `walk_forward.py` but **never imported or called** in `main.py`.
+The pipeline runs `run_forward_pass()` from `forecasting.py` instead, which
+produces a different result type. The walk-forward module (which includes
+per-mode model leaderboard, retrain-at-switch-point logic, and 4 model types)
+is effectively dead code.
+
+### W3: `ForecastResult` has no `residuals` Attribute (Conformal Uncalibrated)
+
+**Severity:** Medium (conformal prediction runs without calibration data)
+**Location:** `main.py:1686`
+**Issue:** The conformal prediction code does:
+```python
+if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
+    for r in forecast_result.residuals:
+        calibrator.update(r)
+```
+But `ForecastResult` (line 104-132 of `forecasting.py`) does NOT define a
+`residuals` attribute. The `hasattr` check always returns `False`, so the
+conformal calibrator **never receives any residual data**. The intervals it
+produces are based only on its default settings, not actual forecast errors.
+
+### W4: `burnout_result` Computed but Never Used Downstream
+
+**Severity:** Low (wasted computation)
+**Location:** `main.py:1606-1618`
+**Issue:** `run_burnout()` is called and the result is logged, but `burnout_result`
+is **never passed to the profile builder, prediction aggregator, or report
+generator**. The burn-out loop (which can run many iterations of model
+refinement) runs but its output is discarded.
+
+### W5: `transfer_entropy_result` Only Stores `{"available": True}` in Profile
+
+**Severity:** Low (incomplete wiring)
+**Location:** `main.py:1962-1963`
+**Issue:** The transfer entropy model runs and produces a full result with
+pairwise entropy scores and causal pairs. However, the profile builder only
+stores `{"available": True}` without any of the actual results. Compare with
+other models like copula, SHAP, or DTW which include their full results via
+`_available_dict()`.
+
+### W6: Intentional Duplicate: `causality.py` wraps `granger_causality.py`
+
+**Severity:** None (intentional backward-compatible wrapper)
+**Location:** `operator1/models/causality.py:56` and
+`operator1/models/granger_causality.py:51`
+**Issue:** Both files define `compute_granger_causality()`. The version in
+`causality.py` explicitly delegates to `granger_causality.py` (the canonical
+implementation) and converts the result to a DataFrame for backward
+compatibility. `main.py` correctly uses the canonical version from
+`granger_causality.py` for Granger tests and `causality.py` for transfer
+entropy. This is NOT a bug.
+
+---
+
 ## Conclusion
 
 The full Operator 1 pipeline is healthy on Python 3.12. All 1053 tests pass
-with no failures. The identified warnings are performance and deprecation
-issues, not correctness bugs. The codebase demonstrates solid defensive
-programming with try/except wrapping around every model, graceful fallback
-chains, and comprehensive test coverage across all 8 pipeline steps.
+with no failures. The codebase demonstrates solid defensive programming with
+try/except wrapping around every model, graceful fallback chains, and
+comprehensive test coverage across all 8 pipeline steps.
+
+**5 wiring issues were found (W1-W5)**, none of which cause crashes thanks to
+defensive `getattr`/`hasattr` checks. However, they silently degrade features:
+- **W1+W2**: Walk-forward model leaderboard and recency-weighted RMSE are dead
+- **W3**: Conformal prediction runs uncalibrated
+- **W4**: Burn-out loop output is discarded
+- **W5**: Transfer entropy results are lost at profile stage
+
+The identified performance warnings (DataFrame fragmentation, copula NaN divide)
+and dependency deprecations (edgartools, statsmodels, pykrx) are minor issues
+that don't affect correctness.
