@@ -34,21 +34,35 @@ class ZAJseClient:
     @property
     def market_name(self) -> str: return "South Africa (JSE)"
 
-    def list_companies(self, query: str = "") -> list[dict[str, Any]]: return []
-    def search_company(self, name: str) -> list[dict[str, Any]]: return []
+    def list_companies(self, query: str = "") -> list[dict[str, Any]]:
+        from operator1.clients.yfinance_backed import yf_search
+        return yf_search(query, self.market_id, "ZA", "JSE", yf_suffix=".JO")
+
+    def search_company(self, name: str) -> list[dict[str, Any]]:
+        return self.list_companies(query=name)
+
     def get_profile(self, identifier: str) -> dict[str, Any]:
         cached = self._read_cache(identifier, "profile.json")
         if cached: return cached
-        raw = {"name": "", "ticker": identifier, "isin": "", "country": "ZA",
-               "sector": "", "industry": "", "exchange": "JSE", "currency": "ZAR", "cik": identifier}
-        from operator1.clients.canonical_translator import translate_profile
-        profile = translate_profile(raw, self.market_id)
+        from operator1.clients.yfinance_backed import yf_get_profile
+        profile = yf_get_profile(identifier, self.market_id, "South Africa", "ZA", "JSE", "ZAR", yf_suffix=".JO")
         self._write_cache(identifier, "profile.json", profile)
         return profile
 
-    def get_income_statement(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
-    def get_balance_sheet(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
-    def get_cashflow_statement(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
-    def get_quotes(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
+    def get_income_statement(self, identifier: str) -> pd.DataFrame:
+        from operator1.clients.yfinance_backed import yf_get_financials
+        return yf_get_financials(identifier, self.market_id, "income", yf_suffix=".JO")
+
+    def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
+        from operator1.clients.yfinance_backed import yf_get_financials
+        return yf_get_financials(identifier, self.market_id, "balance", yf_suffix=".JO")
+
+    def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
+        from operator1.clients.yfinance_backed import yf_get_financials
+        return yf_get_financials(identifier, self.market_id, "cashflow", yf_suffix=".JO")
+
+    def get_quotes(self, identifier: str) -> pd.DataFrame:
+        """JSE does not provide OHLCV data. Handled by ohlcv_provider."""
+        return pd.DataFrame()
     def get_peers(self, identifier: str) -> list[str]: return []
     def get_executives(self, identifier: str) -> list[dict[str, Any]]: return []

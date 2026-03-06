@@ -24,6 +24,8 @@ _PRIMARY_FETCHERS: dict[str, str] = {
     "NL": "ecb",    # Netherlands -- eurozone, use ECB
     "ES": "ecb",    # Spain -- eurozone, use ECB
     "IT": "ecb",    # Italy -- eurozone, use ECB
+    "CH": "ecb",    # Switzerland -- ECB has CHF series, wbgapi fallback
+    "SE": "ecb",    # Sweden -- ECB has SEK series
     "BR": "bcb",
     "MX": "banxico",
     "GB": "ons",       # UK -- ONS (no key needed)
@@ -31,6 +33,10 @@ _PRIMARY_FETCHERS: dict[str, str] = {
     "KR": "kosis",     # Korea -- FRED (KR series) / KOSIS
     "TW": "dgbas",     # Taiwan -- FRED (TW series) / DGBAS
     "CL": "bcch",      # Chile -- FRED (CL series) / BCCh
+    # Phase 2 markets -- wbgapi is the primary fallback for these.
+    # Adding them here so they try wbgapi directly without logging
+    # "no primary" warnings.
+    # CA, AU, HK, SG, ZA, CN, IN, SA, AE -- all use wbgapi fallback
 }
 
 

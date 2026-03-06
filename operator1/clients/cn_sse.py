@@ -358,13 +358,8 @@ class CNSseClient:
     # -- Price data -----------------------------------------------------------
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:
-        """Fetch OHLCV price data via baostock (delegates to ohlcv_baostock)."""
-        try:
-            from operator1.clients.ohlcv_baostock import fetch_ohlcv_baostock
-            return fetch_ohlcv_baostock(identifier, years=2)
-        except Exception as exc:
-            logger.debug("baostock quotes failed for %s: %s", identifier, exc)
-            return pd.DataFrame()
+        """SSE does not provide OHLCV data. Handled by ohlcv_provider."""
+        return pd.DataFrame()
 
     # -- Peers / related entities --------------------------------------------
 

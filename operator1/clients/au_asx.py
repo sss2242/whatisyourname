@@ -80,9 +80,20 @@ class AUAsxClient:
         self._write_cache(identifier, "profile.json", profile)
         return profile
 
-    def get_income_statement(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
-    def get_balance_sheet(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
-    def get_cashflow_statement(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
-    def get_quotes(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
+    def get_income_statement(self, identifier: str) -> pd.DataFrame:
+        from operator1.clients.yfinance_backed import yf_get_financials
+        return yf_get_financials(identifier, self.market_id, "income", yf_suffix=".AX")
+
+    def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
+        from operator1.clients.yfinance_backed import yf_get_financials
+        return yf_get_financials(identifier, self.market_id, "balance", yf_suffix=".AX")
+
+    def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
+        from operator1.clients.yfinance_backed import yf_get_financials
+        return yf_get_financials(identifier, self.market_id, "cashflow", yf_suffix=".AX")
+
+    def get_quotes(self, identifier: str) -> pd.DataFrame:
+        """ASX does not provide OHLCV data. Handled by ohlcv_provider."""
+        return pd.DataFrame()
     def get_peers(self, identifier: str) -> list[str]: return []
     def get_executives(self, identifier: str) -> list[dict[str, Any]]: return []
