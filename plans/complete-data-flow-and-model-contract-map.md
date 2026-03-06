@@ -433,20 +433,60 @@ report generation, with expected vs actual inputs, outputs, and operations.
 
 ---
 
-## Modules That Exist But Are NOT Wired Into The Pipeline
+## Unwired Modules -- Investigation Results
 
-These modules exist in the codebase but are **not called** from `main.py`
-or from any module that `main.py` calls. They may be planned features,
-legacy code, or utilities awaiting integration:
+### W6: `vanity.py` -- SHOULD BE WIRED (profile builder expects it)
 
-| Module | Location | Purpose | Status |
-|--------|----------|---------|--------|
-| `vanity.py` | `analysis/vanity.py` | Vanity metric detection | Not wired |
-| `portfolio_analysis.py` | `features/portfolio_analysis.py` | Portfolio-level analysis | Not wired |
-| `data_extraction.py` | `steps/data_extraction.py` | Legacy data extraction (replaced by inline main.py logic) | Not wired |
-| `verify_identifiers.py` | `steps/verify_identifiers.py` | Legacy identifier verification (imported by data_extraction only) | Not wired |
-| `supplement.py` | `clients/supplement.py` | Supplementary data provider | Not wired |
-| `llm_filing_extractor.py` | `clients/llm_filing_extractor.py` | LLM-based filing field extraction | Not wired |
+**Severity:** Medium (wiring gap -- module is complete, tested, but never called)
+**Location:** `operator1/analysis/vanity.py` (637 lines)
+**Tests:** `tests/test_vanity_v2.py` (dedicated), referenced in `test_phase4_analysis.py`, `test_phase7_report.py`
+**Problem:** The profile builder at `profile_builder.py:333` has `_build_vanity_section(cache)` that reads columns:
+`vanity_score`, `vanity_label`, `vanity_trend`, `vanity_score_21d`,
+`vanity_rnd_mismatch`, `vanity_sga_bloat_v2`, `vanity_capital_misallocation`,
+`vanity_competitive_decay`, `vanity_sentiment_gap`.
+
+But `compute_vanity_scores()` from `vanity.py` is NEVER called in `main.py` to populate these columns.
+The vanity section in every profile will always show as unavailable.
+
+**Fix:** Add a call to `compute_vanity_scores(cache)` in `main.py` Step 5 (feature engineering),
+after financial health and before entity discovery. Requires: cache with derived variables,
+financial health scores, sentiment scores (optional), peer ranking (optional).
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache with derived vars, fh_* scores, sentiment (optional), peer_ranking (optional) | Never called | NOT WIRED |
+| **Output** | cache + `vanity_score`, `vanity_label`, `vanity_trend`, 5 component columns | Never computed | NOT WIRED |
+| **Operation** | 5-component composite: R&D mismatch, SGA bloat, capital misallocation, competitive decay, sentiment gap | Never runs | NOT WIRED |
+
+### W7: `supplement.py` -- SHOULD BE WIRED (fills profile gaps for non-US markets)
+
+**Severity:** Medium (wiring gap -- enrichment available but never called)
+**Location:** `operator1/clients/supplement.py` (549 lines)
+**Tests:** `tests/test_supplement_and_translator.py`
+**Problem:** For non-US markets (EU, Japan, Taiwan, Brazil, Chile), PIT filing APIs often return
+profiles missing sector, industry, and market classification. `supplement.py` provides
+`enrich_profile()` which fills these gaps via OpenFIGI (free, no key) and regional APIs.
+This function is never called from `main.py` even though the pipeline would benefit from it
+for every non-US company.
+
+**Fix:** Add a call to `enrich_profile()` in `main.py` after Step 2 (profile fetch),
+passing the market_id and ticker. This is a safe additive enrichment (never overwrites
+existing data).
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `profile` dict, `ticker`, `market_id` | Never called | NOT WIRED |
+| **Output** | Enriched profile with sector, industry, identifiers filled from OpenFIGI/regional APIs | Profiles stay incomplete for non-US markets | NOT WIRED |
+| **Operation** | OpenFIGI lookup + per-region enrichers (Euronext, JPX, TWSE, B3, Santiago) | Never runs | NOT WIRED |
+
+### Genuinely Unwired (Planned Features / Legacy)
+
+| Module | Location | Lines | Tests | Status | Assessment |
+|--------|----------|-------|-------|--------|------------|
+| `portfolio_analysis.py` | `features/` | 283 | None | Not wired | **Planned feature.** Needs institutional holder data most PIT APIs don't provide. Awaiting data source. |
+| `llm_filing_extractor.py` | `clients/` | 571 | Used in `live_helpers.py` only | Not wired | **Planned feature.** LLM-based PDF/HTML/iXBRL extraction for raw-filing markets (AU, HK, SG, SA, etc.). Awaiting integration. |
+| `data_extraction.py` | `steps/` | 392 | Referenced by `cache_builder.py` for types | Not wired | **Legacy code.** Superseded by `main.py` inline extraction logic. Only used for `EntityData` type import by `cache_builder.py`. |
+| `verify_identifiers.py` | `steps/` | 129 | None direct | Not wired | **Legacy code.** Superseded by `main.py` inline verification. Only imported by `data_extraction.py` for `VerifiedTarget` type. |
 
 ---
 
@@ -485,3 +525,5 @@ legacy code, or utilities awaiting integration:
 | W5 | main.py:1962 | `transfer_entropy_result` stored as `{"available": True}` | Now uses `_available_dict()` for full data |
 | P1 | estimator.py:542 | PerformanceWarning from fragmented DataFrame | Warning suppressed; defragmentation already occurs via `.copy()` |
 | P2 | copula.py:69-74 | NaN from `np.corrcoef` on zero-variance columns | Zero-variance guard + NaN fallback to identity |
+| W6 | vanity.py | Profile builder expects vanity columns but `compute_vanity_scores()` never called | **NOT YET FIXED** -- needs wiring in main.py Step 5 |
+| W7 | supplement.py | Profile enrichment for non-US markets never called | **NOT YET FIXED** -- needs wiring in main.py after Step 2 |
