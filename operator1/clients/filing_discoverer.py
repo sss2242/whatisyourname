@@ -455,6 +455,34 @@ def get_discoverer(market_id: str) -> FilingDiscoverer | None:
     return cls()
 
 
+# Module-level extraction cache to avoid redundant API calls.
+# Keyed by "market_id:ticker" -> DataFrame with ALL extracted fields.
+_extraction_cache: dict[str, "pd.DataFrame"] = {}
+
+# Canonical field names by statement type for filtering.
+_INCOME_FIELDS = {
+    "revenue", "cost_of_revenue", "gross_profit", "operating_income",
+    "ebit", "ebitda", "net_income", "interest_expense", "taxes",
+    "sga_expenses", "rd_expenses", "eps", "eps_diluted",
+}
+_BALANCE_FIELDS = {
+    "total_assets", "total_liabilities", "total_equity",
+    "current_assets", "current_liabilities", "cash_and_equivalents",
+    "short_term_debt", "long_term_debt", "total_debt",
+    "retained_earnings", "goodwill", "intangible_assets",
+    "receivables", "inventory", "payables",
+}
+_CASHFLOW_FIELDS = {
+    "operating_cash_flow", "capex", "free_cash_flow",
+    "investing_cf", "financing_cf", "dividends_paid", "stock_buybacks",
+}
+_STATEMENT_FIELD_MAP = {
+    "income": _INCOME_FIELDS,
+    "balance": _BALANCE_FIELDS,
+    "cashflow": _CASHFLOW_FIELDS,
+}
+
+
 def try_filing_extraction(
     ticker: str,
     market_id: str,
@@ -467,7 +495,10 @@ def try_filing_extraction(
     1. Discovers filings via the exchange's announcement API
     2. Downloads the filing PDF
     3. Extracts structured data via LLMFilingExtractor
-    4. Returns a canonical long-format DataFrame
+    4. Returns a canonical long-format DataFrame filtered by statement_type
+
+    Uses a per-ticker cache so that multiple calls (income, balance,
+    cashflow) only trigger one discovery + download cycle.
 
     Falls back to empty DataFrame if any step fails.
 
@@ -478,11 +509,22 @@ def try_filing_extraction(
     market_id:
         PIT market identifier.
     statement_type:
-        One of 'income', 'balance', 'cashflow'.
+        One of 'income', 'balance', 'cashflow'. Used to filter the
+        extracted data to only return fields relevant to the requested
+        statement type.
     llm_client:
         Optional LLM client for PDF extraction.
     """
     import pandas as pd
+
+    cache_key = f"{market_id}:{ticker}"
+
+    # Check extraction cache first (avoids redundant API calls)
+    if cache_key in _extraction_cache:
+        combined = _extraction_cache[cache_key]
+        if combined.empty:
+            return pd.DataFrame()
+        return _filter_by_statement_type(combined, statement_type)
 
     discoverer = get_discoverer(market_id)
     if discoverer is None:
@@ -492,10 +534,12 @@ def try_filing_extraction(
         discovery = discoverer.discover_filings(ticker, years=2)
     except Exception as exc:
         logger.warning("Filing discovery failed for %s/%s: %s", market_id, ticker, exc)
+        _extraction_cache[cache_key] = pd.DataFrame()
         return pd.DataFrame()
 
     if not discovery.has_filings:
         logger.info("No filings discovered for %s/%s", market_id, ticker)
+        _extraction_cache[cache_key] = pd.DataFrame()
         return pd.DataFrame()
 
     # Try to extract from the most recent filings
@@ -504,6 +548,7 @@ def try_filing_extraction(
         extractor = LLMFilingExtractor(llm_client)
     except ImportError:
         logger.debug("LLMFilingExtractor not available")
+        _extraction_cache[cache_key] = pd.DataFrame()
         return pd.DataFrame()
 
     all_records = []
@@ -531,11 +576,27 @@ def try_filing_extraction(
             continue
 
     if not all_records:
+        _extraction_cache[cache_key] = pd.DataFrame()
         return pd.DataFrame()
 
     combined = pd.concat(all_records, ignore_index=True)
+    _extraction_cache[cache_key] = combined
     logger.info(
-        "Filing extraction for %s/%s: %d records from %d filings",
+        "Filing extraction for %s/%s: %d records from %d filings (cached)",
         market_id, ticker, len(combined), len(all_records),
     )
-    return combined
+    return _filter_by_statement_type(combined, statement_type)
+
+
+def _filter_by_statement_type(df: "pd.DataFrame", statement_type: str) -> "pd.DataFrame":
+    """Filter extraction result to only include fields for the requested statement type."""
+    if df.empty or "canonical_name" not in df.columns:
+        return df
+
+    target_fields = _STATEMENT_FIELD_MAP.get(statement_type)
+    if target_fields is None:
+        return df  # unknown type, return everything
+
+    mask = df["canonical_name"].isin(target_fields)
+    filtered = df[mask].copy()
+    return filtered
