@@ -27,39 +27,41 @@ logger = logging.getLogger(__name__)
 # Model registry -- curated set of report-capable models available on
 # OpenRouter.  The ":free" suffix indicates free-tier models (no cost).
 OPENROUTER_MODELS: dict[str, dict[str, Any]] = {
-    "google/gemini-2.0-flash-exp:free": {
-        "max_output_tokens": 8192,
-        "context_window": 1048576,
+    # --- Free tier (zero cost) ---
+    "qwen/qwen3-coder:free": {
+        "max_output_tokens": 262000,
+        "context_window": 262000,
         "report_capable": True,
         "tier": "free",
     },
-    "google/gemini-2.5-flash-preview": {
-        "max_output_tokens": 65536,
-        "context_window": 1048576,
+    "openai/gpt-oss-120b:free": {
+        "max_output_tokens": 131072,
+        "context_window": 131072,
         "report_capable": True,
-        "tier": "preview",
+        "tier": "free",
     },
+    "mistralai/mistral-small-3.1-24b-instruct:free": {
+        "max_output_tokens": 32768,
+        "context_window": 96000,
+        "report_capable": True,
+        "tier": "free",
+    },
+    "google/gemma-3-4b-it:free": {
+        "max_output_tokens": 8192,
+        "context_window": 131072,
+        "report_capable": True,
+        "tier": "free",
+    },
+    # --- Paid models (available with credits) ---
     "anthropic/claude-sonnet-4": {
         "max_output_tokens": 64000,
         "context_window": 200000,
         "report_capable": True,
         "tier": "balanced",
     },
-    "anthropic/claude-3.5-sonnet": {
+    "google/gemini-2.0-flash-001": {
         "max_output_tokens": 8192,
-        "context_window": 200000,
-        "report_capable": True,
-        "tier": "stable",
-    },
-    "meta-llama/llama-3.1-405b-instruct": {
-        "max_output_tokens": 32768,
-        "context_window": 131072,
-        "report_capable": True,
-        "tier": "stable",
-    },
-    "mistralai/mistral-large-latest": {
-        "max_output_tokens": 32768,
-        "context_window": 131072,
+        "context_window": 1048576,
         "report_capable": True,
         "tier": "stable",
     },
@@ -71,8 +73,8 @@ OPENROUTER_MODELS: dict[str, dict[str, Any]] = {
     },
 }
 
-# Default: pick a free-tier model for zero-cost runs
-_DEFAULT_MODEL = "google/gemini-2.0-flash-exp:free"
+# Default: pick a free-tier model with high output for report generation
+_DEFAULT_MODEL = "qwen/qwen3-coder:free"
 
 
 class OpenRouterClient(LLMClient):
