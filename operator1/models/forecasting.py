@@ -1487,14 +1487,29 @@ def run_forecasting(
     def _extract_multivariate(target: str, max_cols: int = 10) -> pd.DataFrame:
         """Extract a multivariate DataFrame for VAR from the cache.
 
-        Selects numeric variables that have at least some non-NaN values.
-        Columns that are entirely NaN (not even the estimator could fill
-        them) are excluded since VAR needs at least some observations.
+        Mixed-frequency aware: forward-filled quarterly/annual columns are
+        replaced with their filing-change derivatives (the actual change
+        on filing days, zero between filings). This prevents near-singular
+        covariance matrices that cause VAR to fall back to AR(1).
         """
-        candidates = [
-            c for c in available_vars
-            if c in cache.columns and cache[c].notna().any()
-        ][:max_cols]
+        from operator1.models._frequency_classifier import (
+            classify_column_frequency,
+            get_filing_change_derivative,
+        )
+        candidates = []
+        for c in available_vars:
+            if c not in cache.columns or not cache[c].notna().any():
+                continue
+            freq = classify_column_frequency(cache[c])
+            if freq == "daily":
+                candidates.append(c)
+            elif freq in ("quarterly", "annual"):
+                # Use the filing-change derivative instead of raw forward-filled
+                deriv_col = get_filing_change_derivative(cache, c)
+                if cache[deriv_col].notna().any() and cache[deriv_col].abs().sum() > 0:
+                    candidates.append(deriv_col)
+            # Skip 'constant' columns entirely
+        candidates = candidates[:max_cols]
         if target not in candidates:
             candidates = [target] + candidates[:max_cols - 1]
         return cache[candidates].copy()
@@ -1502,11 +1517,15 @@ def run_forecasting(
     def _extract_features(target: str, max_cols: int = 15) -> pd.DataFrame:
         """Extract a feature DataFrame for tree ensembles from the cache.
 
-        Excludes metadata flag columns (is_missing_*, invalid_math_*)
-        which describe data quality rather than financial state. All
-        substantive financial columns are kept -- the estimator should
-        have already filled missing values in Step 4b.
+        Mixed-frequency aware: for quarterly/annual columns, adds
+        engineered features (pct_change_at_filing, days_since_filing)
+        that give the tree meaningful split points instead of only 3-4
+        unique values from forward-filled quarterly data.
         """
+        from operator1.models._frequency_classifier import (
+            classify_column_frequency,
+            add_filing_timing_features,
+        )
         feature_cols = [
             c for c in cache.columns
             if c != target
@@ -1517,7 +1536,16 @@ def run_forecasting(
         ][:max_cols]
         if not feature_cols:
             return pd.DataFrame()
-        return cache[feature_cols + [target]].copy()
+        # Add filing-timing features for quarterly/annual columns
+        extra_timing_cols = []
+        for fc in feature_cols[:10]:  # limit to avoid bloat
+            freq = classify_column_frequency(cache[fc])
+            if freq in ("quarterly", "annual"):
+                new_cols = add_filing_timing_features(cache, fc)
+                extra_timing_cols.extend(new_cols)
+        all_cols = feature_cols + extra_timing_cols + [target]
+        all_cols = [c for c in all_cols if c in cache.columns]
+        return cache[all_cols].copy()
 
     # ------------------------------------------------------------------
     # GARCH on volatility (special case -- uses return_1d from cache)
@@ -2038,6 +2066,27 @@ class LSTMWrapper(BaseModelWrapper):
         clean = series[~np.isnan(series)]
         if len(clean) < _MIN_OBS_LSTM:
             return
+
+        # Mixed-frequency awareness: detect forward-filled quarterly data.
+        # Add small time-varying noise to break constant stretches, so
+        # the LSTM can learn that constant regions represent staleness
+        # (not actual zero-volatility stability).
+        n_unique = len(np.unique(clean))
+        if n_unique > 0 and n_unique / len(clean) < 0.05:
+            # Forward-filled quarterly data detected -- add filing-aware noise
+            rng = np.random.default_rng(42)
+            changes = np.diff(clean, prepend=clean[0])
+            days_since_change = np.zeros(len(clean))
+            counter = 0
+            for i in range(len(clean)):
+                if abs(changes[i]) > 0:
+                    counter = 0
+                counter += 1
+                days_since_change[i] = counter
+            # Noise grows with days since filing (uncertainty about true value)
+            noise_scale = np.std(clean[clean != clean[0]]) if n_unique > 1 else abs(clean[0]) * 0.001
+            noise = rng.normal(0, noise_scale * 0.01 * days_since_change / 63)
+            clean = clean + noise
 
         self._history = list(clean)
         self._scaler_mean = float(np.mean(clean))
