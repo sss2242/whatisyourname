@@ -63,6 +63,7 @@ CMF_BASE_URL: str = "https://www.cmfchile.cl"
 # ---------------------------------------------------------------------------
 GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta"
 CLAUDE_BASE_URL: str = "https://api.anthropic.com/v1"
+OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 
 # ---------------------------------------------------------------------------
 # Match scoring thresholds (entity discovery)

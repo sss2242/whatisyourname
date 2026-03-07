@@ -87,7 +87,7 @@ def fetch_macro(
                 years=years,
             )
         except Exception as exc:
-            logger.debug("FRED primary failed: %s", exc)
+            logger.warning("FRED primary failed: %s", exc)
 
     elif primary == "fred_country":
         try:
@@ -98,7 +98,7 @@ def fetch_macro(
                 years=years,
             )
         except Exception as exc:
-            logger.debug("FRED-country primary failed for %s: %s", cc, exc)
+            logger.warning("FRED-country primary failed for %s: %s", cc, exc)
 
     elif primary == "ecb":
         try:

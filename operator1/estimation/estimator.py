@@ -541,7 +541,16 @@ def _build_estimation_columns(
     new_cols = pd.DataFrame(cols_dict, index=df.index)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*DataFrame is highly fragmented.*")
-        df[new_cols.columns] = new_cols
+        try:
+            df[new_cols.columns] = new_cols
+        except ValueError:
+            # Fallback: assign columns one at a time to avoid shape mismatch
+            # when existing columns overlap with new ones in unexpected ways.
+            for col_name in new_cols.columns:
+                try:
+                    df[col_name] = new_cols[col_name]
+                except Exception as exc:
+                    logger.warning("Failed to assign estimation column %s: %s", col_name, exc)
 
 
 # ---------------------------------------------------------------------------

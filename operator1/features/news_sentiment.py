@@ -147,11 +147,11 @@ def _fetch_news_gnews(symbol: str) -> pd.DataFrame:
         return _fetch_news_rss(symbol)
 
 
-def _fetch_news_rss(symbol: str) -> pd.DataFrame:
-    """Fetch stock news via Google News RSS (no library needed beyond feedparser).
+def _fetch_news_rss(symbol: str, market_id: str = "", company_name: str = "") -> pd.DataFrame:
+    """Fetch stock news via regional RSS feeds with Google News fallback.
 
-    Fallback when gnews is not installed. Uses Google News RSS feed
-    which is free and requires no API key.
+    Tries per-region news sources first (Naver for Korea, Yahoo JP for Japan,
+    etc.), then falls back to Google News RSS.
     """
     try:
         import feedparser
@@ -159,33 +159,77 @@ def _fetch_news_rss(symbol: str) -> pd.DataFrame:
         logger.debug("feedparser not installed; no news source available")
         return pd.DataFrame()
 
-    try:
-        import urllib.parse
-        query = urllib.parse.quote(f"{symbol} stock")
-        url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+    import urllib.parse
 
-        feed = feedparser.parse(url)
-        if not feed.entries:
-            return pd.DataFrame()
+    # Per-region RSS URLs -- try local financial news sources first
+    _REGIONAL_RSS: dict[str, list[str]] = {
+        "kr_dart": [
+            # Google News Korea with Korean search
+            "https://news.google.com/rss/search?q={symbol}+주식&hl=ko&gl=KR&ceid=KR:ko",
+            "https://news.google.com/rss/search?q={name}+주가&hl=ko&gl=KR&ceid=KR:ko",
+        ],
+        "jp_jquants": [
+            "https://news.google.com/rss/search?q={symbol}+株価&hl=ja&gl=JP&ceid=JP:ja",
+            "https://news.google.com/rss/search?q={name}+株式&hl=ja&gl=JP&ceid=JP:ja",
+        ],
+        "br_cvm": [
+            "https://news.google.com/rss/search?q={symbol}+ações&hl=pt-BR&gl=BR&ceid=BR:pt-419",
+            "https://news.google.com/rss/search?q={name}+bolsa&hl=pt-BR&gl=BR&ceid=BR:pt-419",
+        ],
+        "cn_sse": [
+            "https://news.google.com/rss/search?q={symbol}+股票&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+        ],
+        "tw_mops": [
+            "https://news.google.com/rss/search?q={symbol}+股價&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+        ],
+    }
 
-        rows = []
-        for entry in feed.entries[:50]:
-            pub_date = entry.get("published", "")
-            rows.append({
-                "date": pd.to_datetime(pub_date, errors="coerce"),
-                "title": entry.get("title", ""),
-                "url": entry.get("link", ""),
-                "source": entry.get("source", {}).get("title", "") if isinstance(entry.get("source"), dict) else "",
-            })
+    # Try regional sources first
+    urls_to_try: list[str] = []
+    if market_id:
+        regional = _REGIONAL_RSS.get(market_id, [])
+        for tpl in regional:
+            url = tpl.format(
+                symbol=urllib.parse.quote(symbol),
+                name=urllib.parse.quote(company_name or symbol),
+            )
+            urls_to_try.append(url)
 
-        df = pd.DataFrame(rows)
-        df = df.dropna(subset=["date"])
-        logger.info("RSS fetched %d articles for %s", len(df), symbol)
-        return df
+    # Always add English Google News as final fallback
+    urls_to_try.append(
+        f"https://news.google.com/rss/search?q={urllib.parse.quote(symbol)}+stock&hl=en-US&gl=US&ceid=US:en"
+    )
+    if company_name and company_name != symbol:
+        urls_to_try.append(
+            f"https://news.google.com/rss/search?q={urllib.parse.quote(company_name)}+stock&hl=en-US&gl=US&ceid=US:en"
+        )
 
-    except Exception as exc:
-        logger.warning("RSS news fetch failed: %s", exc)
-        return pd.DataFrame()
+    for url in urls_to_try:
+        try:
+            feed = feedparser.parse(url)
+            if not feed.entries:
+                continue
+
+            rows = []
+            for entry in feed.entries[:50]:
+                pub_date = entry.get("published", "")
+                rows.append({
+                    "date": pd.to_datetime(pub_date, errors="coerce"),
+                    "title": entry.get("title", ""),
+                    "url": entry.get("link", ""),
+                    "source": entry.get("source", {}).get("title", "") if isinstance(entry.get("source"), dict) else "",
+                })
+
+            df = pd.DataFrame(rows)
+            df = df.dropna(subset=["date"])
+            if not df.empty:
+                logger.info("RSS fetched %d articles for %s from %s", len(df), symbol, url[:60])
+                return df
+        except Exception:
+            continue
+
+    logger.debug("No RSS articles found for %s across %d sources", symbol, len(urls_to_try))
+    return pd.DataFrame()
 
 
 def _fetch_news_alpha_vantage(symbol: str) -> pd.DataFrame:

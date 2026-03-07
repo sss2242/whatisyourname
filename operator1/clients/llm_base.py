@@ -35,6 +35,7 @@ _last_request_time_by_host: dict[str, float] = {}
 _LLM_HOST_RATE_LIMITS: dict[str, float] = {
     "generativelanguage.googleapis.com": 0.25,  # Gemini free tier
     "api.anthropic.com": 0.8,                   # Claude Tier 1
+    "openrouter.ai": 1.0,                       # OpenRouter (varies by model)
 }
 
 
@@ -86,18 +87,8 @@ GEMINI_MODELS: dict[str, dict[str, Any]] = {
         "report_capable": True,
         "tier": "stable",
     },
-    "gemini-1.5-pro": {
-        "max_output_tokens": 8192,
-        "context_window": 2097152,
-        "report_capable": True,
-        "tier": "stable",
-    },
-    "gemini-1.5-flash": {
-        "max_output_tokens": 8192,
-        "context_window": 1048576,
-        "report_capable": True,
-        "tier": "stable",
-    },
+    # NOTE: gemini-1.5-pro and gemini-1.5-flash removed -- deprecated from
+    # Gemini v1beta API as of early 2026.  Use gemini-2.0-flash or newer.
 }
 
 CLAUDE_MODELS: dict[str, dict[str, Any]] = {

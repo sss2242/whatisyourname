@@ -189,7 +189,35 @@ def _run_copula_impl(
     if len(variables) < 2:
         return CopulaResult(available=False, error="Need >= 2 variables for copula")
 
-    df = cache[variables].dropna()
+    # Mixed-frequency aware: use event-day filtering for forward-filled
+    # variables.  On "event days" (when any financial variable changes),
+    # all variables have meaningful values.  Between events, financial
+    # variables are stale repeats that create false zero-correlation.
+    try:
+        from operator1.models._frequency_classifier import classify_column_frequency, detect_filing_change_days
+
+        has_quarterly = any(
+            classify_column_frequency(cache[v]) in ("quarterly", "annual")
+            for v in variables if v in cache.columns
+        )
+        if has_quarterly:
+            event_mask = pd.Series(False, index=cache.index)
+            for v in variables:
+                if classify_column_frequency(cache[v]) in ("quarterly", "annual"):
+                    event_mask |= detect_filing_change_days(cache[v])
+            event_data = cache[variables][event_mask].dropna()
+            # Use event-day data if enough events; otherwise fall back to weekly resample
+            if len(event_data) >= 20:
+                df = event_data
+                logger.debug("Copula: using %d event-day observations", len(df))
+            else:
+                df = cache[variables].resample("W").last().dropna()
+                logger.debug("Copula: using %d weekly-resampled observations", len(df))
+        else:
+            df = cache[variables].dropna()
+    except Exception:
+        df = cache[variables].dropna()
+
     if len(df) < 30:
         return CopulaResult(available=False, error="Insufficient data for copula fitting")
 

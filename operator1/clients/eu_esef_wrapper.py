@@ -185,9 +185,9 @@ class EUEsefClient:
             except Exception:
                 pass
 
-        # Path 2: Paginated entities search.
+        # Path 2: Paginated entities search (fetch up to 500 for better coverage).
         try:
-            data = self._get_xbrl("/entities", params={"page[size]": 100})
+            data = self._get_xbrl("/entities", params={"page[size]": 500})
             entities = data.get("data", []) if isinstance(data, dict) else []
             q_lower = q.lower()
             for ent in entities:
@@ -258,6 +258,7 @@ class EUEsefClient:
 
     def search_company(self, name: str) -> list[dict[str, Any]]:
         """Search for EU companies -- tries entities API first, then filings."""
+        logger.debug("ESEF search_company('%s') starting (country_filter=%s)", name, self._country_code)
         # Primary: /api/entities endpoint (comprehensive, all registered filers)
         results = self._search_entities_api(name)
         if results:

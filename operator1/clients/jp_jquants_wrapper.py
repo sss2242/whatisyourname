@@ -272,19 +272,34 @@ class JPJquantsClient:
         try:
             # Normalize to 5-digit code
             code = identifier.strip()
+            if not code:
+                logger.warning("J-Quants get_financials called with empty identifier")
+                return empty
             if len(code) == 4:
                 code = code + "0"
 
-            # Fetch financial summary for the date range
+            # Fetch financial summary for the date range.
+            # Use code parameter to avoid fetching ALL companies
+            # (get_fin_summary_range without code returns thousands of rows
+            # and exceeds free-tier rate limits).
             end_dt = datetime.now()
             start_dt = end_dt - timedelta(days=365 * years)
 
             # Docs: jquantsapi/client_v2.py get_fin_summary_range() method
             _jquants_throttle()
-            df = self._client.get_fin_summary_range(
-                start_dt=start_dt,
-                end_dt=end_dt,
-            )
+            try:
+                # Try code-filtered fetch first (faster, less API load)
+                df = self._client.get_fin_summary_range(
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    code=code,
+                )
+            except TypeError:
+                # Fallback: older SDK versions may not support code param
+                df = self._client.get_fin_summary_range(
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                )
 
             if df.empty:
                 return empty

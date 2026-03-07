@@ -335,7 +335,30 @@ class KRDartClient:
                 logger.warning("dart-fss financials failed for %s: %s", identifier, exc)
 
         # Fallback: direct DART API (fnlttSinglAcntAll.json)
-        return self._fetch_via_direct_api_financials(identifier, statement_type)
+        df = self._fetch_via_direct_api_financials(identifier, statement_type)
+
+        # If still sparse (< 10 canonical fields), try LLM filing extraction
+        # to parse the actual DART PDF filing for additional fields like
+        # current_assets, current_liabilities, interest_expense.
+        _KEY_FIELDS = {"current_assets", "current_liabilities", "interest_expense",
+                       "cash_and_equivalents", "short_term_debt", "long_term_debt"}
+        if not df.empty:
+            _has = set(df.get("canonical_name", pd.Series()).unique()) if "canonical_name" in df.columns else set(df.columns)
+            _missing_key = _KEY_FIELDS - _has
+            if _missing_key:
+                logger.info("DART %s sparse data: missing %s. Trying LLM filing extraction...", identifier, _missing_key)
+                try:
+                    llm_df = self._try_llm_filing_extraction(identifier, statement_type)
+                    if llm_df is not None and not llm_df.empty:
+                        df = pd.concat([df, llm_df], ignore_index=True).drop_duplicates(
+                            subset=["canonical_name", "report_date"] if "canonical_name" in df.columns else None,
+                            keep="first",
+                        )
+                        logger.info("LLM extraction added %d rows for %s", len(llm_df), identifier)
+                except Exception as exc:
+                    logger.debug("LLM filing extraction failed for %s: %s", identifier, exc)
+
+        return df
 
     def _fetch_via_dart_fss(self, identifier: str, statement_type: str) -> pd.DataFrame | None:
         """Use dart-fss to get structured financial statements."""
@@ -533,6 +556,38 @@ class KRDartClient:
                         r[k] = v.isoformat()
             self._write_cache(identifier, f"filings/{period_str}.json",
                             {"period_end": period_str, "rows": records})
+
+    # -- LLM filing extraction (for sparse DART data) -------------------------
+
+    def _try_llm_filing_extraction(self, identifier: str, statement_type: str) -> pd.DataFrame | None:
+        """Use LLM to extract missing financial fields from DART filing PDFs.
+
+        Korean K-IFRS taxonomy keywords the LLM should search for:
+        - 유동자산 (current_assets), 유동부채 (current_liabilities)
+        - 이자비용/금융비용 (interest_expense)
+        - 현금및현금성자산 (cash_and_equivalents)
+        - 단기차입금 (short_term_debt), 장기차입금 (long_term_debt)
+        - 매출채권 (receivables), 재고자산 (inventory)
+        - 매입채무 (payables), 이익잉여금 (retained_earnings)
+
+        Uses a single LLM call per filing to minimize API costs.
+        """
+        try:
+            from operator1.clients.filing_discoverer import try_filing_extraction
+        except ImportError:
+            return None
+
+        try:
+            result = try_filing_extraction(
+                ticker=identifier,
+                market_id=self.market_id,
+                statement_type=statement_type,
+                llm_client=None,  # Will use factory default
+            )
+            return result if result is not None and not result.empty else None
+        except Exception as exc:
+            logger.debug("LLM filing extraction for DART %s failed: %s", identifier, exc)
+            return None
 
     # -- Price data ------------------------------------------------------------
 

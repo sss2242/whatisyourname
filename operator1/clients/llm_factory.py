@@ -32,7 +32,7 @@ from operator1.config_loader import get_global_config
 logger = logging.getLogger(__name__)
 
 # Supported provider identifiers (case-insensitive)
-_SUPPORTED_PROVIDERS = ("gemini", "claude")
+_SUPPORTED_PROVIDERS = ("gemini", "claude", "openrouter")
 
 # HTTP status codes that indicate key exhaustion (rotate to next key)
 _EXHAUSTION_ERRORS = ("credit balance is too low", "quota exceeded",
@@ -55,8 +55,14 @@ def get_available_models(provider: str) -> list[dict[str, Any]]:
     List of model info dicts, sorted by tier priority then output capacity.
     """
     from operator1.clients.llm_base import GEMINI_MODELS, CLAUDE_MODELS
+    from operator1.clients.openrouter import OPENROUTER_MODELS
 
-    registry = GEMINI_MODELS if provider == "gemini" else CLAUDE_MODELS
+    if provider == "gemini":
+        registry = GEMINI_MODELS
+    elif provider == "openrouter":
+        registry = OPENROUTER_MODELS
+    else:
+        registry = CLAUDE_MODELS
 
     tier_priority = {"balanced": 0, "stable": 1, "fast": 2, "preview": 3, "flagship": 4}
     models = []
@@ -240,11 +246,13 @@ def create_llm_client(
         model = str(cfg.get("llm_model", "")).strip()
 
     # Build primary clients (one per key in the pool)
-    primary_key_name = "GEMINI_API_KEY" if provider == "gemini" else "ANTHROPIC_API_KEY"
-    fallback_key_name = "ANTHROPIC_API_KEY" if provider == "gemini" else "GEMINI_API_KEY"
+    _KEY_MAP = {"gemini": "GEMINI_API_KEY", "claude": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY"}
+    primary_key_name = _KEY_MAP.get(provider, "GEMINI_API_KEY")
+
+    # Determine fallback providers (exclude the primary)
+    _fallback_order = [p for p in ("gemini", "claude", "openrouter") if p != provider]
 
     primary_keys = get_key_pool(secrets, primary_key_name)
-    fallback_keys = get_key_pool(secrets, fallback_key_name)
 
     primary_clients = []
     for key in primary_keys:
@@ -252,12 +260,18 @@ def create_llm_client(
         if client:
             primary_clients.append(client)
 
-    fallback_provider = "claude" if provider == "gemini" else "gemini"
+    # Build fallback clients from all other providers that have keys
     fallback_clients = []
-    for key in fallback_keys:
-        client = _build_single_client(fallback_provider, key, model)
-        if client:
-            fallback_clients.append(client)
+    fallback_provider = _fallback_order[0] if _fallback_order else "gemini"
+    for fb_provider in _fallback_order:
+        fb_key_name = _KEY_MAP.get(fb_provider, "")
+        if not fb_key_name:
+            continue
+        fb_keys = get_key_pool(secrets, fb_key_name)
+        for key in fb_keys:
+            client = _build_single_client(fb_provider, key, "")
+            if client:
+                fallback_clients.append(client)
 
     all_clients = primary_clients + fallback_clients
     if not all_clients:
@@ -292,6 +306,8 @@ def _auto_detect_provider(secrets: dict[str, str]) -> str:
         return "gemini"
     if get_key_pool(secrets, "ANTHROPIC_API_KEY"):
         return "claude"
+    if get_key_pool(secrets, "OPENROUTER_API_KEY"):
+        return "openrouter"
     return "gemini"
 
 
@@ -324,6 +340,17 @@ def _build_single_client(
             return ClaudeClient(**kwargs)
         except Exception as exc:
             logger.warning("Failed to build Claude client: %s", exc)
+            return None
+
+    if provider == "openrouter":
+        try:
+            from operator1.clients.openrouter import OpenRouterClient
+            kwargs = {"api_key": api_key}
+            if model:
+                kwargs["model"] = model
+            return OpenRouterClient(**kwargs)
+        except Exception as exc:
+            logger.warning("Failed to build OpenRouter client: %s", exc)
             return None
 
     return None

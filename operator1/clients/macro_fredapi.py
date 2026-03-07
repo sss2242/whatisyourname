@@ -126,7 +126,7 @@ def fetch_macro_fred(
                 results[canonical_name] = series
                 logger.debug("FRED %s: %d observations", series_id, len(series))
         except Exception as exc:
-            logger.debug("FRED failed for %s: %s", series_id, exc)
+            logger.warning("FRED fetch failed for %s (%s): %s", canonical_name, series_id, exc)
 
     logger.info("FRED fetched %d/%d indicators", len(results), len(_FRED_SERIES))
     return results
@@ -191,7 +191,7 @@ def fetch_macro_fred_country(
                 results[canonical_name] = series
                 logger.debug("FRED-%s %s: %d observations", cc, series_id, len(series))
         except Exception as exc:
-            logger.debug("FRED-%s failed for %s: %s", cc, series_id, exc)
+            logger.warning("FRED-%s fetch failed for %s (%s): %s", cc, canonical_name, series_id, exc)
 
     logger.info("FRED-%s fetched %d/%d indicators", cc, len(results), len(series_map))
     return results
