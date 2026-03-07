@@ -1111,12 +1111,22 @@ Non-interactive examples:
         except Exception as exc:
             logger.warning("Entity discovery failed (continuing without): %s", exc)
 
-        # Graph risk
+        # Graph risk -- convert LinkedEntity dataclasses to dicts for .get() compat
         try:
+            from dataclasses import asdict as _asdict
             from operator1.models.graph_risk import compute_graph_risk_metrics
+            _rel_dicts = {}
+            for _grp, _ents in relationships.items():
+                if isinstance(_ents, list):
+                    _rel_dicts[_grp] = [
+                        _asdict(e) if hasattr(e, "__dataclass_fields__") else e
+                        for e in _ents
+                    ]
+                else:
+                    _rel_dicts[_grp] = _ents
             graph_risk_result = compute_graph_risk_metrics(
                 target_isin=target_profile.get("isin", ticker),
-                relationships=relationships,
+                relationships=_rel_dicts,
             )
             logger.info(
                 "Graph risk: %d nodes, centrality=%.3f",
@@ -1624,7 +1634,8 @@ Non-interactive examples:
             )
             logger.info("Forward pass complete: %d steps", forward_pass_result.total_days)
         except Exception as exc:
-            logger.warning("Forward pass failed: %s", exc)
+            import traceback as _tb
+            logger.warning("Forward pass failed: %s\n%s", exc, _tb.format_exc())
 
         # Burn-out
         try:
@@ -1646,8 +1657,15 @@ Non-interactive examples:
         try:
             from operator1.models.walk_forward import run_walk_forward
             from operator1.analysis.survival_timeline import compute_survival_timeline
-            _wf_timeline = compute_survival_timeline(cache)
-            walk_forward_result = run_walk_forward(cache, _wf_timeline)
+            _wf_timeline_result = compute_survival_timeline(cache)
+            # Pass the .timeline DataFrame (not the result wrapper) -- walk_forward
+            # calls len() on it, and SurvivalTimelineResult has no __len__.
+            _wf_timeline_df = (
+                _wf_timeline_result.timeline
+                if hasattr(_wf_timeline_result, "timeline")
+                else _wf_timeline_result
+            )
+            walk_forward_result = run_walk_forward(cache, _wf_timeline_df)
             if walk_forward_result and walk_forward_result.fitted:
                 logger.info(
                     "Walk-forward: %d days evaluated, best=%s (MAE=%.6f)",
@@ -1727,7 +1745,7 @@ Non-interactive examples:
                 calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
                 if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
                     for r in forecast_result.residuals:
-                        calibrator.update(r)
+                        calibrator.add_score(r)
                 # Build point forecasts from forecast_result directly
                 _point_forecasts: dict[str, float] = {}
                 if hasattr(forecast_result, "forecasts"):

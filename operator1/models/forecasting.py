@@ -2401,7 +2401,7 @@ class TFTWrapper(BaseModelWrapper):
                     self.skip = nn.Linear(d_in, d_out) if d_in != d_out else nn.Identity()
 
                 def forward(self, x: Any) -> Any:
-                    h = torch.elu(self.fc1(x))
+                    h = torch.nn.functional.elu(self.fc1(x))
                     h2 = self.fc2(h)
                     g = torch.sigmoid(self.gate(h))
                     out = g * h2

@@ -104,9 +104,12 @@ class BRCvmClient:
 
         companies = []
         for item in items:
+            legal_name = item.get("DENOM_SOCIAL", "") or ""
+            commercial_name = item.get("DENOM_COMERC", "") or ""
             companies.append({
                 "ticker": item.get("CD_CVM", "") or item.get("CNPJ_CIA", ""),
-                "name": item.get("DENOM_SOCIAL", "") or item.get("DENOM_COMERC", ""),
+                "name": legal_name or commercial_name,
+                "name_commercial": commercial_name,
                 "cik": item.get("CD_CVM", ""),
                 "cnpj": item.get("CNPJ_CIA", ""),
                 "exchange": "B3",
@@ -114,9 +117,19 @@ class BRCvmClient:
                 "market_id": self.market_id,
             })
 
+        logger.debug("CVM registry loaded: %d active companies", len(companies))
+
         if query:
             q = query.lower()
-            companies = [c for c in companies if q in c["name"].lower() or q in c["ticker"].lower()]
+            # Match against legal name, commercial name, CVM code, and CNPJ
+            companies = [
+                c for c in companies
+                if q in c["name"].lower()
+                or q in c.get("name_commercial", "").lower()
+                or q in c["ticker"].lower()
+                or q in c.get("cnpj", "").lower()
+            ]
+            logger.debug("CVM search '%s': %d matches", query, len(companies))
         return companies
 
     def search_company(self, name: str) -> list[dict[str, Any]]:

@@ -2937,6 +2937,29 @@ def generate_charts(
         logger.warning("No cache data available for chart generation.")
         return chart_paths
 
+    # Ensure cache has a proper DatetimeIndex for matplotlib date formatting.
+    # Without this, integer indices are interpreted as ordinal days since
+    # year 0001, producing dates around 1959-1960 on the x-axis.
+    if not isinstance(cache.index, pd.DatetimeIndex):
+        for _date_col in ("date", "Date", "timestamp", "report_date"):
+            if _date_col in cache.columns:
+                try:
+                    cache = cache.set_index(pd.to_datetime(cache[_date_col]))
+                    logger.debug("Chart: converted '%s' column to DatetimeIndex", _date_col)
+                    break
+                except Exception:
+                    continue
+        else:
+            try:
+                cache.index = pd.to_datetime(cache.index)
+                logger.debug("Chart: converted index to DatetimeIndex")
+            except Exception:
+                logger.warning(
+                    "Cache index is not DatetimeIndex and cannot be converted; "
+                    "chart x-axis dates may be incorrect (type=%s)",
+                    type(cache.index).__name__,
+                )
+
     try:
         import matplotlib
         matplotlib.use("Agg")  # Non-interactive backend
