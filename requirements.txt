@@ -30,6 +30,7 @@ arch==8.0.0
 shap==0.50.0              # SHAP explainability
 mapie==1.3.0              # Conformal prediction
 dtaidistance==2.4.0       # Dynamic Time Warping
+PyWavelets>=1.7           # Wavelet transform for cycle decomposition
 
 # --- Stage 3: Deep Learning + Bayesian ---
 torch==2.10.0             # ~2 GB download -- skip if bandwidth is limited

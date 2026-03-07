@@ -140,10 +140,17 @@ def analyze_filing_calendar(
     # Detect frequency from actual data
     result.detected_frequency = detect_filing_frequency(filing_dates)
 
-    # Check staleness
-    if filing_dates:
-        latest = filing_dates[-1]
-        result.latest_filing_age_days = (pd.Timestamp(today) - latest).days
+    # Check staleness -- prefer filing_date column if available in cache,
+    # otherwise fall back to detected value-change dates (which may correspond
+    # to report_date rather than actual filing publication date).
+    _latest_filing_ts = None
+    if "filing_date" in cache.columns and cache["filing_date"].notna().any():
+        _latest_filing_ts = pd.to_datetime(cache["filing_date"].dropna()).max()
+    elif filing_dates:
+        _latest_filing_ts = filing_dates[-1]
+
+    if _latest_filing_ts is not None:
+        result.latest_filing_age_days = (pd.Timestamp(today) - _latest_filing_ts).days
         result.is_stale = result.latest_filing_age_days > result.stale_threshold_days
     else:
         result.latest_filing_age_days = -1
