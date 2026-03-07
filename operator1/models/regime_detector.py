@@ -203,6 +203,18 @@ class RegimeDetector:
                 regimes = model.predict(X_clean)
                 probs = model.predict_proba(X_clean)
 
+                # Forward-fill any NaN regime labels from warmup period
+                # so no days are left unlabeled in downstream modules.
+                if len(regimes) > 0:
+                    first_valid = 0
+                    for i in range(len(regimes)):
+                        if not np.isnan(regimes[i]):
+                            first_valid = i
+                            break
+                    if first_valid > 0:
+                        regimes[:first_valid] = regimes[first_valid]
+                        probs[:first_valid] = probs[first_valid]
+
                 self._hmm_model = model
                 self._result.hmm_regimes = regimes
                 self._result.hmm_probs = probs

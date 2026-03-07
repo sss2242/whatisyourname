@@ -3012,6 +3012,21 @@ def generate_charts(
             _apply_brand_style(fig, ax, f"{company} -- Closing Price (2Y)")
             ax.set_ylabel("Price ($)", color=_CHART_FG)
 
+            # Next-day Low estimate annotation (Technical Alpha)
+            ta = profile.get("predictions", {}).get("technical_alpha", {})
+            est_low = ta.get("estimated_low")
+            if est_low is None:
+                # Try from ohlc_predictions
+                est_low = profile.get("ohlc_predictions", {}).get("next_day", {}).get("low")
+            if est_low is not None and est_low > 0:
+                ax.axhline(y=est_low, color=_CHART_GOLD, linestyle="--", linewidth=1.5, alpha=0.8)
+                ax.annotate(
+                    f"Next-Day Low: {est_low:,.2f}",
+                    xy=(1.0, est_low), xycoords=("axes fraction", "data"),
+                    fontsize=9, color=_CHART_GOLD, fontweight="bold",
+                    ha="right", va="bottom",
+                )
+
             # Regime shading with professional colors
             if "regime_label" in cache.columns:
                 regime_colors = {
@@ -3281,6 +3296,67 @@ def generate_charts(
             logger.info("Generated chart: %s", path)
     except Exception as exc:
         logger.warning("Failed to generate predicted week OHLC chart: %s", exc)
+
+    # Chart 9.5: Predicted OHLC Candlestick (Next Year -- aggregated weekly)
+    try:
+        next_year = ohlc_data.get("next_year", {})
+        year_series = next_year.get("series", [])
+        if year_series and len(year_series) >= 20:
+            # Aggregate 252 daily candles into weekly bars for readability
+            weekly_bars = []
+            for w_start in range(0, len(year_series), 5):
+                week = year_series[w_start:w_start + 5]
+                if not week:
+                    continue
+                w_open = week[0].get("open", 0) or 0
+                w_high = max((c.get("high", 0) or 0) for c in week)
+                w_low = min((c.get("low", float("inf")) or float("inf")) for c in week)
+                w_close = week[-1].get("close", 0) or 0
+                w_conf = sum(c.get("confidence", 1.0) for c in week) / len(week)
+                if w_open and w_close and w_low < float("inf"):
+                    weekly_bars.append({"open": w_open, "high": w_high, "low": w_low,
+                                        "close": w_close, "confidence": w_conf})
+
+            if len(weekly_bars) >= 5:
+                fig, ax = plt.subplots(figsize=(16, 7))
+                for i, candle in enumerate(weekly_bars):
+                    o, h, l, c_ = candle["open"], candle["high"], candle["low"], candle["close"]
+                    color = _CHART_GREEN if c_ >= o else _CHART_RED
+                    body_bottom = min(o, c_)
+                    body_height = abs(c_ - o)
+                    ax.bar(i, body_height, bottom=body_bottom, width=0.6,
+                           color=color, edgecolor=color, alpha=0.85)
+                    ax.plot([i, i], [l, h], color=color, linewidth=0.8)
+
+                # Confidence envelope
+                confidences = [c["confidence"] for c in weekly_bars]
+                mid_prices = [(c["high"] + c["low"]) / 2 for c in weekly_bars]
+                ranges = [c["high"] - c["low"] for c in weekly_bars]
+                upper = [m + r * (2 - conf) for m, r, conf in zip(mid_prices, ranges, confidences)]
+                lower = [m - r * (2 - conf) for m, r, conf in zip(mid_prices, ranges, confidences)]
+                ax.fill_between(range(len(weekly_bars)), lower, upper, alpha=0.08, color=_CHART_ACCENT)
+
+                _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Year, Weekly)")
+                ax.set_ylabel("Price ($)", color=_CHART_FG)
+                ax.set_xlabel("Weeks Ahead", color=_CHART_FG)
+
+                year_ret = next_year.get("predicted_return")
+                if year_ret is not None:
+                    ax.annotate(
+                        f"Predicted annual return: {year_ret:+.1f}%",
+                        xy=(0.02, 0.95), xycoords="axes fraction",
+                        fontsize=11, color=_CHART_GREEN if year_ret >= 0 else _CHART_RED,
+                        fontweight="bold",
+                    )
+
+                fig.tight_layout()
+                path = str(out / "predicted_ohlc_year.png")
+                fig.savefig(path, dpi=180, facecolor=_CHART_BG)
+                plt.close(fig)
+                chart_paths.append(path)
+                logger.info("Generated chart: %s", path)
+    except Exception as exc:
+        logger.warning("Failed to generate predicted year OHLC chart: %s", exc)
 
     # Chart 9: Conflict Risk Gauge (if conflict data available)
     try:

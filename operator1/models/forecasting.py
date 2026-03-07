@@ -1786,11 +1786,28 @@ class KalmanWrapper(BaseModelWrapper):
         self._state = float(clean[-1]) if len(clean) else 0.0
         self._P = 1.0  # state covariance
         self._Q = 0.01  # process noise
-        self._R = 0.1  # measurement noise
+        self._R = 0.1  # measurement noise (for real observations)
+        self._R_stale = 100.0  # high noise for stale forward-filled days
+        self._filing_aware = False  # set True if series is forward-filled
         self._fitted = len(clean) >= _MIN_OBS_KALMAN
 
+        # Detect forward-filled financial data: if unique values < 5%
+        # of total observations, this is quarterly/annual data repeated daily.
+        # Use filing-aware mode with variable observation noise.
+        if len(clean) >= _MIN_OBS_KALMAN:
+            unique_ratio = len(np.unique(clean)) / len(clean)
+            if unique_ratio < 0.05:
+                self._filing_aware = True
+                self._Q = 0.001  # lower process noise for stable financials
+                self._R = 0.01  # tight on real observation days
+                self._R_stale = 1000.0  # very loose on stale days
+                logger.debug(
+                    "Kalman filing-aware mode: %d unique values in %d obs (%.1f%%)",
+                    len(np.unique(clean)), len(clean), unique_ratio * 100,
+                )
+
         # Try fitting a proper statsmodels model for the initial state.
-        if self._fitted:
+        if self._fitted and not self._filing_aware:
             try:
                 from statsmodels.tsa.statespace.structural import (
                     UnobservedComponents,
@@ -1821,8 +1838,16 @@ class KalmanWrapper(BaseModelWrapper):
             z = float(actual_t_plus_1[0]) if len(actual_t_plus_1) else self._state
             if np.isnan(z):
                 return  # skip update on missing observation
+
+            # Filing-aware: use high observation noise for stale (repeated) values
+            # so the Kalman mostly ignores repeated forward-filled data and only
+            # updates meaningfully when a new filing changes the value.
+            R_effective = self._R
+            if self._filing_aware and abs(z - self._last_value) < 1e-10:
+                R_effective = self._R_stale  # stale repeated value -> high noise
+
             # Kalman gain
-            S = self._P + self._R
+            S = self._P + R_effective
             K = self._P / S if S > 1e-12 else 0.5
             # State update
             innovation = z - self._state
