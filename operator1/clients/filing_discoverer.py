@@ -10,8 +10,9 @@ Currently implemented:
   - BSEFilingDiscoverer (India) -- full pipeline: discovery + PDF download
   - ASXFilingDiscoverer (Australia) -- announcement discovery via MarkitDigital
   - HKEXFilingDiscoverer (Hong Kong) -- HKEX News title search + PDF download
+  - SGXFilingDiscoverer (Singapore) -- SGX announcements API + PDF download
 
-Markets without structured APIs (SGX, BMV, JSE, SIX, Tadawul, DFM,
+Markets without structured APIs (BMV, JSE, SIX, Tadawul, DFM,
 SEDAR+) continue to use yfinance as fallback.
 """
 
@@ -690,10 +691,153 @@ class HKEXFilingDiscoverer:
 # Registry
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# SGX Singapore Filing Discoverer
+# ---------------------------------------------------------------------------
+
+_SGX_ANN_URL = "https://api.sgx.com/announcements/v1.0"
+_SGX_ANN_HEADERS = {
+    "User-Agent": "Operator1/1.0",
+    "Accept": "application/json",
+}
+
+
+class SGXFilingDiscoverer:
+    """Discovers financial result filings from SGX announcements API.
+
+    SGX provides a public announcements endpoint that returns JSON
+    with filing metadata including PDF attachment URLs.
+    """
+
+    def discover_filings(
+        self,
+        ticker: str,
+        years: int = 2,
+    ) -> FilingDiscovery:
+        result = FilingDiscovery(ticker=ticker, market_id="sg_sgx")
+
+        today = date.today()
+        from_date = today - timedelta(days=365 * years)
+
+        try:
+            data = cached_get(
+                _SGX_ANN_URL,
+                params={
+                    "company": ticker,
+                    "category": "FINANCIAL_RESULTS",
+                    "pagesize": "20",
+                    "pagestart": "0",
+                    "from": from_date.strftime("%Y-%m-%d"),
+                    "to": today.strftime("%Y-%m-%d"),
+                },
+                headers=_SGX_ANN_HEADERS,
+            )
+        except Exception as exc:
+            result.errors.append(f"SGX API request failed: {exc}")
+            return result
+
+        items = []
+        if isinstance(data, dict):
+            items = data.get("data", data.get("result", []))
+        elif isinstance(data, list):
+            items = data
+
+        if not items:
+            result.errors.append("No financial result filings found on SGX")
+            return result
+
+        for item in items:
+            title_text = item.get("title", item.get("headline", ""))
+            ann_date = item.get("date", item.get("announcementDate", ""))
+            attachments = item.get("attachments", [])
+
+            if not title_text:
+                continue
+
+            # Determine filing type from title
+            lower = title_text.lower()
+            if "full year" in lower or "annual" in lower:
+                filing_type = "annual"
+            elif "half year" in lower or "six months" in lower:
+                filing_type = "interim"
+            elif "quarter" in lower or "three months" in lower:
+                filing_type = "quarterly"
+            else:
+                filing_type = "annual"
+
+            # Parse report date from title
+            report_date = ""
+            rd_match = re.search(r"[Ee]nded\s+(\d{1,2})\s+(\w+)\s+(\d{4})", title_text)
+            if rd_match:
+                months = {
+                    "january": "01", "february": "02", "march": "03", "april": "04",
+                    "may": "05", "june": "06", "july": "07", "august": "08",
+                    "september": "09", "october": "10", "november": "11", "december": "12",
+                }
+                m = rd_match.group(2).lower()
+                if m in months:
+                    report_date = f"{rd_match.group(3)}-{months[m]}-{int(rd_match.group(1)):02d}"
+
+            filing_date = str(ann_date)[:10] if ann_date else ""
+
+            # Get PDF URL from attachments
+            doc_url = ""
+            for att in attachments if isinstance(attachments, list) else []:
+                url = att.get("url", att.get("fileUrl", ""))
+                if url and url.lower().endswith(".pdf"):
+                    doc_url = url if url.startswith("http") else f"https://api.sgx.com{url}"
+                    break
+
+            if not doc_url and isinstance(item.get("url", ""), str):
+                doc_url = item["url"]
+
+            filing = FilingMetadata(
+                title=title_text,
+                filing_date=filing_date,
+                report_date=report_date,
+                document_url=doc_url,
+                document_format="pdf",
+                filing_type=filing_type,
+                market_id="sg_sgx",
+            )
+            result.filings.append(filing)
+
+        logger.info(
+            "SGX discovery for %s: found %d filings (%d annual, %d interim)",
+            ticker, len(result.filings),
+            len(result.annual_filings()), len(result.quarterly_filings()),
+        )
+        return result
+
+    def download_filing(self, filing: FilingMetadata) -> bytes:
+        """Download an SGX filing document."""
+        if not filing.document_url:
+            raise ValueError("No document URL in filing metadata")
+
+        resp = requests.get(
+            filing.document_url,
+            headers=_SGX_ANN_HEADERS,
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        if resp.content[:4] != b"%PDF":
+            raise ValueError(
+                f"Expected PDF but got {resp.headers.get('Content-Type', 'unknown')}"
+            )
+
+        logger.info(
+            "Downloaded SGX filing: %s (%d bytes)",
+            filing.title[:60], len(resp.content),
+        )
+        return resp.content
+
+
 DISCOVERER_REGISTRY: dict[str, type] = {
     "in_bse": BSEFilingDiscoverer,
     "au_asx": ASXFilingDiscoverer,
     "hk_hkex": HKEXFilingDiscoverer,
+    "sg_sgx": SGXFilingDiscoverer,
 }
 
 
