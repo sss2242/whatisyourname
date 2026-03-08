@@ -172,6 +172,110 @@ def analyze_filing_calendar(
     return result
 
 
+def inject_filing_freshness(
+    cache: pd.DataFrame,
+    calendar_result: FilingCalendarResult,
+    market_id: str = "",
+) -> pd.DataFrame:
+    """Inject filing freshness columns into the daily cache.
+
+    Computes a continuous 0-1 freshness score for each day based on how
+    recently a new filing was published.  Days right after a filing get
+    freshness=1.0; freshness decays linearly toward 0.0 as the expected
+    next filing date approaches and passes.
+
+    New columns added:
+      - ``filing_freshness``: 0.0-1.0 continuous score
+      - ``filing_gap_flag``: 1 if beyond expected filing window
+      - ``days_since_last_filing``: integer days since most recent filing
+
+    Parameters
+    ----------
+    cache:
+        Daily cache DataFrame (modified in place and returned).
+    calendar_result:
+        Result from ``analyze_filing_calendar()``.
+    market_id:
+        Market ID for filing frequency lookup.
+
+    Returns
+    -------
+    cache with freshness columns added.
+    """
+    config = _MARKET_FILING_FREQUENCY.get(market_id, {})
+    expected_gap_days = config.get("days", 90)
+    # Grace period: data is still considered fully fresh for this many days
+    # after expected gap; then decays to 0 over the same period.
+    grace_days = expected_gap_days
+    decay_days = expected_gap_days  # linear decay over one full cycle
+
+    # Parse filing dates
+    filing_dates_ts = []
+    for d_str in calendar_result.filing_dates:
+        try:
+            filing_dates_ts.append(pd.Timestamp(d_str))
+        except (ValueError, TypeError):
+            continue
+
+    if not filing_dates_ts:
+        # No filings detected -- everything is stale
+        cache["filing_freshness"] = 0.0
+        cache["filing_gap_flag"] = 1
+        cache["days_since_last_filing"] = -1
+        logger.warning("No filing dates detected; all data marked as stale.")
+        return cache
+
+    filing_dates_ts = sorted(filing_dates_ts)
+
+    # Compute per-day metrics
+    freshness = pd.Series(0.0, index=cache.index, dtype=float)
+    days_since = pd.Series(-1, index=cache.index, dtype=int)
+    gap_flag = pd.Series(0, index=cache.index, dtype=int)
+
+    for idx_date in cache.index:
+        ts = pd.Timestamp(idx_date)
+
+        # Find the most recent filing on or before this date
+        recent_filings = [f for f in filing_dates_ts if f <= ts]
+        if not recent_filings:
+            # Before any filing in window
+            freshness[idx_date] = 0.0
+            gap_flag[idx_date] = 1
+            days_since[idx_date] = -1
+            continue
+
+        last_filing = recent_filings[-1]
+        days_elapsed = (ts - last_filing).days
+        days_since[idx_date] = days_elapsed
+
+        if days_elapsed <= grace_days:
+            # Within expected window: fully fresh
+            freshness[idx_date] = 1.0
+            gap_flag[idx_date] = 0
+        elif days_elapsed <= grace_days + decay_days:
+            # Decay period: linear decay from 1.0 to 0.0
+            decay_progress = (days_elapsed - grace_days) / decay_days
+            freshness[idx_date] = max(1.0 - decay_progress, 0.0)
+            gap_flag[idx_date] = 1
+        else:
+            # Severely stale
+            freshness[idx_date] = 0.0
+            gap_flag[idx_date] = 1
+
+    cache["filing_freshness"] = freshness
+    cache["filing_gap_flag"] = gap_flag
+    cache["days_since_last_filing"] = days_since
+
+    fresh_pct = (freshness > 0.5).mean() * 100
+    gap_pct = gap_flag.mean() * 100
+    logger.info(
+        "Filing freshness: %.0f%% of days are fresh (>0.5), %.0f%% have gap flags",
+        fresh_pct, gap_pct,
+    )
+
+    return cache
+
+
 def _detect_filing_dates_from_cache(cache: pd.DataFrame) -> list[pd.Timestamp]:
     """Detect filing dates by finding rows where key financial columns change value.
 

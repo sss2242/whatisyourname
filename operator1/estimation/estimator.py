@@ -812,10 +812,29 @@ def run_estimation(
     # Phase 2 + 3: Split estimator (new default)
     # ------------------------------------------------------------------
     if imputer_method == "split" and vars_needing_imputation:
-        _run_split_estimation(
-            result, vars_needing_imputation, tier_membership,
-            tier_weight_columns, coverage,
-        )
+        try:
+            _run_split_estimation(
+                result, vars_needing_imputation, tier_membership,
+                tier_weight_columns, coverage,
+            )
+        except ValueError as exc:
+            if "Shape of passed values" in str(exc):
+                logger.warning(
+                    "Split estimation shape mismatch (%s). "
+                    "Falling back to per-variable BayesianRidge for remaining variables.",
+                    exc,
+                )
+                remaining = [
+                    v for v in vars_needing_imputation
+                    if f"{v}_final" not in result.columns
+                ]
+                if remaining:
+                    _run_pass2_bayesian_ridge(
+                        result, remaining, tier_membership,
+                        tier_weight_columns, coverage,
+                    )
+            else:
+                raise
 
     # ------------------------------------------------------------------
     # Legacy paths (backward compatibility)
@@ -883,6 +902,32 @@ def run_estimation(
         p1_result.total_filled,
         len(coverage.pass2_estimates),
     )
+
+    # ------------------------------------------------------------------
+    # Phase 4: Adjust confidence by filing freshness (if available)
+    # ------------------------------------------------------------------
+    if "filing_freshness" in result.columns:
+        freshness = result["filing_freshness"]
+        n_adjusted = 0
+        for var in variables:
+            conf_col = f"{var}_confidence"
+            if conf_col in result.columns:
+                # Scale confidence by freshness: fresh data keeps full confidence,
+                # stale data gets reduced confidence
+                original = result[conf_col].copy()
+                result[conf_col] = result[conf_col] * freshness
+                # Keep observed values at full confidence regardless of freshness
+                source_col = f"{var}_source"
+                if source_col in result.columns:
+                    observed_mask = result[source_col] == "observed"
+                    result.loc[observed_mask, conf_col] = original[observed_mask]
+                n_adjusted += 1
+        if n_adjusted > 0:
+            logger.info(
+                "Adjusted confidence for %d variables by filing freshness "
+                "(mean freshness: %.2f)",
+                n_adjusted, freshness.mean(),
+            )
 
     # Defragment the DataFrame after adding many estimation columns.
     # This eliminates PerformanceWarning from downstream consumers.

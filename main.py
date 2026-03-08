@@ -988,6 +988,14 @@ Non-interactive examples:
     except Exception as exc:
         logger.warning("Filing calendar analysis failed: %s", exc)
 
+    # Step 4c.1: Inject filing freshness into cache (if calendar succeeded)
+    if filing_calendar_result is not None:
+        try:
+            from operator1.features.filing_calendar import inject_filing_freshness
+            cache = inject_filing_freshness(cache, filing_calendar_result, market_id=market_id)
+        except Exception as exc:
+            logger.warning("Filing freshness injection failed: %s", exc)
+
     # ------------------------------------------------------------------
     # Step 5: Feature engineering
     # ------------------------------------------------------------------
@@ -1747,7 +1755,7 @@ Non-interactive examples:
                 calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
                 if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
                     for r in forecast_result.residuals:
-                        calibrator.add_score(r)
+                        calibrator.add_residual(r)
                 # Build point forecasts from forecast_result directly
                 _point_forecasts: dict[str, float] = {}
                 if hasattr(forecast_result, "forecasts"):
