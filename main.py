@@ -575,9 +575,9 @@ Non-interactive examples:
             logger.info("No company selected. Exiting.")
             return 0
 
-    ticker = company_info.get("ticker", "")
+    ticker = company_info.get("ticker", "") or company_info.get("identifier", "")
     company_name = company_info.get("name", ticker)
-    identifier = company_info.get("cik") or ticker
+    identifier = company_info.get("cik") or ticker or company_info.get("identifier", "")
 
     logger.info("Target: %s (%s) via %s", company_name, ticker, market_info.pit_api_name)
 

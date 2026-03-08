@@ -33,9 +33,11 @@ logger = logging.getLogger(__name__)
 _CACHE_DIR = Path("cache/jp_jquants")
 
 # J-Quants free plan: ~12 requests/minute.
-# Enforce a 6-second minimum interval between API calls to stay safe.
-_JQUANTS_MIN_INTERVAL = 6.0  # seconds between API calls
+# Enforce an 8-second minimum interval between API calls to stay safe
+# (6s was too aggressive, caused 429 bursts during profile + financial fetch).
+_JQUANTS_MIN_INTERVAL = 8.0  # seconds between API calls
 _jquants_last_call: float = 0.0
+_jquants_eq_master_cache: Any = None  # cached equity master DataFrame
 
 
 def _jquants_throttle() -> None:
@@ -183,8 +185,10 @@ class JPJquantsClient:
                 # get_eq_master() returns short: CoName, CoNameEn, S33Nm
                 name = str(row.get("CompanyNameEnglish", "") or row.get("CoNameEn", "") or row.get("CompanyName", "") or row.get("CoName", ""))
                 sector = str(row.get("Sector33CodeName", "") or row.get("S33Nm", "") or row.get("Sector17CodeName", "") or row.get("S17Nm", ""))
+                ticker_code = str(row.get("Code", ""))[:4]
                 results.append({
-                    "identifier": str(row.get("Code", ""))[:4],
+                    "identifier": ticker_code,
+                    "ticker": ticker_code,
                     "name": name,
                     "exchange": "TSE",
                     "sector": sector,
@@ -211,20 +215,36 @@ class JPJquantsClient:
             return {}
 
         try:
-            # Normalize to 5-digit code (J-Quants uses 5 digits)
+            # Normalize to 5-digit code (J-Quants uses 5 digits: 7203 -> 72030)
             code = identifier.strip()
+            base4 = code[:4]  # keep the 4-digit code for matching
             if len(code) == 4:
                 code = code + "0"
 
             # Docs: jquantsapi/client_v2.py get_eq_master() method
             _jquants_throttle()
-            df = self._client.get_eq_master(code=code)
+            try:
+                df = self._client.get_eq_master(code=code)
+            except TypeError:
+                # Older SDK may not support code param; fetch all and filter
+                df = self._client.get_eq_master()
+
             if df.empty:
                 return {}
 
-            row = df.iloc[0]
+            # Exact match on the 5-digit code first
+            code_col = "Code" if "Code" in df.columns else df.columns[0]
+            exact = df[df[code_col].astype(str) == code]
+            if exact.empty:
+                # Try matching on 4-digit prefix (some codes may differ)
+                exact = df[df[code_col].astype(str).str[:4] == base4]
+            if exact.empty:
+                logger.warning("J-Quants: no company found for code %s", code)
+                return {}
+
+            row = exact.iloc[0]
             # V2 eq_master columns: CoName, CoNameEn, S33, S33Nm, Mkt, MktNm
-            return {
+            profile = {
                 "name": str(row.get("CoNameEn", "") or row.get("CoName", "") or row.get("CompanyNameEnglish", "") or row.get("CompanyName", "")),
                 "ticker": str(row.get("Code", ""))[:4],
                 "exchange": "TSE",
@@ -233,6 +253,17 @@ class JPJquantsClient:
                 "country": "Japan",
                 "currency": "JPY",
             }
+
+            # Validate: ensure the returned company matches the requested code
+            returned_ticker = profile.get("ticker", "")
+            if returned_ticker and returned_ticker != base4:
+                logger.error(
+                    "J-Quants profile mismatch: requested %s but got %s (%s). "
+                    "Check code normalization.",
+                    base4, returned_ticker, profile.get("name"),
+                )
+
+            return profile
 
         except Exception as exc:
             logger.error("J-Quants get_profile failed for %s: %s", identifier, exc)
