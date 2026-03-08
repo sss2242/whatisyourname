@@ -60,9 +60,43 @@ def fetch_macro_kosis(
 
             if results:
                 logger.info("Korea macro via FRED: %d/%d indicators", len(results), len(_FRED_KR_SERIES))
-                return results
         except ImportError:
             logger.debug("fredapi not installed for KR macro")
 
-    logger.debug("Korea macro: FRED unavailable; falling back to wbgapi")
+    # Path 2: wbgapi fallback for any indicators FRED didn't return.
+    _WB_KR_SERIES: dict[str, str] = {
+        "gdp_growth": "NY.GDP.MKTP.KD.ZG",
+        "inflation_rate_yoy": "FP.CPI.TOTL.ZG",
+        "unemployment_rate": "SL.UEM.TOTL.ZS",
+        "exchange_rate": "PA.NUS.FCRF",
+    }
+    missing = [k for k in _WB_KR_SERIES if k not in results]
+    if missing:
+        try:
+            import wbgapi as wb
+            start_year = date.today().year - years
+            for canonical_name in missing:
+                wb_id = _WB_KR_SERIES[canonical_name]
+                try:
+                    df = wb.data.DataFrame(wb_id, economy="KOR", time=range(start_year, date.today().year + 1))
+                    if df is not None and not df.empty:
+                        # wbgapi returns year columns like YR2020; transpose to series
+                        series = df.iloc[0].dropna()
+                        if not series.empty:
+                            idx = pd.to_datetime([f"{str(y).replace('YR','')}-12-31" for y in series.index], errors="coerce")
+                            s = pd.Series(series.values, index=idx, name=canonical_name, dtype=float)
+                            s = s.dropna()
+                            if not s.empty:
+                                results[canonical_name] = s
+                                logger.debug("wbgapi-KR %s: %d obs", wb_id, len(s))
+                except Exception as exc:
+                    logger.debug("wbgapi-KR failed for %s: %s", wb_id, exc)
+            if any(k in results for k in missing):
+                logger.info("Korea macro via wbgapi fallback: filled %d/%d missing indicators",
+                            sum(1 for k in missing if k in results), len(missing))
+        except ImportError:
+            logger.debug("wbgapi not installed for KR macro fallback")
+
+    if results:
+        logger.info("Korea macro total: %d/%d indicators", len(results), len(_FRED_KR_SERIES))
     return results
