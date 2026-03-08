@@ -833,11 +833,232 @@ class SGXFilingDiscoverer:
         return resp.content
 
 
+# ---------------------------------------------------------------------------
+# Tadawul Saudi Arabia Filing Discoverer
+# ---------------------------------------------------------------------------
+
+_TADAWUL_DISC_URL = "https://www.saudiexchange.sa/wps/portal/tadawul/market-participants/issuers/reports-statements/financial-statements"
+_TADAWUL_HEADERS = {
+    "User-Agent": "Operator1/1.0",
+    "Accept": "application/json",
+}
+
+
+class TadawulFilingDiscoverer:
+    """Discovers financial filings from Saudi Exchange (Tadawul).
+
+    Searches the Tadawul disclosures portal for financial statements.
+    Falls back gracefully if the API is unavailable.
+    """
+
+    def discover_filings(
+        self,
+        ticker: str,
+        years: int = 2,
+    ) -> FilingDiscovery:
+        result = FilingDiscovery(ticker=ticker, market_id="sa_tadawul")
+
+        today = date.today()
+        from_date = today - timedelta(days=365 * years)
+
+        try:
+            data = cached_get(
+                f"https://www.saudiexchange.sa/tadawul-api/resources/listed-companies/{ticker}/disclosures",
+                params={
+                    "fromDate": from_date.strftime("%Y-%m-%d"),
+                    "toDate": today.strftime("%Y-%m-%d"),
+                    "category": "FINANCIAL",
+                    "pageSize": "20",
+                },
+                headers=_TADAWUL_HEADERS,
+            )
+        except Exception as exc:
+            result.errors.append(f"Tadawul API failed: {exc}")
+            return result
+
+        items = []
+        if isinstance(data, dict):
+            items = data.get("data", data.get("disclosures", data.get("result", [])))
+        elif isinstance(data, list):
+            items = data
+
+        for item in items:
+            title = item.get("title", item.get("subject", ""))
+            ann_date = item.get("publishDate", item.get("date", ""))
+            doc_url = item.get("url", item.get("pdfUrl", ""))
+
+            if not title:
+                continue
+
+            lower = title.lower()
+            if "annual" in lower or "year" in lower:
+                filing_type = "annual"
+            elif "interim" in lower or "half" in lower or "six" in lower:
+                filing_type = "interim"
+            elif "quarter" in lower:
+                filing_type = "quarterly"
+            else:
+                filing_type = "annual"
+
+            filing_date = str(ann_date)[:10] if ann_date else ""
+
+            filing = FilingMetadata(
+                title=title,
+                filing_date=filing_date,
+                document_url=doc_url if doc_url and doc_url.startswith("http") else "",
+                document_format="pdf",
+                filing_type=filing_type,
+                market_id="sa_tadawul",
+            )
+            result.filings.append(filing)
+
+        logger.info("Tadawul discovery for %s: found %d filings", ticker, len(result.filings))
+        return result
+
+    def download_filing(self, filing: FilingMetadata) -> bytes:
+        if not filing.document_url:
+            raise ValueError("No document URL in filing metadata")
+        resp = requests.get(filing.document_url, headers=_TADAWUL_HEADERS, timeout=30)
+        resp.raise_for_status()
+        if resp.content[:4] != b"%PDF":
+            raise ValueError(f"Not a PDF: {resp.headers.get('Content-Type', 'unknown')}")
+        return resp.content
+
+
+# ---------------------------------------------------------------------------
+# SEDAR+ Canada Filing Discoverer
+# ---------------------------------------------------------------------------
+
+_SEDAR_BASE = "https://www.sedarplus.ca/csa-party"
+_SEDAR_HEADERS = {
+    "User-Agent": "Operator1/1.0",
+    "Accept": "application/json",
+}
+
+
+class SEDARFilingDiscoverer:
+    """Discovers financial filings from SEDAR+ (Canada).
+
+    Uses the SEDAR+ document search API to find financial statements.
+    SEDAR+ is the official Canadian securities filing system operated
+    by the Canadian Securities Administrators (CSA).
+    """
+
+    def discover_filings(
+        self,
+        ticker: str,
+        years: int = 2,
+    ) -> FilingDiscovery:
+        result = FilingDiscovery(ticker=ticker, market_id="ca_sedar")
+
+        # First resolve ticker to SEDAR entity ID
+        entity_id = self._resolve_entity(ticker)
+        if not entity_id:
+            result.errors.append(f"Could not resolve {ticker} on SEDAR+")
+            return result
+
+        today = date.today()
+        from_date = today - timedelta(days=365 * years)
+
+        try:
+            data = cached_get(
+                f"{_SEDAR_BASE}/records/companyDocuments",
+                params={
+                    "entityId": entity_id,
+                    "category": "Annual Financial Statements",
+                    "fromDate": from_date.strftime("%Y-%m-%d"),
+                    "toDate": today.strftime("%Y-%m-%d"),
+                    "pageSize": "10",
+                },
+                headers=_SEDAR_HEADERS,
+            )
+        except Exception as exc:
+            result.errors.append(f"SEDAR+ document search failed: {exc}")
+            # Try interim too
+            data = None
+
+        for category in ["Annual Financial Statements", "Interim Financial Statements"]:
+            try:
+                if data is None or (category != "Annual Financial Statements"):
+                    data = cached_get(
+                        f"{_SEDAR_BASE}/records/companyDocuments",
+                        params={
+                            "entityId": entity_id,
+                            "category": category,
+                            "fromDate": from_date.strftime("%Y-%m-%d"),
+                            "toDate": today.strftime("%Y-%m-%d"),
+                            "pageSize": "10",
+                        },
+                        headers=_SEDAR_HEADERS,
+                    )
+            except Exception:
+                continue
+
+            items = []
+            if isinstance(data, dict):
+                items = data.get("documents", data.get("data", data.get("result", [])))
+            elif isinstance(data, list):
+                items = data
+
+            for item in items:
+                title = item.get("title", item.get("name", ""))
+                filing_dt = item.get("filingDate", item.get("date", ""))
+                doc_url = item.get("documentUrl", item.get("url", ""))
+                doc_id = item.get("documentId", item.get("id", ""))
+
+                if not title:
+                    continue
+
+                is_annual = "annual" in category.lower()
+
+                filing = FilingMetadata(
+                    title=title,
+                    filing_date=str(filing_dt)[:10] if filing_dt else "",
+                    document_url=doc_url if doc_url and doc_url.startswith("http") else "",
+                    document_format="pdf",
+                    filing_type="annual" if is_annual else "interim",
+                    market_id="ca_sedar",
+                    attachment_id=str(doc_id),
+                )
+                result.filings.append(filing)
+
+            data = None  # Reset for next category
+
+        logger.info("SEDAR+ discovery for %s: found %d filings", ticker, len(result.filings))
+        return result
+
+    def _resolve_entity(self, ticker: str) -> str:
+        """Resolve a ticker to a SEDAR+ entity ID."""
+        try:
+            data = cached_get(
+                f"{_SEDAR_BASE}/searchCompany",
+                params={"searchText": ticker},
+                headers=_SEDAR_HEADERS,
+            )
+            items = data if isinstance(data, list) else data.get("results", []) if isinstance(data, dict) else []
+            if items:
+                return str(items[0].get("sedarId", items[0].get("entityId", "")))
+        except Exception:
+            pass
+        return ""
+
+    def download_filing(self, filing: FilingMetadata) -> bytes:
+        if not filing.document_url:
+            raise ValueError("No document URL in filing metadata")
+        resp = requests.get(filing.document_url, headers=_SEDAR_HEADERS, timeout=30)
+        resp.raise_for_status()
+        if resp.content[:4] != b"%PDF":
+            raise ValueError(f"Not a PDF: {resp.headers.get('Content-Type', 'unknown')}")
+        return resp.content
+
+
 DISCOVERER_REGISTRY: dict[str, type] = {
     "in_bse": BSEFilingDiscoverer,
     "au_asx": ASXFilingDiscoverer,
     "hk_hkex": HKEXFilingDiscoverer,
     "sg_sgx": SGXFilingDiscoverer,
+    "sa_tadawul": TadawulFilingDiscoverer,
+    "ca_sedar": SEDARFilingDiscoverer,
 }
 
 

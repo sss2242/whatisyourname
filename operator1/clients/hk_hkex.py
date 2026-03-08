@@ -102,13 +102,11 @@ class HKHkexClient:
         return self._fetch_financials(identifier, "cashflow")
 
     def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
-        """Try HKEX filing discovery first, fall back to yfinance.
+        """Fetch financials via HKEX filing discovery only (PIT-compliant).
 
-        Filing discovery provides true PIT data (filing_date from HKEX
-        announcement date). yfinance sets filing_date = report_date
-        which is not PIT-compliant.
+        yfinance is NOT used for financial statements because it does not
+        provide true filing dates (sets filing_date = report_date).
         """
-        # Path 1: HKEX filing discovery + LLM extraction
         try:
             from operator1.clients.filing_discoverer import try_filing_extraction
             df = try_filing_extraction(
@@ -123,11 +121,7 @@ class HKHkexClient:
                 return df
         except Exception as exc:
             logger.debug("HKEX filing discovery failed for %s: %s", identifier, exc)
-
-        # Path 2: yfinance fallback (not PIT-compliant)
-        from operator1.clients.yfinance_backed import yf_get_financials
-        logger.debug("HKEX %s: falling back to yfinance for %s", identifier, statement_type)
-        return yf_get_financials(identifier, self.market_id, statement_type, yf_suffix=".HK")
+        return pd.DataFrame()
 
     # -- Price data ----------------------------------------------------------
 

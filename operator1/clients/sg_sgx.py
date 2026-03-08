@@ -180,12 +180,11 @@ class SGSgxClient:
         return self._fetch_financials(identifier, "cashflow")
 
     def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
-        """Try SGX announcement-based filing discovery first, yfinance fallback.
+        """Fetch financials via SGX filing discovery only (PIT-compliant).
 
-        SGX announcements provide true PIT data (announcement date is
-        the filing date). yfinance sets filing_date = report_date.
+        yfinance is NOT used for financial statements because it does not
+        provide true filing dates (sets filing_date = report_date).
         """
-        # Path 1: SGX filing discovery + LLM extraction
         try:
             from operator1.clients.filing_discoverer import try_filing_extraction
             df = try_filing_extraction(
@@ -200,11 +199,7 @@ class SGSgxClient:
                 return df
         except Exception as exc:
             logger.debug("SGX filing discovery failed for %s: %s", identifier, exc)
-
-        # Path 2: yfinance fallback
-        from operator1.clients.yfinance_backed import yf_get_financials
-        logger.debug("SGX %s: falling back to yfinance for %s", identifier, statement_type)
-        return yf_get_financials(identifier, self.market_id, statement_type, yf_suffix=".SI")
+        return pd.DataFrame()
 
     # -- Price data ----------------------------------------------------------
 
