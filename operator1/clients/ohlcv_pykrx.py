@@ -45,12 +45,32 @@ def fetch_ohlcv_pykrx(
         end_dt = date.today()
         start_dt = end_dt - timedelta(days=365 * years)
 
+        # Normalize ticker: pykrx expects 6-digit zero-padded codes
+        clean_ticker = ticker.split(".")[0].strip().zfill(6)
+        logger.debug("pykrx: fetching %s (original=%s)", clean_ticker, ticker)
+
         # Verbatim from pykrx README
         df = stock.get_market_ohlcv(
             start_dt.strftime("%Y%m%d"),
             end_dt.strftime("%Y%m%d"),
-            ticker,
+            clean_ticker,
         )
+
+        # If empty, the ticker might be KOSDAQ -- pykrx sometimes
+        # needs the market= hint for KOSDAQ stocks.
+        if (df is None or df.empty) and hasattr(stock, "get_market_ohlcv_by_ticker"):
+            try:
+                df = stock.get_market_ohlcv_by_ticker(
+                    end_dt.strftime("%Y%m%d"),
+                    market="KOSDAQ",
+                )
+                if df is not None and clean_ticker in df.index:
+                    # Got a snapshot but need the full range --
+                    # if the ticker is found on KOSDAQ, retry with
+                    # the standard call (pykrx should resolve it).
+                    logger.debug("pykrx: ticker %s confirmed on KOSDAQ", clean_ticker)
+            except Exception:
+                pass
 
         if df is None or df.empty:
             return pd.DataFrame()

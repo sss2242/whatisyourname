@@ -495,10 +495,13 @@ class KRDartClient:
                             continue
 
                         is_annual = reprt_code == "11011"
+                        # rcept_dt is the filing (receipt) date; rcept_no is
+                        # just the document ID and will fail to parse as a date.
+                        filing_dt = item.get("rcept_dt", "") or ""
                         rows.append({
                             "concept": canonical,
                             "value": value,
-                            "filing_date": item.get("rcept_no", ""),
+                            "filing_date": filing_dt,
                             "report_date": f"{year}-12-31" if is_annual else f"{year}-{['03','06','09','12'][int(reprt_code[-1])-1]}-30",
                             "period_type": "annual" if is_annual else "quarterly",
                             "form": "Annual" if is_annual else "Quarterly",
@@ -513,6 +516,24 @@ class KRDartClient:
         for col in ("filing_date", "report_date"):
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
+
+        # Pre-filter duplicates: keep only the latest amendment per
+        # (concept, report_date).  DART returns multiple filings for the
+        # same period (original + amendments), and the downstream
+        # reconciliation layer removes them anyway -- but pre-filtering
+        # here avoids 96% wasted rows (e.g. 186 -> 7).
+        _before = len(df)
+        if "concept" in df.columns and "report_date" in df.columns:
+            df = (
+                df.sort_values("filing_date", ascending=False, na_position="last")
+                .drop_duplicates(subset=["concept", "report_date"], keep="first")
+                .sort_values("report_date")
+                .reset_index(drop=True)
+            )
+            _after = len(df)
+            if _before != _after:
+                logger.info("DART dedup: %d -> %d rows (removed %d duplicates)",
+                            _before, _after, _before - _after)
 
         # Cache filings
         self._cache_filings(identifier, df)

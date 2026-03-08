@@ -50,16 +50,40 @@ class CHSixClient:
         return profile
 
     def get_income_statement(self, identifier: str) -> pd.DataFrame:
-        from operator1.clients.yfinance_backed import yf_get_financials
-        return yf_get_financials(identifier, self.market_id, "income", yf_suffix=".SW")
+        return self._fetch_financials(identifier, "income")
 
     def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
-        from operator1.clients.yfinance_backed import yf_get_financials
-        return yf_get_financials(identifier, self.market_id, "balance", yf_suffix=".SW")
+        return self._fetch_financials(identifier, "balance")
 
     def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
-        from operator1.clients.yfinance_backed import yf_get_financials
-        return yf_get_financials(identifier, self.market_id, "cashflow", yf_suffix=".SW")
+        return self._fetch_financials(identifier, "cashflow")
+
+    def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
+        """Fetch financials via EU ESEF crossover (PIT-compliant).
+
+        Many SIX-listed companies (Nestle, Novartis, Roche, etc.) also
+        file ESEF XBRL reports with EU regulators. We try the EU ESEF
+        wrapper first. yfinance is NOT used for PIT financial statements.
+        """
+        # Path 1: EU ESEF wrapper (Swiss blue chips file ESEF)
+        try:
+            from operator1.clients.eu_esef_wrapper import EUEsefClient
+            esef = EUEsefClient()
+            if statement_type == "income":
+                df = esef.get_income_statement(identifier)
+            elif statement_type == "balance":
+                df = esef.get_balance_sheet(identifier)
+            else:
+                df = esef.get_cashflow_statement(identifier)
+            if df is not None and not df.empty:
+                logger.info("SIX %s %s: %d rows from EU ESEF crossover",
+                           identifier, statement_type, len(df))
+                return df
+        except Exception as exc:
+            logger.debug("EU ESEF crossover failed for SIX %s: %s", identifier, exc)
+
+        # No yfinance fallback -- return empty for PIT compliance
+        return pd.DataFrame()
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:
         """SIX does not provide OHLCV data. Handled by ohlcv_provider."""
