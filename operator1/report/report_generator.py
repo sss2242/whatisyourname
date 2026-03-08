@@ -3513,11 +3513,74 @@ def _embed_charts_in_markdown(
 # ---------------------------------------------------------------------------
 
 
+def _get_template_dir() -> Path:
+    """Return the path to the report templates directory."""
+    return Path(__file__).resolve().parent / "templates"
+
+
+def _generate_html(
+    markdown_path: str | Path,
+    output_path: str | Path | None = None,
+) -> str | None:
+    """Convert Markdown report to styled HTML using pandoc + custom template.
+
+    Returns the HTML path on success, or None if pandoc is unavailable.
+    """
+    if shutil.which("pandoc") is None:
+        logger.info("pandoc not found; skipping HTML generation.")
+        return None
+
+    md = Path(markdown_path)
+    if output_path is None:
+        output_path = md.with_suffix(".html")
+    html = Path(output_path)
+
+    tpl_dir = _get_template_dir()
+    css_path = tpl_dir / "report.css"
+    html_tpl = tpl_dir / "report.html"
+
+    cmd = [
+        "pandoc",
+        str(md),
+        "-o",
+        str(html),
+        "--standalone",
+        "--self-contained",
+    ]
+
+    # Use custom HTML template if available
+    if html_tpl.exists():
+        cmd.extend(["--template", str(html_tpl)])
+
+    # Embed CSS for styling
+    if css_path.exists():
+        cmd.extend(["--css", str(css_path)])
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+        logger.info("HTML report generated: %s", html)
+        return str(html)
+    except FileNotFoundError:
+        logger.info("pandoc not available; skipping HTML generation.")
+        return None
+    except subprocess.CalledProcessError as exc:
+        logger.warning("HTML generation failed: %s", exc.stderr.decode()[:200])
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("HTML generation timed out.")
+        return None
+
+
 def _generate_pdf(
     markdown_path: str | Path,
     output_path: str | Path | None = None,
 ) -> str | None:
     """Convert Markdown report to PDF using pandoc.
+
+    Tries multiple PDF engines in order of preference:
+    1. weasyprint (CSS-styled PDF -- uses our custom stylesheet)
+    2. xelatex (LaTeX-based -- clean but no custom CSS)
+    3. wkhtmltopdf (WebKit-based fallback)
 
     Returns the PDF path on success, or None if pandoc is unavailable.
     """
@@ -3530,32 +3593,50 @@ def _generate_pdf(
         output_path = md.with_suffix(".pdf")
     pdf = Path(output_path)
 
-    try:
-        subprocess.run(
-            [
-                "pandoc",
-                str(md),
-                "-o",
-                str(pdf),
-                "--pdf-engine=xelatex",
-                "-V",
-                "geometry:margin=1in",
-            ],
-            check=True,
-            capture_output=True,
-            timeout=60,
-        )
-        logger.info("PDF report generated: %s", pdf)
-        return str(pdf)
-    except FileNotFoundError:
-        logger.info("pandoc/xelatex not available; skipping PDF.")
-        return None
-    except subprocess.CalledProcessError as exc:
-        logger.warning("PDF generation failed: %s", exc.stderr.decode()[:200])
-        return None
-    except subprocess.TimeoutExpired:
-        logger.warning("PDF generation timed out.")
-        return None
+    tpl_dir = _get_template_dir()
+    css_path = tpl_dir / "report.css"
+
+    # Try weasyprint first (supports CSS natively for beautiful PDFs)
+    for engine, engine_args in [
+        ("weasyprint", [
+            "--pdf-engine=weasyprint",
+            *(["--css", str(css_path)] if css_path.exists() else []),
+        ]),
+        ("xelatex", [
+            "--pdf-engine=xelatex",
+            "-V", "geometry:margin=1in",
+            "-V", "fontsize=10pt",
+            "-V", "mainfont=DejaVu Sans",
+            "-V", "monofont=DejaVu Sans Mono",
+        ]),
+        ("wkhtmltopdf", [
+            "--pdf-engine=wkhtmltopdf",
+            *(["--css", str(css_path)] if css_path.exists() else []),
+        ]),
+    ]:
+        cmd = ["pandoc", str(md), "-o", str(pdf), "--standalone"] + engine_args
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                timeout=120,
+            )
+            logger.info("PDF report generated via %s: %s", engine, pdf)
+            return str(pdf)
+        except FileNotFoundError:
+            logger.debug("PDF engine %s not available, trying next.", engine)
+            continue
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode()[:200] if exc.stderr else "unknown error"
+            logger.debug("PDF engine %s failed: %s", engine, stderr)
+            continue
+        except subprocess.TimeoutExpired:
+            logger.debug("PDF engine %s timed out.", engine)
+            continue
+
+    logger.warning("No PDF engine available (tried weasyprint, xelatex, wkhtmltopdf).")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -3677,7 +3758,10 @@ def generate_report(
             fh.write(markdown)
         logger.info("Embedded %d charts into report.", len(chart_paths))
 
-    # Step 4: Optional PDF (all tiers)
+    # Step 4: Generate styled HTML (always, if pandoc is available)
+    html_path = _generate_html(md_path, out / f"{tier.value}_report.html")
+
+    # Step 5: Optional PDF (all tiers)
     pdf_path: str | None = None
     if generate_pdf:
         pdf_path = _generate_pdf(md_path, out / f"{tier.value}_report.pdf")
@@ -3685,6 +3769,7 @@ def generate_report(
     return {
         "markdown": markdown,
         "markdown_path": str(md_path),
+        "html_path": html_path,
         "chart_paths": chart_paths,
         "pdf_path": pdf_path,
         "tier": tier.value,
