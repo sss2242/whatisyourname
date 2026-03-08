@@ -9,8 +9,9 @@ defines the common interface; per-market implementations handle the specifics.
 Currently implemented:
   - BSEFilingDiscoverer (India) -- full pipeline: discovery + PDF download
   - ASXFilingDiscoverer (Australia) -- announcement discovery via MarkitDigital
+  - HKEXFilingDiscoverer (Hong Kong) -- HKEX News title search + PDF download
 
-Markets without structured APIs (HKEX, SGX, BMV, JSE, SIX, Tadawul, DFM,
+Markets without structured APIs (SGX, BMV, JSE, SIX, Tadawul, DFM,
 SEDAR+) continue to use yfinance as fallback.
 """
 
@@ -438,12 +439,261 @@ class ASXFilingDiscoverer:
 
 
 # ---------------------------------------------------------------------------
+# HKEX Hong Kong Filing Discoverer
+# ---------------------------------------------------------------------------
+
+_HKEX_SEARCH_URL = "https://www1.hkexnews.hk/search/titlesearch.xhtml"
+_HKEX_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+    "Accept": "application/json, text/html",
+    "Referer": "https://www.hkexnews.hk/",
+}
+
+
+def _parse_hkex_report_date(title: str) -> str:
+    """Extract fiscal period end date from HKEX filing title.
+
+    Examples:
+      'Annual Results for the Year Ended 31 December 2025'
+      'Interim Results for the Six Months Ended 30 June 2025'
+    """
+    patterns = [
+        r"[Ee]nded\s+(\d{1,2})\s+(\w+)\s+(\d{4})",
+        r"[Ee]nded\s+(\w+)\s+(\d{1,2}),?\s+(\d{4})",
+    ]
+    months = {
+        "january": "01", "february": "02", "march": "03", "april": "04",
+        "may": "05", "june": "06", "july": "07", "august": "08",
+        "september": "09", "october": "10", "november": "11", "december": "12",
+    }
+    for pattern in patterns:
+        match = re.search(pattern, title, re.IGNORECASE)
+        if match:
+            groups = match.groups()
+            if groups[1].lower() in months:
+                # "31 December 2025"
+                return f"{groups[2]}-{months[groups[1].lower()]}-{int(groups[0]):02d}"
+            elif groups[0].lower() in months:
+                # "December 31, 2025"
+                return f"{groups[2]}-{months[groups[0].lower()]}-{int(groups[1]):02d}"
+    return ""
+
+
+def _classify_hkex_filing_type(title: str) -> str:
+    """Classify HKEX filing as annual, interim, or quarterly."""
+    lower = title.lower()
+    if "annual" in lower or "year ended" in lower:
+        return "annual"
+    if "interim" in lower or "half" in lower or "six months" in lower:
+        return "interim"
+    if "quarter" in lower or "three months" in lower:
+        return "quarterly"
+    return "annual"
+
+
+class HKEXFilingDiscoverer:
+    """Discovers financial result filings from HKEX News.
+
+    Uses the HKEX News title search to find annual/interim result
+    announcements, then extracts PDF document URLs for LLM extraction.
+
+    HKEX stock codes are zero-padded to 5 digits (e.g. 00700 for Tencent,
+    00005 for HSBC).
+    """
+
+    def discover_filings(
+        self,
+        ticker: str,
+        years: int = 2,
+    ) -> FilingDiscovery:
+        """Discover financial result filings from HKEX News.
+
+        Parameters
+        ----------
+        ticker:
+            HKEX stock code (e.g. '0700', '00700', '5').
+        years:
+            Number of years to search back.
+        """
+        result = FilingDiscovery(ticker=ticker, market_id="hk_hkex")
+
+        # HKEX uses 5-digit zero-padded stock codes
+        code = ticker.split(".")[0].strip().zfill(5)
+
+        today = date.today()
+        from_date = today - timedelta(days=365 * years)
+
+        # Search for annual and interim results
+        for search_term in ["annual results", "interim results"]:
+            try:
+                resp = requests.get(
+                    _HKEX_SEARCH_URL,
+                    params={
+                        "lang": "EN",
+                        "category": "0",
+                        "market": "SEHK",
+                        "searchType": "0",
+                        "documentType": "-1",
+                        "t1code": "-2",
+                        "t2Gcode": "-2",
+                        "t2code": "-2",
+                        "stockId": code,
+                        "from": from_date.strftime("%Y%m%d"),
+                        "to": today.strftime("%Y%m%d"),
+                        "title": search_term,
+                        "rowRange": "20",
+                        "sortDir": "desc",
+                        "sortByDate": "desc",
+                    },
+                    headers=_HKEX_HEADERS,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+            except Exception as exc:
+                result.errors.append(f"HKEX search failed for '{search_term}': {exc}")
+                continue
+
+            # HKEX returns HTML with the results.  Parse the title search
+            # results which are in a structured table/JSON depending on the
+            # response format.  We try JSON first, then fall back to HTML regex.
+            try:
+                data = resp.json()
+                records = data.get("result", data.get("data", []))
+                if isinstance(records, list):
+                    for item in records:
+                        title_text = item.get("title", item.get("TITLE", ""))
+                        file_link = item.get("file_link", item.get("FILE_LINK", ""))
+                        date_str = item.get("release_date", item.get("RELEASE_DATE", ""))
+
+                        if not title_text:
+                            continue
+
+                        # Build document URL
+                        doc_url = ""
+                        if file_link:
+                            if file_link.startswith("http"):
+                                doc_url = file_link
+                            else:
+                                doc_url = f"https://www1.hkexnews.hk{file_link}"
+
+                        filing_date = ""
+                        if date_str:
+                            try:
+                                filing_date = str(date_str)[:10]
+                            except Exception:
+                                pass
+
+                        report_date = _parse_hkex_report_date(title_text)
+                        filing_type = _classify_hkex_filing_type(title_text)
+
+                        filing = FilingMetadata(
+                            title=title_text,
+                            filing_date=filing_date,
+                            report_date=report_date,
+                            document_url=doc_url,
+                            document_format="pdf",
+                            filing_type=filing_type,
+                            market_id="hk_hkex",
+                        )
+                        result.filings.append(filing)
+            except (ValueError, AttributeError):
+                # Not JSON -- try HTML parsing with regex
+                html = resp.text
+                # Pattern: look for links to PDF documents with dates
+                link_pattern = re.compile(
+                    r'href="([^"]*\.pdf)"[^>]*>.*?</a>',
+                    re.IGNORECASE | re.DOTALL,
+                )
+                date_pattern = re.compile(
+                    r'(\d{2}/\d{2}/\d{4})',
+                )
+                title_pattern = re.compile(
+                    r'class="[^"]*title[^"]*"[^>]*>([^<]+)<',
+                    re.IGNORECASE,
+                )
+
+                # Extract whatever structured info we can from HTML
+                links = link_pattern.findall(html)
+                dates = date_pattern.findall(html)
+                titles = title_pattern.findall(html)
+
+                for i, link in enumerate(links[:10]):
+                    doc_url = link if link.startswith("http") else f"https://www1.hkexnews.hk{link}"
+                    title_text = titles[i] if i < len(titles) else search_term
+                    date_str = dates[i] if i < len(dates) else ""
+                    filing_date = ""
+                    if date_str:
+                        try:
+                            parts = date_str.split("/")
+                            filing_date = f"{parts[2]}-{parts[1]}-{parts[0]}"
+                        except Exception:
+                            pass
+
+                    report_date = _parse_hkex_report_date(title_text)
+                    filing_type = _classify_hkex_filing_type(title_text)
+
+                    filing = FilingMetadata(
+                        title=title_text.strip(),
+                        filing_date=filing_date,
+                        report_date=report_date,
+                        document_url=doc_url,
+                        document_format="pdf",
+                        filing_type=filing_type,
+                        market_id="hk_hkex",
+                    )
+                    result.filings.append(filing)
+
+        # Dedup by document URL
+        seen_urls: set[str] = set()
+        unique: list[FilingMetadata] = []
+        for f in result.filings:
+            if f.document_url and f.document_url not in seen_urls:
+                seen_urls.add(f.document_url)
+                unique.append(f)
+            elif not f.document_url:
+                unique.append(f)
+        result.filings = unique
+
+        logger.info(
+            "HKEX discovery for %s: found %d filings (%d annual, %d interim)",
+            code, len(result.filings),
+            len(result.annual_filings()), len(result.quarterly_filings()),
+        )
+        return result
+
+    def download_filing(self, filing: FilingMetadata) -> bytes:
+        """Download an HKEX filing document."""
+        if not filing.document_url:
+            raise ValueError("No document URL in filing metadata")
+
+        resp = requests.get(
+            filing.document_url,
+            headers=_HKEX_HEADERS,
+            timeout=60,  # HKEX PDFs can be large
+        )
+        resp.raise_for_status()
+
+        # Validate it's a PDF
+        if resp.content[:4] != b"%PDF":
+            raise ValueError(
+                f"Expected PDF but got {resp.headers.get('Content-Type', 'unknown')}"
+            )
+
+        logger.info(
+            "Downloaded HKEX filing: %s (%d bytes)",
+            filing.title[:60], len(resp.content),
+        )
+        return resp.content
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
 DISCOVERER_REGISTRY: dict[str, type] = {
     "in_bse": BSEFilingDiscoverer,
     "au_asx": ASXFilingDiscoverer,
+    "hk_hkex": HKEXFilingDiscoverer,
 }
 
 
