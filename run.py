@@ -285,7 +285,7 @@ def setup_llm_keys() -> dict[str, str]:
                     keys[k] = v
 
     # Also pull from environment variables
-    for key_name in ["GEMINI_API_KEY", "ANTHROPIC_API_KEY"]:
+    for key_name in ["GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"]:
         if key_name not in keys:
             env_val = os.environ.get(key_name)
             if env_val and env_val.strip():
@@ -293,6 +293,7 @@ def setup_llm_keys() -> dict[str, str]:
 
     has_gemini = "GEMINI_API_KEY" in keys
     has_claude = "ANTHROPIC_API_KEY" in keys
+    has_openrouter = "OPENROUTER_API_KEY" in keys
 
     if has_gemini:
         n_gemini = len([k for k in keys["GEMINI_API_KEY"].split(",") if k.strip()])
@@ -302,10 +303,15 @@ def setup_llm_keys() -> dict[str, str]:
         n_claude = len([k for k in keys["ANTHROPIC_API_KEY"].split(",") if k.strip()])
         key_info = f" ({n_claude} keys for rotation)" if n_claude > 1 else ""
         _ok(f"ANTHROPIC_API_KEY: {_mask_key(keys['ANTHROPIC_API_KEY'].split(',')[0].strip())}{key_info} (loaded from .env)")
+    if has_openrouter:
+        n_or = len([k for k in keys["OPENROUTER_API_KEY"].split(",") if k.strip()])
+        key_info = f" ({n_or} keys for rotation)" if n_or > 1 else ""
+        _ok(f"OPENROUTER_API_KEY: {_mask_key(keys['OPENROUTER_API_KEY'].split(',')[0].strip())}{key_info} (loaded from .env)")
 
-    if has_gemini and has_claude:
-        _ok("Both LLM providers available (cross-provider fallback enabled)")
-    elif has_gemini or has_claude:
+    n_providers = sum([has_gemini, has_claude, has_openrouter])
+    if n_providers >= 2:
+        _ok(f"{n_providers} LLM providers available (cross-provider fallback enabled)")
+    elif n_providers == 1:
         _ok("LLM provider available")
     else:
         # No LLM keys found -- prompt the user
@@ -317,47 +323,68 @@ def setup_llm_keys() -> dict[str, str]:
         print(_dim("  the system rotates to the next key automatically."))
         print(_dim("  You can also provide keys for BOTH providers for cross-provider fallback."))
         print("")
-        print(f"    {_bold('1')}. Google Gemini  -- https://aistudio.google.com/apikey")
-        print(f"    {_bold('2')}. Anthropic Claude -- https://console.anthropic.com/")
-        print(f"    {_bold('3')}. Both providers (recommended for key rotation)")
-        print(f"    {_bold('4')}. Skip (limited functionality, template reports only)")
+        print(f"    {_bold('1')}. Google Gemini    -- https://aistudio.google.com/apikey")
+        print(f"    {_bold('2')}. Anthropic Claude  -- https://console.anthropic.com/")
+        print(f"    {_bold('3')}. OpenRouter (200+ models, free tier available) -- https://openrouter.ai/")
+        print(f"    {_bold('4')}. Multiple providers (recommended for key rotation)")
+        print(f"    {_bold('5')}. Skip (limited functionality, template reports only)")
         print("")
 
-        llm_choice = _prompt("Choose LLM provider (1/2/3/4)", "1")
-        if llm_choice in ("1", "3"):
+        llm_choice = _prompt("Choose LLM provider (1/2/3/4/5)", "1")
+        if llm_choice in ("1", "4"):
             value = _prompt("Enter GEMINI_API_KEY(s) (comma-separate multiple keys)")
             if value:
                 keys["GEMINI_API_KEY"] = value.strip()
                 _save_key_to_env(env_path, "GEMINI_API_KEY", value.strip())
                 n_keys = len([k for k in value.split(",") if k.strip()])
                 _ok(f"GEMINI_API_KEY saved ({n_keys} key{'s' if n_keys > 1 else ''})")
-        if llm_choice in ("2", "3"):
+        if llm_choice in ("2", "4"):
             value = _prompt("Enter ANTHROPIC_API_KEY(s) (comma-separate multiple keys)")
             if value:
                 keys["ANTHROPIC_API_KEY"] = value.strip()
                 _save_key_to_env(env_path, "ANTHROPIC_API_KEY", value.strip())
                 n_keys = len([k for k in value.split(",") if k.strip()])
                 _ok(f"ANTHROPIC_API_KEY saved ({n_keys} key{'s' if n_keys > 1 else ''})")
-        if llm_choice == "4":
+        if llm_choice in ("3", "4"):
+            value = _prompt("Enter OPENROUTER_API_KEY")
+            if value:
+                keys["OPENROUTER_API_KEY"] = value.strip()
+                _save_key_to_env(env_path, "OPENROUTER_API_KEY", value.strip())
+                _ok("OPENROUTER_API_KEY saved")
+        if llm_choice == "5":
             _warn("Skipping LLM setup. Smart routing disabled, template reports only.")
 
     # Determine which LLM provider to use
     has_gemini = "GEMINI_API_KEY" in keys
     has_claude = "ANTHROPIC_API_KEY" in keys
+    has_openrouter = "OPENROUTER_API_KEY" in keys
     llm_provider = ""
 
-    if has_gemini and has_claude:
+    available_providers = []
+    if has_gemini:
+        available_providers.append(("gemini", "Google Gemini"))
+    if has_claude:
+        available_providers.append(("claude", "Anthropic Claude"))
+    if has_openrouter:
+        available_providers.append(("openrouter", "OpenRouter"))
+
+    if len(available_providers) > 1:
         print("")
         print(_bold("  Which LLM provider to use for this session?"))
-        print(f"    {_bold('1')}. Google Gemini")
-        print(f"    {_bold('2')}. Anthropic Claude")
+        for i, (pid, pname) in enumerate(available_providers, 1):
+            print(f"    {_bold(str(i))}. {pname}")
         print("")
-        prov = _prompt("Choose (1/2)", "1")
-        llm_provider = "claude" if prov == "2" else "gemini"
-    elif has_claude:
-        llm_provider = "claude"
-    elif has_gemini:
-        llm_provider = "gemini"
+        prov = _prompt(f"Choose (1-{len(available_providers)})", "1")
+        try:
+            idx = int(prov) - 1
+            if 0 <= idx < len(available_providers):
+                llm_provider = available_providers[idx][0]
+            else:
+                llm_provider = available_providers[0][0]
+        except ValueError:
+            llm_provider = available_providers[0][0]
+    elif len(available_providers) == 1:
+        llm_provider = available_providers[0][0]
 
     # --- Model selection ---
     llm_model = ""
@@ -559,6 +586,64 @@ def setup_market_api_keys(keys: dict[str, str]) -> dict[str, str]:
 # LLM-driven market routing
 # ---------------------------------------------------------------------------
 
+def _try_company_lookup(
+    company: str,
+    market_id: str,
+    keys: dict[str, str],
+) -> bool:
+    """Quick check whether the company can be found via the PIT wrapper.
+
+    Returns True if the wrapper recognizes the company, False otherwise.
+    This is a lightweight probe -- it does NOT fetch full financials.
+    """
+    try:
+        from operator1.clients.equity_provider import create_pit_client
+        secrets = {k: v for k, v in keys.items() if not k.startswith("_")}
+        client = create_pit_client(market_id, secrets)
+        if client is None:
+            return False
+        profile = client.get_profile(company)
+        return bool(profile and profile.get("name"))
+    except Exception:
+        return False
+
+
+def _llm_resolve_company(
+    company: str,
+    market_id: str,
+    market,
+    llm_provider: str,
+    keys: dict[str, str],
+) -> str | None:
+    """Ask the LLM to resolve a company name/ticker for a specific market.
+
+    Returns the corrected ticker/name string, or None if the LLM cannot help.
+    """
+    if not llm_provider:
+        return None
+
+    prompt = (
+        f"I am searching for the company '{company}' on the "
+        f"{market.country} {market.exchange} exchange (data source: {market.pit_api_name}).\n\n"
+        f"The search failed. Can you tell me the correct ticker symbol or "
+        f"official company name that this exchange/data source would recognize?\n\n"
+        f"Return ONLY the ticker or name -- no explanation, no punctuation, no quotes."
+    )
+
+    try:
+        from operator1.clients.llm_factory import create_llm_client
+        client = create_llm_client(keys, provider=llm_provider)
+        if client is None:
+            return None
+        response = client.generate(prompt)
+        if response:
+            return response.strip().strip("'\"")
+    except Exception as exc:
+        _warn(f"LLM company resolution failed: {exc}")
+
+    return None
+
+
 def _resolve_market_with_llm(
     company: str,
     country: str,
@@ -588,16 +673,11 @@ def _resolve_market_with_llm(
     )
 
     try:
-        if llm_provider == "gemini" and keys.get("GEMINI_API_KEY"):
-            from operator1.clients.gemini import GeminiClient
-            client = GeminiClient(api_key=keys["GEMINI_API_KEY"])
-            response = client.generate(prompt)
-        elif llm_provider == "claude" and keys.get("ANTHROPIC_API_KEY"):
-            from operator1.clients.claude import ClaudeClient
-            client = ClaudeClient(api_key=keys["ANTHROPIC_API_KEY"])
-            response = client.generate(prompt)
-        else:
+        from operator1.clients.llm_factory import create_llm_client
+        client = create_llm_client(keys, provider=llm_provider)
+        if client is None:
             return None
+        response = client.generate(prompt)
 
         if response:
             # Extract market_id from the response
@@ -805,51 +885,142 @@ def main() -> int:
         _ok("Using community wrapper libraries only (no extra API keys needed).")
 
     # ------------------------------------------------------------------
-    # Step 6: Company + Country Input
+    # Step 6: Region + Company Selection (region-first flow)
     # ------------------------------------------------------------------
-    _step(6, "Company Selection")
+    _step(6, "Region & Company Selection")
 
-    print(_bold("  Enter the company you want to analyze:"))
-    print(f"  {_dim('Type a ticker (AAPL) or company name (Apple Inc)')}")
+    # 6a: Region selection
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from operator1.clients.pit_registry import (
+        get_regions, get_markets_by_region, MARKETS,
+    )
+
+    regions = get_regions()
+    print(_bold("  Choose the region where the company is listed:"))
     print("")
-    company = _prompt("Company ticker or name")
+    for i, region in enumerate(regions, 1):
+        markets = get_markets_by_region(region)
+        countries = ", ".join(m.country for m in markets)
+        print(f"    {_bold(str(i))}. {region}")
+        print(f"       {_dim(countries)}")
+    print("")
+
+    region_choice = _prompt(f"Select region (1-{len(regions)})", "1")
+    try:
+        region_idx = int(region_choice) - 1
+        if 0 <= region_idx < len(regions):
+            selected_region = regions[region_idx]
+        else:
+            selected_region = regions[0]
+    except ValueError:
+        selected_region = regions[0]
+
+    region_markets = get_markets_by_region(selected_region)
+    _ok(f"Region: {selected_region}")
+
+    # 6b: Market selection within region
+    if len(region_markets) > 1:
+        print("")
+        print(_bold(f"  Markets in {selected_region}:"))
+        print("")
+        for i, m in enumerate(region_markets, 1):
+            key_note = _dim(" (API key required)") if m.requires_api_key else _dim(" (no key needed)")
+            print(f"    {_bold(str(i))}. {m.country} -- {m.exchange}")
+            print(f"       Data source: {m.pit_api_name}{key_note}")
+        print("")
+        mkt_choice = _prompt(f"Select market (1-{len(region_markets)})", "1")
+        try:
+            mkt_idx = int(mkt_choice) - 1
+            if 0 <= mkt_idx < len(region_markets):
+                selected_market = region_markets[mkt_idx]
+            else:
+                selected_market = region_markets[0]
+        except ValueError:
+            selected_market = region_markets[0]
+    else:
+        selected_market = region_markets[0]
+
+    market_id = selected_market.market_id
+    country = selected_market.country
+    _ok(f"Market: {selected_market.country} ({selected_market.pit_api_name})")
+
+    # 6c: Company input with market-specific hints
+    _INPUT_HINTS: dict[str, str] = {
+        "us_sec_edgar": "Enter a ticker (AAPL), CIK number (320193), or company name (Apple Inc)",
+        "uk_companies_house": "Enter a company name (Unilever) or Companies House number (00041424)",
+        "eu_esef_xbrl": "Enter a company name (Siemens) or LEI code",
+        "eu_esef_france": "Enter a company name (LVMH) or SIREN number",
+        "eu_esef_germany": "Enter a company name (BMW) or LEI code",
+        "jp_jquants": "Enter a Japanese ticker code (7203) or company name (Toyota Motor)",
+        "kr_dart": "Enter a Korean stock code (005930) or company name (Samsung Electronics)",
+        "tw_mops": "Enter a Taiwan stock code (2330) or company name (TSMC)",
+        "br_cvm": "Enter a ticker (PETR4) or company name (Petrobras)",
+        "cl_cmf": "Enter a ticker (SQM-B) or company name (SQM)",
+    }
+    hint = _INPUT_HINTS.get(market_id, "Enter a ticker or company name")
+
+    print("")
+    print(_bold("  Enter the company you want to analyze:"))
+    print(f"  {_dim(hint)}")
+    print("")
+    company = _prompt("Company")
     if not company:
         _err("Company is required.")
         return 1
     _ok(f"Company: {company}")
 
-    print("")
-    print(_bold("  Enter the country where this company is listed:"))
-    print(f"  {_dim('e.g. US, Japan, UK, South Korea, Brazil, etc.')}")
-    print("")
-    country = _prompt("Country", "US")
-    _ok(f"Country: {country}")
-
     # --- Personal data check on user input ---
     _check_user_input_pii(company, country, keys)
 
     # ------------------------------------------------------------------
-    # Step 7: LLM resolves market/client
+    # Step 7: LLM-assisted company validation (retry up to 2x)
     # ------------------------------------------------------------------
-    _step(7, "Market Resolution")
+    _step(7, "Company Validation")
 
-    _info(f"Determining the right data source for {company} in {country}...")
-    market_id = resolve_market(company, country, keys)
+    _info(f"Validating '{company}' in {selected_market.country} ({selected_market.pit_api_name})...")
 
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    # Try to verify the company exists via the wrapper first
+    company_validated = False
+    final_company = company
+    for attempt in range(1, 3):  # max 2 attempts
+        if _try_company_lookup(final_company, market_id, keys):
+            company_validated = True
+            _ok(f"Company '{final_company}' found via {selected_market.pit_api_name}")
+            break
+
+        if attempt == 1:
+            _warn(f"Could not find '{final_company}' directly. Asking LLM for help...")
+        else:
+            _warn(f"LLM suggestion '{final_company}' also not found.")
+            break
+
+        # Ask LLM to resolve the company
+        llm_suggestion = _llm_resolve_company(
+            final_company, market_id, selected_market, llm_provider, keys,
+        )
+        if llm_suggestion and llm_suggestion.lower() != final_company.lower():
+            _info(f"LLM suggests: '{llm_suggestion}'")
+            final_company = llm_suggestion
+        else:
+            _warn("LLM could not resolve the company. Proceeding with original input.")
+            break
+
+    if company_validated:
+        company = final_company
+    else:
+        _warn(f"Could not validate '{company}'. Proceeding anyway -- the pipeline will attempt to fetch data.")
+
     from operator1.clients.pit_registry import get_market, get_macro_api_for_market
     market = get_market(market_id)
     macro = get_macro_api_for_market(market_id)
 
-    if market:
-        _ok(f"Market: {market.country} ({market.pit_api_name})")
-        if macro:
-            _info(f"Macro data: {macro.api_name}")
-        # --- Personal data check on wrapper requirements ---
-        _check_market_pii(market_id, market)
-    else:
+    if not market:
         _err(f"Unknown market: {market_id}")
         return 1
+
+    if macro:
+        _info(f"Macro data: {macro.api_name}")
+    _check_market_pii(market_id, market)
 
     # ------------------------------------------------------------------
     # Step 8: Pipeline Options
@@ -881,10 +1052,9 @@ def main() -> int:
     print(f"  Temporal models:  {'Yes' if not skip_models else 'Skip'}")
     print(f"  PDF output:       {'Yes' if gen_pdf else 'No'}")
     llm_model = keys.get("_llm_model", "")
-    if llm_provider == "gemini":
-        _llm_label = f"Gemini / {llm_model or 'default'} (AI-generated)"
-    elif llm_provider == "claude":
-        _llm_label = f"Claude / {llm_model or 'default'} (AI-generated)"
+    _provider_labels = {"gemini": "Gemini", "claude": "Claude", "openrouter": "OpenRouter"}
+    if llm_provider in _provider_labels:
+        _llm_label = f"{_provider_labels[llm_provider]} / {llm_model or 'default'} (AI-generated)"
     else:
         _llm_label = "Template fallback (no LLM key)"
     print(f"  Report engine:    {_llm_label}")

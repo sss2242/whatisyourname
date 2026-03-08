@@ -337,11 +337,20 @@ class LLMClient(ABC):
     # High-level generate methods (use _execute_request internally)
     # ------------------------------------------------------------------
 
-    def _generate(self, prompt: str) -> str:
-        """Send a prompt and return the raw text response."""
+    def generate(self, prompt: str) -> str:
+        """Send a prompt and return the raw text response.
+
+        This is the public interface used by ``run.py`` for LLM-based
+        market routing and by ``PooledLLMClient`` for key rotation.
+        """
         cfg = get_global_config()
         timeout = cfg.get("timeout_s", 30)
         return self._execute_request(prompt, timeout=timeout)
+
+    # Keep private alias for backward compatibility with internal callers
+    def _generate(self, prompt: str) -> str:
+        """Send a prompt and return the raw text response."""
+        return self.generate(prompt)
 
     def _generate_with_config(
         self,
