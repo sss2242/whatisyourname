@@ -1,0 +1,343 @@
+/*
+ * Operator 1 -- Clean Minimalist Report Stylesheet
+ *
+ * Design philosophy: institutional research meets modern fintech.
+ * Inspired by McKinsey/Goldman research reports with Proton brand colors.
+ *
+ * Brand palette (matches chart theme):
+ *   Accent:   #6d4aff (Proton purple)
+ *   Danger:   #dc3545
+ *   Success:  #1ea885 (teal-green)
+ *   Warning:  #e8950a (warm amber)
+ *   Text:     #1a1a2e (near-black with warmth)
+ *   Muted:    #6c6b7b
+ *   Surface:  #fafaf8 (warm off-white)
+ *   Border:   #e5e4e0
+ */
+
+/* ------------------------------------------------------------------ */
+/* Base                                                                */
+/* ------------------------------------------------------------------ */
+
+:root {
+    --accent: #6d4aff;
+    --accent-light: #ede8ff;
+    --text: #1a1a2e;
+    --text-secondary: #6c6b7b;
+    --surface: #fafaf8;
+    --white: #ffffff;
+    --border: #e5e4e0;
+    --border-light: #f0efec;
+    --danger: #dc3545;
+    --success: #1ea885;
+    --warning: #e8950a;
+    --font-sans: "Inter", "SF Pro Display", -apple-system, BlinkMacSystemFont,
+        "Segoe UI", Roboto, sans-serif;
+    --font-mono: "JetBrains Mono", "SF Mono", "Fira Code", monospace;
+}
+
+@page {
+    size: A4;
+    margin: 2.2cm 2cm 2.5cm 2cm;
+
+    @top-right {
+        content: "Operator 1";
+        font-size: 8pt;
+        color: #6c6b7b;
+    }
+    @bottom-center {
+        content: counter(page);
+        font-size: 8pt;
+        color: #6c6b7b;
+    }
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: var(--font-sans);
+    font-size: 10.5pt;
+    line-height: 1.65;
+    color: var(--text);
+    background: var(--white);
+    max-width: 210mm;
+    margin: 0 auto;
+    padding: 2rem 2.5rem;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ------------------------------------------------------------------ */
+/* Typography                                                          */
+/* ------------------------------------------------------------------ */
+
+h1 {
+    font-size: 24pt;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: -0.02em;
+    margin: 0 0 0.3em 0;
+    padding-bottom: 0.5em;
+    border-bottom: 3px solid var(--accent);
+}
+
+h2 {
+    font-size: 14pt;
+    font-weight: 600;
+    color: var(--text);
+    letter-spacing: -0.01em;
+    margin: 2em 0 0.6em 0;
+    padding-bottom: 0.35em;
+    border-bottom: 1px solid var(--border);
+    page-break-after: avoid;
+}
+
+h3 {
+    font-size: 11pt;
+    font-weight: 600;
+    color: var(--accent);
+    margin: 1.5em 0 0.4em 0;
+    page-break-after: avoid;
+}
+
+h4 {
+    font-size: 10.5pt;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin: 1.2em 0 0.3em 0;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 9pt;
+}
+
+p {
+    margin: 0 0 0.8em 0;
+    orphans: 3;
+    widows: 3;
+}
+
+strong {
+    font-weight: 600;
+    color: var(--text);
+}
+
+em {
+    font-style: italic;
+    color: var(--text-secondary);
+}
+
+a {
+    color: var(--accent);
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+    transition: border-color 0.2s;
+}
+
+a:hover {
+    border-bottom-color: var(--accent);
+}
+
+/* ------------------------------------------------------------------ */
+/* Horizontal rules (section dividers)                                 */
+/* ------------------------------------------------------------------ */
+
+hr {
+    border: none;
+    height: 1px;
+    background: var(--border);
+    margin: 2em 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tables                                                              */
+/* ------------------------------------------------------------------ */
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1em 0 1.5em 0;
+    font-size: 9.5pt;
+    page-break-inside: avoid;
+}
+
+thead {
+    background: var(--surface);
+}
+
+th {
+    font-weight: 600;
+    text-align: left;
+    padding: 0.6em 0.8em;
+    border-bottom: 2px solid var(--accent);
+    color: var(--text);
+    font-size: 8.5pt;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+td {
+    padding: 0.5em 0.8em;
+    border-bottom: 1px solid var(--border-light);
+    vertical-align: top;
+}
+
+tbody tr:hover {
+    background: var(--surface);
+}
+
+/* Align numeric columns right */
+td:nth-child(n+2):not(:last-child) {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------------ */
+/* Code / metrics                                                      */
+/* ------------------------------------------------------------------ */
+
+code {
+    font-family: var(--font-mono);
+    font-size: 9pt;
+    background: var(--surface);
+    padding: 0.15em 0.4em;
+    border-radius: 3px;
+    color: var(--accent);
+}
+
+pre {
+    font-family: var(--font-mono);
+    font-size: 9pt;
+    background: var(--surface);
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    overflow-x: auto;
+    margin: 1em 0;
+    line-height: 1.5;
+}
+
+pre code {
+    background: none;
+    padding: 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Lists                                                               */
+/* ------------------------------------------------------------------ */
+
+ul, ol {
+    margin: 0.5em 0 1em 1.5em;
+}
+
+li {
+    margin-bottom: 0.3em;
+}
+
+li::marker {
+    color: var(--accent);
+}
+
+/* ------------------------------------------------------------------ */
+/* Images (charts)                                                     */
+/* ------------------------------------------------------------------ */
+
+img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 6px;
+    margin: 1em 0;
+    display: block;
+}
+
+/* ------------------------------------------------------------------ */
+/* Blockquotes (used for callouts / warnings)                          */
+/* ------------------------------------------------------------------ */
+
+blockquote {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-light);
+    padding: 0.8em 1.2em;
+    margin: 1em 0;
+    border-radius: 0 6px 6px 0;
+    font-size: 10pt;
+}
+
+blockquote p:last-child {
+    margin-bottom: 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Status badges (inline)                                              */
+/* ------------------------------------------------------------------ */
+
+/* Markdown bold with specific text patterns get badge-like styling
+   when viewed in browsers that support :has() */
+
+/* ------------------------------------------------------------------ */
+/* Header meta line                                                    */
+/* ------------------------------------------------------------------ */
+
+h1 + p {
+    color: var(--text-secondary);
+    font-size: 9.5pt;
+    margin-bottom: 1.5em;
+}
+
+/* ------------------------------------------------------------------ */
+/* Print optimizations                                                 */
+/* ------------------------------------------------------------------ */
+
+@media print {
+    body {
+        padding: 0;
+        font-size: 10pt;
+    }
+
+    h1 {
+        font-size: 20pt;
+    }
+
+    h2 {
+        page-break-before: auto;
+        page-break-after: avoid;
+    }
+
+    table, figure, img {
+        page-break-inside: avoid;
+    }
+
+    a {
+        color: var(--text);
+        border-bottom: none;
+    }
+
+    a[href^="http"]::after {
+        content: none;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Responsive (for HTML preview in browser)                            */
+/* ------------------------------------------------------------------ */
+
+@media screen and (max-width: 768px) {
+    body {
+        padding: 1rem;
+        font-size: 10pt;
+    }
+
+    h1 {
+        font-size: 18pt;
+    }
+
+    table {
+        font-size: 8.5pt;
+    }
+
+    th, td {
+        padding: 0.4em 0.5em;
+    }
+}
