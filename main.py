@@ -1326,6 +1326,8 @@ Non-interactive examples:
             cache,
             gemini_client=llm_client,
             symbol=ticker,
+            market_id=market_id,
+            company_name=company_name,
         )
         if _sent_result.n_articles_scored > 0:
             sentiment_result = {

@@ -230,13 +230,14 @@ _UCDP_BASE = "https://ucdpapi.pcr.uu.se/api/gedevents/24.0.10"
 def _fetch_ucdp_events(
     country_iso2: str,
     days: int = 365,
+    api_key: str = "",
 ) -> list[dict[str, Any]]:
     """Fetch recent conflict events from UCDP GED API.
 
-    Note: The UCDP API may require authentication in newer versions.
-    If the API returns 401, we fall back to static lists only.
-    This is acceptable because the static lists (ACTIVE_WAR_COUNTRIES,
-    SANCTIONED_COUNTRIES, FRAGILE_CONFLICT_STATES) provide reliable
+    Since 2025, the UCDP API requires authentication. If a
+    ``UCDP_API_KEY`` is provided (via .env or environment variable),
+    it is sent as a Bearer token. Otherwise, the API returns 401
+    and we fall back to static lists, which still provide reliable
     baseline conflict classification for all countries.
 
     Parameters
@@ -245,6 +246,8 @@ def _fetch_ucdp_events(
         ISO-2 country code.
     days:
         How many days back to search.
+    api_key:
+        Optional UCDP API key for authenticated access.
 
     Returns
     -------
@@ -258,6 +261,10 @@ def _fetch_ucdp_events(
 
     start_date = (date.today() - timedelta(days=days)).isoformat()
 
+    headers: dict[str, str] = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
     try:
         resp = requests.get(
             _UCDP_BASE,
@@ -266,14 +273,21 @@ def _fetch_ucdp_events(
                 "StartDate": start_date,
                 "pagesize": 500,
             },
-            headers={"Accept": "application/json"},
+            headers=headers,
             timeout=15,
         )
         if resp.status_code == 401:
-            logger.info(
-                "UCDP API requires authentication (401). "
-                "Using static conflict lists as fallback."
-            )
+            if api_key:
+                logger.warning(
+                    "UCDP API rejected API key (401). Check UCDP_API_KEY. "
+                    "Using static conflict lists as fallback."
+                )
+            else:
+                logger.info(
+                    "UCDP API requires authentication (401). "
+                    "Set UCDP_API_KEY in .env for real-time conflict data. "
+                    "Using static conflict lists as fallback."
+                )
             return []
         resp.raise_for_status()
         data = resp.json()
@@ -534,6 +548,7 @@ def assess_conflict_risk(
     company_name: str | None = None,
     skip_ucdp: bool = False,
     skip_gdelt: bool = False,
+    ucdp_api_key: str = "",
 ) -> ConflictRiskResult:
     """Assess war/conflict risk for a country and optionally a company.
 
@@ -584,8 +599,13 @@ def assess_conflict_risk(
     ucdp_conflict_type = "none"
     ucdp_trend = "stable"
 
+    # Auto-detect UCDP key from environment if not provided
+    if not ucdp_api_key:
+        import os
+        ucdp_api_key = os.environ.get("UCDP_API_KEY", "")
+
     if not skip_ucdp:
-        ucdp_events = _fetch_ucdp_events(cc, days=365)
+        ucdp_events = _fetch_ucdp_events(cc, days=365, api_key=ucdp_api_key)
         if ucdp_events:
             analysis = _analyze_ucdp_events(ucdp_events)
             events_30d = analysis["events_30d"]

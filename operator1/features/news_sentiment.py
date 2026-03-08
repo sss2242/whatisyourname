@@ -1,14 +1,19 @@
 """News Sentiment Scoring -- daily sentiment from stock news.
 
 Fetches stock news via GNews (Google News scraper, no API key) or RSS
-fallback, scores sentiment via Gemini (1 API call for all headlines),
+fallback, scores sentiment via LLM (1 API call for all headlines),
 and injects daily sentiment columns into the cache for temporal model
 learning.
 
-Falls back to keyword-based scoring if Gemini is unavailable.
+GNews targets the correct country for the market (English articles from
+that country's news ecosystem), with local-language RSS feeds as
+supplementary data scored by the LLM.
+
+Falls back to keyword-based scoring if the LLM is unavailable.
 
 Top-level entry point:
-    ``compute_news_sentiment(cache, symbol, gemini_client=None)``
+    ``compute_news_sentiment(cache, symbol, gemini_client=None,
+                             market_id="", company_name="")``
 """
 
 from __future__ import annotations
@@ -105,25 +110,66 @@ def _sentiment_label(score: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Market -> GNews country code mapping
+# ---------------------------------------------------------------------------
+
+# GNews country codes (ISO-2 uppercase).  We keep language="en" for all
+# markets so keyword scoring works, but target the correct country so
+# Google News returns locally relevant English articles.
+_MARKET_TO_GNEWS_COUNTRY: dict[str, str] = {
+    "us_sec_edgar":       "US",
+    "uk_companies_house": "GB",
+    "eu_esef_xbrl":       "GB",   # pan-EU defaults to UK English news
+    "eu_esef_france":     "FR",
+    "eu_esef_germany":    "DE",
+    "jp_jquants":         "JP",
+    "kr_dart":            "KR",
+    "tw_mops":            "TW",
+    "br_cvm":             "BR",
+    "cl_cmf":             "CL",
+    "cn_sse":             "CN",
+    "in_bse":             "IN",
+    "au_asx":             "AU",
+    "hk_hkex":            "HK",
+    "sg_sgx":             "SG",
+    "za_jse":             "ZA",
+    "sa_tadawul":         "SA",
+    "ae_dfm":             "AE",
+    "mx_bmv":             "MX",
+    "ch_six":             "CH",
+    "ca_sedar":           "CA",
+}
+
+
+# ---------------------------------------------------------------------------
 # News fetchers (free APIs)
 # ---------------------------------------------------------------------------
 
 
-def _fetch_news_gnews(symbol: str) -> pd.DataFrame:
+def _fetch_news_gnews(
+    symbol: str,
+    market_id: str = "",
+) -> pd.DataFrame:
     """Fetch stock news via GNews (Google News scraper, no API key).
 
-    Uses the gnews library (pip install gnews) to search Google News
-    for recent articles about the given stock symbol/company.
+    Uses the gnews library to search Google News for recent English articles
+    about the given stock symbol/company. The ``market_id`` determines which
+    country's news ecosystem to search (e.g. Korean financial news in English
+    for ``kr_dart``), improving relevance for non-US markets.
+
     Returns a DataFrame with columns: date, title, url, source.
     """
     try:
         from gnews import GNews
     except ImportError:
         logger.debug("gnews not installed; trying RSS fallback")
-        return _fetch_news_rss(symbol)
+        return _fetch_news_rss(symbol, market_id=market_id)
+
+    # Target the correct country but keep English for keyword scoring
+    country = _MARKET_TO_GNEWS_COUNTRY.get(market_id, "US")
 
     try:
-        gn = GNews(language="en", country="US", period="6m", max_results=50)
+        gn = GNews(language="en", country=country, period="6m", max_results=50)
         articles = gn.get_news(f"{symbol} stock")
         if not articles:
             return pd.DataFrame()
@@ -139,12 +185,12 @@ def _fetch_news_gnews(symbol: str) -> pd.DataFrame:
 
         df = pd.DataFrame(rows)
         df = df.dropna(subset=["date"])
-        logger.info("GNews fetched %d articles for %s", len(df), symbol)
+        logger.info("GNews fetched %d articles for %s (country=%s)", len(df), symbol, country)
         return df
 
     except Exception as exc:
         logger.warning("GNews fetch failed for %s: %s; trying RSS", symbol, exc)
-        return _fetch_news_rss(symbol)
+        return _fetch_news_rss(symbol, market_id=market_id)
 
 
 def _fetch_news_rss(symbol: str, market_id: str = "", company_name: str = "") -> pd.DataFrame:
@@ -161,10 +207,12 @@ def _fetch_news_rss(symbol: str, market_id: str = "", company_name: str = "") ->
 
     import urllib.parse
 
-    # Per-region RSS URLs -- try local financial news sources first
+    # Per-region RSS URLs -- local-language supplementary feeds.
+    # These are scored by the LLM (keyword scoring is English-only).
+    # English articles come from GNews; these add local-language coverage.
     _REGIONAL_RSS: dict[str, list[str]] = {
+        # Asia
         "kr_dart": [
-            # Google News Korea with Korean search
             "https://news.google.com/rss/search?q={symbol}+주식&hl=ko&gl=KR&ceid=KR:ko",
             "https://news.google.com/rss/search?q={name}+주가&hl=ko&gl=KR&ceid=KR:ko",
         ],
@@ -172,15 +220,63 @@ def _fetch_news_rss(symbol: str, market_id: str = "", company_name: str = "") ->
             "https://news.google.com/rss/search?q={symbol}+株価&hl=ja&gl=JP&ceid=JP:ja",
             "https://news.google.com/rss/search?q={name}+株式&hl=ja&gl=JP&ceid=JP:ja",
         ],
-        "br_cvm": [
-            "https://news.google.com/rss/search?q={symbol}+ações&hl=pt-BR&gl=BR&ceid=BR:pt-419",
-            "https://news.google.com/rss/search?q={name}+bolsa&hl=pt-BR&gl=BR&ceid=BR:pt-419",
-        ],
         "cn_sse": [
             "https://news.google.com/rss/search?q={symbol}+股票&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
         ],
         "tw_mops": [
             "https://news.google.com/rss/search?q={symbol}+股價&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+        ],
+        "hk_hkex": [
+            "https://news.google.com/rss/search?q={symbol}+股價&hl=zh-TW&gl=HK&ceid=HK:zh-Hant",
+        ],
+        "in_bse": [
+            "https://news.google.com/rss/search?q={symbol}+stock&hl=en&gl=IN&ceid=IN:en",
+            "https://news.google.com/rss/search?q={name}+share+price&hl=en&gl=IN&ceid=IN:en",
+        ],
+        "sg_sgx": [
+            "https://news.google.com/rss/search?q={symbol}+SGX&hl=en&gl=SG&ceid=SG:en",
+        ],
+        # South America
+        "br_cvm": [
+            "https://news.google.com/rss/search?q={symbol}+ações&hl=pt-BR&gl=BR&ceid=BR:pt-419",
+            "https://news.google.com/rss/search?q={name}+bolsa&hl=pt-BR&gl=BR&ceid=BR:pt-419",
+        ],
+        "cl_cmf": [
+            "https://news.google.com/rss/search?q={symbol}+acciones&hl=es&gl=CL&ceid=CL:es-419",
+        ],
+        # Europe
+        "eu_esef_france": [
+            "https://news.google.com/rss/search?q={symbol}+bourse&hl=fr&gl=FR&ceid=FR:fr",
+            "https://news.google.com/rss/search?q={name}+actions&hl=fr&gl=FR&ceid=FR:fr",
+        ],
+        "eu_esef_germany": [
+            "https://news.google.com/rss/search?q={symbol}+Aktie&hl=de&gl=DE&ceid=DE:de",
+            "https://news.google.com/rss/search?q={name}+Boerse&hl=de&gl=DE&ceid=DE:de",
+        ],
+        "ch_six": [
+            "https://news.google.com/rss/search?q={symbol}+Aktie&hl=de&gl=CH&ceid=CH:de",
+        ],
+        # Middle East
+        "sa_tadawul": [
+            "https://news.google.com/rss/search?q={symbol}+سهم&hl=ar&gl=SA&ceid=SA:ar",
+        ],
+        "ae_dfm": [
+            "https://news.google.com/rss/search?q={symbol}+سهم&hl=ar&gl=AE&ceid=AE:ar",
+        ],
+        # Americas
+        "mx_bmv": [
+            "https://news.google.com/rss/search?q={symbol}+acciones&hl=es&gl=MX&ceid=MX:es-419",
+        ],
+        "ca_sedar": [
+            "https://news.google.com/rss/search?q={symbol}+TSX&hl=en&gl=CA&ceid=CA:en",
+        ],
+        # Oceania
+        "au_asx": [
+            "https://news.google.com/rss/search?q={symbol}+ASX&hl=en&gl=AU&ceid=AU:en",
+        ],
+        # Africa
+        "za_jse": [
+            "https://news.google.com/rss/search?q={symbol}+JSE&hl=en&gl=ZA&ceid=ZA:en",
         ],
     }
 
@@ -232,12 +328,7 @@ def _fetch_news_rss(symbol: str, market_id: str = "", company_name: str = "") ->
     return pd.DataFrame()
 
 
-def _fetch_news_alpha_vantage(symbol: str) -> pd.DataFrame:
-    """Alpha Vantage news endpoint -- removed (paid/commercial API).
 
-    Redirects to GNews/RSS fetcher instead.
-    """
-    return _fetch_news_gnews(symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -251,13 +342,15 @@ def compute_news_sentiment(
     _legacy_fmp_client: Any = None,
     gemini_client: Any = None,
     symbol: str = "",
+    market_id: str = "",
+    company_name: str = "",
     news_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, SentimentResult]:
     """Compute daily news sentiment and inject into cache.
 
-    Uses 1 FMP API call to fetch all news, then 1 Gemini call to
-    batch-score all headlines. Falls back to keyword scoring if
-    Gemini is unavailable.
+    Fetches English news via GNews (targeted to the market's country),
+    supplements with local-language RSS feeds, then scores via LLM
+    (1 API call) or keyword fallback.
 
     Parameters
     ----------
@@ -266,12 +359,20 @@ def compute_news_sentiment(
     _legacy_fmp_client:
         Legacy parameter, ignored.
     gemini_client:
-        GeminiClient instance for AI sentiment scoring. Optional.
+        LLM client instance for AI sentiment scoring. Optional.
+        Accepts GeminiClient, ClaudeClient, OpenRouterClient, or
+        PooledLLMClient.
     symbol:
-        Trading symbol (e.g. 'AAPL') for FMP news query.
+        Trading symbol (e.g. 'AAPL') for news query.
+    market_id:
+        Market identifier (e.g. 'kr_dart') for country-targeted
+        news fetching. Derived from the user's region selection in
+        run.py or from the ``--market`` CLI argument.
+    company_name:
+        Company name for supplementary RSS searches.
     news_df:
         Pre-fetched news DataFrame (for testing). If provided,
-        FMP client is not called.
+        news fetchers are not called.
 
     Returns
     -------
@@ -283,17 +384,28 @@ def compute_news_sentiment(
     result = SentimentResult()
 
     # Step 1: Fetch news
-    # Priority: pre-fetched > Alpha Vantage (free) > legacy FMP > empty
+    # Priority: pre-fetched > GNews (English, country-targeted) > RSS (local language) > empty
     if news_df is not None:
         articles = news_df.copy()
     elif symbol:
-        articles = _fetch_news_alpha_vantage(symbol)
-        if articles.empty and _legacy_fmp_client is not None:
-            try:
-                articles = _legacy_fmp_client.get_stock_news(symbol, limit=1000)
-            except Exception as exc:
-                logger.warning("FMP news fetch failed: %s", exc)
-                articles = pd.DataFrame()
+        # Primary: English articles from the target country
+        articles = _fetch_news_gnews(symbol, market_id=market_id)
+        # Supplementary: local-language RSS (if market has regional feeds)
+        if market_id:
+            rss_articles = _fetch_news_rss(
+                symbol, market_id=market_id, company_name=company_name or symbol,
+            )
+            if not rss_articles.empty:
+                if articles.empty:
+                    articles = rss_articles
+                else:
+                    # Merge, deduplicate by title
+                    articles = pd.concat([articles, rss_articles], ignore_index=True)
+                    articles = articles.drop_duplicates(subset=["title"], keep="first")
+                    logger.info(
+                        "Merged %d RSS articles with GNews (total: %d)",
+                        len(rss_articles), len(articles),
+                    )
     else:
         logger.warning("No symbol for sentiment -- skipping news fetch")
         articles = pd.DataFrame()
