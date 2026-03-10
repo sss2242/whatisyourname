@@ -559,13 +559,29 @@ def _order_regimes_by_mean_return(
     regimes: np.ndarray,
     returns_clean: np.ndarray,
     n_regimes: int,
+    *,
+    has_volatility_info: bool = True,
 ) -> dict[int, str]:
     """Map regime integers to labels ordered by mean return.
 
     Lowest mean return -> "bear", highest -> "bull".  Intermediate
-    regimes are labelled by volatility.
+    regimes are labelled by volatility when the model used volatility
+    features (HMM), or by return magnitude when it didn't (GMM).
+
+    Parameters
+    ----------
+    has_volatility_info:
+        True for HMM (which uses returns + volatility features),
+        False for GMM (which uses returns only).  When False,
+        intermediate labels use "low_return"/"moderate_return"
+        instead of the misleading "low_vol"/"high_vol".
     """
-    label_pool = ["bear", "low_vol", "high_vol", "bull"]
+    if has_volatility_info:
+        label_pool = ["bear", "low_vol", "high_vol", "bull"]
+    else:
+        # GMM only sees returns, so "low_vol"/"high_vol" labels are
+        # misleading -- use return-based labels instead.
+        label_pool = ["bear", "low_return", "moderate_return", "bull"]
     if n_regimes > len(label_pool):
         # Extend with generic names for extra regimes.
         for i in range(len(label_pool), n_regimes):
@@ -740,7 +756,8 @@ def detect_regimes_and_breaks(
         returns_clean = returns[valid_both]
 
         label_map = _order_regimes_by_mean_return(
-            hmm_regimes, returns_clean, n_regimes
+            hmm_regimes, returns_clean, n_regimes,
+            has_volatility_info=True,
         )
         cache["regime_label"] = cache["regime_hmm"].map(label_map)
         logger.info("Regime label mapping: %s", label_map)
@@ -748,7 +765,8 @@ def detect_regimes_and_breaks(
     elif gmm_regimes is not None:
         returns_clean = returns[valid_ret]
         label_map = _order_regimes_by_mean_return(
-            gmm_regimes, returns_clean, n_regimes
+            gmm_regimes, returns_clean, n_regimes,
+            has_volatility_info=False,
         )
         cache["regime_label"] = cache["regime_gmm"].map(label_map)
         logger.info("Regime label mapping (from GMM fallback): %s", label_map)

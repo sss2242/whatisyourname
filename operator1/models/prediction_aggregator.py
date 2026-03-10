@@ -393,18 +393,25 @@ def optimise_ensemble_weights_ga(
 
 def aggregate_forecasts(
     forecast_result: ForecastResult,
+    forward_pass_result: Any = None,
 ) -> dict[str, dict[str, float]]:
     """Extract aggregated point forecasts per variable per horizon.
 
-    In the current architecture, ``ForecastResult.forecasts`` already
-    contains the best model's prediction for each variable (selected by
-    the fallback chain in ``run_forecasting``).  This function passes
-    them through with validation.
+    In the current architecture, ``ForecastResult.forecasts`` contains
+    the best model's prediction from the fallback chain.  When a
+    ``ForwardPassResult`` with model states is available, we blend the
+    forward pass ensemble predictions into the point forecasts using
+    a 70/30 weighting (70% fallback-chain winner, 30% forward-pass
+    ensemble) to incorporate the online-learned model states.
 
     Parameters
     ----------
     forecast_result:
         Output from ``run_forecasting``.
+    forward_pass_result:
+        Optional ``ForwardPassResult`` from ``run_forward_pass``.
+        If provided and model states are available, their last
+        predictions are blended into the aggregated forecasts.
 
     Returns
     -------
@@ -412,12 +419,33 @@ def aggregate_forecasts(
     """
     aggregated: dict[str, dict[str, float]] = {}
 
+    # Extract forward-pass model state predictions if available.
+    fp_predictions: dict[str, float] = {}
+    if forward_pass_result is not None:
+        model_states = getattr(forward_pass_result, "model_states", {})
+        for var_name, wrapper in model_states.items():
+            try:
+                pred = wrapper.predict(np.array([0.0]))
+                if len(pred) > 0 and not np.isnan(pred[0]):
+                    fp_predictions[var_name] = float(pred[0])
+            except Exception:
+                pass
+
     for var_name, horizons in forecast_result.forecasts.items():
         var_forecasts: dict[str, float] = {}
 
         for h_label, value in horizons.items():
-            if not math.isnan(value):
-                var_forecasts[h_label] = value
+            if math.isnan(value):
+                continue
+
+            # Blend with forward-pass ensemble prediction for the 1d
+            # horizon (model states predict one step ahead).
+            if h_label == "1d" and var_name in fp_predictions:
+                fp_val = fp_predictions[var_name]
+                # 70% fallback-chain winner, 30% online-learned ensemble.
+                value = 0.7 * value + 0.3 * fp_val
+
+            var_forecasts[h_label] = value
 
         if var_forecasts:
             aggregated[var_name] = var_forecasts

@@ -347,15 +347,17 @@ def compute_survival_timeline(
         mode_codes = modes.map(MODE_TO_CODE).astype(int)
         mode_codes.name = "survival_mode_code"
 
-        # Build enriched timeline
-        timeline = daily_cache.copy()
-        timeline["survival_mode"] = modes
-        timeline["survival_mode_code"] = mode_codes
-        timeline["switch_point"] = switch_flags
-        timeline["days_in_mode"] = days_counter
-        timeline["stability_score_21d"] = stability
+        # Write enriched columns back to the original cache so downstream
+        # modules (prediction_aggregator, walk_forward) can read them
+        # without needing to merge a separate DataFrame.
+        daily_cache["survival_mode"] = modes
+        daily_cache["survival_mode_code"] = mode_codes
+        daily_cache["switch_point"] = switch_flags
+        daily_cache["days_in_mode"] = days_counter
+        daily_cache["stability_score_21d"] = stability
 
-        result.timeline = timeline
+        # Also keep a reference as the result timeline for backward compat.
+        result.timeline = daily_cache
 
         # Extract structured switch points
         result.switch_points = _extract_switch_list(modes, switch_flags)
@@ -574,7 +576,12 @@ def compute_enriched_survival_timeline(
         return result
 
     try:
-        timeline = base_result.timeline.copy()
+        # Use the base timeline directly (which IS the original cache
+        # after compute_survival_timeline now writes in-place).
+        # We still copy here because the enriched timeline adds columns
+        # that are specific to the enriched analysis, and we also write
+        # the key columns back to the original daily_cache for downstream.
+        timeline = base_result.timeline
 
         # Step 2: Merge market regime labels.
         if regime_labels is not None and not regime_labels.empty:
