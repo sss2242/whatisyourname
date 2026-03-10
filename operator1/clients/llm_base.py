@@ -555,7 +555,7 @@ this information into actionable insights for sophisticated investors.
 
 ---
 
-REPORT STRUCTURE (MUST INCLUDE ALL 13 SECTIONS):
+REPORT STRUCTURE (MUST INCLUDE ALL 14 SECTIONS):
 
 1. EXECUTIVE SUMMARY
    - 3 bullet points summarizing key findings
@@ -661,7 +661,15 @@ investors understand the *quality* of each prediction.
     **Overall Ethical Score:** Combine all filters; is this investment suitable for ethical/Islamic investors?
     Universal lessons: Why these filters matter for ALL investors.
 
-11. RISK FACTORS & LIMITATIONS
+11. GEOPOLITICAL & CONFLICT RISK
+    - Country conflict status (active conflict zones, fragile state classification)
+    - Sanctions exposure (OFAC, EU, UN sanctions lists)
+    - Conflict intensity score (0-1 scale) and trend
+    - Supply chain exposure to conflict zones (linked entities in war zones)
+    - Revenue exposure to conflict regions
+    - Investment implications of geopolitical risk
+
+12. RISK FACTORS & LIMITATIONS
     - Model assumptions and their limitations
     - Key risks: company-specific, industry/sector, macro/country
     - Scenarios that could invalidate predictions
@@ -672,7 +680,7 @@ macro frequency reality (macro APIs provide monthly/quarterly data, aligned dail
 missingness summary, any modules that failed and how the report compensated. \
 Must be easy for a non-technical client to understand.
 
-12. INVESTMENT RECOMMENDATION
+13. INVESTMENT RECOMMENDATION
     **Recommendation:** [BUY / HOLD / SELL]
     **Confidence Level:** [High / Medium / Low]
     **12-Month Target Price:** with rationale
@@ -681,7 +689,7 @@ Must be easy for a non-technical client to understand.
     **Exit Strategy:** price targets for profits and stop-loss levels
     **Position Sizing:** suggested portfolio allocation based on risk profile
 
-13. APPENDIX
+14. APPENDIX
     - Methodology summary: all 23+ temporal modules used:
       * Regime Detection: HMM, GMM, PELT, Bayesian Change Point
       * Forecasting: Adaptive Kalman, GARCH, VAR, LSTM, Temporal Fusion Transformer (TFT)
