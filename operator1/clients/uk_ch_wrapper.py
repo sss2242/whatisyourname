@@ -550,6 +550,11 @@ class UKCompaniesHouseClient:
     def _extract_ixbrl_values(self, identifier: str, transaction_id: str) -> dict[str, float]:
         """Download and parse an iXBRL document from Companies House.
 
+        Uses the Document API (document-api.company-information.service.gov.uk)
+        with content negotiation to request XHTML format when available.
+        Falls back to the find-and-update URL if the metadata link is
+        unavailable.
+
         Uses ixbrl-parse library (if installed) for structured extraction,
         with regex fallback for common UK-GAAP tags.
 
@@ -558,21 +563,71 @@ class UKCompaniesHouseClient:
         """
         values: dict[str, float] = {}
 
-        # Download the document
+        # Download the document via the Document API (supports content negotiation).
         try:
             import requests
-            doc_url = f"https://find-and-update.company-information.service.gov.uk/company/{identifier}/filing-history/{transaction_id}/document"
-            headers = {"Accept": "application/xhtml+xml, text/html", "User-Agent": "Operator1/1.0"}
-            if self._api_key:
-                import base64
-                encoded = base64.b64encode(f"{self._api_key}:".encode()).decode()
-                headers["Authorization"] = f"Basic {encoded}"
+            import base64
 
-            resp = requests.get(doc_url, headers=headers, timeout=30, allow_redirects=True)
-            if resp.status_code != 200 or not resp.content:
+            auth_headers: dict[str, str] = {"User-Agent": "Operator1/1.0"}
+            if self._api_key:
+                encoded = base64.b64encode(f"{self._api_key}:".encode()).decode()
+                auth_headers["Authorization"] = f"Basic {encoded}"
+
+            # Step 1: Get document metadata to find the content URL and
+            # check if XHTML format is available.
+            meta_url = ""
+            try:
+                filing_data = self._get(
+                    f"/company/{identifier}/filing-history/{transaction_id}",
+                )
+                meta_url = filing_data.get("links", {}).get("document_metadata", "")
+            except Exception:
+                pass
+
+            html_content = ""
+
+            if meta_url:
+                # Check metadata for available formats.
+                meta_resp = requests.get(
+                    meta_url,
+                    headers={**auth_headers, "Accept": "application/json"},
+                    timeout=30,
+                )
+                if meta_resp.status_code == 200:
+                    resources = meta_resp.json().get("resources", {})
+                    content_url = meta_resp.json().get("links", {}).get("document", "")
+
+                    if "application/xhtml+xml" in resources and content_url:
+                        # Request iXBRL XHTML format via content negotiation.
+                        xhtml_resp = requests.get(
+                            content_url,
+                            headers={**auth_headers, "Accept": "application/xhtml+xml"},
+                            timeout=30,
+                            allow_redirects=True,
+                        )
+                        if xhtml_resp.status_code == 200 and "xhtml" in xhtml_resp.headers.get("Content-Type", ""):
+                            html_content = xhtml_resp.text
+                            logger.debug(
+                                "Downloaded iXBRL XHTML for %s/%s (%d bytes)",
+                                identifier, transaction_id, len(html_content),
+                            )
+
+            # Fallback: try the find-and-update URL (old approach).
+            if not html_content:
+                doc_url = f"https://find-and-update.company-information.service.gov.uk/company/{identifier}/filing-history/{transaction_id}/document"
+                resp = requests.get(
+                    doc_url,
+                    headers={**auth_headers, "Accept": "application/xhtml+xml, text/html"},
+                    timeout=30,
+                    allow_redirects=True,
+                )
+                ct = resp.headers.get("Content-Type", "")
+                if resp.status_code == 200 and ("html" in ct or "xhtml" in ct):
+                    html_content = resp.text
+
+            if not html_content:
                 return values
 
-            html_content = resp.text
         except Exception as exc:
             logger.debug("iXBRL download failed for %s/%s: %s", identifier, transaction_id, exc)
             return values
@@ -584,7 +639,15 @@ class UKCompaniesHouseClient:
             from ixbrl_parse.ixbrl import parse as ixbrl_parse
             import io
 
-            tree = ET.parse(io.StringIO(html_content))
+            # Strip XML declaration to avoid lxml "Unicode strings with
+            # encoding declaration are not supported" error.
+            clean_content = html_content
+            if clean_content.startswith("<?xml"):
+                end_decl = clean_content.find("?>")
+                if end_decl != -1:
+                    clean_content = clean_content[end_decl + 2:].lstrip()
+
+            tree = ET.parse(io.StringIO(clean_content))
             ixbrl = ixbrl_parse(tree)
 
             from operator1.clients.canonical_translator import _UKGAAP_MAP, _IFRS_MAP
