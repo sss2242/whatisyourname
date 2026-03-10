@@ -2452,6 +2452,9 @@ class TFTWrapper(BaseModelWrapper):
         self._history = list(clean.values)
         self._scaler_mean = float(clean.mean())
         self._scaler_std = float(clean.std()) or 1.0
+        # Store multivariate feature history for predict() so TFT
+        # retains its multi-feature advantage during online prediction.
+        self._feature_history: list[np.ndarray] = []
 
         try:
             import torch
@@ -2547,6 +2550,11 @@ class TFTWrapper(BaseModelWrapper):
                 optimizer.step()
 
             self._fitted = True
+            # Store the multivariate feature history so predict() can
+            # use all features, not just the target variable.
+            self._feature_history = [
+                feature_data[i] for i in range(len(feature_data))
+            ]
             logger.info("TFT wrapper fitted for %s (%d sequences, %d features)", target_col, len(X_seqs), n_features)
 
         except ImportError:
@@ -2561,21 +2569,30 @@ class TFTWrapper(BaseModelWrapper):
         try:
             import torch
 
-            # Use last lookback values from history
-            if len(self._history) < self._lookback:
-                return np.array([self._history[-1]])
-
-            # Build feature sequence from recent history (simplified: use target only)
-            recent = np.array(self._history[-self._lookback:]).reshape(-1, 1)
-            # Pad to n_features if needed
             n_feat = len(self._numeric_cols)
-            if recent.shape[1] < n_feat:
-                padded = np.zeros((self._lookback, n_feat))
-                padded[:, 0] = recent[:, 0]
-                recent = padded
 
-            # Normalise
-            scaled = (recent - self._feat_mean[:recent.shape[1]]) / self._feat_std[:recent.shape[1]]
+            # Use multivariate feature history if available (preserves
+            # TFT's multi-feature advantage during online prediction).
+            if len(self._feature_history) >= self._lookback:
+                recent = np.array(self._feature_history[-self._lookback:])
+                # Ensure correct shape (lookback, n_features)
+                if recent.ndim == 1:
+                    recent = recent.reshape(-1, 1)
+                if recent.shape[1] < n_feat:
+                    padded = np.zeros((self._lookback, n_feat))
+                    padded[:, :recent.shape[1]] = recent
+                    recent = padded
+                elif recent.shape[1] > n_feat:
+                    recent = recent[:, :n_feat]
+            elif len(self._history) >= self._lookback:
+                # Fallback: univariate target history with zero-padding
+                recent = np.zeros((self._lookback, n_feat))
+                recent[:, 0] = np.array(self._history[-self._lookback:])
+            else:
+                return np.array([self._history[-1]]) if self._history else np.zeros(1)
+
+            # Normalise using the stored feature statistics
+            scaled = (recent - self._feat_mean[:n_feat]) / self._feat_std[:n_feat]
 
             x = torch.FloatTensor(scaled).unsqueeze(0)
             self._model.eval()
@@ -2599,6 +2616,18 @@ class TFTWrapper(BaseModelWrapper):
             val = float(actual_t_plus_1[0])
             if not np.isnan(val):
                 self._history.append(val)
+            # Also update multivariate feature history if we have
+            # more than just the target value in the actual vector.
+            if len(actual_t_plus_1) >= len(self._numeric_cols):
+                self._feature_history.append(
+                    actual_t_plus_1[:len(self._numeric_cols)].copy()
+                )
+            elif self._feature_history:
+                # Fallback: carry forward last feature row with updated target
+                last_row = self._feature_history[-1].copy()
+                if not np.isnan(val):
+                    last_row[0] = val  # target is always column 0
+                self._feature_history.append(last_row)
             self.failed_update = False
         except Exception as exc:
             self.failed_update = True
@@ -2682,6 +2711,7 @@ class ForwardPassResult:
     total_days: int = 0
     warmup_days: int = 0
     pid_summary: dict[str, Any] = field(default_factory=dict)  # PID controller state
+    conformal_calibrator: Any = None  # Trained ConformalCalibrator from the forward pass
 
 
 def _init_model_wrappers(
@@ -3012,8 +3042,10 @@ def run_forward_pass(
             pid_summary.mean_multiplier, pid_summary.max_multiplier,
         )
 
-    # Store conformal diagnostics
+    # Store conformal calibrator and diagnostics so downstream modules
+    # (prediction_aggregator) can use the trained calibrator directly.
     if _conformal_calibrator is not None:
+        result.conformal_calibrator = _conformal_calibrator
         try:
             result.conformal_diagnostics = _conformal_calibrator.get_diagnostics()
             logger.info("Conformal calibrator: %s", result.conformal_diagnostics)

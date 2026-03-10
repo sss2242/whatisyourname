@@ -17,6 +17,27 @@ compared against the actual value from the cache.
    model receives a score for each survival mode, identifying which
    model performs best under each condition.
 
+**Relationship to ``run_forward_pass()`` in forecasting.py:**
+
+Both modules implement day-by-day predict-compare-update loops, but
+they serve different purposes:
+
+- ``run_forward_pass()`` (forecasting.py, Phase D): the *main* temporal
+  engine with online model updates, PID-adjusted learning rates,
+  conformal calibration, candlestick pattern injection, cycle
+  decomposition, and DTW analog signals.  Its output model states
+  feed into prediction aggregation.
+
+- ``run_walk_forward()`` (this module, Phase 3): a *diagnostic* loop
+  focused on per-survival-mode model scoring.  Its main output is the
+  ``WalkForwardResult.mode_scores`` leaderboard which tells the
+  prediction aggregator which models perform best under each survival
+  condition (normal, company_only, country_exposed, etc.).
+
+In short: the forward pass *learns*, the walk-forward *evaluates*.
+Their outputs are complementary and both feed into the prediction
+aggregator.
+
 Top-level entry point:
     ``run_walk_forward(daily_cache, timeline_result, models) -> WalkForwardResult``
 
