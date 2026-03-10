@@ -3098,43 +3098,7 @@ def generate_charts(
     except Exception as exc:
         logger.warning("Failed to generate survival timeline chart: %s", exc)
 
-    # Chart 3: Risk Hierarchy Weight Allocation
-    try:
-        tier_cols = [
-            f"hierarchy_tier{i}_weight" for i in range(1, 6)
-            if f"hierarchy_tier{i}_weight" in cache.columns
-        ]
-        if tier_cols:
-            tier_names = [
-                "Tier 1: Liquidity", "Tier 2: Solvency", "Tier 3: Stability",
-                "Tier 4: Profitability", "Tier 5: Growth",
-            ]
-            tier_colors = ["#6d4aff", "#1ea885", "#e8950a", "#dc3545", "#8b8694"]
-            fig, ax = plt.subplots(figsize=(16, 5))
-            ax.stackplot(
-                cache.index,
-                *[cache[c].fillna(0) for c in tier_cols],
-                labels=tier_names[:len(tier_cols)],
-                colors=tier_colors[:len(tier_cols)],
-                alpha=0.85,
-            )
-            _apply_brand_style(fig, ax, f"{company} -- Risk Hierarchy Weight Allocation")
-            ax.set_ylabel("Portfolio Weight", color=_CHART_FG)
-            ax.set_ylim(0, 1.05)
-            leg = ax.legend(
-                loc="upper right", fontsize=9, facecolor=_CHART_BG,
-                edgecolor=_CHART_GRID, labelcolor=_CHART_FG,
-            )
-            fig.tight_layout()
-            path = str(out / "hierarchy_weights.png")
-            fig.savefig(path, dpi=180, facecolor=_CHART_BG)
-            plt.close(fig)
-            chart_paths.append(path)
-            logger.info("Generated chart: %s", path)
-    except Exception as exc:
-        logger.warning("Failed to generate hierarchy weight chart: %s", exc)
-
-    # Chart 4: 21-Day Realized Volatility
+    # Chart 3: 21-Day Realized Volatility
     try:
         if "volatility_21d" in cache.columns:
             fig, ax = plt.subplots(figsize=(16, 5))
@@ -3449,12 +3413,12 @@ def generate_charts(
 _CHART_SECTION_MAP: dict[str, str] = {
     "price_history.png": "## 3. Historical Performance Analysis",
     "survival_timeline.png": "## 6. Survival Mode Analysis",
-    "hierarchy_weights.png": "## 4. Current Financial Snapshot",
     "volatility.png": "## 8. Temporal Analysis",
     "financial_health.png": "## 5. Financial Health Scoring",
     "sentiment.png": "## 16. Market Sentiment",
+    "predicted_ohlc_week.png": "## 9. Predictions & Forecasts",
     "predicted_ohlc_month.png": "## 9. Predictions & Forecasts",
-    "predicted_ohlc_week.png": "## 10. Technical Patterns",
+    "predicted_ohlc_year.png": "## 9. Predictions & Forecasts",
     "conflict_risk.png": "## 19.5. Geopolitical",
 }
 
