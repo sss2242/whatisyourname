@@ -227,7 +227,11 @@ def compute_news_sentiment(
                 break
 
     if "publishedDate" in articles.columns:
-        articles["date"] = pd.to_datetime(articles["publishedDate"]).dt.normalize()
+        # Convert with utc=True then strip timezone to avoid
+        # "Tz-aware datetime cannot be converted to datetime64" errors
+        # when reindexing against the tz-naive cache index.
+        _dt = pd.to_datetime(articles["publishedDate"], utc=True, errors="coerce")
+        articles["date"] = _dt.dt.tz_localize(None).dt.normalize()
     else:
         # Last resort: assign today's date to all
         articles["date"] = pd.Timestamp.now().normalize()

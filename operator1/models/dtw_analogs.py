@@ -201,7 +201,14 @@ def find_historical_analogs(
     )
 
     if len(cache) < MIN_HISTORY_FOR_DTW:
-        logger.warning("Insufficient data for DTW analogs (%d < %d)", len(cache), MIN_HISTORY_FOR_DTW)
+        # Log once per distinct cache length to avoid spamming during
+        # forward pass warmup (called hundreds of times with growing cache).
+        _cache_len = len(cache)
+        if not hasattr(find_historical_analogs, "_warned_lengths"):
+            find_historical_analogs._warned_lengths = set()
+        if _cache_len not in find_historical_analogs._warned_lengths:
+            logger.warning("Insufficient data for DTW analogs (%d < %d)", _cache_len, MIN_HISTORY_FOR_DTW)
+            find_historical_analogs._warned_lengths.add(_cache_len)
         return result
 
     # Select variables

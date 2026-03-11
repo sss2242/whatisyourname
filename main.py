@@ -1456,17 +1456,26 @@ Non-interactive examples:
                 if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
                     for r in forecast_result.residuals:
                         calibrator.update(r)
-                _point_forecasts: dict[str, float] = {}
+                # build_conformal_result expects nested dict:
+                # {variable: {horizon_label: point_forecast}}
+                _nested_forecasts: dict[str, dict[str, float]] = {}
                 if hasattr(pred_result, "predictions"):
                     for var, horizons_dict in pred_result.predictions.items():
                         if isinstance(horizons_dict, dict):
+                            _nested_forecasts[var] = {}
                             for h, hp in horizons_dict.items():
                                 pf = getattr(hp, "point_forecast", None)
                                 if pf is not None:
-                                    _point_forecasts[f"{var}_{h}"] = pf
+                                    try:
+                                        _nested_forecasts[var][h] = float(pf)
+                                    except (TypeError, ValueError):
+                                        pass
+                            # Remove empty variable entries
+                            if not _nested_forecasts[var]:
+                                del _nested_forecasts[var]
                 conformal_result = build_conformal_result(
                     calibrator,
-                    forecasts=_point_forecasts,
+                    forecasts=_nested_forecasts,
                     horizons={"1d": 1, "5d": 5, "21d": 21, "252d": 252},
                 )
                 logger.info("Conformal prediction intervals computed")
