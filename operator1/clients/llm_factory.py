@@ -23,7 +23,7 @@ from operator1.config_loader import get_global_config
 logger = logging.getLogger(__name__)
 
 # Supported provider identifiers (case-insensitive)
-_SUPPORTED_PROVIDERS = ("gemini", "claude")
+_SUPPORTED_PROVIDERS = ("gemini", "claude", "openrouter")
 
 
 def get_available_models(provider: str) -> list[dict[str, Any]]:
@@ -125,6 +125,8 @@ def create_llm_client(
     # Build the client
     if provider == "claude":
         return _build_claude(secrets, model)
+    elif provider == "openrouter":
+        return _build_openrouter(secrets, model)
     else:
         return _build_gemini(secrets, model)
 
@@ -135,6 +137,8 @@ def _auto_detect_provider(secrets: dict[str, str]) -> str:
         return "gemini"
     if secrets.get("ANTHROPIC_API_KEY"):
         return "claude"
+    if secrets.get("OPENROUTER_API_KEY"):
+        return "openrouter"
     # Default to gemini even without a key (caller handles None)
     return "gemini"
 
@@ -174,6 +178,26 @@ def _build_claude(secrets: dict[str, str], model: str = "") -> LLMClient | None:
     client = ClaudeClient(**kwargs)
     logger.info(
         "Using Claude as LLM provider (model: %s, max_output: %d tokens)",
+        client.model_name, client.max_output_tokens,
+    )
+    return client
+
+
+def _build_openrouter(secrets: dict[str, str], model: str = "") -> LLMClient | None:
+    """Build an OpenRouterClient if an API key is present."""
+    api_key = secrets.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        logger.info("No OPENROUTER_API_KEY found; LLM features disabled.")
+        return None
+    from operator1.clients.openrouter import OpenRouterClient
+
+    kwargs: dict = {"api_key": api_key}
+    if model:
+        kwargs["model"] = model
+
+    client = OpenRouterClient(**kwargs)
+    logger.info(
+        "Using OpenRouter as LLM provider (model: %s, max_output: %d tokens)",
         client.model_name, client.max_output_tokens,
     )
     return client
