@@ -77,16 +77,21 @@ _V2_BALANCE_MAP = {
     "Equity": "total_equity",
     # Legacy short names
     "TA": "total_assets",
+    "TL": "total_liabilities",
     "Eq": "total_equity",
+    "CA": "current_assets",
+    "CL": "current_liabilities",
     "CashEq": "cash_and_equivalents",
     "BPS": "book_value_per_share",
+    # J-Quants V2 condensed summary may not have all of these;
+    # missing fields will be derived post-extraction or filled by
+    # the estimation engine.
 }
 
 _V2_CASHFLOW_MAP = {
-    # Legacy short names (cashflow not in base fin_summary)
-    "CFO": "operating_cashflow",
-    "CFI": "investing_cashflow",
-    "CFF": "financing_cashflow",
+    "CFO": "operating_cash_flow",  # must match cache_builder.STATEMENT_FIELDS
+    "CFI": "investing_cf",          # was "investing_cashflow" (wrong)
+    "CFF": "financing_cf",          # was "financing_cashflow" (wrong)
 }
 
 
@@ -405,6 +410,11 @@ class JPJquantsClient:
                     val = row.get(v2_col)
                     if pd.notna(val):
                         rec[canonical] = float(val)
+                # Derive missing fields from accounting identities
+                ta = rec.get("total_assets")
+                eq = rec.get("total_equity")
+                if ta is not None and eq is not None and "total_liabilities" not in rec:
+                    rec["total_liabilities"] = ta - eq
                 balance_rows.append(rec)
 
             # Build cash flow statement
@@ -419,6 +429,23 @@ class JPJquantsClient:
                     if pd.notna(val):
                         rec[canonical] = float(val)
                 cashflow_rows.append(rec)
+
+            # Log unmapped J-Quants V2 columns for diagnostic purposes.
+            # J-Quants bypasses canonical_translator, so the global
+            # unmapped concept logging doesn't cover this wrapper.
+            _meta_cols = {
+                date_col, period_end_col, "Code", "LocalCode",
+                "CurPerType", "DocType", "DiscDate", "DisclosedDate",
+                "CurPerEn", "CurrentPeriodEndDate",
+            }
+            _all_mapped = set(_V2_INCOME_MAP) | set(_V2_BALANCE_MAP) | set(_V2_CASHFLOW_MAP)
+            _available = set(df_annual.columns) - _meta_cols
+            _unmapped = _available - _all_mapped
+            if _unmapped:
+                logger.debug(
+                    "J-Quants V2 unmapped columns (not in _V2_*_MAP): %s",
+                    sorted(_unmapped)[:20],
+                )
 
             return {
                 "income": pd.DataFrame(income_rows) if income_rows else pd.DataFrame(),

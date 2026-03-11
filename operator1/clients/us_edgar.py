@@ -602,55 +602,66 @@ class USEdgarClient:
         *,
         exclude: set[str] | None = None,
     ) -> list[str]:
-        """Query SEC browse-edgar for companies matching a SIC code.
+        """Find peer companies matching a SIC code.
+
+        Uses the SEC EFTS full-text search API (modern, reliable) instead
+        of the deprecated cgi-bin/browse-edgar endpoint which returns 503.
+
+        Falls back to filtering the company_tickers.json list by SIC prefix
+        if the EFTS query fails.
 
         Returns a list of resolved ticker symbols (up to 10).
         """
         import requests
 
         exclude = exclude or set()
+        peers: list[str] = []
+
+        # Method 1: Use EFTS search API (modern, reliable)
         try:
             resp = requests.get(
-                "https://www.sec.gov/cgi-bin/browse-edgar",
+                "https://efts.sec.gov/LATEST/search-index",
                 params={
-                    "action": "getcompany",
-                    "SIC": sic,
-                    "owner": "include",
-                    "count": "100",
-                    "output": "atom",
+                    "q": f"SIC:{sic}",
+                    "dateRange": "custom",
+                    "startdt": "2024-01-01",
+                    "forms": "10-K,10-Q",
                 },
                 headers={"User-Agent": self._user_agent},
                 timeout=30,
             )
-            resp.raise_for_status()
+            if resp.status_code == 200:
+                data = resp.json()
+                hits = data.get("hits", {}).get("hits", [])
+                for hit in hits:
+                    source = hit.get("_source", {})
+                    entity_name = source.get("entity_name", "")
+                    cik = str(source.get("entity_id", "")).lstrip("0")
+                    ticker = cik_to_ticker.get(cik, "")
+                    if ticker and ticker != target_ticker and ticker not in peers and ticker not in exclude:
+                        peers.append(ticker)
+                    if len(peers) >= 10:
+                        return peers
+                if peers:
+                    return peers
         except Exception as exc:
-            logger.warning("SEC browse-edgar SIC query failed: %s", exc)
-            return []
+            logger.debug("EFTS SIC search failed: %s", exc)
 
-        # Parse the Atom XML to extract CIKs
-        peer_ciks: list[str] = []
+        # Method 2: Filter from already-loaded company tickers by SIC prefix
+        # The cik_to_ticker map was built from company_tickers.json which
+        # also contains SIC codes. Use edgartools if available.
         try:
-            from xml.etree import ElementTree as ET
-            root = ET.fromstring(resp.content)
-            ns = {"atom": "http://www.w3.org/2005/Atom"}
-            for entry in root.findall(".//atom:entry", ns):
-                for el in entry.iter():
-                    tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
-                    if tag == "cik" and el.text:
-                        peer_ciks.append(el.text.lstrip("0"))
+            from edgar import get_companies
+            sic_matches = get_companies(sic=int(sic))
+            if sic_matches is not None:
+                for _, row in sic_matches.iterrows() if hasattr(sic_matches, "iterrows") else []:
+                    ticker = str(row.get("ticker", ""))
+                    if ticker and ticker != target_ticker and ticker not in peers and ticker not in exclude:
+                        peers.append(ticker)
+                    if len(peers) >= 10:
                         break
         except Exception as exc:
-            logger.warning("Failed to parse SEC browse-edgar XML: %s", exc)
-            return []
-
-        # Map CIKs to tickers, excluding the target and already-found peers
-        peers: list[str] = []
-        for cik in peer_ciks:
-            ticker = cik_to_ticker.get(cik, "")
-            if ticker and ticker != target_ticker and ticker not in peers and ticker not in exclude:
-                peers.append(ticker)
-            if len(peers) >= 10:
-                break
+            logger.debug("edgartools SIC lookup failed: %s", exc)
 
         return peers
 
@@ -797,25 +808,32 @@ class USEdgarClient:
                     for xbrl_concept, value in df[col].items():
                         if pd.isna(value):
                             continue
-                        try:
-                            float_val = float(value)
-                        except (ValueError, TypeError):
-                            continue
-
-                        # Use raw XBRL concept name as the concept -- the
-                        # canonical_translator's _USGAAP_MAP already knows
-                        # how to map these (e.g. "RevenueFromContract..." -> "revenue").
-                        # This keeps the mapping in one place (canonical_translator.py).
-                        concept_name = str(xbrl_concept)
-                        filing_dt = filing_date_map.get(period_end, period_end)
-                        rows.append({
-                            "concept": concept_name,
-                            "value": float_val,
-                            "filing_date": filing_dt,
-                            "report_date": period_end,
-                            "period_type": "annual" if annual else "quarterly",
-                            "form": "10-K" if annual else "10-Q",
-                        })
+                        canonical = self._map_edgartools_concept(
+                            str(concept_label), statement_type,
+                        )
+                        if not canonical:
+                            # Log unmapped concepts once per label to help
+                            # diagnose missing canonical field mappings.
+                            if not hasattr(self, "_unmapped_concepts"):
+                                self._unmapped_concepts: set[str] = set()
+                            _key = f"{statement_type}:{concept_label}"
+                            if _key not in self._unmapped_concepts:
+                                self._unmapped_concepts.add(_key)
+                                logger.debug(
+                                    "Unmapped edgartools concept: %s (type=%s)",
+                                    concept_label, statement_type,
+                                )
+                        if canonical:
+                            # Look up filing date from our map
+                            filing_dt = filing_date_map.get(period_end, period_end)
+                            rows.append({
+                                "concept": canonical,
+                                "value": float(value) if value is not None else None,
+                                "filing_date": filing_dt,
+                                "report_date": period_end,
+                                "period_type": "annual" if annual else "quarterly",
+                                "form": "10-K" if annual else "10-Q",
+                            })
             except Exception as exc:
                 logger.debug(
                     "edgartools %s (%s, annual=%s) failed: %s",
@@ -838,6 +856,78 @@ class USEdgarClient:
         # Translate through canonical_translator
         from operator1.clients.canonical_translator import translate_financials
         return translate_financials(df, self.market_id, statement_type)
+
+    def _llm_resolve_unmapped_concepts(
+        self,
+        unmapped_labels: list[str],
+        statement_type: str,
+        llm_client: Any = None,
+    ) -> dict[str, str]:
+        """Use LLM to resolve unmapped financial statement concept labels.
+
+        When edgartools returns concept labels that don't match any static
+        mapping (e.g. company-specific line item names), ask the LLM to
+        identify which canonical field they map to.
+
+        Parameters
+        ----------
+        unmapped_labels:
+            List of unrecognized concept labels from edgartools.
+        statement_type:
+            One of "income", "balance", "cashflow".
+        llm_client:
+            An LLM client instance (from llm_factory). If None, returns
+            empty dict (no-op).
+
+        Returns
+        -------
+        Dict mapping unmapped label -> canonical field name.
+        Labels the LLM can't resolve are omitted.
+        """
+        if not llm_client or not unmapped_labels:
+            return {}
+
+        # Canonical field names the LLM can choose from
+        from operator1.steps.cache_builder import STATEMENT_FIELDS
+        canonical_list = ", ".join(STATEMENT_FIELDS)
+
+        prompt = (
+            f"I have a {statement_type} financial statement from SEC EDGAR with "
+            f"the following unrecognized line item labels:\n\n"
+            + "\n".join(f"  - {label}" for label in unmapped_labels[:30])
+            + f"\n\nMap each label to one of these canonical field names "
+            f"(or SKIP if it does not match any):\n{canonical_list}\n\n"
+            f"Return ONLY a JSON object mapping label -> canonical name. "
+            f"Example: {{\"Net Sales\": \"revenue\", \"Unknown Item\": \"SKIP\"}}"
+        )
+
+        try:
+            response = llm_client.generate(prompt)
+            if response:
+                import json as _json
+                # Extract JSON from response (may have markdown wrapping)
+                _cleaned = response.strip()
+                if "```" in _cleaned:
+                    _cleaned = _cleaned.split("```")[1]
+                    if _cleaned.startswith("json"):
+                        _cleaned = _cleaned[4:]
+                    _cleaned = _cleaned.strip()
+                mappings = _json.loads(_cleaned)
+                result = {}
+                for label, canonical in mappings.items():
+                    if canonical and canonical != "SKIP" and canonical in STATEMENT_FIELDS:
+                        result[label.lower().strip()] = canonical
+                if result:
+                    logger.info(
+                        "LLM resolved %d/%d unmapped %s concepts: %s",
+                        len(result), len(unmapped_labels), statement_type,
+                        list(result.values()),
+                    )
+                return result
+        except Exception as exc:
+            logger.debug("LLM concept resolution failed: %s", exc)
+
+        return {}
 
     def _build_filing_date_map(self, company) -> dict[str, str]:
         """Build a mapping of report_date -> filing_date from SEC filings.
@@ -920,11 +1010,20 @@ class USEdgarClient:
                 "equity": "total_equity",
                 "current assets": "current_assets",
                 "total current assets": "current_assets",
+                "assets, current": "current_assets",
+                "assetscurrent": "current_assets",
                 "current liabilities": "current_liabilities",
                 "total current liabilities": "current_liabilities",
+                "liabilities, current": "current_liabilities",
+                "liabilitiescurrent": "current_liabilities",
                 "cash and cash equivalents": "cash_and_equivalents",
                 "cash and equivalents": "cash_and_equivalents",
                 "cash, cash equivalents": "cash_and_equivalents",
+                "cash, cash equivalents and restricted cash": "cash_and_equivalents",
+                "cash and cash equivalents, at carrying value": "cash_and_equivalents",
+                "cash & cash equivalents": "cash_and_equivalents",
+                "cash & equivalents": "cash_and_equivalents",
+                "cashandcashequivalentsatcarryingvalue": "cash_and_equivalents",
                 "short-term debt": "short_term_debt",
                 "short term borrowings": "short_term_debt",
                 "current portion of long-term debt": "short_term_debt",
@@ -942,7 +1041,34 @@ class USEdgarClient:
                 "inventory": "inventory",
                 "accounts payable": "payables",
             }
-            return balance_map.get(label_lower)
+            exact = balance_map.get(label_lower)
+            if exact:
+                return exact
+            # Fuzzy fallback: check substrings for common XBRL label variants
+            _balance_substring_map = [
+                ("current assets", "current_assets"),
+                ("current liabilities", "current_liabilities"),
+                ("cash and cash equivalents", "cash_and_equivalents"),
+                ("cash equivalents", "cash_and_equivalents"),
+                ("short-term debt", "short_term_debt"),
+                ("short term borrowings", "short_term_debt"),
+                ("long-term debt", "long_term_debt"),
+                ("retained earnings", "retained_earnings"),
+                ("accounts receivable", "receivables"),
+                ("trade receivable", "receivables"),
+                ("accounts payable", "payables"),
+                ("inventories", "inventory"),
+                ("goodwill", "goodwill"),
+                ("intangible assets", "intangible_assets"),
+                ("total assets", "total_assets"),
+                ("total liabilities", "total_liabilities"),
+                ("stockholders' equity", "total_equity"),
+                ("shareholders' equity", "total_equity"),
+            ]
+            for substr, canonical in _balance_substring_map:
+                if substr in label_lower:
+                    return canonical
+            return None
 
         # Cash flow
         if statement_type == "cashflow":

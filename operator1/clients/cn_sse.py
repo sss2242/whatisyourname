@@ -303,9 +303,38 @@ class CNSseClient:
             import baostock as bs
             bs_code = _to_baostock_code(identifier)
 
-            lg = bs.login()
-            if lg.error_code != "0":
+            # Normalize to canonical format with filing_date and report_date.
+            # akshare returns wide format: columns are Chinese line item names,
+            # rows are reporting periods. We need to melt/unpivot into long
+            # format with a 'concept' column for translate_financials to map.
+            if "报告日" in df.columns:
+                date_col = "报告日"
+            elif df.columns[0] not in ("report_date",):
+                date_col = df.columns[0]
+            else:
+                date_col = "report_date"
+
+            # Identify value columns (everything except the date column)
+            value_cols = [c for c in df.columns if c != date_col]
+
+            if not value_cols:
                 return pd.DataFrame()
+
+            # Melt wide -> long: each Chinese column name becomes a 'concept' row
+            long_df = df.melt(
+                id_vars=[date_col],
+                value_vars=value_cols,
+                var_name="concept",
+                value_name="value",
+            )
+            long_df = long_df.rename(columns={date_col: "report_date"})
+            long_df["report_date"] = pd.to_datetime(long_df["report_date"], errors="coerce")
+            long_df["filing_date"] = long_df["report_date"] + pd.Timedelta(days=45)  # Estimate
+            long_df["value"] = pd.to_numeric(long_df["value"], errors="coerce")
+            long_df = long_df.dropna(subset=["value"])
+
+            from operator1.clients.canonical_translator import translate_financials
+            return translate_financials(long_df, self.market_id, statement_type)
 
             current_year = date.today().year
             all_rows = []

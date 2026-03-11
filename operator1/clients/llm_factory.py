@@ -34,10 +34,6 @@ logger = logging.getLogger(__name__)
 # Supported provider identifiers (case-insensitive)
 _SUPPORTED_PROVIDERS = ("gemini", "claude", "openrouter")
 
-# HTTP status codes that indicate key exhaustion (rotate to next key)
-_EXHAUSTION_ERRORS = ("credit balance is too low", "quota exceeded",
-                      "rate limit", "429", "402", "insufficient")
-
 
 def get_available_models(provider: str) -> list[dict[str, Any]]:
     """Return a list of available models for the given provider.
@@ -245,58 +241,13 @@ def create_llm_client(
         cfg = get_global_config()
         model = str(cfg.get("llm_model", "")).strip()
 
-    # Build primary clients (one per key in the pool)
-    _KEY_MAP = {"gemini": "GEMINI_API_KEY", "claude": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY"}
-    primary_key_name = _KEY_MAP.get(provider, "GEMINI_API_KEY")
-
-    # Determine fallback providers (exclude the primary)
-    _fallback_order = [p for p in ("gemini", "claude", "openrouter") if p != provider]
-
-    primary_keys = get_key_pool(secrets, primary_key_name)
-
-    primary_clients = []
-    for key in primary_keys:
-        client = _build_single_client(provider, key, model)
-        if client:
-            primary_clients.append(client)
-
-    # Build fallback clients from all other providers that have keys
-    fallback_clients = []
-    fallback_provider = _fallback_order[0] if _fallback_order else "gemini"
-    for fb_provider in _fallback_order:
-        fb_key_name = _KEY_MAP.get(fb_provider, "")
-        if not fb_key_name:
-            continue
-        fb_keys = get_key_pool(secrets, fb_key_name)
-        for key in fb_keys:
-            client = _build_single_client(fb_provider, key, "")
-            if client:
-                fallback_clients.append(client)
-
-    all_clients = primary_clients + fallback_clients
-    if not all_clients:
-        logger.info("No LLM API keys available; LLM features disabled.")
-        return None
-
-    if len(all_clients) == 1:
-        # Single key -- no need for pooling overhead
-        client = all_clients[0]
-        logger.info(
-            "Using %s as LLM provider (model: %s, max_output: %d tokens)",
-            client.provider_name, client.model_name, client.max_output_tokens,
-        )
-        return client
-
-    # Multiple keys -- wrap in pooled client
-    pooled = PooledLLMClient(primary_clients, fallback_clients)
-    logger.info(
-        "LLM key pool: %d primary (%s) + %d fallback (%s) keys. "
-        "Active: %s / %s",
-        len(primary_clients), provider,
-        len(fallback_clients), fallback_provider,
-        pooled.provider_name, pooled.model_name,
-    )
-    return pooled
+    # Build the client
+    if provider == "claude":
+        return _build_claude(secrets, model)
+    elif provider == "openrouter":
+        return _build_openrouter(secrets, model)
+    else:
+        return _build_gemini(secrets, model)
 
 
 def _auto_detect_provider(secrets: dict[str, str]) -> str:
@@ -306,8 +257,9 @@ def _auto_detect_provider(secrets: dict[str, str]) -> str:
         return "gemini"
     if get_key_pool(secrets, "ANTHROPIC_API_KEY"):
         return "claude"
-    if get_key_pool(secrets, "OPENROUTER_API_KEY"):
+    if secrets.get("OPENROUTER_API_KEY"):
         return "openrouter"
+    # Default to gemini even without a key (caller handles None)
     return "gemini"
 
 
@@ -331,26 +283,29 @@ def _build_single_client(
             logger.warning("Failed to build Gemini client: %s", exc)
             return None
 
-    if provider == "claude":
-        try:
-            from operator1.clients.claude import ClaudeClient
-            kwargs = {"api_key": api_key}
-            if model:
-                kwargs["model"] = model
-            return ClaudeClient(**kwargs)
-        except Exception as exc:
-            logger.warning("Failed to build Claude client: %s", exc)
-            return None
+    client = ClaudeClient(**kwargs)
+    logger.info(
+        "Using Claude as LLM provider (model: %s, max_output: %d tokens)",
+        client.model_name, client.max_output_tokens,
+    )
+    return client
 
-    if provider == "openrouter":
-        try:
-            from operator1.clients.openrouter import OpenRouterClient
-            kwargs = {"api_key": api_key}
-            if model:
-                kwargs["model"] = model
-            return OpenRouterClient(**kwargs)
-        except Exception as exc:
-            logger.warning("Failed to build OpenRouter client: %s", exc)
-            return None
 
-    return None
+def _build_openrouter(secrets: dict[str, str], model: str = "") -> LLMClient | None:
+    """Build an OpenRouterClient if an API key is present."""
+    api_key = secrets.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        logger.info("No OPENROUTER_API_KEY found; LLM features disabled.")
+        return None
+    from operator1.clients.openrouter import OpenRouterClient
+
+    kwargs: dict = {"api_key": api_key}
+    if model:
+        kwargs["model"] = model
+
+    client = OpenRouterClient(**kwargs)
+    logger.info(
+        "Using OpenRouter as LLM provider (model: %s, max_output: %d tokens)",
+        client.model_name, client.max_output_tokens,
+    )
+    return client

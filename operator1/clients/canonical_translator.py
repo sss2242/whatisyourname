@@ -844,9 +844,16 @@ def translate_financials(
     if statement_type:
         result["statement_type"] = statement_type
 
-    # 5. Drop rows where canonical_name is empty (unmapped concepts)
+    # 5. Log and drop rows where canonical_name is empty (unmapped concepts)
     if "canonical_name" in result.columns:
-        result = result[result["canonical_name"].astype(str).str.len() > 0]
+        _mask_empty = result["canonical_name"].astype(str).str.len() == 0
+        if _mask_empty.any() and "concept" in result.columns:
+            _unmapped = result.loc[_mask_empty, "concept"].unique().tolist()
+            logger.debug(
+                "Unmapped concepts dropped (%s, %s): %s",
+                market_id, statement_type, _unmapped[:20],
+            )
+        result = result[~_mask_empty]
 
     return result
 
@@ -1021,6 +1028,12 @@ def _map_concept(concept: str, concept_map: dict[str, str]) -> str:
     concept_lower = concept.lower().replace(" ", "_")
     if concept_lower in _FIELD_ALIASES:
         return _FIELD_ALIASES[concept_lower]
+
+    # Case-insensitive match against concept map keys
+    # (handles FRS102/UK-GAAP/IFRS case variations like "CurrentAssets" vs "currentassets")
+    for key, canonical in concept_map.items():
+        if key.lower() == concept_lower or key.lower().replace(" ", "_") == concept_lower:
+            return _FIELD_ALIASES.get(canonical, canonical)
 
     # Try case-insensitive match on the concept value itself
     # (handles cases where the concept IS already the canonical name)

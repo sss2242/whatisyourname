@@ -22,6 +22,21 @@ from operator1.config_loader import get_global_config
 
 logger = logging.getLogger(__name__)
 
+
+class LLMNonRetryableError(Exception):
+    """Raised for non-retryable LLM API errors (e.g. 400 invalid key).
+
+    This intentionally does NOT inherit from ``requests.RequestException``
+    so that the retry catch block will not intercept it.
+    """
+
+    def __init__(self, provider: str, status_code: int, detail: str) -> None:
+        self.provider = provider
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"{provider} API error {status_code}: {detail}")
+
+
 # ---------------------------------------------------------------------------
 # Per-host rate limiting (mirrors http_utils._rate_limit_sleep)
 # ---------------------------------------------------------------------------
@@ -292,9 +307,8 @@ class LLMClient(ABC):
                         "%s API error %d (non-retryable): %s",
                         self.provider_name, resp.status_code, error_detail,
                     )
-                    raise requests.HTTPError(
-                        f"{self.provider_name} API error {resp.status_code}: {error_detail}",
-                        response=resp,
+                    raise LLMNonRetryableError(
+                        self.provider_name, resp.status_code, error_detail,
                     )
 
                 # Retryable error -- backoff

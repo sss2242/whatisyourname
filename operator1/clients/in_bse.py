@@ -183,16 +183,123 @@ class INBseClient:
     # -- Financial statements ------------------------------------------------
 
     def get_income_statement(self, identifier: str) -> pd.DataFrame:
-        """Fetch income statements via BSE filing discovery + LLM, yfinance fallback."""
+        """Fetch income statements from BSE India financial results API."""
         return self._fetch_financials(identifier, "income")
 
     def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
-        """Fetch balance sheets via BSE filing discovery + LLM, yfinance fallback."""
+        """Fetch balance sheets from BSE India financial results API."""
         return self._fetch_financials(identifier, "balance")
 
     def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
-        """Fetch cash flow statements via BSE filing discovery + LLM, yfinance fallback."""
+        """Fetch cash flow statements from BSE India financial results API."""
         return self._fetch_financials(identifier, "cashflow")
+
+    def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
+        """Fetch financial data from BSE India API.
+
+        Uses the StockReach/FinancialResult endpoint which provides
+        quarterly and annual results for listed companies.
+
+        The BSE API returns JSON with financial line items that we
+        map through the canonical translator using _IFRS_MAP
+        (India uses Ind AS, which is IFRS-converged).
+        """
+        # Map statement types to BSE API parameters
+        _bse_type_map = {
+            "income": "Profit & Loss",
+            "balance": "Balance Sheet",
+            "cashflow": "Cash Flow",
+        }
+
+        bse_type = _bse_type_map.get(statement_type, "")
+        if not bse_type:
+            return pd.DataFrame()
+
+        try:
+            # BSE financial results endpoint
+            data = cached_get(
+                f"{_BSE_BASE}/FinancialResult/CompanyResults",
+                params={
+                    "scripcode": identifier,
+                    "Ession_Flag": bse_type,
+                },
+                headers=self._headers,
+            )
+
+            if not data or not isinstance(data, (list, dict)):
+                logger.debug("BSE financials empty for %s/%s", identifier, statement_type)
+                return pd.DataFrame()
+
+            items = data if isinstance(data, list) else data.get("Table", [])
+            if not items:
+                return pd.DataFrame()
+
+            rows: list[dict] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                # BSE returns fields like "from_date", "to_date", field name, value
+                report_date = item.get("to_date", item.get("ToDate", ""))
+                filing_date = item.get("from_date", item.get("FromDate", report_date))
+
+                # Each item may have multiple key-value financial fields
+                # or it may be a single row with a "ParticularsDesc" + "Value" pattern
+                concept = item.get("ParticularsDesc", item.get("particulars", ""))
+                value = item.get("Value", item.get("value", item.get("Amount", None)))
+
+                if concept and value is not None:
+                    try:
+                        rows.append({
+                            "concept": str(concept).strip(),
+                            "value": float(str(value).replace(",", "")),
+                            "filing_date": filing_date,
+                            "report_date": report_date,
+                        })
+                    except (ValueError, TypeError):
+                        pass
+
+            if not rows:
+                # Alternative: try flat structure where columns ARE the financial fields
+                if isinstance(items, list) and items and isinstance(items[0], dict):
+                    for item in items:
+                        report_date = item.get("to_date", item.get("ToDate", ""))
+                        filing_date = item.get("from_date", item.get("FromDate", report_date))
+                        for key, val in item.items():
+                            if key.lower() in ("to_date", "from_date", "todate", "fromdate",
+                                               "scripcode", "scrip_code", "company_name"):
+                                continue
+                            if val is not None:
+                                try:
+                                    rows.append({
+                                        "concept": str(key).strip(),
+                                        "value": float(str(val).replace(",", "")),
+                                        "filing_date": filing_date,
+                                        "report_date": report_date,
+                                    })
+                                except (ValueError, TypeError):
+                                    pass
+
+            if not rows:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(rows)
+            for col in ("filing_date", "report_date"):
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col], errors="coerce")
+
+            # Filter to 2-year window
+            cutoff = pd.Timestamp.now() - pd.Timedelta(days=730)
+            if "report_date" in df.columns:
+                df = df[df["report_date"] >= cutoff]
+
+            from operator1.clients.canonical_translator import translate_financials
+            return translate_financials(df, self.market_id, statement_type)
+
+        except Exception as exc:
+            logger.debug("BSE financials failed for %s/%s: %s", identifier, statement_type, exc)
+            return pd.DataFrame()
+
+    # -- Price data -----------------------------------------------------------
 
     def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
         """Try BSE filing discovery first, fall back to yfinance.

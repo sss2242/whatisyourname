@@ -378,7 +378,7 @@ def compute_survival_timeline(
         logger.info(
             "Survival timeline computed: %d days, %d switches, "
             "mean_stability=%.3f, distribution=%s",
-            len(timeline),
+            len(result.timeline),
             result.n_switches,
             result.mean_stability,
             {k: f"{v:.2%}" for k, v in result.mode_distribution.items() if v > 0},

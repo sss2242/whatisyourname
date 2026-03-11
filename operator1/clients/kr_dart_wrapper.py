@@ -542,12 +542,29 @@ class KRDartClient:
         return translate_financials(df, self.market_id, statement_type)
 
     def _map_dart_concept(self, concept: str, statement_type: str) -> str | None:
-        """Map DART Korean account name to canonical name."""
+        """Map DART Korean account name to canonical name.
+
+        Tries exact match first, then normalized match (strip whitespace
+        and parenthetical content) to handle Korean label variations.
+        """
+        import re
         from operator1.clients.canonical_translator import _DART_MAP, _IFRS_MAP
         combined = {**_DART_MAP, **_IFRS_MAP}
 
+        # Exact match first
         if concept in combined:
             return combined[concept]
+
+        # Normalized match: strip whitespace and parenthetical content
+        # Handles variations like "유동자산" vs "유 동 자 산" or "자본총계(지배)"
+        normalized = re.sub(r'\s+', '', concept)
+        normalized = re.sub(r'\(.*?\)', '', normalized)
+        for key, canonical in combined.items():
+            key_norm = re.sub(r'\s+', '', key)
+            key_norm = re.sub(r'\(.*?\)', '', key_norm)
+            if normalized == key_norm:
+                return canonical
+
         return None
 
     def _resolve_corp_code(self, identifier: str) -> str:
