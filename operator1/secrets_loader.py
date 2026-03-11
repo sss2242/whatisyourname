@@ -124,7 +124,7 @@ def load_secrets() -> dict[str, str]:
         secrets = _load_from_env()
 
     # Also collect numbered key variants (e.g. GEMINI_API_KEY_1, _2, _3)
-    for provider_key in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY"):
+    for provider_key in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"):
         extra_keys = []
         for i in range(1, 10):
             numbered = os.environ.get(f"{provider_key}_{i}", "").strip()
