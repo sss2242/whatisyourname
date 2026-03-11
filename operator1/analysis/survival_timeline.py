@@ -347,15 +347,17 @@ def compute_survival_timeline(
         mode_codes = modes.map(MODE_TO_CODE).astype(int)
         mode_codes.name = "survival_mode_code"
 
-        # Build enriched timeline
-        timeline = daily_cache.copy()
-        timeline["survival_mode"] = modes
-        timeline["survival_mode_code"] = mode_codes
-        timeline["switch_point"] = switch_flags
-        timeline["days_in_mode"] = days_counter
-        timeline["stability_score_21d"] = stability
+        # Write enriched columns back to the original cache so downstream
+        # modules (prediction_aggregator, walk_forward) can read them
+        # without needing to merge a separate DataFrame.
+        daily_cache["survival_mode"] = modes
+        daily_cache["survival_mode_code"] = mode_codes
+        daily_cache["switch_point"] = switch_flags
+        daily_cache["days_in_mode"] = days_counter
+        daily_cache["stability_score_21d"] = stability
 
-        result.timeline = timeline
+        # Also keep a reference as the result timeline for backward compat.
+        result.timeline = daily_cache
 
         # Extract structured switch points
         result.switch_points = _extract_switch_list(modes, switch_flags)
@@ -417,3 +419,246 @@ def get_switch_dates(
     if sp is None:
         return []
     return list(sp.index[sp == 1])
+
+
+# ---------------------------------------------------------------------------
+# Enriched survival timeline (bridge between rule-based flags + HMM regimes)
+# ---------------------------------------------------------------------------
+
+# Combined state mapping: (survival_mode, market_regime) -> (state, intensity)
+# Market regime comes from HMM (bull/bear/high_vol/low_vol) or "unknown".
+# Intensity is a continuous [0, 1] score where 0 = safe, 1 = extreme crisis.
+_COMBINED_STATE_MAP: dict[tuple[str, str], tuple[str, float]] = {
+    # normal survival + market regimes
+    ("normal", "bull"): ("stable_growth", 0.0),
+    ("normal", "low_vol"): ("stable_growth", 0.05),
+    ("normal", "high_vol"): ("elevated_risk", 0.25),
+    ("normal", "bear"): ("market_stress", 0.30),
+    ("normal", "unknown"): ("stable_growth", 0.05),
+    # company_only + market regimes
+    ("company_only", "bull"): ("company_distress_mild", 0.45),
+    ("company_only", "low_vol"): ("company_distress_mild", 0.50),
+    ("company_only", "high_vol"): ("company_distress_severe", 0.60),
+    ("company_only", "bear"): ("company_distress_severe", 0.70),
+    ("company_only", "unknown"): ("company_distress_mild", 0.55),
+    # country_protected + market regimes
+    ("country_protected", "bull"): ("protected_stress", 0.15),
+    ("country_protected", "low_vol"): ("protected_stress", 0.20),
+    ("country_protected", "high_vol"): ("protected_stress", 0.30),
+    ("country_protected", "bear"): ("protected_stress", 0.35),
+    ("country_protected", "unknown"): ("protected_stress", 0.25),
+    # country_exposed + market regimes
+    ("country_exposed", "bull"): ("country_crisis_mild", 0.40),
+    ("country_exposed", "low_vol"): ("country_crisis_mild", 0.45),
+    ("country_exposed", "high_vol"): ("country_crisis_severe", 0.60),
+    ("country_exposed", "bear"): ("country_crisis_severe", 0.70),
+    ("country_exposed", "unknown"): ("country_crisis_mild", 0.50),
+    # both_unprotected + market regimes
+    ("both_unprotected", "bull"): ("crisis", 0.70),
+    ("both_unprotected", "low_vol"): ("crisis", 0.75),
+    ("both_unprotected", "high_vol"): ("crisis", 0.90),
+    ("both_unprotected", "bear"): ("extreme_crisis", 1.00),
+    ("both_unprotected", "unknown"): ("crisis", 0.80),
+    # both_protected + market regimes
+    ("both_protected", "bull"): ("protected_crisis", 0.45),
+    ("both_protected", "low_vol"): ("protected_crisis", 0.50),
+    ("both_protected", "high_vol"): ("protected_crisis", 0.60),
+    ("both_protected", "bear"): ("protected_crisis", 0.65),
+    ("both_protected", "unknown"): ("protected_crisis", 0.55),
+}
+
+# All possible combined state labels (for documentation / validation).
+COMBINED_STATES = sorted({v[0] for v in _COMBINED_STATE_MAP.values()})
+
+
+@dataclass
+class EnrichedTimelineResult:
+    """Output of the enriched survival timeline computation.
+
+    Extends ``SurvivalTimelineResult`` with regime-aware fields.
+    """
+
+    # Base survival timeline result.
+    base: SurvivalTimelineResult = field(
+        default_factory=SurvivalTimelineResult,
+    )
+
+    # Enriched timeline DataFrame (superset of base.timeline columns).
+    timeline: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+    # Whether HMM regime data was available and incorporated.
+    regime_available: bool = False
+
+    # Combined state distribution: {state_label: fraction}.
+    combined_state_distribution: dict[str, float] = field(default_factory=dict)
+
+    # Mean survival intensity across all days.
+    mean_intensity: float = float("nan")
+
+    fitted: bool = False
+    error: str | None = None
+
+
+_WARNED_UNMAPPED_KEYS: set[tuple[str, str]] = set()
+
+
+def _map_combined_state(
+    survival_mode: str,
+    market_regime: str,
+) -> tuple[str, float]:
+    """Look up combined state and intensity for a (survival_mode, market_regime) pair."""
+    key = (survival_mode, market_regime)
+    if key in _COMBINED_STATE_MAP:
+        return _COMBINED_STATE_MAP[key]
+    # Fallback: use the unknown-regime row for the survival mode.
+    fallback_key = (survival_mode, "unknown")
+    if fallback_key in _COMBINED_STATE_MAP:
+        # Warn once per unmapped key so operators know they might want to
+        # extend _COMBINED_STATE_MAP (e.g., when using n_regimes > 4).
+        if key not in _WARNED_UNMAPPED_KEYS:
+            _WARNED_UNMAPPED_KEYS.add(key)
+            logger.warning(
+                "Unmapped (survival_mode=%r, market_regime=%r) -- "
+                "falling back to 'unknown' regime row. Consider extending "
+                "_COMBINED_STATE_MAP if this regime label is expected.",
+                survival_mode, market_regime,
+            )
+        return _COMBINED_STATE_MAP[fallback_key]
+    # Last resort: both survival_mode and regime are unknown.
+    if key not in _WARNED_UNMAPPED_KEYS:
+        _WARNED_UNMAPPED_KEYS.add(key)
+        logger.warning(
+            "Completely unmapped (survival_mode=%r, market_regime=%r) -- "
+            "returning ('unknown', 0.5)",
+            survival_mode, market_regime,
+        )
+    return ("unknown", 0.5)
+
+
+def compute_enriched_survival_timeline(
+    daily_cache: pd.DataFrame,
+    regime_labels: pd.Series | None = None,
+    regime_confidence: pd.Series | None = None,
+) -> EnrichedTimelineResult:
+    """Compute the enriched survival timeline that bridges rule-based flags and HMM regimes.
+
+    This function:
+    1. Runs the base ``compute_survival_timeline()`` for rule-based mode classification.
+    2. Overlays HMM regime labels (if provided) to create a combined state vector.
+    3. Produces ``regime_state`` (categorical), ``survival_intensity`` (continuous 0-1),
+       and ``regime_confidence`` (HMM posterior probability) columns.
+
+    Parameters
+    ----------
+    daily_cache:
+        Daily cache DataFrame with survival flag columns.
+    regime_labels:
+        Optional Series of market regime labels (e.g. "bull", "bear", "high_vol",
+        "low_vol") aligned to the cache index. Typically from HMM/GMM output.
+    regime_confidence:
+        Optional Series of regime posterior probabilities (0-1) aligned to the
+        cache index. Typically the max HMM posterior per day.
+
+    Returns
+    -------
+    EnrichedTimelineResult
+        Contains the enriched timeline DataFrame with combined state columns.
+    """
+    result = EnrichedTimelineResult()
+
+    # Step 1: Run base survival timeline.
+    base_result = compute_survival_timeline(daily_cache)
+    result.base = base_result
+
+    if not base_result.fitted:
+        result.error = f"Base survival timeline failed: {base_result.error}"
+        logger.warning(result.error)
+        return result
+
+    try:
+        # Use the base timeline directly (which IS the original cache
+        # after compute_survival_timeline now writes in-place).
+        # We still copy here because the enriched timeline adds columns
+        # that are specific to the enriched analysis, and we also write
+        # the key columns back to the original daily_cache for downstream.
+        timeline = base_result.timeline
+
+        # Step 2: Merge market regime labels.
+        if regime_labels is not None and not regime_labels.empty:
+            # Align to timeline index, fill missing with "unknown".
+            aligned_regimes = regime_labels.reindex(timeline.index).fillna("unknown")
+            timeline["market_regime"] = aligned_regimes.astype(str)
+            result.regime_available = True
+        else:
+            timeline["market_regime"] = "unknown"
+
+        # Step 3: Compute combined state and survival intensity.
+        survival_modes = timeline["survival_mode"]
+        market_regimes = timeline["market_regime"]
+
+        combined_states = []
+        intensities = []
+        for sm, mr in zip(survival_modes, market_regimes):
+            state, intensity = _map_combined_state(str(sm), str(mr))
+            combined_states.append(state)
+            intensities.append(intensity)
+
+        timeline["regime_state"] = combined_states
+        timeline["survival_intensity"] = intensities
+
+        # Step 4: Add regime confidence (HMM posterior or default).
+        if regime_confidence is not None and not regime_confidence.empty:
+            aligned_conf = regime_confidence.reindex(timeline.index).fillna(0.5)
+            timeline["regime_confidence"] = aligned_conf
+        else:
+            # Default confidence: 1.0 if we have no HMM (rule-based is certain),
+            # but reduce for "unknown" market regimes to signal uncertainty.
+            timeline["regime_confidence"] = np.where(
+                timeline["market_regime"] == "unknown", 0.5, 0.8
+            )
+
+        # Step 5: Compute regime transition probability estimate.
+        # Simple empirical estimate: fraction of regime switches in a trailing window.
+        _TRANSITION_WINDOW = 42  # ~2 months
+        switch_flags = (
+            timeline["regime_state"] != timeline["regime_state"].shift(1)
+        ).astype(int)
+        switch_flags.iloc[0] = 0
+        timeline["regime_switch"] = switch_flags
+        timeline["regime_transition_prob"] = (
+            switch_flags
+            .rolling(window=_TRANSITION_WINDOW, min_periods=1)
+            .mean()
+        )
+
+        result.timeline = timeline
+
+        # Summary statistics.
+        state_counts = pd.Series(combined_states).value_counts(normalize=True)
+        result.combined_state_distribution = {
+            str(k): float(v) for k, v in state_counts.items()
+        }
+        result.mean_intensity = float(np.nanmean(intensities))
+        result.fitted = True
+
+        # Item 7: Log confidence range to help diagnose low-confidence situations.
+        _conf = timeline["regime_confidence"]
+        logger.info(
+            "Enriched survival timeline: %d days, mean_intensity=%.3f, "
+            "regime_available=%s, confidence=[min=%.3f, mean=%.3f, max=%.3f], "
+            "states=%s",
+            len(timeline),
+            result.mean_intensity,
+            result.regime_available,
+            float(_conf.min()),
+            float(_conf.mean()),
+            float(_conf.max()),
+            {k: f"{v:.1%}" for k, v in result.combined_state_distribution.items()
+             if v > 0.01},
+        )
+
+    except Exception as exc:
+        result.error = f"Enriched survival timeline failed: {exc}"
+        logger.error(result.error)
+
+    return result

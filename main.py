@@ -42,11 +42,56 @@ import pandas as pd
 # Early setup: configure logging before any operator1 imports
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
+_LOG_DIR = Path("cache")
+_LOG_FILE = _LOG_DIR / "pipeline_run.md"
+
+
+def _setup_logging() -> None:
+    """Configure logging to both console and a markdown log file.
+
+    The markdown log is saved to ``cache/pipeline_run.md`` so that users
+    can review the full pipeline output after the run completes.
+    """
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    # Console handler
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    root_logger.addHandler(console)
+
+    # Markdown file handler -- writes a fenced code block for easy reading
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(_LOG_FILE, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    root_logger.addHandler(file_handler)
+
+    # Write markdown header
+    with open(_LOG_FILE, "w", encoding="utf-8") as f:
+        f.write("# Operator 1 -- Pipeline Run Log\n\n")
+        f.write(f"**Started:** {date.today().isoformat()}\n\n")
+        f.write("```\n")
+
+
+def _finalize_log() -> None:
+    """Close the markdown fenced code block in the log file."""
+    try:
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("```\n\n")
+            f.write(f"**Log saved to:** `{_LOG_FILE}`\n")
+    except Exception:
+        pass
+
+
+_setup_logging()
 logger = logging.getLogger("operator1.main")
 
 
@@ -530,9 +575,9 @@ Non-interactive examples:
             logger.info("No company selected. Exiting.")
             return 0
 
-    ticker = company_info.get("ticker", "")
+    ticker = company_info.get("ticker", "") or company_info.get("identifier", "")
     company_name = company_info.get("name", ticker)
-    identifier = company_info.get("cik") or ticker
+    identifier = company_info.get("cik") or ticker or company_info.get("identifier", "")
 
     logger.info("Target: %s (%s) via %s", company_name, ticker, market_info.pit_api_name)
 
@@ -569,6 +614,19 @@ Non-interactive examples:
         )
     except Exception as exc:
         logger.warning("Profile fetch failed (continuing with basic info): %s", exc)
+
+    # W7 fix: Enrich profile for non-US markets via OpenFIGI/regional APIs.
+    # This fills sector, industry, and identifier gaps without overwriting
+    # existing data.
+    try:
+        from operator1.clients.supplement import enrich_profile
+        target_profile = enrich_profile(
+            market_id=market_id,
+            ticker=ticker,
+            existing_profile=target_profile,
+        )
+    except Exception as exc:
+        logger.debug("Supplement enrichment skipped: %s", exc)
         target_profile = {
             "name": company_name,
             "ticker": ticker,
@@ -626,11 +684,20 @@ Non-interactive examples:
     # OHLCV source (Alpha Vantage or exchange-specific APIs).
     # Raw exchange OHLCV is inherently PIT: a trade at a given price on
     # a given date is an immutable fact that never changes retroactively.
+    _ohlcv_source_label = market_info.pit_api_name  # default: same as PIT source
     if quotes_df.empty and ticker:
         logger.info(
-            "PIT source %s does not provide OHLCV -- price features will be limited.",
+            "PIT source %s does not provide OHLCV -- fetching from OHLCV provider.",
             market_info.pit_api_name,
         )
+        try:
+            from operator1.clients.ohlcv_provider import fetch_ohlcv
+            quotes_df = fetch_ohlcv(ticker, market_id=args.market)
+            if not quotes_df.empty:
+                _ohlcv_source_label = "yfinance (Yahoo Finance)"
+                logger.info("OHLCV fetched from yfinance provider: %d rows", len(quotes_df))
+        except Exception as exc:
+            logger.warning("OHLCV provider failed: %s", exc)
 
     # Step 3b: Reconcile financial data (normalize fields, validate dates)
     reconciliation_report = {}
@@ -660,6 +727,12 @@ Non-interactive examples:
         for label, stmt_df in [("income", income_df), ("balance", balance_df), ("cashflow", cashflow_df)]:
             if stmt_df.empty:
                 continue
+            logger.debug(
+                "Pivot check for %s: columns=%s, has_canonical=%s, has_value=%s",
+                label, list(stmt_df.columns)[:5],
+                "canonical_name" in stmt_df.columns,
+                "value" in stmt_df.columns,
+            )
             if "canonical_name" in stmt_df.columns and "value" in stmt_df.columns:
                 wide = pivot_to_canonical_wide(stmt_df, date_col="report_date")
                 if not wide.empty:
@@ -732,14 +805,19 @@ Non-interactive examples:
         if stmt_df.empty:
             continue
         try:
-            # Use filing_date for PIT alignment (no look-ahead)
-            date_col = "filing_date" if "filing_date" in stmt_df.columns else "report_date"
+            # Use report_date for alignment (filing_date has duplicates from
+            # multi-period filings like 10-Q containing both Q and YTD data).
+            # The PIT constraint is still satisfied: we forward-fill from the
+            # report_date, which is always <= filing_date.
+            date_col = "report_date" if "report_date" in stmt_df.columns else "filing_date"
             if date_col not in stmt_df.columns:
                 logger.warning("No date column in %s data, skipping merge", label)
                 continue
 
             stmt_df[date_col] = pd.to_datetime(stmt_df[date_col])
             stmt_df = stmt_df.sort_values(date_col)
+            # Deduplicate: keep last row per date (most recent filing)
+            stmt_df = stmt_df.drop_duplicates(subset=[date_col], keep="last")
 
             # Forward-fill financial data onto the daily cache (as-of join)
             numeric_cols = stmt_df.select_dtypes(include=["number"]).columns.tolist()
@@ -749,8 +827,12 @@ Non-interactive examples:
                 continue
 
             stmt_indexed = stmt_df.set_index(date_col)[numeric_cols]
-            # Reindex to cache dates and forward-fill
-            stmt_aligned = stmt_indexed.reindex(cache.index, method="ffill")
+            # Forward-fill financial data onto the daily cache (as-of join).
+            # The quarterly filing dates don't exist in the daily index,
+            # so we union the indices first, then ffill, then select daily dates.
+            combined_idx = cache.index.union(stmt_indexed.index).sort_values()
+            stmt_aligned = stmt_indexed.reindex(combined_idx).ffill()
+            stmt_aligned = stmt_aligned.reindex(cache.index)
 
             # Skip columns already in cache (first statement wins)
             new_cols = [c for c in stmt_aligned.columns if c not in _merged_cols]
@@ -767,15 +849,60 @@ Non-interactive examples:
     # ------------------------------------------------------------------
     # Step 4a: Fetch macro data for survival mode analysis
     # ------------------------------------------------------------------
-    macro_data = {}          # raw dict[str, pd.Series] (macro APIs removed)
-    macro_dataset = None     # MacroDataset for downstream modules
+    macro_data = {}
+    macro_dataset = None
     macro_quadrant_result = None
 
     if macro_api_info:
         logger.info("")
-        logger.info(
-            "Step 4a: Macro data fetching skipped (government macro APIs removed).",
-        )
+        logger.info("Step 4a: Fetching macro data from %s...", macro_api_info.api_name)
+        try:
+            from operator1.clients.macro_provider import fetch_macro
+            macro_data = fetch_macro(
+                market_info.country_code,
+                secrets=secrets,
+                years=int(getattr(args, "years", 2)),
+            )
+            if macro_data:
+                logger.info("Macro data: %d indicators fetched", len(macro_data))
+                for name, series in macro_data.items():
+                    logger.info("    [OK] %s: %d observations", name, len(series))
+            else:
+                logger.warning("Macro data: no indicators returned (APIs may need keys)")
+        except Exception as exc:
+            logger.warning("Macro data fetch failed (continuing without macro): %s", exc)
+
+    # Build MacroDataset from raw macro dict (structured container for downstream)
+    if macro_data:
+        try:
+            from operator1.steps.macro_mapping import fetch_macro_data as _build_macro_ds
+            macro_dataset = _build_macro_ds(
+                country_iso2=market_info.country_code,
+                macro_raw=macro_data,
+            )
+            logger.info(
+                "MacroDataset built: %d indicators, %d missing",
+                len(macro_dataset.indicators),
+                len(macro_dataset.missing),
+            )
+        except Exception as exc:
+            logger.warning("MacroDataset construction failed: %s", exc)
+
+    # Compute macro quadrant classification
+    if macro_data:
+        try:
+            from operator1.features.macro_quadrant import compute_macro_quadrant
+            cache, macro_quadrant_result = compute_macro_quadrant(
+                cache,
+                macro_data=macro_dataset,
+            )
+            logger.info(
+                "Macro quadrant: %s, stability=%.3f",
+                getattr(macro_quadrant_result, "latest_quadrant", "N/A"),
+                getattr(macro_quadrant_result, "stability_score", 0.0),
+            )
+        except Exception as exc:
+            logger.warning("Macro quadrant classification failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Step 4a-validate: Log what both APIs returned for diagnostics
@@ -829,6 +956,45 @@ Non-interactive examples:
             logger.info("Estimation coverage saved: %s", coverage_path)
     except Exception as exc:
         logger.warning("Estimation failed (continuing with raw data): %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 4c: Filing calendar analysis
+    # ------------------------------------------------------------------
+    filing_calendar_result = None
+    try:
+        from operator1.features.filing_calendar import analyze_filing_calendar
+        filing_calendar_result = analyze_filing_calendar(cache, market_id=market_id)
+        logger.info(
+            "Filing calendar: expected=%d, actual=%d (%.0f%%), freq=%s, stale=%s (age=%dd)",
+            filing_calendar_result.expected_filings_2yr,
+            filing_calendar_result.actual_filings_2yr,
+            filing_calendar_result.coverage_ratio * 100,
+            filing_calendar_result.detected_frequency,
+            filing_calendar_result.is_stale,
+            filing_calendar_result.latest_filing_age_days,
+        )
+        if filing_calendar_result.is_stale:
+            logger.warning(
+                "STALE DATA: Latest filing is %d days old (threshold: %d days for %s)",
+                filing_calendar_result.latest_filing_age_days,
+                filing_calendar_result.stale_threshold_days,
+                market_id,
+            )
+        if filing_calendar_result.gaps:
+            logger.warning(
+                "Filing gaps detected: %d gaps in 2-year window",
+                len(filing_calendar_result.gaps),
+            )
+    except Exception as exc:
+        logger.warning("Filing calendar analysis failed: %s", exc)
+
+    # Step 4c.1: Inject filing freshness into cache (if calendar succeeded)
+    if filing_calendar_result is not None:
+        try:
+            from operator1.features.filing_calendar import inject_filing_freshness
+            cache = inject_filing_freshness(cache, filing_calendar_result, market_id=market_id)
+        except Exception as exc:
+            logger.warning("Filing freshness injection failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Step 5: Feature engineering
@@ -906,6 +1072,16 @@ Non-interactive examples:
     except Exception as exc:
         logger.warning("Financial health scoring failed: %s", exc)
 
+    # W6 fix: Compute vanity (capital allocation quality) scores.
+    # Profile builder reads vanity_score, vanity_label, vanity_trend, and
+    # 5 component columns -- these were never populated without this call.
+    try:
+        from operator1.analysis.vanity import compute_vanity_score
+        cache = compute_vanity_score(cache)
+        logger.info("Vanity scores computed")
+    except Exception as exc:
+        logger.debug("Vanity scoring skipped: %s", exc)
+
     # Step 5e: Linked entity discovery via Gemini (optional)
     relationships = {}
     graph_risk_result = None
@@ -943,12 +1119,22 @@ Non-interactive examples:
         except Exception as exc:
             logger.warning("Entity discovery failed (continuing without): %s", exc)
 
-        # Graph risk
+        # Graph risk -- convert LinkedEntity dataclasses to dicts for .get() compat
         try:
+            from dataclasses import asdict as _asdict
             from operator1.models.graph_risk import compute_graph_risk_metrics
+            _rel_dicts = {}
+            for _grp, _ents in relationships.items():
+                if isinstance(_ents, list):
+                    _rel_dicts[_grp] = [
+                        _asdict(e) if hasattr(e, "__dataclass_fields__") else e
+                        for e in _ents
+                    ]
+                else:
+                    _rel_dicts[_grp] = _ents
             graph_risk_result = compute_graph_risk_metrics(
                 target_isin=target_profile.get("isin", ticker),
-                relationships=relationships,
+                relationships=_rel_dicts,
             )
             logger.info(
                 "Graph risk: %d nodes, centrality=%.3f",
@@ -964,6 +1150,7 @@ Non-interactive examples:
             game_theory_result = analyze_competitive_dynamics(
                 target_cache=cache,
                 target_name=target_profile.get("name", "target"),
+                competitor_caches=linked_caches if linked_caches else None,
             )
             logger.info(
                 "Game theory: %s, pressure=%.3f",
@@ -1026,20 +1213,25 @@ Non-interactive examples:
                             )
                         )
 
-                    # Merge statements (same logic as target cache, simplified)
+                    # Merge statements (same logic as target cache)
                     for _lbl, _sdf in [("inc", _inc), ("bal", _bal), ("cf", _cf)]:
                         if _sdf.empty:
                             continue
-                        _dcol = "filing_date" if "filing_date" in _sdf.columns else "report_date"
+                        # Use report_date first (consistent with target cache merge)
+                        _dcol = "report_date" if "report_date" in _sdf.columns else "filing_date"
                         if _dcol not in _sdf.columns:
                             continue
                         _sdf[_dcol] = pd.to_datetime(_sdf[_dcol])
                         _sdf = _sdf.sort_values(_dcol)
+                        _sdf = _sdf.drop_duplicates(subset=[_dcol], keep="last")
                         _ncols = _sdf.select_dtypes(include=["number"]).columns.tolist()
                         _ncols = [c for c in _ncols if c != _dcol and "date" not in c.lower()]
                         if _ncols:
                             _si = _sdf.set_index(_dcol)[_ncols]
-                            _sa = _si.reindex(_ent_cache.index, method="ffill")
+                            # Union+ffill+reindex (same as target cache merge)
+                            _combined = _ent_cache.index.union(_si.index).sort_values()
+                            _sa = _si.reindex(_combined).ffill()
+                            _sa = _sa.reindex(_ent_cache.index)
                             _new = [c for c in _sa.columns if c not in _ent_cache.columns]
                             if _new:
                                 _ent_cache = _ent_cache.join(_sa[_new], how="left")
@@ -1142,6 +1334,8 @@ Non-interactive examples:
             cache,
             gemini_client=llm_client,
             symbol=ticker,
+            market_id=market_id,
+            company_name=company_name,
         )
         if _sent_result.n_articles_scored > 0:
             sentiment_result = {
@@ -1166,10 +1360,106 @@ Non-interactive examples:
         logger.warning("News sentiment scoring failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 5.5: Enriched survival timeline (bridge: rule-based + HMM)
+    # ------------------------------------------------------------------
+    # Runs early regime detection (HMM/GMM/PELT/BCP) and combines it
+    # with the rule-based survival flags into a unified state vector.
+    # This gives downstream temporal models a single interface for
+    # regime_state, survival_intensity, and regime_confidence.
+    enriched_timeline_result = None
+    early_regime_result = None
+    regime_detector = None
+
+    if not args.skip_models:
+        logger.info("")
+        logger.info("Step 5.5: Enriched survival timeline...")
+
+        try:
+            from operator1.models.regime_detector import run_early_regime_detection
+            from operator1.analysis.survival_timeline import (
+                compute_enriched_survival_timeline,
+            )
+
+            # Early regime detection: runs HMM/GMM/PELT/BCP and adds regime
+            # columns to cache. This replaces the separate regime detection
+            # that used to run at the start of Step 6.
+            cache, early_regime_result = run_early_regime_detection(cache)
+            if early_regime_result and early_regime_result.fitted:
+                regime_detector = early_regime_result.detector
+                logger.info("Early regime detection complete")
+            else:
+                logger.info(
+                    "Early regime detection did not fit: %s",
+                    getattr(early_regime_result, "error", "unknown"),
+                )
+
+            # Build enriched survival timeline.
+            _regime_labels = (
+                early_regime_result.regime_labels
+                if early_regime_result else None
+            )
+            _regime_confidence = (
+                early_regime_result.regime_confidence
+                if early_regime_result else None
+            )
+            enriched_timeline_result = compute_enriched_survival_timeline(
+                cache,
+                regime_labels=_regime_labels,
+                regime_confidence=_regime_confidence,
+            )
+            if enriched_timeline_result and enriched_timeline_result.fitted:
+                # Item 3: Index length check before merging.
+                _etl = enriched_timeline_result.timeline
+                if len(_etl) != len(cache):
+                    logger.warning(
+                        "Enriched timeline length (%d) differs from cache (%d) "
+                        "-- using reindex to align safely",
+                        len(_etl), len(cache),
+                    )
+
+                # Merge enriched columns back into cache.
+                _enriched_cols = [
+                    "regime_state", "survival_intensity",
+                    "regime_confidence", "regime_switch",
+                    "regime_transition_prob", "survival_mode",
+                    "survival_mode_code", "switch_point",
+                    "days_in_mode", "stability_score_21d",
+                    "market_regime",
+                ]
+                for col in _enriched_cols:
+                    if col in _etl.columns:
+                        if col not in cache.columns:
+                            # Align by index in case lengths differ.
+                            cache[col] = _etl[col].reindex(cache.index)
+                        else:
+                            # Item 2: Log when a column is skipped due to collision.
+                            logger.debug(
+                                "Enriched column '%s' skipped -- already in cache",
+                                col,
+                            )
+                logger.info(
+                    "Enriched survival timeline: mean_intensity=%.3f, "
+                    "regime_available=%s, states=%s",
+                    enriched_timeline_result.mean_intensity,
+                    enriched_timeline_result.regime_available,
+                    {k: f"{v:.1%}"
+                     for k, v in enriched_timeline_result.combined_state_distribution.items()
+                     if v > 0.01},
+                )
+            else:
+                logger.warning(
+                    "Enriched survival timeline failed: %s",
+                    getattr(enriched_timeline_result, "error", "unknown"),
+                )
+        except Exception as exc:
+            logger.warning("Step 5.5 (enriched survival timeline) failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 6: Temporal modeling (optional)
     # ------------------------------------------------------------------
     forecast_result = None
     forward_pass_result = None
+    walk_forward_result = None
     burnout_result = None
     mc_result = None
     pred_result = None
@@ -1206,6 +1496,7 @@ Non-interactive examples:
         # Collect injected feature columns for temporal model learning.
         # Include linked aggregate columns (competitors_avg_*, suppliers_median_*,
         # etc.) so that temporal models can learn from cross-entity signals.
+        # Also include enriched survival timeline columns.
         _linked_prefixes = (
             "competitors_", "suppliers_", "customers_",
             "financial_institutions_", "sector_peers_", "industry_peers_",
@@ -1214,6 +1505,8 @@ Non-interactive examples:
             c for c in cache.columns
             if (c.startswith("fh_") or c.startswith("sentiment_")
                 or c.startswith("peer_") or c.startswith("macro_")
+                or c in ("survival_intensity", "regime_confidence",
+                         "regime_transition_prob", "stability_score_21d")
                 or any(c.startswith(p) for p in _linked_prefixes))
             and cache[c].dtype in ("float64", "float32", "int64")
             and not c.startswith("is_missing_")
@@ -1221,13 +1514,22 @@ Non-interactive examples:
         if _extra_vars:
             logger.info("Extra variables for temporal models (%d): %s", len(_extra_vars), _extra_vars[:10])
 
-        # Regime detection
-        regime_detector = None
-        try:
-            cache, regime_detector = detect_regimes_and_breaks(cache)
-            logger.info("Regimes detected")
-        except Exception as exc:
-            logger.warning("Regime detection failed: %s", exc)
+        # Item 4: Regime detection -- skip if already run in Step 5.5.
+        # Check both that detector exists AND regime columns are in cache
+        # to guard against partial state from a Step 5.5 exception.
+        _regime_ready = (
+            regime_detector is not None
+            and hasattr(regime_detector, "result")
+            and "regime_label" in cache.columns
+        )
+        if not _regime_ready:
+            try:
+                cache, regime_detector = detect_regimes_and_breaks(cache)
+                logger.info("Regimes detected")
+            except Exception as exc:
+                logger.warning("Regime detection failed: %s", exc)
+        else:
+            logger.info("Regime detection: using results from Step 5.5 (early detection)")
 
         # Dual regime classification
         try:
@@ -1342,7 +1644,8 @@ Non-interactive examples:
             )
             logger.info("Forward pass complete: %d steps", forward_pass_result.total_days)
         except Exception as exc:
-            logger.warning("Forward pass failed: %s", exc)
+            import traceback as _tb
+            logger.warning("Forward pass failed: %s\n%s", exc, _tb.format_exc())
 
         # Burn-out
         try:
@@ -1359,6 +1662,30 @@ Non-interactive examples:
             )
         except Exception as exc:
             logger.warning("Burn-out failed: %s", exc)
+
+        # Walk-forward evaluation (produces WalkForwardResult for recency-weighted RMSE)
+        try:
+            from operator1.models.walk_forward import run_walk_forward
+            from operator1.analysis.survival_timeline import compute_survival_timeline
+            _wf_timeline_result = compute_survival_timeline(cache)
+            # Pass the .timeline DataFrame (not the result wrapper) -- walk_forward
+            # calls len() on it, and SurvivalTimelineResult has no __len__.
+            _wf_timeline_df = (
+                _wf_timeline_result.timeline
+                if hasattr(_wf_timeline_result, "timeline")
+                else _wf_timeline_result
+            )
+            walk_forward_result = run_walk_forward(cache, _wf_timeline_df)
+            if walk_forward_result and walk_forward_result.fitted:
+                logger.info(
+                    "Walk-forward: %d days evaluated, best=%s (MAE=%.6f)",
+                    walk_forward_result.total_days_evaluated,
+                    walk_forward_result.overall_best_model,
+                    walk_forward_result.overall_mae
+                    if not pd.isna(walk_forward_result.overall_mae) else 0.0,
+                )
+        except Exception as exc:
+            logger.warning("Walk-forward evaluation failed: %s", exc)
 
         # Monte Carlo
         try:
@@ -1421,37 +1748,10 @@ Non-interactive examples:
         except Exception as exc:
             logger.warning("Particle filter failed: %s", exc)
 
-        # Prediction aggregation
-        if forecast_result is not None:
-            try:
-                pred_result = run_prediction_aggregation(
-                    cache, forecast_result, mc_result,
-                )
-                logger.info("Predictions aggregated")
-
-                # Copula tail adjustment
-                if (
-                    copula_result is not None
-                    and hasattr(copula_result, "tail_dependence")
-                    and copula_result.tail_dependence > 0.2
-                    and pred_result is not None
-                    and pred_result.fitted
-                ):
-                    _tail_mult = 1.0 + copula_result.tail_dependence
-                    for var_preds in pred_result.predictions.values():
-                        for hp in var_preds.values():
-                            if not (hp.lower_ci != hp.lower_ci):
-                                mid = hp.point_forecast
-                                hp.lower_ci = mid - (mid - hp.lower_ci) * _tail_mult
-                                hp.upper_ci = mid + (hp.upper_ci - mid) * _tail_mult
-                    logger.info("Copula tail adjustment applied")
-            except Exception as exc:
-                logger.warning("Prediction aggregation failed: %s", exc)
-
-        # Conformal prediction
+        # Conformal prediction (before aggregation so results feed in)
         try:
             from operator1.models.conformal import ConformalCalibrator, build_conformal_result
-            if forecast_result is not None and pred_result is not None:
+            if forecast_result is not None:
                 calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
                 if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
                     for r in forecast_result.residuals:
@@ -1482,7 +1782,7 @@ Non-interactive examples:
         except Exception as exc:
             logger.warning("Conformal prediction failed: %s", exc)
 
-        # DTW analogs
+        # DTW analogs (before aggregation so results feed in)
         try:
             from operator1.models.dtw_analogs import find_historical_analogs
             dtw_result = find_historical_analogs(cache)
@@ -1490,7 +1790,28 @@ Non-interactive examples:
         except Exception as exc:
             logger.warning("DTW historical analogs failed: %s", exc)
 
-        # SHAP explainability
+        # Prediction aggregation (now receives conformal + DTW results)
+        if forecast_result is not None:
+            try:
+                pred_result = run_prediction_aggregation(
+                    cache, forecast_result, mc_result,
+                    conformal_result=conformal_result,
+                    dual_regime_result=dual_regime_result,
+                    copula_result=copula_result,
+                    dtw_result=dtw_result,
+                    granger_result=granger_result,
+                    shap_result=shap_result,
+                    walk_forward_result=walk_forward_result,
+                )
+                logger.info("Predictions aggregated (with %d sibling module results)",
+                    sum(1 for r in [conformal_result, dual_regime_result,
+                        copula_result, dtw_result, granger_result,
+                        shap_result, forward_pass_result] if r is not None)
+                )
+            except Exception as exc:
+                logger.warning("Prediction aggregation failed: %s", exc)
+
+        # SHAP explainability (after aggregation -- needs pred_result)
         try:
             from operator1.models.explainability import compute_shap_explanations
             if pred_result is not None:
@@ -1503,9 +1824,17 @@ Non-interactive examples:
                                 pf = getattr(hp_1d, "point_forecast", None)
                                 if pf is not None:
                                     _shap_preds[var] = pf
+                # W9 fix: Extract predict functions from forward pass model states
+                # so SHAP can generate actual explanations instead of returning empty.
+                _shap_predict_fns: dict[str, Any] = {}
+                if forward_pass_result is not None and hasattr(forward_pass_result, "model_states"):
+                    for var, wrapper in forward_pass_result.model_states.items():
+                        if hasattr(wrapper, "predict"):
+                            _shap_predict_fns[var] = wrapper.predict
                 shap_result = compute_shap_explanations(
                     cache,
                     predictions=_shap_preds,
+                    predict_fns=_shap_predict_fns if _shap_predict_fns else None,
                 )
                 logger.info("SHAP explanations computed")
         except Exception as exc:
@@ -1548,11 +1877,19 @@ Non-interactive examples:
             logger.warning("OHLC candlestick prediction failed: %s", exc)
     else:
         logger.info("Step 6: Skipped (--skip-models)")
-        regime_detector = None
+        # regime_detector may have been set in Step 5.5; keep it if so.
 
     # ------------------------------------------------------------------
     # Step 7: Build company profile
     # ------------------------------------------------------------------
+    # Item 5: When --skip-models is used, the following variables are None:
+    #   enriched_timeline_result, early_regime_result, regime_detector,
+    #   forecast_result, forward_pass_result, burnout_result, mc_result,
+    #   pred_result, transfer_entropy_result, cycle_result, pattern_result,
+    #   copula_result, conformal_result, dtw_result, shap_result,
+    #   sobol_result, particle_filter_result, transformer_result,
+    #   dual_regime_result, granger_result, ga_result, ohlc_result.
+    # All downstream code must check for None before accessing these.
     logger.info("")
     logger.info("Step 7: Building company profile...")
 
@@ -1624,6 +1961,37 @@ Non-interactive examples:
             macro_quadrant_result=_to_dict(macro_quadrant_result),
         )
 
+        # Inject enriched survival timeline summary
+        if enriched_timeline_result and enriched_timeline_result.fitted:
+            profile["enriched_survival_timeline"] = {
+                "available": True,
+                "regime_available": enriched_timeline_result.regime_available,
+                "mean_intensity": enriched_timeline_result.mean_intensity,
+                "combined_state_distribution": (
+                    enriched_timeline_result.combined_state_distribution
+                ),
+                "base_n_switches": enriched_timeline_result.base.n_switches,
+                "base_mean_stability": enriched_timeline_result.base.mean_stability,
+            }
+        else:
+            profile["enriched_survival_timeline"] = {"available": False}
+
+        # Inject filing calendar analysis
+        if filing_calendar_result is not None:
+            profile["filing_calendar"] = {
+                "available": True,
+                "expected_frequency": filing_calendar_result.expected_frequency,
+                "detected_frequency": filing_calendar_result.detected_frequency,
+                "expected_filings_2yr": filing_calendar_result.expected_filings_2yr,
+                "actual_filings_2yr": filing_calendar_result.actual_filings_2yr,
+                "coverage_ratio": round(filing_calendar_result.coverage_ratio, 3),
+                "latest_filing_age_days": filing_calendar_result.latest_filing_age_days,
+                "is_stale": filing_calendar_result.is_stale,
+                "gaps": filing_calendar_result.gaps,
+            }
+        else:
+            profile["filing_calendar"] = {"available": False}
+
         # Inject economic plane classification
         try:
             from operator1.analysis.economic_planes import classify_economic_plane
@@ -1646,6 +2014,11 @@ Non-interactive examples:
         profile["meta"]["market_id"] = market_id
         profile["meta"]["pit_source"] = True
         profile["meta"]["using_pit_only"] = True
+
+        # Track the actual OHLCV source separately from the filing source.
+        # SEC EDGAR and most PIT filing APIs don't provide price data --
+        # OHLCV typically comes from yfinance or a per-region wrapper.
+        profile["meta"]["ohlcv_source"] = _ohlcv_source_label
 
         # Inject macro data summary
         if macro_api_info:
@@ -1671,7 +2044,7 @@ Non-interactive examples:
             profile["extended_models"] = {}
 
         if transfer_entropy_result is not None:
-            profile["extended_models"]["transfer_entropy"] = {"available": True}
+            profile["extended_models"]["transfer_entropy"] = _available_dict(transfer_entropy_result)
         if cycle_result is not None:
             profile["extended_models"]["cycle_decomposition"] = _available_dict(cycle_result)
         if pattern_result is not None:
@@ -1748,6 +2121,14 @@ Non-interactive examples:
                     if dual_regime_result.fund_regime_labels is not None
                     else {}
                 ),
+            }
+
+        # Burn-out results
+        if burnout_result is not None:
+            profile["extended_models"]["burnout"] = {
+                "available": True,
+                "iterations_completed": burnout_result.iterations_completed,
+                "converged": burnout_result.converged,
             }
 
         # GA optimization
@@ -1855,4 +2236,8 @@ def _generate_report_only(args: argparse.Namespace, secrets: dict) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        exit_code = main()
+    finally:
+        _finalize_log()
+    sys.exit(exit_code)

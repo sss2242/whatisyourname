@@ -1,15 +1,14 @@
-"""India BSE/NSE PIT client -- uses jugaad-data + BSE API.
+"""India BSE/NSE PIT client -- uses yfinance + BSE API.
 
-Primary library: jugaad-data (https://marketsetup.in/documentation/jugaad-data/)
-  - NSE stock data (historical + live), RBI rates
-  - Built-in caching to avoid getting blocked by NSE
-  - Supports new NSE website
-
+Primary: yfinance (profile, financials via .NS suffix -- works globally)
 Fallback: Direct BSE India API (https://api.bseindia.com/BseIndiaAPI/api)
 
-Coverage: ~5,500+ listed companies on BSE/NSE, ~$4T market cap.
+OHLCV: handled separately via ohlcv_nselib.py + ohlcv_provider.py
 
-Research: .roo/research/in-bse-2026-02-24.md
+Note: jugaad-data was removed because it depends on NSE endpoints that
+geo-block non-Indian IPs and frequently change their anti-scraping measures.
+
+Coverage: ~5,500+ listed companies on BSE/NSE, ~$4T market cap.
 """
 
 from __future__ import annotations
@@ -32,12 +31,10 @@ _CACHE_DIR = Path("cache/in_bse")
 
 
 class INBseClient:
-    """PIT client for Indian BSE/NSE equities using jugaad-data.
+    """PIT client for Indian BSE/NSE equities using yfinance + BSE API.
 
-    Implements the ``PITClient`` protocol. Uses jugaad-data as primary
-    data source for NSE stock data, with BSE India API as fallback.
-
-    Research source: .roo/research/in-bse-2026-02-24.md
+    Implements the ``PITClient`` protocol. Uses yfinance as primary
+    data source for profile, financial data. BSE API for company search.
     """
 
     def __init__(self, cache_dir: Path | str = _CACHE_DIR) -> None:
@@ -47,14 +44,6 @@ class INBseClient:
             "User-Agent": "Operator1/1.0",
             "Referer": "https://www.bseindia.com/",
         }
-        self._jugaad_available = False
-
-        try:
-            from jugaad_data.nse import stock_df
-            self._jugaad_available = True
-            logger.info("jugaad-data available for Indian market data")
-        except ImportError:
-            logger.info("jugaad-data not installed; Indian market data limited to BSE API")
 
     def _cache_path(self, identifier: str, fn: str) -> Path:
         return self._cache_dir / identifier.upper() / fn
@@ -81,7 +70,7 @@ class INBseClient:
 
     @property
     def market_name(self) -> str:
-        return "India (BSE / NSE) -- jugaad-data"
+        return "India (BSE / NSE) -- yfinance"
 
     # -- Company discovery ---------------------------------------------------
 
@@ -126,12 +115,58 @@ class INBseClient:
             "country": "IN",
             "sector": "",
             "industry": "",
+            "sub_industry": "",
             "exchange": "BSE",
             "currency": "INR",
             "cik": identifier,
+            "market_cap": "",
+            "shares_outstanding": "",
+            "lei": "",
         }
 
-        # Try BSE API for profile
+        # Primary: yfinance for rich profile data
+        self._enrich_from_yfinance(identifier, raw)
+
+        # Fallback: BSE API for basic info
+        if not raw.get("name"):
+            self._enrich_from_bse_api(identifier, raw)
+
+        from operator1.clients.canonical_translator import translate_profile
+        profile = translate_profile(raw, self.market_id)
+        self._write_cache(identifier, "profile.json", profile)
+        return profile
+
+    def _enrich_from_yfinance(self, identifier: str, raw: dict) -> None:
+        """Enrich profile with yfinance data (.NS suffix for NSE)."""
+        try:
+            import yfinance as yf
+
+            # Try NSE (.NS) first, then BSE (.BO)
+            for suffix in [".NS", ".BO"]:
+                yf_ticker = f"{identifier}{suffix}"
+                t = yf.Ticker(yf_ticker)
+                info = t.info or {}
+
+                if info.get("longName") or info.get("shortName"):
+                    raw["name"] = info.get("longName") or info.get("shortName") or ""
+                    raw["sector"] = info.get("sector", "")
+                    raw["industry"] = info.get("industry", "")
+                    mc = info.get("marketCap")
+                    if mc:
+                        raw["market_cap"] = str(mc)
+                    shares = info.get("sharesOutstanding")
+                    if shares:
+                        raw["shares_outstanding"] = str(shares)
+                    raw["isin"] = info.get("isin", "")
+                    raw["exchange"] = info.get("exchange", "NSI")
+                    logger.info("yfinance enriched %s via %s: %s", identifier, yf_ticker, raw["name"])
+                    break
+
+        except Exception as exc:
+            logger.debug("yfinance profile failed for %s: %s", identifier, exc)
+
+    def _enrich_from_bse_api(self, identifier: str, raw: dict) -> None:
+        """Fallback: BSE API for basic profile."""
         try:
             data = cached_get(
                 f"{_BSE_BASE}/StockReachGraph/stockData/{identifier}",
@@ -144,24 +179,6 @@ class INBseClient:
                 raw["industry"] = data.get("industry", "")
         except Exception as exc:
             logger.debug("BSE profile failed for %s: %s", identifier, exc)
-
-        # Try jugaad-data for live quote (to get current name)
-        if not raw["name"] and self._jugaad_available:
-            try:
-                from jugaad_data.nse import NSELive
-                n = NSELive()
-                q = n.stock_quote(identifier)
-                if q and isinstance(q, dict):
-                    info = q.get("info", {})
-                    raw["name"] = info.get("companyName", "")
-                    raw["industry"] = info.get("industry", "")
-            except Exception:
-                pass
-
-        from operator1.clients.canonical_translator import translate_profile
-        profile = translate_profile(raw, self.market_id)
-        self._write_cache(identifier, "profile.json", profile)
-        return profile
 
     # -- Financial statements ------------------------------------------------
 
@@ -284,54 +301,74 @@ class INBseClient:
 
     # -- Price data -----------------------------------------------------------
 
-    def get_quotes(self, identifier: str) -> pd.DataFrame:
-        """Fetch OHLCV price data via jugaad-data or BSE API.
+    def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
+        """Try BSE filing discovery first, fall back to yfinance.
 
-        jugaad-data provides NSE historical data with proper OHLCV format.
-        Research: .roo/research/in-bse-2026-02-24.md Section A2
+        The filing discoverer finds actual PDF filings from BSE's
+        disclosure system and extracts structured data via LLM. This
+        provides true Point-in-Time data with accurate filing dates.
         """
-        if self._jugaad_available:
-            try:
-                from jugaad_data.nse import stock_df
-
-                end_date = date.today()
-                start_date = end_date - timedelta(days=730)
-
-                # jugaad-data: stock_df(symbol, from_date, to_date, series)
-                df = stock_df(
-                    symbol=identifier.upper(),
-                    from_date=start_date,
-                    to_date=end_date,
-                    series="EQ",
+        # Try BSE filing discovery + LLM extraction first
+        try:
+            from operator1.clients.filing_discoverer import try_filing_extraction
+            df = try_filing_extraction(
+                ticker=identifier,
+                market_id=self.market_id,
+                statement_type=statement_type,
+            )
+            if df is not None and not df.empty:
+                logger.info(
+                    "BSE filing extraction succeeded for %s/%s: %d records",
+                    identifier, statement_type, len(df),
                 )
+                return df
+        except Exception as exc:
+            logger.debug("BSE filing extraction failed for %s: %s", identifier, exc)
 
-                if df is not None and not df.empty:
-                    # Normalize column names
-                    col_map = {
-                        "DATE": "date",
-                        "OPEN": "open",
-                        "HIGH": "high",
-                        "LOW": "low",
-                        "CLOSE": "close",
-                        "VOLUME": "volume",
-                        "LTP": "close",  # Last Traded Price as fallback
-                    }
-                    # Case-insensitive rename
-                    df.columns = [c.upper() for c in df.columns]
-                    df = df.rename(columns=col_map)
+        # Fallback to yfinance
+        return self._fetch_financials_yf(identifier, statement_type)
 
-                    ohlcv_cols = ["date", "open", "high", "low", "close", "volume"]
-                    available = [c for c in ohlcv_cols if c in df.columns]
-                    df = df[available]
+    def _fetch_financials_yf(self, identifier: str, statement_type: str) -> pd.DataFrame:
+        """Fetch financial statements via yfinance Ticker object."""
+        try:
+            import yfinance as yf
+            t = yf.Ticker(f"{identifier}.NS")
 
-                    if "date" in df.columns:
-                        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            fetch_map = {
+                "income": t.financials,
+                "balance": t.balance_sheet,
+                "cashflow": t.cashflow,
+            }
 
-                    return df
+            df = fetch_map.get(statement_type)
+            if df is None or df.empty:
+                return pd.DataFrame()
 
-            except Exception as exc:
-                logger.debug("jugaad-data quotes failed for %s: %s", identifier, exc)
+            # yfinance returns columns as dates, rows as concepts
+            # Transpose to get: rows = periods, columns = concepts
+            df = df.T
+            df = df.reset_index()
+            df = df.rename(columns={"index": "report_date"})
+            df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
+            df["filing_date"] = df["report_date"] + pd.Timedelta(days=60)
 
+            # Melt to long format for the translator
+            id_cols = ["report_date", "filing_date"]
+            value_cols = [c for c in df.columns if c not in id_cols]
+            long = df.melt(id_vars=id_cols, value_vars=value_cols,
+                           var_name="concept", value_name="value")
+
+            from operator1.clients.canonical_translator import translate_financials
+            return translate_financials(long, self.market_id, statement_type)
+
+        except Exception as exc:
+            logger.debug("yfinance financials failed for %s/%s: %s", identifier, statement_type, exc)
+            return pd.DataFrame()
+
+    # -- Price data -----------------------------------------------------------
+
+    def get_quotes(self, identifier: str) -> pd.DataFrame:
+        """BSE does not provide OHLCV data. Handled by ohlcv_provider."""
         return pd.DataFrame()
 
     # -- Peers / related entities --------------------------------------------

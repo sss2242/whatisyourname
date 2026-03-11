@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,20 @@ logger = logging.getLogger(__name__)
 
 _DART_BASE = "https://opendart.fss.or.kr/api"
 _CACHE_DIR = Path("cache/kr_dart")
+
+# DART free plan: 10,000 req/day, ~1,000 req/min.
+# We add a small delay between API calls to stay well within limits.
+_DART_MIN_INTERVAL = 0.15  # seconds between API calls
+_dart_last_call: float = 0.0
+
+
+def _dart_throttle() -> None:
+    """Enforce minimum interval between DART API calls."""
+    global _dart_last_call
+    elapsed = time.monotonic() - _dart_last_call
+    if elapsed < _DART_MIN_INTERVAL:
+        time.sleep(_DART_MIN_INTERVAL - elapsed)
+    _dart_last_call = time.monotonic()
 
 
 class KRDartError(Exception):
@@ -132,6 +147,7 @@ class KRDartClient:
         if self._dart_fss_available:
             try:
                 import dart_fss
+                _dart_throttle()
                 corp_list = dart_fss.get_corp_list()
                 results = corp_list.find_by_corp_name(name, exactly=False)
                 if results:
@@ -156,6 +172,7 @@ class KRDartClient:
         if self._dart_fss_available:
             try:
                 import dart_fss
+                _dart_throttle()
                 corp_list = dart_fss.get_corp_list()
                 companies = []
                 for corp in corp_list.corps:
@@ -190,6 +207,7 @@ class KRDartClient:
             params["corp_name"] = query
 
         try:
+            _dart_throttle()
             data = cached_get(f"{_DART_BASE}/list.json", params=params)
             items = data.get("list", []) if isinstance(data, dict) else []
             seen: dict[str, dict] = {}
@@ -229,6 +247,7 @@ class KRDartClient:
         if self._dart_fss_available:
             try:
                 import dart_fss
+                _dart_throttle()
                 corp_list = dart_fss.get_corp_list()
                 # Try stock code first, then name
                 corp = None
@@ -261,6 +280,7 @@ class KRDartClient:
             from operator1.http_utils import cached_get
             try:
                 corp_code = self._resolve_corp_code(identifier)
+                _dart_throttle()
                 data = cached_get(
                     f"{_DART_BASE}/company.json",
                     params={"crtfc_key": self._api_key, "corp_code": corp_code},
@@ -315,12 +335,36 @@ class KRDartClient:
                 logger.warning("dart-fss financials failed for %s: %s", identifier, exc)
 
         # Fallback: direct DART API (fnlttSinglAcntAll.json)
-        return self._fetch_via_direct_api_financials(identifier, statement_type)
+        df = self._fetch_via_direct_api_financials(identifier, statement_type)
+
+        # If still sparse (< 10 canonical fields), try LLM filing extraction
+        # to parse the actual DART PDF filing for additional fields like
+        # current_assets, current_liabilities, interest_expense.
+        _KEY_FIELDS = {"current_assets", "current_liabilities", "interest_expense",
+                       "cash_and_equivalents", "short_term_debt", "long_term_debt"}
+        if not df.empty:
+            _has = set(df.get("canonical_name", pd.Series()).unique()) if "canonical_name" in df.columns else set(df.columns)
+            _missing_key = _KEY_FIELDS - _has
+            if _missing_key:
+                logger.info("DART %s sparse data: missing %s. Trying LLM filing extraction...", identifier, _missing_key)
+                try:
+                    llm_df = self._try_llm_filing_extraction(identifier, statement_type)
+                    if llm_df is not None and not llm_df.empty:
+                        df = pd.concat([df, llm_df], ignore_index=True).drop_duplicates(
+                            subset=["canonical_name", "report_date"] if "canonical_name" in df.columns else None,
+                            keep="first",
+                        )
+                        logger.info("LLM extraction added %d rows for %s", len(llm_df), identifier)
+                except Exception as exc:
+                    logger.debug("LLM filing extraction failed for %s: %s", identifier, exc)
+
+        return df
 
     def _fetch_via_dart_fss(self, identifier: str, statement_type: str) -> pd.DataFrame | None:
         """Use dart-fss to get structured financial statements."""
         import dart_fss
 
+        _dart_throttle()
         corp_list = dart_fss.get_corp_list()
         corp = None
 
@@ -451,10 +495,13 @@ class KRDartClient:
                             continue
 
                         is_annual = reprt_code == "11011"
+                        # rcept_dt is the filing (receipt) date; rcept_no is
+                        # just the document ID and will fail to parse as a date.
+                        filing_dt = item.get("rcept_dt", "") or ""
                         rows.append({
                             "concept": canonical,
                             "value": value,
-                            "filing_date": item.get("rcept_no", ""),
+                            "filing_date": filing_dt,
                             "report_date": f"{year}-12-31" if is_annual else f"{year}-{['03','06','09','12'][int(reprt_code[-1])-1]}-30",
                             "period_type": "annual" if is_annual else "quarterly",
                             "form": "Annual" if is_annual else "Quarterly",
@@ -469,6 +516,24 @@ class KRDartClient:
         for col in ("filing_date", "report_date"):
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
+
+        # Pre-filter duplicates: keep only the latest amendment per
+        # (concept, report_date).  DART returns multiple filings for the
+        # same period (original + amendments), and the downstream
+        # reconciliation layer removes them anyway -- but pre-filtering
+        # here avoids 96% wasted rows (e.g. 186 -> 7).
+        _before = len(df)
+        if "concept" in df.columns and "report_date" in df.columns:
+            df = (
+                df.sort_values("filing_date", ascending=False, na_position="last")
+                .drop_duplicates(subset=["concept", "report_date"], keep="first")
+                .sort_values("report_date")
+                .reset_index(drop=True)
+            )
+            _after = len(df)
+            if _before != _after:
+                logger.info("DART dedup: %d -> %d rows (removed %d duplicates)",
+                            _before, _after, _before - _after)
 
         # Cache filings
         self._cache_filings(identifier, df)
@@ -529,6 +594,38 @@ class KRDartClient:
                         r[k] = v.isoformat()
             self._write_cache(identifier, f"filings/{period_str}.json",
                             {"period_end": period_str, "rows": records})
+
+    # -- LLM filing extraction (for sparse DART data) -------------------------
+
+    def _try_llm_filing_extraction(self, identifier: str, statement_type: str) -> pd.DataFrame | None:
+        """Use LLM to extract missing financial fields from DART filing PDFs.
+
+        Korean K-IFRS taxonomy keywords the LLM should search for:
+        - 유동자산 (current_assets), 유동부채 (current_liabilities)
+        - 이자비용/금융비용 (interest_expense)
+        - 현금및현금성자산 (cash_and_equivalents)
+        - 단기차입금 (short_term_debt), 장기차입금 (long_term_debt)
+        - 매출채권 (receivables), 재고자산 (inventory)
+        - 매입채무 (payables), 이익잉여금 (retained_earnings)
+
+        Uses a single LLM call per filing to minimize API costs.
+        """
+        try:
+            from operator1.clients.filing_discoverer import try_filing_extraction
+        except ImportError:
+            return None
+
+        try:
+            result = try_filing_extraction(
+                ticker=identifier,
+                market_id=self.market_id,
+                statement_type=statement_type,
+                llm_client=None,  # Will use factory default
+            )
+            return result if result is not None and not result.empty else None
+        except Exception as exc:
+            logger.debug("LLM filing extraction for DART %s failed: %s", identifier, exc)
+            return None
 
     # -- Price data ------------------------------------------------------------
 

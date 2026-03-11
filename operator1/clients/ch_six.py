@@ -34,21 +34,59 @@ class CHSixClient:
     @property
     def market_name(self) -> str: return "Switzerland (SIX)"
 
-    def list_companies(self, query: str = "") -> list[dict[str, Any]]: return []
-    def search_company(self, name: str) -> list[dict[str, Any]]: return []
+    def list_companies(self, query: str = "") -> list[dict[str, Any]]:
+        from operator1.clients.yfinance_backed import yf_search
+        return yf_search(query, self.market_id, "CH", "SIX", yf_suffix=".SW")
+
+    def search_company(self, name: str) -> list[dict[str, Any]]:
+        return self.list_companies(query=name)
+
     def get_profile(self, identifier: str) -> dict[str, Any]:
         cached = self._read_cache(identifier, "profile.json")
         if cached: return cached
-        raw = {"name": "", "ticker": identifier, "isin": "", "country": "CH",
-               "sector": "", "industry": "", "exchange": "SIX", "currency": "CHF", "cik": identifier}
-        from operator1.clients.canonical_translator import translate_profile
-        profile = translate_profile(raw, self.market_id)
+        from operator1.clients.yfinance_backed import yf_get_profile
+        profile = yf_get_profile(identifier, self.market_id, "Switzerland", "CH", "SIX", "CHF", yf_suffix=".SW")
         self._write_cache(identifier, "profile.json", profile)
         return profile
 
-    def get_income_statement(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
-    def get_balance_sheet(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
-    def get_cashflow_statement(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
-    def get_quotes(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
+    def get_income_statement(self, identifier: str) -> pd.DataFrame:
+        return self._fetch_financials(identifier, "income")
+
+    def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
+        return self._fetch_financials(identifier, "balance")
+
+    def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
+        return self._fetch_financials(identifier, "cashflow")
+
+    def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
+        """Fetch financials via EU ESEF crossover (PIT-compliant).
+
+        Many SIX-listed companies (Nestle, Novartis, Roche, etc.) also
+        file ESEF XBRL reports with EU regulators. We try the EU ESEF
+        wrapper first. yfinance is NOT used for PIT financial statements.
+        """
+        # Path 1: EU ESEF wrapper (Swiss blue chips file ESEF)
+        try:
+            from operator1.clients.eu_esef_wrapper import EUEsefClient
+            esef = EUEsefClient()
+            if statement_type == "income":
+                df = esef.get_income_statement(identifier)
+            elif statement_type == "balance":
+                df = esef.get_balance_sheet(identifier)
+            else:
+                df = esef.get_cashflow_statement(identifier)
+            if df is not None and not df.empty:
+                logger.info("SIX %s %s: %d rows from EU ESEF crossover",
+                           identifier, statement_type, len(df))
+                return df
+        except Exception as exc:
+            logger.debug("EU ESEF crossover failed for SIX %s: %s", identifier, exc)
+
+        # No yfinance fallback -- return empty for PIT compliance
+        return pd.DataFrame()
+
+    def get_quotes(self, identifier: str) -> pd.DataFrame:
+        """SIX does not provide OHLCV data. Handled by ohlcv_provider."""
+        return pd.DataFrame()
     def get_peers(self, identifier: str) -> list[str]: return []
     def get_executives(self, identifier: str) -> list[dict[str, Any]]: return []

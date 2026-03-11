@@ -24,8 +24,9 @@ search_budget_global: 50      # max total search calls across all groups
 FORCE_REBUILD: false
 
 # Estimation settings
-# Pass 2 imputer method: "bayesian_ridge" (default, linear) or "vae" (nonlinear)
-estimation_imputer: bayesian_ridge
+# Imputer method: "split" (default, classifies MAR vs MNAR),
+# "bayesian_ridge" (legacy linear), or "vae" (legacy nonlinear)
+estimation_imputer: split
 # VAE hyperparameters (only used when estimation_imputer is "vae")
 vae_latent_dim: 8
 vae_hidden_dim: 32
@@ -33,7 +34,7 @@ vae_epochs: 80
 vae_kl_weight: 0.5
 
 # LLM provider for report generation, entity discovery, and sentiment.
-# Supported values: "gemini" (default), "claude"
+# Supported values: "gemini" (default), "claude", "openrouter"
 # Can also be set via the LLM_PROVIDER environment variable.
 # If left empty, auto-detects based on which API key is available.
 llm_provider: ""
@@ -42,10 +43,13 @@ llm_provider: ""
 # Can also be set via the LLM_MODEL environment variable.
 # Use "auto" to let the factory pick the best report-capable model.
 #
-# Gemini models:  gemini-2.0-flash (default), gemini-1.5-pro,
-#                 gemini-2.5-flash-preview-05-20, gemini-2.5-pro-preview-05-06
+# Gemini models:  gemini-2.0-flash (default), gemini-2.5-flash-preview-05-20,
+#                 gemini-2.5-pro-preview-05-06
 # Claude models:  claude-sonnet-4-20250514 (default), claude-opus-4-20250514,
 #                 claude-3-5-sonnet-20241022, claude-3-5-haiku-20241022
+# OpenRouter:     google/gemini-2.0-flash-exp:free (default),
+#                 anthropic/claude-sonnet-4, meta-llama/llama-3.1-405b-instruct,
+#                 mistralai/mistral-large-latest, deepseek/deepseek-chat
 llm_model: ""
 
 # Logging

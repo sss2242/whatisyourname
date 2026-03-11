@@ -66,12 +66,28 @@ def fetch_macro_banxico(
 
     for canonical_name, series_id in _BANXICO_SERIES.items():
         try:
-            data = api.get_series_data(series_id, start, end)
-            if data:
-                # banxicoapi returns dict with dates as keys
-                series = pd.Series(data)
-                series.index = pd.to_datetime(series.index)
-                series.name = canonical_name
+            # banxicoapi 1.0.2: get() takes a list of series IDs and date range
+            raw = api.get([series_id], start_date=start, end_date=end)
+            if not raw or not isinstance(raw, list):
+                continue
+
+            # Response format: [{"idSerie": "...", "datos": [{"fecha": "dd/mm/yyyy", "dato": "value"}, ...]}]
+            datos = raw[0].get("datos", []) if raw else []
+            if not datos:
+                continue
+
+            dates = []
+            values = []
+            for d in datos:
+                try:
+                    dates.append(pd.to_datetime(d["fecha"], dayfirst=True))
+                    values.append(float(d["dato"].replace(",", "")))
+                except (ValueError, KeyError):
+                    continue
+
+            if dates:
+                series = pd.Series(values, index=pd.DatetimeIndex(dates), name=canonical_name)
+                series = series.sort_index()
                 results[canonical_name] = series
                 logger.debug("Banxico %s: %d observations", series_id, len(series))
         except Exception as exc:

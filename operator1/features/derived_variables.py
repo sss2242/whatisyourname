@@ -302,7 +302,11 @@ def _compute_profitability(df: pd.DataFrame) -> pd.DataFrame:
     """
     revenue = df.get("revenue", pd.Series(np.nan, index=df.index))
     gross_profit = df.get("gross_profit", pd.Series(np.nan, index=df.index))
+    # Prefer ebit; fall back to operating_income (canonical name used by
+    # many international data sources via canonical_translator).
     ebit = df.get("ebit", pd.Series(np.nan, index=df.index))
+    if ebit.isna().all():
+        ebit = df.get("operating_income", pd.Series(np.nan, index=df.index))
     net_income = df.get("net_income", pd.Series(np.nan, index=df.index))
     equity = df.get("total_equity", pd.Series(np.nan, index=df.index))
 
@@ -397,6 +401,8 @@ def _compute_interest_coverage(df: pd.DataFrame) -> pd.DataFrame:
     Variable: interest_coverage = EBIT / interest_expense.
     """
     ebit = df.get("ebit", pd.Series(np.nan, index=df.index))
+    if ebit.isna().all():
+        ebit = df.get("operating_income", pd.Series(np.nan, index=df.index))
     interest_expense = df.get("interest_expense", pd.Series(np.nan, index=df.index))
 
     result, ism, inv = safe_ratio(ebit, interest_expense, "interest_coverage")
@@ -489,6 +495,92 @@ def _compute_volume_avg(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Per-share metrics
+# ---------------------------------------------------------------------------
+
+
+def _compute_per_share(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute per-share metrics.
+
+    Variables: eps_calc, book_value_per_share, revenue_per_share.
+    """
+    shares = df.get("shares_outstanding", pd.Series(np.nan, index=df.index))
+    net_income = df.get("net_income", pd.Series(np.nan, index=df.index))
+    equity = df.get("total_equity", pd.Series(np.nan, index=df.index))
+    revenue = df.get("revenue", pd.Series(np.nan, index=df.index))
+
+    # EPS (already computed internally in _compute_valuation but not exposed)
+    result, ism, inv = safe_ratio(net_income, shares, "eps_calc")
+    _set_ratio_columns(df, "eps_calc", result, ism, inv)
+
+    # Book value per share
+    result, ism, inv = safe_ratio(equity, shares, "book_value_per_share")
+    _set_ratio_columns(df, "book_value_per_share", result, ism, inv)
+
+    # Revenue per share
+    result, ism, inv = safe_ratio(revenue, shares, "revenue_per_share")
+    _set_ratio_columns(df, "revenue_per_share", result, ism, inv)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Technical indicators (familiar from TradingView, Yahoo Finance)
+# ---------------------------------------------------------------------------
+
+
+def _compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute common technical indicators from close price.
+
+    Variables: sma_50, sma_200, rsi_14, macd, macd_signal,
+    bollinger_upper, bollinger_lower.
+    """
+    close = df.get("close", pd.Series(np.nan, index=df.index))
+
+    # Collect all new columns in a dict to avoid DataFrame fragmentation
+    # (repeated df["col"] = ... triggers PerformanceWarning).
+    _new: dict[str, pd.Series] = {}
+
+    # Simple Moving Averages (50-day and 200-day)
+    _new["sma_50"] = close.rolling(window=50, min_periods=10).mean()
+    _new["is_missing_sma_50"] = _new["sma_50"].isna().astype(int)
+
+    _new["sma_200"] = close.rolling(window=200, min_periods=50).mean()
+    _new["is_missing_sma_200"] = _new["sma_200"].isna().astype(int)
+
+    # RSI (14-day) -- Relative Strength Index
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.rolling(window=14, min_periods=5).mean()
+    avg_loss = loss.rolling(window=14, min_periods=5).mean()
+    rs = avg_gain / avg_loss.where(avg_loss.abs() > EPSILON, other=np.nan)
+    _new["rsi_14"] = 100.0 - (100.0 / (1.0 + rs))
+    _new["is_missing_rsi_14"] = _new["rsi_14"].isna().astype(int)
+
+    # MACD (12/26/9 standard parameters)
+    ema_12 = close.ewm(span=12, min_periods=8, adjust=False).mean()
+    ema_26 = close.ewm(span=26, min_periods=18, adjust=False).mean()
+    _new["macd"] = ema_12 - ema_26
+    _new["macd_signal"] = _new["macd"].ewm(span=9, min_periods=5, adjust=False).mean()
+    _new["is_missing_macd"] = _new["macd"].isna().astype(int)
+    _new["is_missing_macd_signal"] = _new["macd_signal"].isna().astype(int)
+
+    # Bollinger Bands (20-day, 2 standard deviations)
+    sma_20 = close.rolling(window=20, min_periods=5).mean()
+    std_20 = close.rolling(window=20, min_periods=5).std()
+    _new["bollinger_upper"] = sma_20 + 2 * std_20
+    _new["bollinger_lower"] = sma_20 - 2 * std_20
+    _new["is_missing_bollinger_upper"] = _new["bollinger_upper"].isna().astype(int)
+    _new["is_missing_bollinger_lower"] = _new["bollinger_lower"].isna().astype(int)
+
+    # Assign all columns at once to avoid fragmentation
+    df = pd.concat([df, pd.DataFrame(_new, index=df.index)], axis=1)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -504,6 +596,8 @@ _COMPUTE_STAGES = (
     _compute_valuation,
     _compute_ttm_and_growth,
     _compute_volume_avg,
+    _compute_per_share,
+    _compute_technical_indicators,
 )
 
 # All derived variable names (for inspection / downstream reference)
@@ -529,6 +623,11 @@ DERIVED_VARIABLES: tuple[str, ...] = (
     "revenue_growth_yoy", "earnings_growth_yoy",
     # Volume
     "volume_avg_21d",
+    # Per-share
+    "eps_calc", "book_value_per_share", "revenue_per_share",
+    # Technical indicators
+    "sma_50", "sma_200", "rsi_14", "macd", "macd_signal",
+    "bollinger_upper", "bollinger_lower",
 )
 
 
@@ -556,6 +655,11 @@ def compute_derived_variables(df: pd.DataFrame) -> pd.DataFrame:
             logger.warning(
                 "Derived variable stage %s failed: %s", stage.__name__, exc,
             )
+    # Defragment after adding ~39 columns one-by-one across stages.
+    # Without this, downstream consumers trigger PerformanceWarning from
+    # pandas 2.x fragmented DataFrame internals.
+    result = result.copy()
+
     logger.info(
         "Derived variables computed: %d new columns",
         len(result.columns) - len(df.columns),

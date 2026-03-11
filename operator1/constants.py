@@ -5,6 +5,22 @@ from datetime import date, timedelta
 # ---------------------------------------------------------------------------
 # Date window -- 2-year lookback from today
 # ---------------------------------------------------------------------------
+
+
+def get_date_window(years: int = 2) -> tuple[date, date]:
+    """Return (start, end) date window computed at call time.
+
+    Use this instead of the module-level DATE_START/DATE_END constants
+    when running in a long-lived process or service where the date may
+    change between pipeline runs.
+    """
+    end = date.today()
+    start = end - timedelta(days=365 * years)
+    return start, end
+
+
+# Module-level constants kept for backward compatibility.
+# These are evaluated once at import time.
 DATE_END: date = date.today()
 DATE_START: date = DATE_END - timedelta(days=730)
 
@@ -47,6 +63,7 @@ CMF_BASE_URL: str = "https://www.cmfchile.cl"
 # ---------------------------------------------------------------------------
 GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta"
 CLAUDE_BASE_URL: str = "https://api.anthropic.com/v1"
+OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 
 # ---------------------------------------------------------------------------
 # Match scoring thresholds (entity discovery)

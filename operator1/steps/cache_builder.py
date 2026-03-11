@@ -67,12 +67,15 @@ QUOTE_FIELDS = (
 
 # Financial-statement decision variables (Sec 8)
 STATEMENT_FIELDS = (
-    "revenue", "gross_profit", "operating_income", "ebit", "ebitda", "net_income",
+    "revenue", "cost_of_revenue", "gross_profit",
+    "operating_income", "ebit", "ebitda", "net_income",
     "interest_expense", "taxes",
     "total_assets", "total_liabilities", "total_equity",
     "current_assets", "current_liabilities",
     "cash_and_equivalents", "short_term_debt", "long_term_debt",
-    "total_debt", "receivables",
+    "total_debt", "retained_earnings",
+    "goodwill", "intangible_assets",
+    "receivables", "inventory", "payables",
     "operating_cash_flow", "capex", "free_cash_flow",
     "investing_cf", "financing_cf", "dividends_paid",
     "stock_buybacks",
@@ -105,6 +108,101 @@ PROTECTION_SCORE_FIELDS = (
     "fuzzy_policy_score",
     "sector_strategicness",
 )
+
+# Conflict / geopolitical risk columns persisted in the daily cache
+# so survival models can incorporate war and sanctions risk.
+CONFLICT_RISK_FIELDS = (
+    "country_conflict_flag",
+    "company_conflict_flag",
+    "conflict_intensity_score",
+    "sanctions_flag",
+    "fragile_state_flag",
+    "conflict_type",
+    "supply_chain_risk_score",
+    "revenue_exposure_score",
+    "competitive_advantage_score",
+)
+
+# ---------------------------------------------------------------------------
+# Column namespace registry
+# ---------------------------------------------------------------------------
+# Every module that writes columns to the cache should register its
+# output columns here. Columns matching a registered prefix (ending
+# with _) are automatically accepted. Unregistered columns are logged
+# as warnings during the data quality audit.
+
+COLUMN_NAMESPACES: dict[str, tuple[str, ...]] = {
+    "core": (
+        "close", "open", "high", "low", "volume",
+        "adjusted_close", "vwap", "market_cap", "shares_outstanding",
+    ),
+    "profile": PROFILE_FIELDS,
+    "stmt": STATEMENT_FIELDS,
+    "macro": MACRO_INDICATOR_FIELDS,
+    "protection": PROTECTION_SCORE_FIELDS,
+    "conflict": CONFLICT_RISK_FIELDS,
+}
+
+# Prefixes: any column starting with these is accepted automatically.
+COLUMN_PREFIXES: tuple[str, ...] = (
+    "is_missing_",        # companion missing flags
+    "invalid_math_",      # invalid ratio flags
+    "fh_",                # financial health scores
+    "regime_",            # regime detection columns
+    "hierarchy_tier",     # hierarchy weight columns
+    "survival_",          # survival timeline columns
+    "peer_",              # peer ranking columns
+    "sentiment_",         # news sentiment columns
+    "vanity_",            # vanity score columns
+    "competitors_",       # linked aggregate: competitors
+    "suppliers_",         # linked aggregate: suppliers
+    "customers_",         # linked aggregate: customers
+    "cycle_phase_",       # cycle decomposition features
+    "structural_break",   # breakpoint detection
+    "breakpoint_",        # breakpoint method
+)
+
+# Derived variable columns (from derived_variables.py)
+DERIVED_COLUMN_NAMES: tuple[str, ...] = (
+    "return_1d", "log_return_1d", "return_5d", "return_21d",
+    "volatility_21d", "volatility_63d",
+    "drawdown_252d", "max_drawdown_252d",
+    "current_ratio", "debt_to_equity_abs", "net_debt",
+    "cash_ratio", "quick_ratio",
+    "gross_margin", "operating_margin", "net_margin", "ebitda_margin",
+    "fcf_yield", "pe_ratio_calc", "ev_ebitda_calc",
+    "revenue_ttm", "net_income_ttm", "operating_cash_flow_ttm",
+    "free_cash_flow_ttm", "ebitda_ttm",
+    "total_debt_asof",
+)
+
+
+def validate_cache_columns(cache: "pd.DataFrame") -> list[str]:
+    """Return list of cache columns not in any registered namespace.
+
+    Used during data quality audit to catch columns from unregistered
+    modules or typos in column names.
+    """
+    all_known = set()
+    for cols in COLUMN_NAMESPACES.values():
+        all_known.update(cols)
+    all_known.update(DERIVED_COLUMN_NAMES)
+
+    unknown = []
+    for col in cache.columns:
+        if col in all_known:
+            continue
+        if any(col.startswith(p) for p in COLUMN_PREFIXES):
+            continue
+        unknown.append(col)
+
+    if unknown:
+        logger.debug(
+            "Cache has %d unregistered columns: %s",
+            len(unknown), unknown[:10],
+        )
+
+    return unknown
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +425,7 @@ def _build_column_rename_map(columns: list[str]) -> dict[str, str]:
         "financing_cashflow": "financing_cf",
         "pretax_income": "ebit",
         "eps": "eps",
+        "eps_basic": "eps",  # canonical translator outputs eps_basic
         "epsDiluted": "eps_diluted",
         "sharesOutstanding": "shares_outstanding",
         "marketCap": "market_cap",

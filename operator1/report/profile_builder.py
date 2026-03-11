@@ -28,7 +28,7 @@ import logging
 import math
 import os
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -178,11 +178,11 @@ def _build_current_state_section(cache: pd.DataFrame | None) -> dict[str, Any]:
         "available": True,
         "date": str(latest.name.date()) if hasattr(latest.name, "date") else str(latest.name),
         "tier1_liquidity": {
-            "cash_and_equivalents": _get("cash_and_equivalents_asof"),
+            "cash_and_equivalents": _get("cash_and_equivalents"),
             "cash_ratio": _get("cash_ratio"),
             "current_ratio": _get("current_ratio"),
-            "free_cash_flow_ttm": _get("free_cash_flow_ttm"),
-            "operating_cash_flow": _get("operating_cash_flow_asof"),
+            "free_cash_flow_ttm": _get("free_cash_flow_ttm_asof"),
+            "operating_cash_flow": _get("operating_cash_flow"),
         },
         "tier2_solvency": {
             "total_debt": _get("total_debt_asof"),
@@ -813,12 +813,25 @@ def _build_failed_modules_section(
             "lstm": "LSTM",
             "tree": "RF/GBM/XGB",
         }
+        # Collect variables that fell through to baseline_zero (all-NaN data)
+        model_used = forecast_result.get("model_used", {})
+        zero_vars = [v for v, m in model_used.items() if m == "baseline_zero"]
+
         for key, name in model_names.items():
             if forecast_result.get(f"model_failed_{key}", False):
                 error = forecast_result.get(f"{key}_error", "")
+                # Add context about which variables were affected
+                affected_note = ""
+                if zero_vars and key in ("kalman", "var", "lstm", "tree"):
+                    affected_note = (
+                        f" Affected variables with no data: "
+                        f"{', '.join(zero_vars[:5])}"
+                        f"{'...' if len(zero_vars) > 5 else ''}"
+                        f" ({len(zero_vars)} total)."
+                    )
                 failed.append({
                     "module": f"Forecasting ({name})",
-                    "error": error or "model failed",
+                    "error": (error or "model failed") + affected_note,
                     "mitigation": (
                         "Forecasts produced by next model in fallback "
                         "chain; baseline (last-value/EMA) always succeeds."
@@ -995,6 +1008,50 @@ def _build_macro_quadrant_section(
     return section
 
 
+def _build_conflict_risk_profile_section(cache: pd.DataFrame | None) -> dict[str, Any]:
+    """Build conflict risk section for the profile from cache columns.
+
+    Reads the conflict risk columns injected by
+    ``conflict_risk.inject_conflict_risk_into_cache()`` and packages
+    them into the format expected by the report generator's
+    ``_build_geopolitical_risk_section()``.
+    """
+    if cache is None or cache.empty:
+        return {"available": False}
+
+    # Check if conflict columns exist
+    if "country_conflict_flag" not in cache.columns:
+        return {"available": False}
+
+    try:
+        latest = cache.iloc[-1]
+
+        result: dict[str, Any] = {
+            "available": True,
+            "country_iso2": str(latest.get("country", "")),
+            "country_conflict_flag": bool(int(latest.get("country_conflict_flag", 0))),
+            "company_conflict_flag": bool(int(latest.get("company_conflict_flag", 0))),
+            "conflict_intensity_score": float(latest.get("conflict_intensity_score", 0)),
+            "sanctions_flag": bool(int(latest.get("sanctions_flag", 0))),
+            "fragile_state_flag": bool(int(latest.get("fragile_state_flag", 0))),
+            "conflict_type": str(latest.get("conflict_type", "none")),
+        }
+
+        # Optional linked entity conflict columns
+        if "supply_chain_risk_score" in cache.columns:
+            result["supply_chain_risk_score"] = float(latest.get("supply_chain_risk_score", 0))
+        if "revenue_exposure_score" in cache.columns:
+            result["revenue_exposure_score"] = float(latest.get("revenue_exposure_score", 0))
+        if "competitive_advantage_score" in cache.columns:
+            result["competitive_advantage_score"] = float(latest.get("competitive_advantage_score", 0))
+
+        return result
+
+    except Exception as exc:
+        logger.warning("Failed to build conflict risk profile section: %s", exc)
+        return {"available": False, "error": str(exc)}
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -1084,7 +1141,7 @@ def build_company_profile(
     # Assemble profile
     profile: dict[str, Any] = {
         "meta": {
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": datetime.now(timezone.utc).isoformat() + "Z",
             "pipeline_version": "1.0.0",
             "date_range": {
                 "start": DATE_START.isoformat(),
@@ -1111,6 +1168,7 @@ def build_company_profile(
         "sentiment": _build_sentiment_section(cache, sentiment_result),
         "peer_ranking": _build_peer_ranking_section(cache, peer_ranking_result),
         "macro_quadrant": _build_macro_quadrant_section(cache, macro_quadrant_result),
+        "conflict_risk": _build_conflict_risk_profile_section(cache),
         "data_quality": _build_data_quality_section(quality_report_path),
         "estimation": _build_estimation_section(estimation_coverage_path),
         "failed_modules": _build_failed_modules_section(

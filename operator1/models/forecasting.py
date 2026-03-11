@@ -100,6 +100,11 @@ class ModelMetrics:
     fitted: bool = False
     error: str | None = None
 
+    # Actual validation residuals (predicted - actual) from train/test split.
+    # Used by ConformalCalibrator for distribution-free interval estimation.
+    # If None, the calibrator falls back to synthetic +/-RMSE pairs.
+    test_residuals: list[float] | None = None
+
 
 @dataclass
 class ForecastResult:
@@ -131,6 +136,10 @@ class ForecastResult:
     # {variable: model_name}
     model_used: dict[str, str] = field(default_factory=dict)
 
+    # Validation residuals collected across all fitted models.
+    # Fed to ConformalCalibrator for distribution-free interval calibration.
+    residuals: list[float] | None = None
+
 
 # ---------------------------------------------------------------------------
 # Helper: error metrics
@@ -150,6 +159,24 @@ def _compute_metrics(
     mae = float(np.mean(np.abs(yt - yp)))
     rmse = float(np.sqrt(np.mean((yt - yp) ** 2)))
     return mae, rmse
+
+
+def _compute_residuals(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> list[float]:
+    """Return list of (actual - predicted) residuals for non-NaN pairs.
+
+    Used to feed the ConformalCalibrator with actual validation residuals
+    instead of synthetic +/-RMSE pairs.
+    """
+    y_true = np.asarray(y_true, dtype=float).ravel()
+    y_pred = np.asarray(y_pred, dtype=float).ravel()
+    n = min(len(y_true), len(y_pred))
+    if n == 0:
+        return []
+    mask = ~(np.isnan(y_true[:n]) | np.isnan(y_pred[:n]))
+    return (y_true[:n][mask] - y_pred[:n][mask]).tolist()
 
 
 def _split_train_test(
@@ -255,6 +282,7 @@ def fit_kalman(
             forecast_obj = result.get_forecast(steps=len(test))
             preds = forecast_obj.predicted_mean
             mae, rmse = _compute_metrics(test, preds)
+            metrics.test_residuals = _compute_residuals(test, preds)
         else:
             mae, rmse = float("nan"), float("nan")
 
@@ -541,7 +569,7 @@ def _fit_ar1_fallback(
 
         if len(test) > 0:
             preds = result.predict(start=len(train), end=len(train) + len(test) - 1)
-            mae, rmse = _compute_metrics(test, preds.values)
+            mae, rmse = _compute_metrics(test, np.asarray(preds))
         else:
             mae, rmse = float("nan"), float("nan")
 
@@ -563,7 +591,7 @@ def _fit_ar1_fallback(
         metrics.fitted = True
 
         logger.info("AR(1) fallback fit: MAE=%.6f, RMSE=%.6f", mae, rmse)
-        return preds_final.values, metrics
+        return np.asarray(preds_final), metrics
 
     except Exception as exc:
         metrics.error = f"AR(1) fallback failed: {exc}"
@@ -703,6 +731,7 @@ def fit_lstm(
                 preds_test_denorm = preds_test * std_val + mean_val
                 y_test_denorm = y_test * std_val + mean_val
                 mae, rmse = _compute_metrics(y_test_denorm, preds_test_denorm)
+                metrics.test_residuals = _compute_residuals(y_test_denorm, preds_test_denorm)
             else:
                 mae, rmse = float("nan"), float("nan")
 
@@ -1044,6 +1073,7 @@ def _fit_linear_fallback(
         if len(X_test) > 0:
             preds = model.predict(X_test)
             mae, rmse = _compute_metrics(y_test, preds)
+            metrics.test_residuals = _compute_residuals(y_test, preds)
         else:
             mae, rmse = float("nan"), float("nan")
 
@@ -1143,6 +1173,7 @@ def fit_tree_ensemble(
         if len(X_test) > 0:
             preds = model_obj.predict(X_test)
             mae, rmse = _compute_metrics(y_test, preds)
+            metrics.test_residuals = _compute_residuals(y_test, preds)
         else:
             mae, rmse = float("nan"), float("nan")
 
@@ -1283,6 +1314,7 @@ def fit_baseline(
         metrics.rmse = rmse
         metrics.n_train = split
         metrics.n_test = len(test)
+        metrics.test_residuals = _compute_residuals(test, preds)
 
     logger.info(
         "Baseline (%s) forecast: %.6f (n_forecast=%d)",
@@ -1437,10 +1469,89 @@ def run_forecasting(
     has_volatility = "volatility_21d" in cache.columns
 
     # ------------------------------------------------------------------
-    # GARCH on volatility (special case)
+    # Unified cache-to-model data extraction
+    # ------------------------------------------------------------------
+    # All models consume the same cache DataFrame. This adapter
+    # centralises how data is extracted for each model type, so every
+    # model gets consistent, quality-checked inputs from the pipeline.
+
+    def _extract_series(var: str) -> np.ndarray:
+        """Extract a single variable's values from the cache.
+
+        The pipeline's estimation step (Step 4b) fills missing values
+        before forecasting runs. This function simply extracts whatever
+        the estimator produced -- observed, estimated, or still NaN.
+        """
+        return cache[var].values
+
+    def _extract_multivariate(target: str, max_cols: int = 10) -> pd.DataFrame:
+        """Extract a multivariate DataFrame for VAR from the cache.
+
+        Mixed-frequency aware: forward-filled quarterly/annual columns are
+        replaced with their filing-change derivatives (the actual change
+        on filing days, zero between filings). This prevents near-singular
+        covariance matrices that cause VAR to fall back to AR(1).
+        """
+        from operator1.models._frequency_classifier import (
+            classify_column_frequency,
+            get_filing_change_derivative,
+        )
+        candidates = []
+        for c in available_vars:
+            if c not in cache.columns or not cache[c].notna().any():
+                continue
+            freq = classify_column_frequency(cache[c])
+            if freq == "daily":
+                candidates.append(c)
+            elif freq in ("quarterly", "annual"):
+                # Use the filing-change derivative instead of raw forward-filled
+                deriv_col = get_filing_change_derivative(cache, c)
+                if cache[deriv_col].notna().any() and cache[deriv_col].abs().sum() > 0:
+                    candidates.append(deriv_col)
+            # Skip 'constant' columns entirely
+        candidates = candidates[:max_cols]
+        if target not in candidates:
+            candidates = [target] + candidates[:max_cols - 1]
+        return cache[candidates].copy()
+
+    def _extract_features(target: str, max_cols: int = 15) -> pd.DataFrame:
+        """Extract a feature DataFrame for tree ensembles from the cache.
+
+        Mixed-frequency aware: for quarterly/annual columns, adds
+        engineered features (pct_change_at_filing, days_since_filing)
+        that give the tree meaningful split points instead of only 3-4
+        unique values from forward-filled quarterly data.
+        """
+        from operator1.models._frequency_classifier import (
+            classify_column_frequency,
+            add_filing_timing_features,
+        )
+        feature_cols = [
+            c for c in cache.columns
+            if c != target
+            and not c.startswith("is_missing_")
+            and not c.startswith("invalid_math_")
+            and cache[c].dtype in (np.float64, np.float32, np.int64)
+            and cache[c].notna().any()  # exclude entirely empty columns
+        ][:max_cols]
+        if not feature_cols:
+            return pd.DataFrame()
+        # Add filing-timing features for quarterly/annual columns
+        extra_timing_cols = []
+        for fc in feature_cols[:10]:  # limit to avoid bloat
+            freq = classify_column_frequency(cache[fc])
+            if freq in ("quarterly", "annual"):
+                new_cols = add_filing_timing_features(cache, fc)
+                extra_timing_cols.extend(new_cols)
+        all_cols = feature_cols + extra_timing_cols + [target]
+        all_cols = [c for c in all_cols if c in cache.columns]
+        return cache[all_cols].copy()
+
+    # ------------------------------------------------------------------
+    # GARCH on volatility (special case -- uses return_1d from cache)
     # ------------------------------------------------------------------
     if has_returns:
-        returns = cache["return_1d"].values
+        returns = _extract_series("return_1d")
         max_horizon = max(HORIZONS.values())
         garch_fcast, garch_met = fit_garch(
             returns, n_forecast=max_horizon,
@@ -1466,7 +1577,7 @@ def run_forecasting(
     tree_attempted = False
 
     for var_name in available_vars:
-        series = cache[var_name].values
+        series = _extract_series(var_name)
         tier = _get_tier_for_variable(var_name, tier_map)
         max_horizon = max(HORIZONS.values())
         best_forecast: np.ndarray | None = None
@@ -1490,14 +1601,7 @@ def run_forecasting(
 
         # --- VAR (if multiple variables available) ---
         if best_forecast is None and len(available_vars) >= 2:
-            # Build a small multivariate frame from available vars.
-            var_subset_cols = [
-                c for c in available_vars
-                if c in cache.columns
-            ][:10]  # Cap at 10 for stability.
-            if var_name not in var_subset_cols:
-                var_subset_cols = [var_name] + var_subset_cols[:9]
-            var_df = cache[var_subset_cols].copy()
+            var_df = _extract_multivariate(var_name)
 
             fcast, met = fit_var(var_df, var_name, n_forecast=max_horizon)
             met.variable = var_name
@@ -1533,13 +1637,8 @@ def run_forecasting(
 
         # --- Tree ensemble on tabular features ---
         if best_forecast is None:
-            feature_cols = [
-                c for c in cache.columns
-                if c != var_name
-                and cache[c].dtype in (np.float64, np.float32, np.int64)
-            ][:15]
-            if feature_cols:
-                feat_df = cache[feature_cols + [var_name]].copy()
+            feat_df = _extract_features(var_name)
+            if not feat_df.empty:
                 fcast, met = fit_tree_ensemble(
                     feat_df,
                     var_name,
@@ -1608,6 +1707,14 @@ def run_forecasting(
     for var, model in result.model_used.items():
         models_used[model] = models_used.get(model, 0) + 1
 
+    # Identify variables that had zero non-NaN observations (all-NaN columns)
+    zero_obs_vars = []
+    for var_name in available_vars:
+        series = cache[var_name].values
+        n_clean = int(np.sum(~np.isnan(series)))
+        if n_clean == 0:
+            zero_obs_vars.append(var_name)
+
     logger.info(
         "Forecasting complete: %d variables forecasted, %d model types failed, "
         "model distribution: %s",
@@ -1615,6 +1722,34 @@ def run_forecasting(
         n_failed,
         models_used,
     )
+
+    if zero_obs_vars:
+        logger.warning(
+            "Forecasting: %d variables had 0 non-NaN observations (all-NaN columns, "
+            "likely missing from data source): %s",
+            len(zero_obs_vars),
+            zero_obs_vars,
+        )
+
+    # Collect validation residuals from fitted models for conformal calibration.
+    # Prefer actual test residuals stored per-metric (distribution-free).
+    # Fall back to synthetic +/-RMSE pairs if no real residuals available.
+    _residuals: list[float] = []
+    _has_real = False
+    for met in result.metrics:
+        if met.fitted and met.test_residuals:
+            _residuals.extend(met.test_residuals)
+            _has_real = True
+        elif met.fitted and np.isfinite(met.rmse) and met.rmse > 0:
+            # Synthetic fallback: +/- RMSE (Gaussian assumption).
+            _residuals.append(met.rmse)
+            _residuals.append(-met.rmse)
+    if _residuals:
+        result.residuals = _residuals
+        logger.info(
+            "Collected %d %s residual samples for conformal calibration",
+            len(_residuals), "real" if _has_real else "synthetic",
+        )
 
     return cache, result
 
@@ -1679,11 +1814,28 @@ class KalmanWrapper(BaseModelWrapper):
         self._state = float(clean[-1]) if len(clean) else 0.0
         self._P = 1.0  # state covariance
         self._Q = 0.01  # process noise
-        self._R = 0.1  # measurement noise
+        self._R = 0.1  # measurement noise (for real observations)
+        self._R_stale = 100.0  # high noise for stale forward-filled days
+        self._filing_aware = False  # set True if series is forward-filled
         self._fitted = len(clean) >= _MIN_OBS_KALMAN
 
+        # Detect forward-filled financial data: if unique values < 5%
+        # of total observations, this is quarterly/annual data repeated daily.
+        # Use filing-aware mode with variable observation noise.
+        if len(clean) >= _MIN_OBS_KALMAN:
+            unique_ratio = len(np.unique(clean)) / len(clean)
+            if unique_ratio < 0.05:
+                self._filing_aware = True
+                self._Q = 0.001  # lower process noise for stable financials
+                self._R = 0.01  # tight on real observation days
+                self._R_stale = 1000.0  # very loose on stale days
+                logger.debug(
+                    "Kalman filing-aware mode: %d unique values in %d obs (%.1f%%)",
+                    len(np.unique(clean)), len(clean), unique_ratio * 100,
+                )
+
         # Try fitting a proper statsmodels model for the initial state.
-        if self._fitted:
+        if self._fitted and not self._filing_aware:
             try:
                 from statsmodels.tsa.statespace.structural import (
                     UnobservedComponents,
@@ -1714,8 +1866,16 @@ class KalmanWrapper(BaseModelWrapper):
             z = float(actual_t_plus_1[0]) if len(actual_t_plus_1) else self._state
             if np.isnan(z):
                 return  # skip update on missing observation
+
+            # Filing-aware: use high observation noise for stale (repeated) values
+            # so the Kalman mostly ignores repeated forward-filled data and only
+            # updates meaningfully when a new filing changes the value.
+            R_effective = self._R
+            if self._filing_aware and abs(z - self._last_value) < 1e-10:
+                R_effective = self._R_stale  # stale repeated value -> high noise
+
             # Kalman gain
-            S = self._P + self._R
+            S = self._P + R_effective
             K = self._P / S if S > 1e-12 else 0.5
             # State update
             innovation = z - self._state
@@ -1906,6 +2066,27 @@ class LSTMWrapper(BaseModelWrapper):
         clean = series[~np.isnan(series)]
         if len(clean) < _MIN_OBS_LSTM:
             return
+
+        # Mixed-frequency awareness: detect forward-filled quarterly data.
+        # Add small time-varying noise to break constant stretches, so
+        # the LSTM can learn that constant regions represent staleness
+        # (not actual zero-volatility stability).
+        n_unique = len(np.unique(clean))
+        if n_unique > 0 and n_unique / len(clean) < 0.05:
+            # Forward-filled quarterly data detected -- add filing-aware noise
+            rng = np.random.default_rng(42)
+            changes = np.diff(clean, prepend=clean[0])
+            days_since_change = np.zeros(len(clean))
+            counter = 0
+            for i in range(len(clean)):
+                if abs(changes[i]) > 0:
+                    counter = 0
+                counter += 1
+                days_since_change[i] = counter
+            # Noise grows with days since filing (uncertainty about true value)
+            noise_scale = np.std(clean[clean != clean[0]]) if n_unique > 1 else abs(clean[0]) * 0.001
+            noise = rng.normal(0, noise_scale * 0.01 * days_since_change / 63)
+            clean = clean + noise
 
         self._history = list(clean)
         self._scaler_mean = float(np.mean(clean))
@@ -2271,6 +2452,9 @@ class TFTWrapper(BaseModelWrapper):
         self._history = list(clean.values)
         self._scaler_mean = float(clean.mean())
         self._scaler_std = float(clean.std()) or 1.0
+        # Store multivariate feature history for predict() so TFT
+        # retains its multi-feature advantage during online prediction.
+        self._feature_history: list[np.ndarray] = []
 
         try:
             import torch
@@ -2294,7 +2478,7 @@ class TFTWrapper(BaseModelWrapper):
                     self.skip = nn.Linear(d_in, d_out) if d_in != d_out else nn.Identity()
 
                 def forward(self, x: Any) -> Any:
-                    h = torch.elu(self.fc1(x))
+                    h = torch.nn.functional.elu(self.fc1(x))
                     h2 = self.fc2(h)
                     g = torch.sigmoid(self.gate(h))
                     out = g * h2
@@ -2366,6 +2550,11 @@ class TFTWrapper(BaseModelWrapper):
                 optimizer.step()
 
             self._fitted = True
+            # Store the multivariate feature history so predict() can
+            # use all features, not just the target variable.
+            self._feature_history = [
+                feature_data[i] for i in range(len(feature_data))
+            ]
             logger.info("TFT wrapper fitted for %s (%d sequences, %d features)", target_col, len(X_seqs), n_features)
 
         except ImportError:
@@ -2380,21 +2569,30 @@ class TFTWrapper(BaseModelWrapper):
         try:
             import torch
 
-            # Use last lookback values from history
-            if len(self._history) < self._lookback:
-                return np.array([self._history[-1]])
-
-            # Build feature sequence from recent history (simplified: use target only)
-            recent = np.array(self._history[-self._lookback:]).reshape(-1, 1)
-            # Pad to n_features if needed
             n_feat = len(self._numeric_cols)
-            if recent.shape[1] < n_feat:
-                padded = np.zeros((self._lookback, n_feat))
-                padded[:, 0] = recent[:, 0]
-                recent = padded
 
-            # Normalise
-            scaled = (recent - self._feat_mean[:recent.shape[1]]) / self._feat_std[:recent.shape[1]]
+            # Use multivariate feature history if available (preserves
+            # TFT's multi-feature advantage during online prediction).
+            if len(self._feature_history) >= self._lookback:
+                recent = np.array(self._feature_history[-self._lookback:])
+                # Ensure correct shape (lookback, n_features)
+                if recent.ndim == 1:
+                    recent = recent.reshape(-1, 1)
+                if recent.shape[1] < n_feat:
+                    padded = np.zeros((self._lookback, n_feat))
+                    padded[:, :recent.shape[1]] = recent
+                    recent = padded
+                elif recent.shape[1] > n_feat:
+                    recent = recent[:, :n_feat]
+            elif len(self._history) >= self._lookback:
+                # Fallback: univariate target history with zero-padding
+                recent = np.zeros((self._lookback, n_feat))
+                recent[:, 0] = np.array(self._history[-self._lookback:])
+            else:
+                return np.array([self._history[-1]]) if self._history else np.zeros(1)
+
+            # Normalise using the stored feature statistics
+            scaled = (recent - self._feat_mean[:n_feat]) / self._feat_std[:n_feat]
 
             x = torch.FloatTensor(scaled).unsqueeze(0)
             self._model.eval()
@@ -2418,6 +2616,18 @@ class TFTWrapper(BaseModelWrapper):
             val = float(actual_t_plus_1[0])
             if not np.isnan(val):
                 self._history.append(val)
+            # Also update multivariate feature history if we have
+            # more than just the target value in the actual vector.
+            if len(actual_t_plus_1) >= len(self._numeric_cols):
+                self._feature_history.append(
+                    actual_t_plus_1[:len(self._numeric_cols)].copy()
+                )
+            elif self._feature_history:
+                # Fallback: carry forward last feature row with updated target
+                last_row = self._feature_history[-1].copy()
+                if not np.isnan(val):
+                    last_row[0] = val  # target is always column 0
+                self._feature_history.append(last_row)
             self.failed_update = False
         except Exception as exc:
             self.failed_update = True
@@ -2501,6 +2711,7 @@ class ForwardPassResult:
     total_days: int = 0
     warmup_days: int = 0
     pid_summary: dict[str, Any] = field(default_factory=dict)  # PID controller state
+    conformal_calibrator: Any = None  # Trained ConformalCalibrator from the forward pass
 
 
 def _init_model_wrappers(
@@ -2831,8 +3042,10 @@ def run_forward_pass(
             pid_summary.mean_multiplier, pid_summary.max_multiplier,
         )
 
-    # Store conformal diagnostics
+    # Store conformal calibrator and diagnostics so downstream modules
+    # (prediction_aggregator) can use the trained calibrator directly.
     if _conformal_calibrator is not None:
+        result.conformal_calibrator = _conformal_calibrator
         try:
             result.conformal_diagnostics = _conformal_calibrator.get_diagnostics()
             logger.info("Conformal calibrator: %s", result.conformal_diagnostics)

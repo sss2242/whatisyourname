@@ -2,7 +2,7 @@
 
 Consumes the ``company_profile.json`` built by T7.1 and produces:
 
-1. A **Bloomberg-style Markdown report** via Gemini (or a fallback
+1. A **branded Markdown report** via Gemini (or a fallback
    template when Gemini is unavailable).
 2. An **optional set of charts** (matplotlib) saved as PNG files.
 3. An **optional PDF** via ``pandoc`` (skipped gracefully if pandoc
@@ -25,7 +25,7 @@ import logging
 import os
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -63,12 +63,33 @@ class ReportTier(str, Enum):
         return f"{self.value}_report.md"
 
 
+class ReportMode(str, Enum):
+    """Two modes controlling explanation depth.
+
+    LEARN:   Plain-English explanations for financial newcomers.
+             Each indicator gets context: what it means, whether the
+             value is good or bad, and why it matters.
+    RESULTS: Data-forward, minimal prose.  Clean grids and charts
+             for professionals who already know the terminology.
+    """
+
+    LEARN = "learn"
+    RESULTS = "results"
+
+    @property
+    def label(self) -> str:
+        return {
+            "learn": "Learn",
+            "results": "Results",
+        }[self.value]
+
+
 # Sections included in each tier.  Section numbers match the fallback
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20},
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 7, 11, 14, 16, 17, 18, 20},
-    ReportTier.PREMIUM: set(range(1, 23)),  # all 22 sections
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 7, 11, 14, 16, 17, 18, 195, 20},
+    ReportTier.PREMIUM: set(range(1, 23)) | {195},  # all 22 sections + geopolitical
 }
 
 
@@ -194,6 +215,12 @@ _FALLBACK_TEMPLATE = """\
 ## 19. Advanced Quantitative Insights
 
 {advanced_insights}
+
+---
+
+## 19.5. Geopolitical & Conflict Risk
+
+{geopolitical_risk}
 
 ---
 
@@ -846,12 +873,26 @@ def _build_limitations(profile: dict[str, Any]) -> str:
     _provider_label = meta.get("data_provider_label", _provider)
     _is_pit = meta.get("pit_source", True)
 
+    _ohlcv_source = meta.get("ohlcv_source", "")
+
     if _is_pit:
         lines.extend([
-            f"- All financial data (statements, filings, prices) is sourced from "
+            f"- Financial statements and filings are sourced from "
             f"**{_provider_label}** -- a free government filing API.",
             "- Filing dates are immutable and used for point-in-time alignment "
             "(no look-ahead bias in historical analysis).",
+        ])
+        if _ohlcv_source and _ohlcv_source != _provider:
+            lines.extend([
+                f"- Price data (OHLCV) is sourced from **{_ohlcv_source}**, "
+                "a separate market data provider. Raw exchange prices are "
+                "inherently point-in-time (immutable historical facts).",
+            ])
+        else:
+            lines.extend([
+                f"- Price data is also sourced from **{_provider_label}**.",
+            ])
+        lines.extend([
             "- Price data may not account for all corporate actions "
             "(splits, dividends) depending on exchange adjustments.",
         ])
@@ -2341,8 +2382,273 @@ def _build_portfolio_fit(profile: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _build_fallback_report(profile: dict[str, Any], tier: ReportTier = ReportTier.PREMIUM) -> str:
-    """Build a report using the local template, filtered by tier.
+def _build_key_indicators_table(profile: dict[str, Any], mode: ReportMode = ReportMode.RESULTS) -> str:
+    """Build a Key Financial Indicators summary table.
+
+    In LEARN mode, each indicator includes a plain-English explanation.
+    In RESULTS mode, just the clean data grid.
+    """
+    # The profile stores current state under "current_state" with values
+    # nested inside tier sub-dicts (tier1_liquidity, tier2_solvency, etc.).
+    # Flatten all tier sub-dicts into a single lookup dict.
+    cs = profile.get("current_state", {})
+    snapshot: dict[str, Any] = {}
+    for key, val in cs.items():
+        if isinstance(val, dict):
+            # Flatten tier sub-dicts (e.g. tier1_liquidity: {cash_ratio: 0.5})
+            snapshot.update(val)
+        else:
+            snapshot[key] = val
+    fh = profile.get("financial_health", {})
+
+    # Indicator definitions: (label, value_key, format, learn_explanation)
+    _INDICATORS: list[tuple[str, str, str, str]] = [
+        ("P/E Ratio", "pe_ratio_calc", ".1f",
+         "How much investors pay per dollar of earnings. "
+         "Lower than sector average may suggest undervaluation."),
+        ("P/B Ratio", "pb_ratio", ".2f",
+         "Market price relative to book value. "
+         "Below 1.0 means the market values the company below its net assets."),
+        ("EV/EBITDA", "ev_to_ebitda", ".1f",
+         "Enterprise value relative to operating cash earnings. "
+         "Lower values suggest cheaper valuation relative to cash generation."),
+        ("Gross Margin", "gross_margin", ".1%",
+         "Percentage of revenue retained after direct costs. "
+         "Higher is better -- shows pricing power and cost efficiency."),
+        ("Operating Margin", "operating_margin", ".1%",
+         "Percentage of revenue left after all operating expenses. "
+         "Measures core business profitability before interest and taxes."),
+        ("Net Margin", "net_margin", ".1%",
+         "Percentage of revenue that becomes profit. "
+         "The bottom line -- what shareholders actually keep."),
+        ("ROE", "roe", ".1%",
+         "Return on Equity -- profit generated per dollar of shareholder investment. "
+         "Above 15% is generally considered strong."),
+        ("ROA", "roa", ".1%",
+         "Return on Assets -- how efficiently the company uses its total assets "
+         "to generate profit. Higher means better asset utilization."),
+        ("Current Ratio", "current_ratio", ".2f",
+         "Can the company pay its short-term bills? Above 1.0 means yes. "
+         "Below 1.0 means current debts exceed current assets -- a warning sign."),
+        ("Debt-to-Equity", "debt_to_equity_abs", ".2f",
+         "Total debt relative to shareholder equity. "
+         "Above 2.0 means the company is heavily leveraged."),
+        ("Interest Coverage", "interest_coverage", ".1f",
+         "How many times operating profit covers interest payments. "
+         "Below 1.5 means the company struggles to service its debt."),
+        ("FCF Yield", "fcf_yield", ".1%",
+         "Free cash flow relative to market cap. "
+         "Higher means more cash generated per dollar of market value."),
+        ("Revenue Growth YoY", "revenue_growth_yoy", ".1%",
+         "Year-over-year revenue growth rate. "
+         "Shows whether the business is expanding or contracting."),
+        ("Volatility (21d)", "volatility_21d", ".1%",
+         "How much the stock price fluctuates day-to-day. "
+         "Higher volatility means more risk but also more opportunity."),
+        ("Max Drawdown (1Y)", "drawdown_252d", ".1%",
+         "Largest peak-to-trough decline in the past year. "
+         "Shows the worst-case loss an investor would have experienced."),
+    ]
+
+    lines = ["### Key Financial Indicators", ""]
+
+    if mode == ReportMode.RESULTS:
+        lines.append("| Indicator | Value |")
+        lines.append("|-----------|-------|")
+        for label, key, fmt, _ in _INDICATORS:
+            val = snapshot.get(key)
+            lines.append(f"| {label} | {_fmt(val, fmt)} |")
+    else:
+        # LEARN mode: table with explanation column
+        lines.append("| Indicator | Value | What This Means |")
+        lines.append("|-----------|-------|-----------------|")
+        for label, key, fmt, explanation in _INDICATORS:
+            val = snapshot.get(key)
+            lines.append(f"| {label} | {_fmt(val, fmt)} | {explanation} |")
+
+    # Altman Z-Score (always included -- people know this one)
+    z_data = fh.get("altman_z", {})
+    if isinstance(z_data, dict) and z_data.get("available"):
+        z_val = z_data.get("latest_z_score")
+        zone = z_data.get("zone", "unknown")
+        lines.append("")
+        if mode == ReportMode.LEARN:
+            zone_explain = {
+                "safe": "Above 2.99 -- low bankruptcy risk. The company is financially healthy.",
+                "grey": "Between 1.81 and 2.99 -- moderate uncertainty. Worth monitoring.",
+                "distress": "Below 1.81 -- elevated bankruptcy risk. Proceed with caution.",
+            }.get(zone, "")
+            lines.append(f"**Altman Z-Score:** {_fmt(z_val, '.2f')} ({zone}) -- {zone_explain}")
+        else:
+            lines.append(f"**Altman Z-Score:** {_fmt(z_val, '.2f')} ({zone})")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _build_geopolitical_risk_section(profile: dict[str, Any]) -> str:
+    """Build Geopolitical & Conflict Risk section from conflict_risk data."""
+    lines: list[str] = []
+
+    conflict = profile.get("conflict_risk", profile.get("geopolitical_risk", {}))
+    if not conflict or not isinstance(conflict, dict):
+        lines.append("No geopolitical risk data available for this market.")
+        lines.append("")
+        return "\n".join(lines)
+
+    country = conflict.get("country_iso2", "")
+    intensity = conflict.get("conflict_intensity_score", 0)
+    conflict_type = conflict.get("conflict_type", "none")
+    country_flag = conflict.get("country_conflict_flag", False)
+    company_flag = conflict.get("company_conflict_flag", False)
+    sanctions = conflict.get("sanctions_flag", False)
+    fragile = conflict.get("fragile_state_flag", False)
+
+    # Status badge
+    if intensity > 0.7:
+        badge = "CRITICAL -- Active Conflict Zone"
+        badge_color = "red"
+    elif intensity > 0.4:
+        badge = "ELEVATED -- Significant Geopolitical Risk"
+        badge_color = "orange"
+    elif intensity > 0.1:
+        badge = "MODERATE -- Some Geopolitical Concerns"
+        badge_color = "yellow"
+    else:
+        badge = "LOW -- Stable Geopolitical Environment"
+        badge_color = "green"
+
+    lines.append(f"**Risk Level:** **{badge}**")
+    lines.append("")
+    lines.append(f"**Conflict Intensity Score:** {_fmt(intensity, '.2f')} / 1.00")
+    lines.append("")
+
+    # Status flags table
+    lines.append("| Risk Factor | Status |")
+    lines.append("|-------------|--------|")
+    lines.append(f"| Country Conflict Flag | {'Yes' if country_flag else 'No'} |")
+    lines.append(f"| Company Directly Affected | {'Yes' if company_flag else 'No'} |")
+    lines.append(f"| International Sanctions | {'Yes' if sanctions else 'No'} |")
+    lines.append(f"| World Bank Fragile State | {'Yes' if fragile else 'No'} |")
+    lines.append(f"| Conflict Classification | {conflict_type.replace('_', ' ').title()} |")
+    lines.append("")
+
+    # Event data
+    events_30 = conflict.get("recent_events_30d", 0)
+    events_90 = conflict.get("recent_events_90d", 0)
+    fatalities_30 = conflict.get("recent_fatalities_30d", 0)
+    trend = conflict.get("conflict_trend", "stable")
+
+    if events_30 > 0 or events_90 > 0:
+        lines.append("### Recent Conflict Events (UCDP)")
+        lines.append("")
+        lines.append(f"- **Last 30 days:** {events_30} events, {fatalities_30} fatalities")
+        lines.append(f"- **Last 90 days:** {events_90} events")
+        lines.append(f"- **Trend:** {trend.replace('_', ' ').title()}")
+        lines.append("")
+
+    # News monitoring
+    news_mentions = conflict.get("news_conflict_mentions_7d", 0)
+    news_tone = conflict.get("news_conflict_tone", 0)
+    if news_mentions > 0:
+        lines.append("### Conflict News Monitoring (GDELT)")
+        lines.append("")
+        tone_desc = "negative" if news_tone < -2 else "neutral" if news_tone < 2 else "positive"
+        lines.append(f"- **Conflict-related articles (7 days):** {news_mentions}")
+        lines.append(f"- **Average tone:** {_fmt(news_tone, '.1f')} ({tone_desc})")
+        lines.append("")
+
+    # Investment implications
+    if country_flag:
+        lines.append("### Investment Implications")
+        lines.append("")
+        if intensity > 0.7:
+            lines.append(
+                "This company operates in an **active conflict zone**. "
+                "Key risks include supply chain disruption, asset destruction, "
+                "capital flight, currency devaluation, and regulatory instability. "
+                "Survival analysis models have been adjusted to prioritize "
+                "liquidity and solvency metrics."
+            )
+        elif sanctions:
+            lines.append(
+                "This company's country is under **international sanctions**. "
+                "Key risks include trade restrictions, frozen assets, SWIFT exclusion, "
+                "reduced FDI, and increased cost of capital. Investors should assess "
+                "sanctions compliance risk for their jurisdiction."
+            )
+        elif fragile:
+            lines.append(
+                "This company operates in a **fragile state** as classified by the "
+                "World Bank. Key risks include institutional weakness, governance gaps, "
+                "and elevated political instability. Due diligence should include "
+                "assessment of operational resilience."
+            )
+        lines.append("")
+    else:
+        lines.append(
+            "No active conflict or sanctions risk detected for this market. "
+            "The geopolitical environment is considered stable for investment purposes."
+        )
+        lines.append("")
+
+    # Linked entity conflict propagation
+    linked_conflict = profile.get("linked_conflict", conflict.get("linked_conflict", {}))
+    if linked_conflict and isinstance(linked_conflict, dict):
+        affected = linked_conflict.get("linked_entities_in_conflict", [])
+        if affected:
+            lines.append("### Linked Entity Conflict Exposure")
+            lines.append("")
+            lines.append("| Entity | Country | Relationship | Risk Type | Severity | Reason |")
+            lines.append("|--------|---------|-------------|-----------|----------|--------|")
+            for e in affected:
+                lines.append(
+                    f"| {e.get('name', 'N/A')} | {e.get('country', '')} | "
+                    f"{e.get('group', '')} | {e.get('risk_type', '')} | "
+                    f"{_fmt(e.get('severity'), '.0%')} | {e.get('reason', '')} |"
+                )
+            lines.append("")
+
+            sc_risk = linked_conflict.get("supply_chain_risk_score", 0)
+            rev_risk = linked_conflict.get("revenue_exposure_score", 0)
+            comp_adv = linked_conflict.get("competitive_advantage_score", 0)
+
+            if sc_risk > 0:
+                lines.append(f"**Supply Chain Risk:** {_fmt(sc_risk, '.0%')} -- "
+                             "linked suppliers or logistics partners operate in conflict zones. "
+                             "Disruption to raw materials, components, or shipping is probable.")
+                lines.append("")
+            if rev_risk > 0:
+                lines.append(f"**Revenue Exposure:** {_fmt(rev_risk, '.0%')} -- "
+                             "linked customers operate in conflict zones. "
+                             "Demand contraction, payment delays, or market exit risk.")
+                lines.append("")
+            if comp_adv > 0:
+                lines.append(f"**Competitive Advantage:** {_fmt(comp_adv, '.0%')} -- "
+                             "competitors are impaired by conflict. "
+                             "Potential market share gains if supply chains are diversified.")
+                lines.append("")
+
+        summary = linked_conflict.get("linked_conflict_summary", "")
+        if summary:
+            lines.append(f"*{summary}*")
+            lines.append("")
+
+    # Data sources
+    sources = conflict.get("data_sources_used", [])
+    if sources:
+        lines.append(f"*Data sources: {', '.join(sources)}*")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _build_fallback_report(
+    profile: dict[str, Any],
+    tier: ReportTier = ReportTier.PREMIUM,
+    mode: ReportMode = ReportMode.RESULTS,
+) -> str:
+    """Build a report using the local template, filtered by tier and mode.
 
     Parameters
     ----------
@@ -2350,6 +2656,8 @@ def _build_fallback_report(profile: dict[str, Any], tier: ReportTier = ReportTie
         Company profile dict.
     tier:
         Report tier controlling which sections are included.
+    mode:
+        Report mode controlling explanation depth (Learn vs Results).
     """
     # Map section numbers to their rendered content
     _section_builders: dict[int, tuple[str, str]] = {
@@ -2373,6 +2681,7 @@ def _build_fallback_report(profile: dict[str, Any], tier: ReportTier = ReportTie
         17: ("17. Peer Comparison & Relative Valuation", _build_peer_ranking_section(profile)),
         18: ("18. Macroeconomic Environment", _build_macro_quadrant_section(profile)),
         19: ("19. Advanced Quantitative Insights", _build_advanced_insights(profile)),
+        195: ("19.5. Geopolitical & Conflict Risk", _build_geopolitical_risk_section(profile)),
         20: ("20. Risk Factors & Limitations", (
             _build_risk_assessment(profile) + "\n\n### 20.1 LIMITATIONS\n\n" + _build_limitations(profile)
         )),
@@ -2383,7 +2692,7 @@ def _build_fallback_report(profile: dict[str, Any], tier: ReportTier = ReportTie
     included = TIER_SECTIONS.get(tier, TIER_SECTIONS[ReportTier.PREMIUM])
 
     generated_at = profile.get("meta", {}).get(
-        "generated_at", datetime.utcnow().isoformat(),
+        "generated_at", datetime.now(timezone.utc).isoformat(),
     )
     identity = profile.get("identity", {})
     company_name = identity.get("name", "Unknown Company")
@@ -2397,6 +2706,14 @@ def _build_fallback_report(profile: dict[str, Any], tier: ReportTier = ReportTie
         "---",
         "",
     ]
+
+    # Key Financial Indicators summary (always first, all tiers)
+    key_indicators = _build_key_indicators_table(profile, mode=mode)
+    if key_indicators.strip():
+        lines.append(key_indicators)
+        lines.append("")
+        lines.append("---")
+        lines.append("")
 
     for section_num in sorted(included):
         heading, content = _section_builders.get(section_num, ("", ""))
@@ -2620,6 +2937,29 @@ def generate_charts(
         logger.warning("No cache data available for chart generation.")
         return chart_paths
 
+    # Ensure cache has a proper DatetimeIndex for matplotlib date formatting.
+    # Without this, integer indices are interpreted as ordinal days since
+    # year 0001, producing dates around 1959-1960 on the x-axis.
+    if not isinstance(cache.index, pd.DatetimeIndex):
+        for _date_col in ("date", "Date", "timestamp", "report_date"):
+            if _date_col in cache.columns:
+                try:
+                    cache = cache.set_index(pd.to_datetime(cache[_date_col]))
+                    logger.debug("Chart: converted '%s' column to DatetimeIndex", _date_col)
+                    break
+                except Exception:
+                    continue
+        else:
+            try:
+                cache.index = pd.to_datetime(cache.index)
+                logger.debug("Chart: converted index to DatetimeIndex")
+            except Exception:
+                logger.warning(
+                    "Cache index is not DatetimeIndex and cannot be converted; "
+                    "chart x-axis dates may be incorrect (type=%s)",
+                    type(cache.index).__name__,
+                )
+
     try:
         import matplotlib
         matplotlib.use("Agg")  # Non-interactive backend
@@ -2630,17 +2970,19 @@ def generate_charts(
         logger.warning("matplotlib not installed; skipping chart generation.")
         return chart_paths
 
-    # Bloomberg-style chart theme
-    _CHART_BG = "#1a1a2e"
-    _CHART_FG = "#e0e0e0"
-    _CHART_GRID = "#2d2d44"
-    _CHART_ACCENT = "#00d4ff"
-    _CHART_RED = "#ff4757"
-    _CHART_GREEN = "#2ed573"
-    _CHART_GOLD = "#ffa502"
+    # --- Operator 1 Brand Palette ---
+    # Proton-inspired: warm, clean, trustworthy, distinctive.
+    # Purple accent is our signature -- no other finance product uses it.
+    _CHART_BG = "#1c1b22"       # deep warm charcoal (not cold navy)
+    _CHART_FG = "#eae7e1"       # warm off-white text
+    _CHART_GRID = "#2d2b33"     # subtle warm grid
+    _CHART_ACCENT = "#6d4aff"   # Proton-inspired purple (brand signature)
+    _CHART_RED = "#dc3545"      # clear danger/bearish
+    _CHART_GREEN = "#1ea885"    # teal-green (calmer than neon)
+    _CHART_GOLD = "#e8950a"     # warm amber warning
 
-    def _apply_bloomberg_style(fig, ax, title: str) -> None:
-        """Apply Bloomberg Terminal-inspired dark theme to a chart."""
+    def _apply_brand_style(fig, ax, title: str) -> None:
+        """Apply Operator 1 brand theme to a chart."""
         fig.patch.set_facecolor(_CHART_BG)
         ax.set_facecolor(_CHART_BG)
         ax.set_title(title, color=_CHART_FG, fontsize=14, fontweight="bold", pad=12)
@@ -2667,8 +3009,23 @@ def generate_charts(
         if "close" in cache.columns:
             fig, ax = plt.subplots(figsize=(16, 7))
             ax.plot(cache.index, cache["close"], linewidth=1.5, color=_CHART_ACCENT, zorder=3)
-            _apply_bloomberg_style(fig, ax, f"{company} -- Closing Price (2Y)")
+            _apply_brand_style(fig, ax, f"{company} -- Closing Price (2Y)")
             ax.set_ylabel("Price ($)", color=_CHART_FG)
+
+            # Next-day Low estimate annotation (Technical Alpha)
+            ta = profile.get("predictions", {}).get("technical_alpha", {})
+            est_low = ta.get("estimated_low")
+            if est_low is None:
+                # Try from ohlc_predictions
+                est_low = profile.get("ohlc_predictions", {}).get("next_day", {}).get("low")
+            if est_low is not None and est_low > 0:
+                ax.axhline(y=est_low, color=_CHART_GOLD, linestyle="--", linewidth=1.5, alpha=0.8)
+                ax.annotate(
+                    f"Next-Day Low: {est_low:,.2f}",
+                    xy=(1.0, est_low), xycoords=("axes fraction", "data"),
+                    fontsize=9, color=_CHART_GOLD, fontweight="bold",
+                    ha="right", va="bottom",
+                )
 
             # Regime shading with professional colors
             if "regime_label" in cache.columns:
@@ -2676,7 +3033,7 @@ def generate_charts(
                     "bull": (_CHART_GREEN, "Bull Market"),
                     "bear": (_CHART_RED, "Bear Market"),
                     "high_vol": (_CHART_GOLD, "High Volatility"),
-                    "low_vol": ("#7bed9f", "Low Volatility"),
+                    "low_vol": ("#8b8694", "Low Volatility"),
                 }
                 for regime, (color, label) in regime_colors.items():
                     mask = cache["regime_label"] == regime
@@ -2727,7 +3084,7 @@ def generate_charts(
                 )
             ax.set_yticks(range(len(flag_cols)))
             ax.set_yticklabels([nice_labels.get(c, c) for c in flag_cols], fontsize=10)
-            _apply_bloomberg_style(fig, ax, f"{company} -- Survival Mode Timeline")
+            _apply_brand_style(fig, ax, f"{company} -- Survival Mode Timeline")
             leg = ax.legend(
                 loc="upper right", fontsize=9, facecolor=_CHART_BG,
                 edgecolor=_CHART_GRID, labelcolor=_CHART_FG,
@@ -2741,43 +3098,7 @@ def generate_charts(
     except Exception as exc:
         logger.warning("Failed to generate survival timeline chart: %s", exc)
 
-    # Chart 3: Risk Hierarchy Weight Allocation
-    try:
-        tier_cols = [
-            f"hierarchy_tier{i}_weight" for i in range(1, 6)
-            if f"hierarchy_tier{i}_weight" in cache.columns
-        ]
-        if tier_cols:
-            tier_names = [
-                "Tier 1: Liquidity", "Tier 2: Solvency", "Tier 3: Stability",
-                "Tier 4: Profitability", "Tier 5: Growth",
-            ]
-            tier_colors = ["#00d4ff", "#2ed573", "#ffa502", "#ff6348", "#a4b0be"]
-            fig, ax = plt.subplots(figsize=(16, 5))
-            ax.stackplot(
-                cache.index,
-                *[cache[c].fillna(0) for c in tier_cols],
-                labels=tier_names[:len(tier_cols)],
-                colors=tier_colors[:len(tier_cols)],
-                alpha=0.85,
-            )
-            _apply_bloomberg_style(fig, ax, f"{company} -- Risk Hierarchy Weight Allocation")
-            ax.set_ylabel("Portfolio Weight", color=_CHART_FG)
-            ax.set_ylim(0, 1.05)
-            leg = ax.legend(
-                loc="upper right", fontsize=9, facecolor=_CHART_BG,
-                edgecolor=_CHART_GRID, labelcolor=_CHART_FG,
-            )
-            fig.tight_layout()
-            path = str(out / "hierarchy_weights.png")
-            fig.savefig(path, dpi=180, facecolor=_CHART_BG)
-            plt.close(fig)
-            chart_paths.append(path)
-            logger.info("Generated chart: %s", path)
-    except Exception as exc:
-        logger.warning("Failed to generate hierarchy weight chart: %s", exc)
-
-    # Chart 4: 21-Day Realized Volatility
+    # Chart 3: 21-Day Realized Volatility
     try:
         if "volatility_21d" in cache.columns:
             fig, ax = plt.subplots(figsize=(16, 5))
@@ -2786,7 +3107,7 @@ def generate_charts(
                 alpha=0.3, color=_CHART_RED,
             )
             ax.plot(cache.index, cache["volatility_21d"], linewidth=1.2, color=_CHART_RED)
-            _apply_bloomberg_style(fig, ax, f"{company} -- 21-Day Realized Volatility")
+            _apply_brand_style(fig, ax, f"{company} -- 21-Day Realized Volatility")
             ax.set_ylabel("Annualized Volatility", color=_CHART_FG)
             ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.0%}"))
             fig.tight_layout()
@@ -2809,7 +3130,7 @@ def generate_charts(
                             alpha=0.15, color=_CHART_GREEN)
             ax.fill_between(cache.index, 0, score, where=score < 50,
                             alpha=0.15, color=_CHART_RED)
-            _apply_bloomberg_style(fig, ax, f"{company} -- Financial Health Composite (0-100)")
+            _apply_brand_style(fig, ax, f"{company} -- Financial Health Composite (0-100)")
             ax.set_ylabel("Health Score", color=_CHART_FG)
             ax.set_ylim(0, 100)
             fig.tight_layout()
@@ -2832,7 +3153,7 @@ def generate_charts(
                 ax.plot(cache.index, cache["sentiment_momentum_21d"],
                         linewidth=2, color=_CHART_GOLD, label="21-Day Sentiment Trend")
             ax.axhline(y=0, color=_CHART_FG, linewidth=0.5, alpha=0.5)
-            _apply_bloomberg_style(fig, ax, f"{company} -- Market Sentiment & News Flow")
+            _apply_brand_style(fig, ax, f"{company} -- Market Sentiment & News Flow")
             ax.set_ylabel("Sentiment (-1 Bearish to +1 Bullish)", color=_CHART_FG)
             ax.set_ylim(-1.1, 1.1)
             leg = ax.legend(
@@ -2882,7 +3203,7 @@ def generate_charts(
                 lower = [m - r * (2 - conf) for m, r, conf in zip(mid_prices, ranges, confidences)]
                 ax.fill_between(dates, lower, upper, alpha=0.08, color=_CHART_ACCENT)
 
-                _apply_bloomberg_style(fig, ax, f"{company} -- Predicted Price (Next Month)")
+                _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Month)")
                 ax.set_ylabel("Price ($)", color=_CHART_FG)
                 ax.set_xlabel("Trading Days Ahead", color=_CHART_FG)
 
@@ -2918,7 +3239,7 @@ def generate_charts(
                        color=color, edgecolor=color, alpha=0.85)
                 ax.plot([i, i], [l, h], color=color, linewidth=0.8)
 
-            _apply_bloomberg_style(fig, ax, f"{company} -- Predicted Price (Next Week)")
+            _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Week)")
             ax.set_ylabel("Price ($)", color=_CHART_FG)
             ax.set_xlabel("Trading Days Ahead", color=_CHART_FG)
 
@@ -2940,7 +3261,227 @@ def generate_charts(
     except Exception as exc:
         logger.warning("Failed to generate predicted week OHLC chart: %s", exc)
 
+    # Chart 9.5: Predicted OHLC Candlestick (Next Year -- aggregated weekly)
+    try:
+        next_year = ohlc_data.get("next_year", {})
+        year_series = next_year.get("series", [])
+        if year_series and len(year_series) >= 20:
+            # Aggregate 252 daily candles into weekly bars for readability
+            weekly_bars = []
+            for w_start in range(0, len(year_series), 5):
+                week = year_series[w_start:w_start + 5]
+                if not week:
+                    continue
+                w_open = week[0].get("open", 0) or 0
+                w_high = max((c.get("high", 0) or 0) for c in week)
+                w_low = min((c.get("low", float("inf")) or float("inf")) for c in week)
+                w_close = week[-1].get("close", 0) or 0
+                w_conf = sum(c.get("confidence", 1.0) for c in week) / len(week)
+                if w_open and w_close and w_low < float("inf"):
+                    weekly_bars.append({"open": w_open, "high": w_high, "low": w_low,
+                                        "close": w_close, "confidence": w_conf})
+
+            if len(weekly_bars) >= 5:
+                fig, ax = plt.subplots(figsize=(16, 7))
+                for i, candle in enumerate(weekly_bars):
+                    o, h, l, c_ = candle["open"], candle["high"], candle["low"], candle["close"]
+                    color = _CHART_GREEN if c_ >= o else _CHART_RED
+                    body_bottom = min(o, c_)
+                    body_height = abs(c_ - o)
+                    ax.bar(i, body_height, bottom=body_bottom, width=0.6,
+                           color=color, edgecolor=color, alpha=0.85)
+                    ax.plot([i, i], [l, h], color=color, linewidth=0.8)
+
+                # Confidence envelope
+                confidences = [c["confidence"] for c in weekly_bars]
+                mid_prices = [(c["high"] + c["low"]) / 2 for c in weekly_bars]
+                ranges = [c["high"] - c["low"] for c in weekly_bars]
+                upper = [m + r * (2 - conf) for m, r, conf in zip(mid_prices, ranges, confidences)]
+                lower = [m - r * (2 - conf) for m, r, conf in zip(mid_prices, ranges, confidences)]
+                ax.fill_between(range(len(weekly_bars)), lower, upper, alpha=0.08, color=_CHART_ACCENT)
+
+                _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Year, Weekly)")
+                ax.set_ylabel("Price ($)", color=_CHART_FG)
+                ax.set_xlabel("Weeks Ahead", color=_CHART_FG)
+
+                year_ret = next_year.get("predicted_return")
+                if year_ret is not None:
+                    ax.annotate(
+                        f"Predicted annual return: {year_ret:+.1f}%",
+                        xy=(0.02, 0.95), xycoords="axes fraction",
+                        fontsize=11, color=_CHART_GREEN if year_ret >= 0 else _CHART_RED,
+                        fontweight="bold",
+                    )
+
+                fig.tight_layout()
+                path = str(out / "predicted_ohlc_year.png")
+                fig.savefig(path, dpi=180, facecolor=_CHART_BG)
+                plt.close(fig)
+                chart_paths.append(path)
+                logger.info("Generated chart: %s", path)
+    except Exception as exc:
+        logger.warning("Failed to generate predicted year OHLC chart: %s", exc)
+
+    # Chart 9: Conflict Risk Gauge (if conflict data available)
+    try:
+        if "conflict_intensity_score" in cache.columns:
+            intensity = cache["conflict_intensity_score"].iloc[-1] if not cache["conflict_intensity_score"].isna().all() else 0
+            conflict_flag = cache["country_conflict_flag"].iloc[-1] if "country_conflict_flag" in cache.columns else 0
+            sanctions = cache["sanctions_flag"].iloc[-1] if "sanctions_flag" in cache.columns else 0
+
+            fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+            fig.patch.set_facecolor(_CHART_BG)
+
+            # Gauge 1: Conflict Intensity
+            ax = axes[0]
+            ax.set_facecolor(_CHART_BG)
+            theta = intensity * 180  # 0 to 180 degrees
+            colors_gauge = [_CHART_GREEN, _CHART_GOLD, _CHART_RED]
+            # Draw arc background
+            from matplotlib.patches import Wedge
+            for i, (start, end, color) in enumerate([(0, 60, _CHART_GREEN), (60, 120, _CHART_GOLD), (120, 180, _CHART_RED)]):
+                wedge = Wedge((0.5, 0), 0.4, start, end, width=0.12,
+                              facecolor=color, alpha=0.3, transform=ax.transAxes)
+                ax.add_patch(wedge)
+            # Needle
+            import math
+            needle_angle = math.radians(180 - theta)
+            nx = 0.5 + 0.35 * math.cos(needle_angle)
+            ny = 0.35 * math.sin(needle_angle)
+            ax.annotate("", xy=(nx, ny), xytext=(0.5, 0),
+                        arrowprops=dict(arrowstyle="-|>", color=_CHART_FG, lw=2),
+                        xycoords="axes fraction", textcoords="axes fraction")
+            ax.text(0.5, -0.15, f"Intensity: {intensity:.2f}", ha="center",
+                    color=_CHART_FG, fontsize=12, fontweight="bold",
+                    transform=ax.transAxes)
+            ax.set_title("Conflict Intensity", color=_CHART_FG, fontsize=11, fontweight="bold")
+            ax.set_xlim(-0.1, 1.1)
+            ax.set_ylim(-0.3, 0.6)
+            ax.axis("off")
+
+            # Gauge 2: Country Conflict Status
+            ax = axes[1]
+            ax.set_facecolor(_CHART_BG)
+            status_color = _CHART_RED if conflict_flag else _CHART_GREEN
+            status_text = "ACTIVE" if conflict_flag else "CLEAR"
+            circle = plt.Circle((0.5, 0.3), 0.25, color=status_color, alpha=0.3,
+                                transform=ax.transAxes)
+            ax.add_patch(circle)
+            ax.text(0.5, 0.3, status_text, ha="center", va="center",
+                    color=status_color, fontsize=16, fontweight="bold",
+                    transform=ax.transAxes)
+            ax.set_title("Country Conflict", color=_CHART_FG, fontsize=11, fontweight="bold")
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 0.7)
+            ax.axis("off")
+
+            # Gauge 3: Sanctions Status
+            ax = axes[2]
+            ax.set_facecolor(_CHART_BG)
+            sanc_color = _CHART_RED if sanctions else _CHART_GREEN
+            sanc_text = "SANCTIONED" if sanctions else "CLEAR"
+            circle = plt.Circle((0.5, 0.3), 0.25, color=sanc_color, alpha=0.3,
+                                transform=ax.transAxes)
+            ax.add_patch(circle)
+            ax.text(0.5, 0.3, sanc_text, ha="center", va="center",
+                    color=sanc_color, fontsize=16, fontweight="bold",
+                    transform=ax.transAxes)
+            ax.set_title("Sanctions Status", color=_CHART_FG, fontsize=11, fontweight="bold")
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 0.7)
+            ax.axis("off")
+
+            fig.suptitle(f"{company} -- Geopolitical Risk Dashboard",
+                         color=_CHART_FG, fontsize=14, fontweight="bold")
+            fig.tight_layout()
+            path = str(out / "conflict_risk.png")
+            fig.savefig(path, dpi=180, facecolor=_CHART_BG)
+            plt.close(fig)
+            chart_paths.append(path)
+            logger.info("Generated chart: %s", path)
+    except Exception as exc:
+        logger.warning("Failed to generate conflict risk chart: %s", exc)
+
     return chart_paths
+
+
+# ---------------------------------------------------------------------------
+# Chart embedding into Markdown
+# ---------------------------------------------------------------------------
+
+# Maps chart filename -> list of keyword patterns to match section headings.
+# Uses keyword matching (case-insensitive) so charts embed correctly in both
+# LLM-generated reports (13 sections) and fallback template reports (22 sections),
+# regardless of section numbering.
+_CHART_KEYWORDS: dict[str, list[str]] = {
+    "price_history.png": ["historical", "performance"],
+    "survival_timeline.png": ["survival", "mode"],
+    "volatility.png": ["temporal", "analysis"],
+    "financial_health.png": ["financial", "health"],
+    "sentiment.png": ["sentiment"],
+    "predicted_ohlc_week.png": ["prediction", "forecast"],
+    "predicted_ohlc_month.png": ["prediction", "forecast"],
+    "predicted_ohlc_year.png": ["prediction", "forecast"],
+    "conflict_risk.png": ["geopolitical", "conflict"],
+}
+
+
+def _embed_charts_in_markdown(
+    markdown: str,
+    chart_paths: list[str],
+    chart_dir_relative: str = "charts",
+) -> str:
+    """Embed chart image references into the report markdown.
+
+    For each generated chart, inserts a markdown image tag
+    ``![title](charts/filename.png)`` after the matching section heading.
+
+    Uses keyword matching so charts embed correctly in both LLM-generated
+    reports (which use a 13-section structure) and fallback template
+    reports (which use a 22-section structure).  The keywords are
+    matched case-insensitively against ``##`` heading lines.
+
+    Parameters
+    ----------
+    markdown:
+        The full report markdown text.
+    chart_paths:
+        List of absolute/relative chart PNG paths from ``generate_charts()``.
+    chart_dir_relative:
+        Relative path from the report markdown file to the charts directory.
+
+    Returns
+    -------
+    Updated markdown with embedded chart references.
+    """
+    if not chart_paths:
+        return markdown
+
+    for chart_path in chart_paths:
+        filename = os.path.basename(chart_path)
+        keywords = _CHART_KEYWORDS.get(filename, [])
+
+        if not keywords:
+            continue
+
+        # Build the image markdown
+        title = filename.replace(".png", "").replace("_", " ").title()
+        image_tag = f"\n\n![{title}]({chart_dir_relative}/{filename})\n"
+
+        # Find the first ## heading line that contains ALL keywords
+        for line in markdown.split("\n"):
+            stripped = line.strip()
+            if not stripped.startswith("##"):
+                continue
+            line_lower = stripped.lower()
+            if all(kw in line_lower for kw in keywords):
+                # Insert the image tag after this heading line
+                parts = markdown.split(line, 1)
+                if len(parts) == 2:
+                    markdown = parts[0] + line + image_tag + parts[1]
+                break
+
+    return markdown
 
 
 # ---------------------------------------------------------------------------
@@ -2948,11 +3489,74 @@ def generate_charts(
 # ---------------------------------------------------------------------------
 
 
+def _get_template_dir() -> Path:
+    """Return the path to the report templates directory."""
+    return Path(__file__).resolve().parent / "templates"
+
+
+def _generate_html(
+    markdown_path: str | Path,
+    output_path: str | Path | None = None,
+) -> str | None:
+    """Convert Markdown report to styled HTML using pandoc + custom template.
+
+    Returns the HTML path on success, or None if pandoc is unavailable.
+    """
+    if shutil.which("pandoc") is None:
+        logger.info("pandoc not found; skipping HTML generation.")
+        return None
+
+    md = Path(markdown_path)
+    if output_path is None:
+        output_path = md.with_suffix(".html")
+    html = Path(output_path)
+
+    tpl_dir = _get_template_dir()
+    css_path = tpl_dir / "report.css"
+    html_tpl = tpl_dir / "report.html"
+
+    cmd = [
+        "pandoc",
+        str(md),
+        "-o",
+        str(html),
+        "--standalone",
+        "--self-contained",
+    ]
+
+    # Use custom HTML template if available
+    if html_tpl.exists():
+        cmd.extend(["--template", str(html_tpl)])
+
+    # Embed CSS for styling
+    if css_path.exists():
+        cmd.extend(["--css", str(css_path)])
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+        logger.info("HTML report generated: %s", html)
+        return str(html)
+    except FileNotFoundError:
+        logger.info("pandoc not available; skipping HTML generation.")
+        return None
+    except subprocess.CalledProcessError as exc:
+        logger.warning("HTML generation failed: %s", exc.stderr.decode()[:200])
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("HTML generation timed out.")
+        return None
+
+
 def _generate_pdf(
     markdown_path: str | Path,
     output_path: str | Path | None = None,
 ) -> str | None:
     """Convert Markdown report to PDF using pandoc.
+
+    Tries multiple PDF engines in order of preference:
+    1. weasyprint (CSS-styled PDF -- uses our custom stylesheet)
+    2. xelatex (LaTeX-based -- clean but no custom CSS)
+    3. wkhtmltopdf (WebKit-based fallback)
 
     Returns the PDF path on success, or None if pandoc is unavailable.
     """
@@ -2965,32 +3569,50 @@ def _generate_pdf(
         output_path = md.with_suffix(".pdf")
     pdf = Path(output_path)
 
-    try:
-        subprocess.run(
-            [
-                "pandoc",
-                str(md),
-                "-o",
-                str(pdf),
-                "--pdf-engine=xelatex",
-                "-V",
-                "geometry:margin=1in",
-            ],
-            check=True,
-            capture_output=True,
-            timeout=60,
-        )
-        logger.info("PDF report generated: %s", pdf)
-        return str(pdf)
-    except FileNotFoundError:
-        logger.info("pandoc/xelatex not available; skipping PDF.")
-        return None
-    except subprocess.CalledProcessError as exc:
-        logger.warning("PDF generation failed: %s", exc.stderr.decode()[:200])
-        return None
-    except subprocess.TimeoutExpired:
-        logger.warning("PDF generation timed out.")
-        return None
+    tpl_dir = _get_template_dir()
+    css_path = tpl_dir / "report.css"
+
+    # Try weasyprint first (supports CSS natively for beautiful PDFs)
+    for engine, engine_args in [
+        ("weasyprint", [
+            "--pdf-engine=weasyprint",
+            *(["--css", str(css_path)] if css_path.exists() else []),
+        ]),
+        ("xelatex", [
+            "--pdf-engine=xelatex",
+            "-V", "geometry:margin=1in",
+            "-V", "fontsize=10pt",
+            "-V", "mainfont=DejaVu Sans",
+            "-V", "monofont=DejaVu Sans Mono",
+        ]),
+        ("wkhtmltopdf", [
+            "--pdf-engine=wkhtmltopdf",
+            *(["--css", str(css_path)] if css_path.exists() else []),
+        ]),
+    ]:
+        cmd = ["pandoc", str(md), "-o", str(pdf), "--standalone"] + engine_args
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                timeout=120,
+            )
+            logger.info("PDF report generated via %s: %s", engine, pdf)
+            return str(pdf)
+        except FileNotFoundError:
+            logger.debug("PDF engine %s not available, trying next.", engine)
+            continue
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode()[:200] if exc.stderr else "unknown error"
+            logger.debug("PDF engine %s failed: %s", engine, stderr)
+            continue
+        except subprocess.TimeoutExpired:
+            logger.debug("PDF engine %s timed out.", engine)
+            continue
+
+    logger.warning("No PDF engine available (tried weasyprint, xelatex, wkhtmltopdf).")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -3007,6 +3629,7 @@ def generate_report(
     generate_pdf: bool = False,
     generate_chart_images: bool = True,
     tier: ReportTier = ReportTier.PREMIUM,
+    mode: ReportMode = ReportMode.RESULTS,
 ) -> dict[str, Any]:
     """Generate an analysis report from a company profile.
 
@@ -3029,6 +3652,10 @@ def generate_report(
     tier:
         Report tier controlling how many sections are included.
         Defaults to PREMIUM (all 22 sections).
+    mode:
+        Report mode controlling explanation depth.
+        LEARN adds plain-English explanations for newcomers.
+        RESULTS (default) is data-forward for professionals.
 
     Returns
     -------
@@ -3038,6 +3665,7 @@ def generate_report(
         - ``chart_paths``: list of chart PNG paths
         - ``pdf_path``: path to PDF (or None)
         - ``tier``: the report tier used
+        - ``mode``: the report mode used
     """
     if output_dir is None:
         output_dir = Path(CACHE_DIR) / "report"
@@ -3063,8 +3691,8 @@ def generate_report(
 
     # Fallback if Gemini produced nothing or tier is not premium
     if not markdown or not markdown.strip():
-        markdown = _build_fallback_report(profile, tier=tier)
-        logger.info("%s generated using local template.", tier.label)
+        markdown = _build_fallback_report(profile, tier=tier, mode=mode)
+        logger.info("%s (%s mode) generated using local template.", tier.label, mode.label)
 
     # Ensure LIMITATIONS section exists (append if Gemini missed it)
     if "LIMITATIONS" not in markdown.upper():
@@ -3092,13 +3720,24 @@ def generate_report(
         fh.write(markdown)
     logger.info("Markdown report saved to %s", md_path)
 
-    # Step 3: Generate charts (only for premium)
+    # Step 3: Generate charts (for Pro and Premium tiers)
     chart_paths: list[str] = []
-    if generate_chart_images and tier == ReportTier.PREMIUM:
+    if generate_chart_images and tier in (ReportTier.PRO, ReportTier.PREMIUM):
         chart_dir = out / "charts"
         chart_paths = generate_charts(cache, profile, chart_dir)
 
-    # Step 4: Optional PDF (all tiers)
+    # Step 3b: Embed chart images into the markdown report
+    if chart_paths:
+        markdown = _embed_charts_in_markdown(markdown, chart_paths, "charts")
+        # Re-save the markdown with embedded charts
+        with open(md_path, "w", encoding="utf-8") as fh:
+            fh.write(markdown)
+        logger.info("Embedded %d charts into report.", len(chart_paths))
+
+    # Step 4: Generate styled HTML (always, if pandoc is available)
+    html_path = _generate_html(md_path, out / f"{tier.value}_report.html")
+
+    # Step 5: Optional PDF (all tiers)
     pdf_path: str | None = None
     if generate_pdf:
         pdf_path = _generate_pdf(md_path, out / f"{tier.value}_report.pdf")
@@ -3106,9 +3745,11 @@ def generate_report(
     return {
         "markdown": markdown,
         "markdown_path": str(md_path),
+        "html_path": html_path,
         "chart_paths": chart_paths,
         "pdf_path": pdf_path,
         "tier": tier.value,
+        "mode": mode.value,
     }
 
 
@@ -3120,6 +3761,7 @@ def generate_all_reports(
     output_dir: str | Path | None = None,
     generate_pdf: bool = False,
     generate_chart_images: bool = True,
+    mode: ReportMode = ReportMode.RESULTS,
 ) -> dict[str, dict[str, Any]]:
     """Generate all three report tiers (Basic, Pro, Premium) at once.
 
@@ -3137,6 +3779,8 @@ def generate_all_reports(
         If True, generate PDF for all three report tiers.
     generate_chart_images:
         If True, generate chart PNGs (premium report only).
+    mode:
+        Report mode (LEARN or RESULTS) applied to all tiers.
 
     Returns
     -------
@@ -3153,6 +3797,7 @@ def generate_all_reports(
             generate_pdf=generate_pdf,
             generate_chart_images=generate_chart_images,
             tier=tier,
+            mode=mode,
         )
 
     logger.info(

@@ -1,6 +1,6 @@
 # Operator 1 -- Point-in-Time Financial Analysis Pipeline
 
-Institutional-grade equity research powered by free government filing APIs. Covers 10 markets, $91+ trillion in market cap, with 25+ mathematical models and zero data subscription costs.
+Institutional-grade equity research powered by free government filing APIs. Covers 25 markets across 7 regions, $100+ trillion in market cap, with 25+ mathematical models and zero data subscription costs.
 
 ---
 
@@ -8,7 +8,7 @@ Institutional-grade equity research powered by free government filing APIs. Cove
 
 Operator 1 is an open-source equity research pipeline that performs the same type of fundamental and quantitative analysis that institutional investors pay $20,000+/year per Bloomberg Terminal to access -- except it pulls data directly from free government filing APIs and runs everything locally on your machine.
 
-The core idea: every public company in the world is required by law to file financial statements with a government regulator. Those filings are public, free, and immutable (they have a filing date that never changes). Operator 1 taps into those regulatory APIs across 10 global markets, normalizes the data into a single format, runs 25+ quantitative models, and produces a professional investment report.
+The core idea: every public company in the world is required by law to file financial statements with a government regulator. Those filings are public, free, and immutable (they have a filing date that never changes). Operator 1 taps into those regulatory APIs across 25 global markets, normalizes the data into a single format, runs 25+ quantitative models, and produces a professional investment report.
 
 No subscriptions. No paid data feeds. Just government data and math.
 
@@ -19,19 +19,19 @@ No subscriptions. No paid data feeds. Just government data and math.
 You pick a market, search for a company, and Operator 1 runs an 8-step pipeline:
 
 **Step 1 -- Data Source Selection**
-Choose a region and market. The app connects to the corresponding government filing API (SEC EDGAR for the US, EDINET for Japan, DART for Korea, etc.).
+Choose a region and market. The app connects to the corresponding government filing API (SEC EDGAR for the US, J-Quants for Japan, DART for Korea, etc.).
 
 **Step 2 -- Company Profile**
 Fetches the company's identity, sector, industry, and exchange information from the regulatory database.
 
 **Step 3 -- Point-in-Time Financial Data**
-Downloads income statements, balance sheets, and cash flow statements with their original filing dates. Also fetches OHLCV price data. All data is merged using filing dates (not report dates) to prevent look-ahead bias -- the same discipline used by quantitative hedge funds.
+Downloads income statements, balance sheets, and cash flow statements with their original filing dates. Also fetches OHLCV price data via yfinance (and regional providers like pykrx, akshare, jugaad-data, twstock). All data is merged using filing dates (not report dates) to prevent look-ahead bias -- the same discipline used by quantitative hedge funds.
 
 **Step 4 -- Daily Cache Construction**
 Builds a unified time-indexed table where financial statement data is forward-filled onto daily price data using as-of joins. Macroeconomic indicators (GDP, inflation, interest rates, unemployment, FX) from central bank APIs are merged in. Missing values are filled using accounting identities first, then Bayesian Ridge regression or a Variational Autoencoder.
 
 **Step 5 -- Feature Engineering & Analysis**
-Computes 25+ derived financial ratios (margins, coverage ratios, yields, returns). Runs survival mode detection to flag companies in financial distress. Applies fuzzy logic government protection scoring. Calculates financial health scores (0-100) across five tiers: liquidity, solvency, stability, profitability, and growth. Runs ethical filters for purchasing power, leverage, speculation risk, and cash flow quality. Optionally discovers linked entities (competitors, suppliers, customers) via Gemini AI.
+Computes 25+ derived financial ratios (margins, coverage ratios, yields, returns). Runs survival mode detection to flag companies in financial distress. Applies fuzzy logic government protection scoring. Calculates financial health scores (0-100) across five tiers: liquidity, solvency, stability, profitability, and growth. Runs ethical filters for purchasing power, leverage, speculation risk, and cash flow quality. Optionally discovers linked entities (competitors, suppliers, customers) via Gemini or Claude AI.
 
 **Step 6 -- Temporal Modeling**
 Runs 25+ models including:
@@ -55,26 +55,102 @@ Produces three tiers of investment reports:
 - **Pro** (13 sections) -- with peers and macro context
 - **Premium** (22 sections) -- full institutional-grade analysis
 
-Reports are generated via Google Gemini AI for natural language narrative, with a structured template fallback when Gemini is unavailable. Optional PDF output via pandoc.
+Reports are generated via Google Gemini or Anthropic Claude AI for natural language narrative, with a structured template fallback when neither is available. Optional PDF output via pandoc.
 
 ---
 
-## Supported Markets ($91T+ Coverage)
+## Supported Markets ($100T+ Coverage)
 
-| Region | Country | Exchange | Market Cap | Data Source | Macro API | Free? |
-|--------|---------|----------|-----------|-------------|-----------|-------|
-| North America | **United States** | NYSE / NASDAQ | $50T | SEC EDGAR | FRED | Yes |
-| Europe | **United Kingdom** | LSE | $3.18T | Companies House | ONS | Yes |
-| Europe | **European Union** | ESEF (pan-EU) | $8-9T | ESEF / XBRL | ECB SDW | Yes |
-| Europe | **France** | Paris / Euronext | $3.13T | ESEF | INSEE | Yes |
-| Europe | **Germany** | Frankfurt / XETRA | $2.04T | ESEF | Bundesbank | Yes |
-| Asia | **Japan** | Tokyo (JPX) | $6.5T | EDINET | e-Stat | Yes |
-| Asia | **South Korea** | KOSPI / KOSDAQ | $2.5T | DART | KOSIS | Yes |
-| Asia | **Taiwan** | TWSE / TPEX | ~$1.2T | MOPS | DGBAS | Yes |
-| South America | **Brazil** | B3 | $2.2T | CVM | BCB | Yes |
-| South America | **Chile** | Santiago | $0.4T | CMF | BCCh | Yes |
+### Tier 1 -- Core Markets (10)
+
+| Region | Country | Exchange | Market Cap | PIT Data Source | Macro API | Key Required? |
+|--------|---------|----------|-----------|-----------------|-----------|---------------|
+| North America | **United States** | NYSE / NASDAQ | $50T | SEC EDGAR | FRED | Email only |
+| Europe | **United Kingdom** | LSE | $3.18T | Companies House + ixbrl-parse | FRED (UK series) | Yes (free) |
+| Europe | **European Union** | ESEF (pan-EU) | $8-9T | ESEF / XBRL Europe | ECB SDW | No |
+| Europe | **France** | Paris / Euronext | $3.13T | ESEF | ECB SDW | No |
+| Europe | **Germany** | Frankfurt / XETRA | $2.04T | ESEF | ECB SDW | No |
+| Asia | **Japan** | Tokyo (JPX) | $6.5T | J-Quants | FRED (JP series) | Yes (free) |
+| Asia | **South Korea** | KOSPI / KOSDAQ | $2.5T | DART | FRED (KR series) | Yes (free) |
+| Asia | **Taiwan** | TWSE / TPEX | ~$1.2T | MOPS | FRED (TW series) | No |
+| South America | **Brazil** | B3 | $2.2T | CVM | BCB | No |
+| South America | **Chile** | Santiago | $0.4T | CMF | FRED (CL series) | No |
+
+### Tier 2 -- Phase 2 Markets (15)
+
+| Region | Country | Exchange | Market Cap | PIT Data Source | Key Required? |
+|--------|---------|----------|-----------|-----------------|---------------|
+| North America | **Canada** | TSX / TSXV | ~$3T | SEDAR+ | No |
+| Oceania | **Australia** | ASX | ~$1.8T | ASX API | No |
+| Asia | **India** | BSE / NSE | ~$4T | BSE India | No |
+| Asia | **China** | SSE / SZSE | ~$10T | SSE / CSRC | No |
+| Asia | **Hong Kong** | HKEX | ~$4.5T | HKEX | No |
+| Asia | **Singapore** | SGX | ~$0.6T | SGX | No |
+| Latin America | **Mexico** | BMV | ~$0.5T | BMV | No |
+| Africa | **South Africa** | JSE | ~$1T | JSE | No |
+| Europe | **Switzerland** | SIX | ~$1.8T | SIX | No |
+| Europe | **Netherlands** | Euronext Amsterdam | ~$1.2T | ESEF (NL) | No |
+| Europe | **Spain** | BME (Madrid) | ~$0.7T | ESEF (ES) | No |
+| Europe | **Italy** | Borsa Italiana | ~$0.8T | ESEF (IT) | No |
+| Europe | **Sweden** | Nasdaq Stockholm | ~$0.9T | ESEF (SE) | No |
+| Middle East | **Saudi Arabia** | Tadawul | ~$2.7T | Tadawul | No |
+| Middle East | **UAE** | DFM / ADX | ~$0.8T | DFM / ADX | No |
 
 All data sources are free government APIs. No Bloomberg Terminal or paid data subscriptions required.
+
+---
+
+## OHLCV Price Data Providers
+
+| Provider | Markets | Key? | Package |
+|----------|---------|------|---------|
+| yfinance | All 25 markets (fallback) | No | yfinance |
+| pykrx | South Korea (primary) | No | pykrx |
+| akshare | China (primary) | No | akshare |
+| jugaad-data | India (primary) | No | jugaad-data |
+| twstock | Taiwan (primary) | No | twstock |
+
+---
+
+## Macro Economic Data Providers
+
+| Provider | Countries | Key? | Package |
+|----------|-----------|------|---------|
+| FRED | US, UK, JP, KR, TW, CL | Yes (free) | fredapi |
+| World Bank (wbgapi) | All (fallback) | No | wbgapi |
+| BCB | Brazil | No | python-bcb |
+| ECB (SDMX) | EU, FR, DE, NL, ES, IT, SE | No | sdmx1 |
+| Banxico | Mexico | Yes (free) | banxicoapi |
+
+---
+
+## Test Suite
+
+The project has 1000+ tests covering every wrapper and module:
+
+```bash
+# Run all tests (mock-based, no network/API keys needed)
+python3 -m pytest tests/ -v
+
+# Run wrapper tests only
+python3 -m pytest tests/test_ohlcv_*.py tests/test_macro_*.py tests/test_pit_*.py -v
+
+# Run live integration tests (requires API keys in .env)
+python3 -m pytest tests/test_live_wrappers.py -v
+```
+
+| Test Category | Files | Tests |
+|--------------|-------|-------|
+| OHLCV wrappers | 6 files | ~20 |
+| Macro wrappers | 11 files | ~40 |
+| PIT clients (Tier 1) | 8 files | ~50 |
+| PIT clients (Tier 2) | 1 file (batch) | ~30 |
+| Equity provider / PIT registry | 2 files | ~30 |
+| Canonical translator | 1 file | ~10 |
+| LLM wrappers | 4 files | ~25 |
+| UK iXBRL integration | 1 file | 9 |
+| Live integration | 1 file | ~20 (skipped without keys) |
+| Existing tests | 15 files | ~850 |
 
 ---
 
@@ -161,31 +237,6 @@ Every model has a fallback -- if a dependency is missing or data is insufficient
 
 ---
 
-## Output Files
-
-After the pipeline finishes, results are in the `cache/` folder:
-
-```
-cache/
-  company_profile.json          # Complete analysis data (JSON)
-  estimation_coverage.json      # Variable coverage statistics
-  report/
-    basic_report.md             # Quick screening report (5 sections)
-    pro_report.md               # Peer + macro report (13 sections)
-    premium_report.md           # Full institutional report (22 sections)
-    premium_report.pdf          # PDF version (if --pdf flag used)
-    charts/
-      price_history.png         # 2-year price chart with regime shading
-      survival_timeline.png     # Distress period visualization
-      hierarchy_weights.png     # Risk allocation over time
-      volatility.png            # Realized volatility chart
-      financial_health.png      # Composite health score chart
-      predicted_ohlc_week.png   # Predicted candlestick (next week)
-      predicted_ohlc_month.png  # Predicted candlestick (next month)
-```
-
----
-
 ## Architecture
 
 ```
@@ -193,19 +244,51 @@ main.py                     # CLI entry point (8-step pipeline)
 run.py                      # Interactive terminal launcher
 operator1/
   clients/
-    pit_registry.py         # Market registry (10 markets)
+    pit_registry.py         # Market registry (25 markets)
     pit_base.py             # PITClient protocol (filing_date + report_date)
-    us_edgar.py             # US SEC EDGAR (via edgartools + sec-edgar-api)
-    eu_esef_wrapper.py      # EU ESEF/XBRL (via pyesef)
-    uk_ch_wrapper.py        # UK Companies House wrapper
-    jp_edinet_wrapper.py    # Japan EDINET (via edinet-tools)
+    equity_provider.py      # Factory: create_pit_client() for any market
+    us_edgar.py             # US SEC EDGAR (edgartools + direct requests fallback)
+    uk_ch_wrapper.py        # UK Companies House + ixbrl-parse for financial data
+    eu_esef_wrapper.py      # EU ESEF/XBRL Europe (filings.xbrl.org)
+    jp_jquants_wrapper.py   # Japan J-Quants (replaces EDINET)
     kr_dart_wrapper.py      # South Korea DART (via dart-fss)
-    tw_mops_wrapper.py      # Taiwan MOPS scraper wrapper
-    br_cvm_wrapper.py       # Brazil CVM (via pycvm)
-    cl_cmf_wrapper.py       # Chile CMF wrapper
-    canonical_translator.py # Normalizes all filing formats into one schema
-    gemini.py               # Gemini AI (report generation only)
-    claude.py               # Anthropic Claude (alternative LLM)
+    tw_mops_wrapper.py      # Taiwan MOPS scraper
+    br_cvm_wrapper.py       # Brazil CVM
+    cl_cmf_wrapper.py       # Chile CMF
+    ca_sedar.py             # Canada SEDAR+
+    au_asx.py               # Australia ASX
+    in_bse.py               # India BSE
+    cn_sse.py               # China SSE
+    hk_hkex.py              # Hong Kong HKEX
+    sg_sgx.py               # Singapore SGX
+    mx_bmv.py               # Mexico BMV
+    za_jse.py               # South Africa JSE
+    ch_six.py               # Switzerland SIX
+    sa_tadawul.py           # Saudi Arabia Tadawul
+    ae_dfm.py               # UAE DFM
+    ohlcv_yfinance.py       # OHLCV: yfinance (global fallback)
+    ohlcv_pykrx.py          # OHLCV: Korea via pykrx
+    ohlcv_akshare.py        # OHLCV: China via akshare
+    ohlcv_jugaad.py         # OHLCV: India via jugaad-data
+    ohlcv_twstock.py        # OHLCV: Taiwan via twstock
+    ohlcv_provider.py       # OHLCV dispatcher (primary + yfinance fallback)
+    macro_fredapi.py        # Macro: US FRED
+    macro_bcb.py            # Macro: Brazil BCB
+    macro_wbgapi.py         # Macro: World Bank (global fallback)
+    macro_banxico.py        # Macro: Mexico Banxico
+    macro_sdmx.py           # Macro: ECB/EU via SDMX
+    macro_ons.py            # Macro: UK via FRED
+    macro_estat.py          # Macro: Japan via FRED
+    macro_kosis.py          # Macro: Korea via FRED
+    macro_dgbas.py          # Macro: Taiwan via FRED
+    macro_bcch.py           # Macro: Chile via FRED
+    macro_provider.py       # Macro dispatcher (primary + wbgapi fallback)
+    canonical_translator.py # Normalizes all filing formats (US GAAP, IFRS, UK GAAP, FRS 102, etc.)
+    supplement.py           # OpenFIGI, Euronext, JPX, TWSE enrichment
+    gemini.py               # Google Gemini LLM client
+    claude.py               # Anthropic Claude LLM client
+    llm_base.py             # Abstract LLM base class with retry/rate limiting
+    llm_factory.py          # LLM provider factory (auto-detect from keys)
   estimation/
     estimator.py            # Two-pass missing data inference (accounting + ML)
     vae_imputer.py          # Variational Autoencoder imputation option
@@ -261,22 +344,46 @@ config/
 
 ---
 
-## API Keys (All Optional)
+## API Keys
 
-| Key | Purpose | Required? | Where to get it |
-|-----|---------|-----------|-----------------|
-| `GEMINI_API_KEY` | AI report generation (Gemini) | Optional | [ai.google.dev](https://ai.google.dev/) |
-| `ANTHROPIC_API_KEY` | AI report generation (Claude) | Optional | [console.anthropic.com](https://console.anthropic.com/) |
-| `COMPANIES_HOUSE_API_KEY` | UK market data | Optional | [developer.company-information.service.gov.uk](https://developer.company-information.service.gov.uk/) |
-| `DART_API_KEY` | South Korea market data | Optional | [opendart.fss.or.kr](https://opendart.fss.or.kr/) |
+| Key | Purpose | Required? | Cost | Where to get it |
+|-----|---------|-----------|------|-----------------|
+| `EDGAR_IDENTITY` | US SEC EDGAR User-Agent | Recommended | Free | Just your email address |
+| `COMPANIES_HOUSE_API_KEY` | UK Companies House + iXBRL | For UK market | Free | [developer.company-information.service.gov.uk](https://developer.company-information.service.gov.uk/) |
+| `JQUANTS_API_KEY` | Japan J-Quants (JPX) | For JP market | Free | [jpx-jquants.com](https://jpx-jquants.com/login) |
+| `DART_API_KEY` | South Korea DART | For KR market | Free | [opendart.fss.or.kr](https://opendart.fss.or.kr/) |
+| `FRED_API_KEY` | FRED macro data (US, UK, JP, KR, TW, CL) | Recommended | Free | [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html) |
+| `GEMINI_API_KEY` | AI report generation (Gemini) | Optional | Free | [ai.google.dev](https://ai.google.dev/) |
+| `ANTHROPIC_API_KEY` | AI report generation (Claude) | Optional | Paid | [console.anthropic.com](https://console.anthropic.com/) |
+| `BANXICO_API_TOKEN` | Mexico macro data | For MX market | Free | [banxico.org.mx](https://www.banxico.org.mx/SieAPIRest/service/v1/) |
 
-Without any keys, the pipeline works for most markets using free community wrapper libraries.
+Without any keys, the pipeline works for US (SEC EDGAR needs only an email), EU, Taiwan, Brazil, Chile, and all Phase 2 markets using free APIs. World Bank (wbgapi) provides macro data as a zero-key fallback for all countries.
 
 ---
 
 ## Running the App
 
 For detailed setup and usage instructions, see [HOW-TO-RUN.md](HOW-TO-RUN.md).
+
+Quick start:
+
+```bash
+# Clone and setup
+git clone https://github.com/sos0240/github-is-mean.git
+cd github-is-mean
+python3 -m venv venv && source venv/bin/activate
+pip install --timeout 300 -r requirements.txt
+
+# Copy and edit API keys
+cp .env.example .env
+nano .env  # Add your keys
+
+# Run interactive mode
+python3 run.py
+
+# Or direct command
+python3 main.py --market us_sec_edgar --company AAPL
+```
 
 ---
 

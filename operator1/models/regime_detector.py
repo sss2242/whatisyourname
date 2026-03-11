@@ -178,42 +178,75 @@ class RegimeDetector:
             self._result.hmm_error = msg
             return None, None
 
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                model = GaussianHMM(
-                    n_components=self.n_regimes,
-                    covariance_type="full",
-                    n_iter=200,
-                    random_state=self.random_state,
-                    verbose=False,
+        # Add small regularization to prevent singular covariance matrices.
+        # Near-zero variance in one feature (e.g., very low-vol regime)
+        # can cause 'covars must be symmetric, positive-definite' errors.
+        _epsilon = 1e-6
+        X_clean = X_clean + np.random.default_rng(self.random_state).normal(
+            0, _epsilon, size=X_clean.shape
+        )
+
+        # Try full covariance first, fall back to diagonal if singular.
+        for cov_type in ("full", "diag"):
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    model = GaussianHMM(
+                        n_components=self.n_regimes,
+                        covariance_type=cov_type,
+                        n_iter=200,
+                        random_state=self.random_state,
+                        verbose=False,
+                    )
+                    model.fit(X_clean)
+
+                regimes = model.predict(X_clean)
+                probs = model.predict_proba(X_clean)
+
+                # Forward-fill any NaN regime labels from warmup period
+                # so no days are left unlabeled in downstream modules.
+                if len(regimes) > 0:
+                    first_valid = 0
+                    for i in range(len(regimes)):
+                        if not np.isnan(regimes[i]):
+                            first_valid = i
+                            break
+                    if first_valid > 0:
+                        regimes[:first_valid] = regimes[first_valid]
+                        probs[:first_valid] = probs[first_valid]
+
+                self._hmm_model = model
+                self._result.hmm_regimes = regimes
+                self._result.hmm_probs = probs
+                self._result.hmm_fitted = True
+
+                monitor = getattr(model, "monitor_", None)
+                converged = getattr(monitor, "converged", "unknown") if monitor is not None else "unknown"
+                logger.info(
+                    "HMM fit: %d regimes, %d observations, cov=%s, converged=%s",
+                    self.n_regimes,
+                    len(X_clean),
+                    cov_type,
+                    converged,
                 )
-                model.fit(X_clean)
+                return regimes, probs
 
-            regimes = model.predict(X_clean)
-            probs = model.predict_proba(X_clean)
+            except Exception as exc:
+                if cov_type == "full":
+                    logger.info(
+                        "HMM full covariance failed (%s), retrying with diagonal covariance",
+                        exc,
+                    )
+                    continue
+                msg = f"HMM fitting failed: {exc}"
+                logger.warning(msg)
+                self._result.hmm_error = msg
+                return None, None
 
-            self._hmm_model = model
-            self._result.hmm_regimes = regimes
-            self._result.hmm_probs = probs
-            self._result.hmm_fitted = True
-
-            # ConvergenceMonitor is an object, not a dict; use getattr.
-            monitor = getattr(model, "monitor_", None)
-            converged = getattr(monitor, "converged", "unknown") if monitor is not None else "unknown"
-            logger.info(
-                "HMM fit: %d regimes, %d observations, converged=%s",
-                self.n_regimes,
-                len(X_clean),
-                converged,
-            )
-            return regimes, probs
-
-        except Exception as exc:
-            msg = f"HMM fitting failed: {exc}"
-            logger.warning(msg)
-            self._result.hmm_error = msg
-            return None, None
+        msg = "HMM fitting failed: all covariance types exhausted"
+        logger.warning(msg)
+        self._result.hmm_error = msg
+        return None, None
 
     # ------------------------------------------------------------------
     # GMM
@@ -526,13 +559,29 @@ def _order_regimes_by_mean_return(
     regimes: np.ndarray,
     returns_clean: np.ndarray,
     n_regimes: int,
+    *,
+    has_volatility_info: bool = True,
 ) -> dict[int, str]:
     """Map regime integers to labels ordered by mean return.
 
     Lowest mean return -> "bear", highest -> "bull".  Intermediate
-    regimes are labelled by volatility.
+    regimes are labelled by volatility when the model used volatility
+    features (HMM), or by return magnitude when it didn't (GMM).
+
+    Parameters
+    ----------
+    has_volatility_info:
+        True for HMM (which uses returns + volatility features),
+        False for GMM (which uses returns only).  When False,
+        intermediate labels use "low_return"/"moderate_return"
+        instead of the misleading "low_vol"/"high_vol".
     """
-    label_pool = ["bear", "low_vol", "high_vol", "bull"]
+    if has_volatility_info:
+        label_pool = ["bear", "low_vol", "high_vol", "bull"]
+    else:
+        # GMM only sees returns, so "low_vol"/"high_vol" labels are
+        # misleading -- use return-based labels instead.
+        label_pool = ["bear", "low_return", "moderate_return", "bull"]
     if n_regimes > len(label_pool):
         # Extend with generic names for extra regimes.
         for i in range(len(label_pool), n_regimes):
@@ -707,7 +756,8 @@ def detect_regimes_and_breaks(
         returns_clean = returns[valid_both]
 
         label_map = _order_regimes_by_mean_return(
-            hmm_regimes, returns_clean, n_regimes
+            hmm_regimes, returns_clean, n_regimes,
+            has_volatility_info=True,
         )
         cache["regime_label"] = cache["regime_hmm"].map(label_map)
         logger.info("Regime label mapping: %s", label_map)
@@ -715,7 +765,8 @@ def detect_regimes_and_breaks(
     elif gmm_regimes is not None:
         returns_clean = returns[valid_ret]
         label_map = _order_regimes_by_mean_return(
-            gmm_regimes, returns_clean, n_regimes
+            gmm_regimes, returns_clean, n_regimes,
+            has_volatility_info=False,
         )
         cache["regime_label"] = cache["regime_gmm"].map(label_map)
         logger.info("Regime label mapping (from GMM fallback): %s", label_map)
@@ -747,3 +798,108 @@ def _add_empty_regime_columns(cache: pd.DataFrame, n_regimes: int) -> None:
     cache["breakpoint_method"] = ""
     for r in range(n_regimes):
         cache[f"regime_hmm_prob_{r}"] = np.nan
+
+
+# ---------------------------------------------------------------------------
+# Early regime detection (Step 5.5 bridge)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EarlyRegimeResult:
+    """Lightweight result from early regime detection for the enriched survival timeline."""
+
+    regime_labels: pd.Series | None = None
+    regime_confidence: pd.Series | None = None
+    detector: RegimeDetector | None = None
+    fitted: bool = False
+    error: str | None = None
+
+
+def run_early_regime_detection(
+    cache: pd.DataFrame,
+    *,
+    n_regimes: int = DEFAULT_N_REGIMES,
+    pelt_penalty: float = DEFAULT_PELT_PENALTY,
+    bcp_hazard_lambda: float = 200.0,
+    bcp_threshold: float = 0.5,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, EarlyRegimeResult]:
+    """Run regime detection early in the pipeline (Step 5.5).
+
+    This is a wrapper around ``detect_regimes_and_breaks()`` that also
+    extracts the regime labels and confidence series needed by the
+    enriched survival timeline.
+
+    The full regime columns (``regime_hmm``, ``regime_gmm``, ``regime_label``,
+    ``structural_break``, etc.) are added to the cache by the underlying
+    ``detect_regimes_and_breaks()`` call, so Step 6 does not need to re-run
+    regime detection.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache DataFrame with ``return_1d`` and ``volatility_21d``.
+    n_regimes, pelt_penalty, bcp_hazard_lambda, bcp_threshold, random_state:
+        Passed through to ``detect_regimes_and_breaks()``.
+
+    Returns
+    -------
+    (cache, early_result)
+        The mutated cache and an ``EarlyRegimeResult`` with regime_labels
+        and regime_confidence Series aligned to the cache index.
+    """
+    early = EarlyRegimeResult()
+
+    try:
+        cache, detector = detect_regimes_and_breaks(
+            cache,
+            n_regimes=n_regimes,
+            pelt_penalty=pelt_penalty,
+            bcp_hazard_lambda=bcp_hazard_lambda,
+            bcp_threshold=bcp_threshold,
+            random_state=random_state,
+        )
+        early.detector = detector
+
+        # Extract regime labels as a string Series.
+        # IMPORTANT: The ordering below matters -- astype(str) first converts
+        # NaN to the literal string "nan", then .where() replaces those
+        # positions with "unknown" using the *original* NaN mask.  Do NOT
+        # refactor to labels.fillna("unknown").astype(str) -- that would
+        # skip the mask check and could leak "nan" strings if dtype changes.
+        if "regime_label" in cache.columns:
+            labels = cache["regime_label"].copy()
+            if labels.notna().any():
+                early.regime_labels = labels.astype(str).where(labels.notna(), "unknown")
+            else:
+                early.regime_labels = pd.Series("unknown", index=cache.index)
+        else:
+            early.regime_labels = pd.Series("unknown", index=cache.index)
+
+        # Safety net: replace any lingering "nan" strings that might leak
+        # through unexpected code paths (e.g., mixed-type Series edge cases).
+        early.regime_labels = early.regime_labels.replace("nan", "unknown")
+
+        # Extract max HMM posterior as regime confidence.
+        prob_cols = [c for c in cache.columns if c.startswith("regime_hmm_prob_")]
+        if prob_cols:
+            prob_df = cache[prob_cols]
+            if prob_df.notna().any().any():
+                early.regime_confidence = prob_df.max(axis=1)
+            else:
+                early.regime_confidence = pd.Series(0.5, index=cache.index)
+        else:
+            early.regime_confidence = pd.Series(0.5, index=cache.index)
+
+        early.fitted = True
+        logger.info("Early regime detection complete for enriched survival timeline")
+
+    except Exception as exc:
+        early.error = f"Early regime detection failed: {exc}"
+        logger.warning(early.error)
+        # Provide safe defaults so enriched timeline can still run.
+        early.regime_labels = pd.Series("unknown", index=cache.index)
+        early.regime_confidence = pd.Series(0.5, index=cache.index)
+
+    return cache, early

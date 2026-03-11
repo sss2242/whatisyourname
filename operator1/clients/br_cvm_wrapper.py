@@ -84,21 +84,32 @@ class BRCvmClient:
         return "Brazil (B3) -- CVM"
 
     def list_companies(self, query: str = "") -> list[dict[str, Any]]:
+        """Fetch company list from CVM CSV registry (replaces dead /api/v1/)."""
+        import io
+        import csv
+
         try:
-            data = cached_get(
-                f"{_CVM_BASE}/cia_aberta",
-                params={"$top": 500, "$format": "json"},
+            import requests
+            r = requests.get(
+                f"{_CVM_DATASET_BASE}/CAD/DADOS/cad_cia_aberta.csv",
+                timeout=30,
                 headers=self._headers,
             )
-            items = data.get("value", []) if isinstance(data, dict) else []
-        except Exception:
+            r.raise_for_status()
+            reader = csv.DictReader(io.StringIO(r.text), delimiter=";")
+            items = [row for row in reader if row.get("SIT") == "ATIVO"]
+        except Exception as exc:
+            logger.warning("CVM CSV fetch failed: %s", exc)
             items = []
 
         companies = []
         for item in items:
+            legal_name = item.get("DENOM_SOCIAL", "") or ""
+            commercial_name = item.get("DENOM_COMERC", "") or ""
             companies.append({
                 "ticker": item.get("CD_CVM", "") or item.get("CNPJ_CIA", ""),
-                "name": item.get("DENOM_SOCIAL", "") or item.get("DENOM_COMERC", ""),
+                "name": legal_name or commercial_name,
+                "name_commercial": commercial_name,
                 "cik": item.get("CD_CVM", ""),
                 "cnpj": item.get("CNPJ_CIA", ""),
                 "exchange": "B3",
@@ -106,9 +117,19 @@ class BRCvmClient:
                 "market_id": self.market_id,
             })
 
+        logger.debug("CVM registry loaded: %d active companies", len(companies))
+
         if query:
             q = query.lower()
-            companies = [c for c in companies if q in c["name"].lower() or q in c["ticker"].lower()]
+            # Match against legal name, commercial name, CVM code, and CNPJ
+            companies = [
+                c for c in companies
+                if q in c["name"].lower()
+                or q in c.get("name_commercial", "").lower()
+                or q in c["ticker"].lower()
+                or q in c.get("cnpj", "").lower()
+            ]
+            logger.debug("CVM search '%s': %d matches", query, len(companies))
         return companies
 
     def search_company(self, name: str) -> list[dict[str, Any]]:
@@ -120,6 +141,21 @@ class BRCvmClient:
             return cached
 
         matches = self.list_companies(query=identifier)
+
+        # B3 tickers (e.g. PETR4, VALE3, ITUB4) use a 4-letter base + share
+        # class digit.  CVM registry doesn't store B3 tickers, so strip the
+        # trailing digit(s) and retry as a name search.
+        if not matches and identifier.strip() and identifier[-1].isdigit():
+            import re
+            base = re.sub(r"\d+$", "", identifier).strip()
+            if len(base) >= 3:
+                matches = self.list_companies(query=base)
+                if matches:
+                    logger.info(
+                        "Resolved B3 ticker '%s' -> CVM company '%s' (CD_CVM=%s)",
+                        identifier, matches[0].get("name"), matches[0].get("cik"),
+                    )
+
         if not matches:
             raise BRCvmError("get_profile", f"Company not found: {identifier}")
 

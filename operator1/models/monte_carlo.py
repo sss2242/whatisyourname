@@ -440,12 +440,19 @@ def evolve_variables(
     return_paths: np.ndarray,
     initial_values: dict[str, float],
     variable_sensitivities: dict[str, float] | None = None,
+    variable_frequencies: dict[str, str] | None = None,
 ) -> dict[str, np.ndarray]:
     """Evolve survival-trigger variables along simulated return paths.
 
     Uses a simplified model where each variable evolves as a function
     of cumulative returns.  The ``variable_sensitivities`` dict maps
     each variable to its beta (sensitivity) to the return path.
+
+    **Frequency-aware evolution**: quarterly/annual variables (like
+    ``current_ratio``, ``fcf_yield``) are updated only at estimated
+    filing intervals (~63 days for quarterly, ~252 for annual), holding
+    the previous value between filings.  This prevents the unrealistic
+    daily jitter that overstates short-horizon survival risk.
 
     Parameters
     ----------
@@ -457,6 +464,11 @@ def evolve_variables(
         ``{variable_name: beta}``.  Positive beta means the variable
         moves with returns; negative means inversely.  If ``None``,
         sensible defaults are used.
+    variable_frequencies:
+        ``{variable_name: frequency}``.  Frequency is one of
+        ``"daily"``, ``"quarterly"``, ``"annual"``.  If ``None``,
+        defaults are used: ``drawdown_252d`` is daily, others are
+        quarterly.
 
     Returns
     -------
@@ -475,6 +487,22 @@ def evolve_variables(
             "drawdown_252d": 1.0,
         }
 
+    if variable_frequencies is None:
+        # Default frequencies: drawdown is daily, financial ratios are quarterly.
+        variable_frequencies = {
+            "current_ratio": "quarterly",
+            "debt_to_equity_abs": "quarterly",
+            "fcf_yield": "quarterly",
+            "drawdown_252d": "daily",
+        }
+
+    # Filing intervals in trading days.
+    _FILING_INTERVALS = {
+        "daily": 1,
+        "quarterly": 63,  # ~3 months of trading days
+        "annual": 252,
+    }
+
     n_paths, n_steps = return_paths.shape
     result: dict[str, np.ndarray] = {}
 
@@ -486,6 +514,8 @@ def evolve_variables(
             continue
 
         init_val = initial_values[var_name]
+        freq = variable_frequencies.get(var_name, "daily")
+        filing_interval = _FILING_INTERVALS.get(freq, 1)
 
         if var_name == "drawdown_252d":
             # Drawdown is special: track running max and compute drawdown.
@@ -495,9 +525,27 @@ def evolve_variables(
             drawdowns = (price_paths / np.maximum(running_max, 1e-12)) - 1.0
             # Combine with initial drawdown (take the worse of the two).
             result[var_name] = np.minimum(drawdowns, init_val)
+        elif filing_interval > 1:
+            # Frequency-aware evolution: update only at filing intervals.
+            # Between filings, hold the last reported value constant.
+            scale = max(abs(init_val), 1e-6)
+            evolved = np.full((n_paths, n_steps), init_val)
+            for t in range(n_steps):
+                if t > 0 and t % filing_interval == 0:
+                    # Filing day: update based on cumulative returns since
+                    # last filing.
+                    prev_filing_t = t - filing_interval
+                    if prev_filing_t >= 0:
+                        cum_since_filing = cum_returns[:, t] - cum_returns[:, prev_filing_t]
+                    else:
+                        cum_since_filing = cum_returns[:, t]
+                    evolved[:, t] = evolved[:, max(0, t - 1)] + beta * cum_since_filing * scale
+                elif t > 0:
+                    # Non-filing day: carry forward previous value.
+                    evolved[:, t] = evolved[:, t - 1]
+            result[var_name] = evolved
         else:
-            # Linear sensitivity model.
-            # Variable evolves as: init + beta * cum_return * |init|
+            # Daily evolution: original linear sensitivity model.
             scale = max(abs(init_val), 1e-6)
             noise = cum_returns * beta * scale
             result[var_name] = init_val + noise

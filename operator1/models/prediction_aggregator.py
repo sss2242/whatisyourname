@@ -4,6 +4,26 @@ Consumes outputs from T6.1 (regime detection), T6.2 (forecasting models),
 and T6.3 (Monte Carlo simulations) to produce unified, multi-horizon
 predictions with uncertainty bands and Technical Alpha protection.
 
+Additionally integrates optional results from sibling modules when
+available, falling back to the base behaviour when they are not:
+
+- **Conformal prediction intervals** (``ConformalResult``) replace the
+  Gaussian RMSE-based bands with distribution-free calibrated intervals.
+- **Dual regime probabilities** (``DualRegimeResult``) enable soft
+  regime-weighted ensemble blending instead of hard label switching.
+- **Copula tail dependencies** (``CopulaResult``) widen uncertainty
+  bands for variables with high joint crisis probability.
+- **DTW historical analogs** (``DTWAnalogResult``) provide an
+  independent empirical forecast channel.
+- **Granger causal structure** (``GrangerResult``) propagates forecast
+  adjustments from causal drivers to dependent variables.
+- **SHAP explanations** (``SHAPResult``) attach interpretability
+  narratives to each prediction.
+- **Walk-forward diagnostics** (``WalkForwardResult``) enable
+  recency-weighted ensemble RMSE.
+- **Kalman/Particle fusion** via model synergies for regime-conditional
+  state estimation blending.
+
 **Key features:**
 
 1. **Ensemble weighting**: inverse-RMSE weighting across all models that
@@ -13,9 +33,10 @@ predictions with uncertainty bands and Technical Alpha protection.
 2. **Multi-horizon predictions**: aggregated point forecasts for 1d, 5d,
    21d, and 252d horizons.
 
-3. **Uncertainty bands**: confidence intervals derived from model RMSE
-   scaled by the square root of horizon (standard financial assumption),
-   optionally widened when Monte Carlo survival probability is low.
+3. **Uncertainty bands**: confidence intervals derived from conformal
+   calibration (preferred) or model RMSE scaled by the square root of
+   horizon (fallback), optionally widened when Monte Carlo survival
+   probability is low or copula tail dependence is high.
 
 4. **Technical Alpha protection**: next-day OHLC predictions are masked
    (set to ``None``) except for the Low estimate, per Sec 17 of the spec.
@@ -25,9 +46,10 @@ predictions with uncertainty bands and Technical Alpha protection.
    ``cache/prediction_summary.json``.
 
 Top-level entry point:
-  ``run_prediction_aggregation(cache, forecast_result, mc_result)``
+  ``run_prediction_aggregation(cache, forecast_result, mc_result, ...)``
 
-Spec refs: Sec 17
+Spec refs: Sec 17, Phase F (conformal), Sec K (regime mixer),
+           Sec E.2 Category 3 (copula), Sec E.2 Category 4 (GA)
 """
 
 from __future__ import annotations
@@ -53,6 +75,44 @@ from operator1.models.forecasting import (
     ModelMetrics,
 )
 from operator1.models.monte_carlo import MonteCarloResult
+
+# Optional result types -- imported lazily in functions to avoid hard
+# dependencies, but declared here for type annotations.
+try:
+    from operator1.models.conformal import ConformalInterval, ConformalResult
+except ImportError:  # pragma: no cover
+    ConformalResult = None  # type: ignore[assignment,misc]
+    ConformalInterval = None  # type: ignore[assignment,misc]
+
+try:
+    from operator1.models.regime_mixer import DualRegimeResult
+except ImportError:  # pragma: no cover
+    DualRegimeResult = None  # type: ignore[assignment,misc]
+
+try:
+    from operator1.models.copula import CopulaResult
+except ImportError:  # pragma: no cover
+    CopulaResult = None  # type: ignore[assignment,misc]
+
+try:
+    from operator1.models.dtw_analogs import DTWAnalogResult
+except ImportError:  # pragma: no cover
+    DTWAnalogResult = None  # type: ignore[assignment,misc]
+
+try:
+    from operator1.models.granger_causality import GrangerResult
+except ImportError:  # pragma: no cover
+    GrangerResult = None  # type: ignore[assignment,misc]
+
+try:
+    from operator1.models.explainability import SHAPResult
+except ImportError:  # pragma: no cover
+    SHAPResult = None  # type: ignore[assignment,misc]
+
+try:
+    from operator1.models.walk_forward import WalkForwardResult
+except ImportError:  # pragma: no cover
+    WalkForwardResult = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +176,14 @@ class HorizonPrediction:
     ensemble_weight: float = 0.0  # weight this model got
     survival_adjusted: bool = False  # whether survival prob was factored in
 
+    # --- New fields from full-potential upgrade ---
+    interval_source: str = "rmse"  # "conformal" or "rmse"
+    explanation: str = ""  # SHAP narrative for this prediction
+    top_drivers: list[str] = field(default_factory=list)  # top feature names
+    analog_forecast: float | None = None  # DTW empirical forecast if available
+    causal_adjustment: float = 0.0  # adjustment from Granger propagation
+    regime_blend_applied: bool = False  # True if soft regime blending was used
+
 
 @dataclass
 class TechnicalAlphaMask:
@@ -170,6 +238,15 @@ class PredictionAggregatorResult:
     # Error info.
     error: str | None = None
     fitted: bool = False
+
+    # --- New fields from full-potential upgrade ---
+    conformal_coverage: float | None = None  # coverage level if conformal used
+    copula_tail_risk: float = 0.0  # joint crisis probability from copula
+    dtw_analogs_used: int = 0  # number of DTW analogs contributing
+    granger_adjustments_applied: int = 0  # number of causal propagations
+    regime_blend_method: str = ""  # "hard_label" or "soft_probability"
+    recency_weighted_rmse_used: bool = False  # True if walk-forward recency applied
+    shap_available: bool = False  # True if SHAP explanations were attached
 
 
 # ---------------------------------------------------------------------------
@@ -316,18 +393,25 @@ def optimise_ensemble_weights_ga(
 
 def aggregate_forecasts(
     forecast_result: ForecastResult,
+    forward_pass_result: Any = None,
 ) -> dict[str, dict[str, float]]:
     """Extract aggregated point forecasts per variable per horizon.
 
-    In the current architecture, ``ForecastResult.forecasts`` already
-    contains the best model's prediction for each variable (selected by
-    the fallback chain in ``run_forecasting``).  This function passes
-    them through with validation.
+    In the current architecture, ``ForecastResult.forecasts`` contains
+    the best model's prediction from the fallback chain.  When a
+    ``ForwardPassResult`` with model states is available, we blend the
+    forward pass ensemble predictions into the point forecasts using
+    a 70/30 weighting (70% fallback-chain winner, 30% forward-pass
+    ensemble) to incorporate the online-learned model states.
 
     Parameters
     ----------
     forecast_result:
         Output from ``run_forecasting``.
+    forward_pass_result:
+        Optional ``ForwardPassResult`` from ``run_forward_pass``.
+        If provided and model states are available, their last
+        predictions are blended into the aggregated forecasts.
 
     Returns
     -------
@@ -335,12 +419,33 @@ def aggregate_forecasts(
     """
     aggregated: dict[str, dict[str, float]] = {}
 
+    # Extract forward-pass model state predictions if available.
+    fp_predictions: dict[str, float] = {}
+    if forward_pass_result is not None:
+        model_states = getattr(forward_pass_result, "model_states", {})
+        for var_name, wrapper in model_states.items():
+            try:
+                pred = wrapper.predict(np.array([0.0]))
+                if len(pred) > 0 and not np.isnan(pred[0]):
+                    fp_predictions[var_name] = float(pred[0])
+            except Exception:
+                pass
+
     for var_name, horizons in forecast_result.forecasts.items():
         var_forecasts: dict[str, float] = {}
 
         for h_label, value in horizons.items():
-            if not math.isnan(value):
-                var_forecasts[h_label] = value
+            if math.isnan(value):
+                continue
+
+            # Blend with forward-pass ensemble prediction for the 1d
+            # horizon (model states predict one step ahead).
+            if h_label == "1d" and var_name in fp_predictions:
+                fp_val = fp_predictions[var_name]
+                # 70% fallback-chain winner, 30% online-learned ensemble.
+                value = 0.7 * value + 0.3 * fp_val
+
+            var_forecasts[h_label] = value
 
         if var_forecasts:
             aggregated[var_name] = var_forecasts
@@ -543,6 +648,536 @@ def apply_technical_alpha_mask(
     return mask
 
 
+# ===========================================================================
+# Phase 1: Conformal interval integration
+# ===========================================================================
+
+
+def get_conformal_interval(
+    variable: str,
+    horizon: str,
+    conformal_result: Any | None,
+) -> tuple[float, float, bool]:
+    """Try to extract a conformal prediction interval for a variable/horizon.
+
+    Parameters
+    ----------
+    variable:
+        Variable name.
+    horizon:
+        Horizon label (e.g. ``"1d"``).
+    conformal_result:
+        ``ConformalResult`` instance (or None).
+
+    Returns
+    -------
+    (lower, upper, used_conformal)
+        If a conformal interval is available with sufficient calibration,
+        return its bounds and ``True``.  Otherwise ``(nan, nan, False)``.
+    """
+    if conformal_result is None:
+        return float("nan"), float("nan"), False
+
+    try:
+        intervals = conformal_result.intervals
+    except AttributeError:
+        return float("nan"), float("nan"), False
+
+    var_intervals = intervals.get(variable, {})
+    ci = var_intervals.get(horizon)
+    if ci is None:
+        return float("nan"), float("nan"), False
+
+    # Require minimum calibration size for trustworthy intervals.
+    cal_size = getattr(ci, "calibration_size", 0)
+    if cal_size < 20:
+        logger.debug(
+            "Conformal interval for %s/%s has only %d calibration samples "
+            "(need 20) -- falling back to RMSE",
+            variable, horizon, cal_size,
+        )
+        return float("nan"), float("nan"), False
+
+    lower = getattr(ci, "lower", float("nan"))
+    upper = getattr(ci, "upper", float("nan"))
+
+    if math.isnan(lower) or math.isnan(upper):
+        return float("nan"), float("nan"), False
+
+    return lower, upper, True
+
+
+# ===========================================================================
+# Phase 2: Regime probability blending
+# ===========================================================================
+
+
+def compute_regime_blended_weights(
+    base_weights: dict[str, float],
+    dual_regime_result: Any | None,
+    model_regime_affinity: dict[str, dict[str, float]] | None = None,
+) -> tuple[dict[str, float], bool]:
+    """Compute soft-blended ensemble weights using regime probabilities.
+
+    Instead of switching weights based on a single hard regime label, this
+    uses the continuous probability distribution over regimes to produce a
+    smooth blend.
+
+    Parameters
+    ----------
+    base_weights:
+        Default inverse-RMSE or survival-aware weights.
+    dual_regime_result:
+        ``DualRegimeResult`` with ``market_regime_probs`` and/or
+        ``fund_regime_probs`` DataFrames.  Each row is a day, columns are
+        regime names with probability values.
+    model_regime_affinity:
+        Optional mapping ``{model_name: {regime_name: affinity_score}}``.
+        Higher affinity means the model is better in that regime.
+        If None, a default affinity mapping is used.
+
+    Returns
+    -------
+    (blended_weights, was_applied)
+    """
+    if dual_regime_result is None:
+        return base_weights, False
+
+    # Extract latest regime probabilities.
+    market_probs: dict[str, float] = {}
+    fund_probs: dict[str, float] = {}
+
+    try:
+        mrp = dual_regime_result.market_regime_probs
+        if mrp is not None and len(mrp) > 0:
+            last_row = mrp.iloc[-1]
+            market_probs = {col: float(last_row[col]) for col in mrp.columns
+                           if not math.isnan(float(last_row[col]))}
+    except Exception:
+        pass
+
+    try:
+        frp = dual_regime_result.fund_regime_probs
+        if frp is not None and len(frp) > 0:
+            last_row = frp.iloc[-1]
+            fund_probs = {col: float(last_row[col]) for col in frp.columns
+                          if not math.isnan(float(last_row[col]))}
+    except Exception:
+        pass
+
+    if not market_probs and not fund_probs:
+        return base_weights, False
+
+    # Default model-regime affinity: simple heuristics.
+    # Models with "kalman"/"var" in the name are better in calm regimes;
+    # models with "tree"/"xgboost" handle non-linearity (turbulent) better.
+    if model_regime_affinity is None:
+        model_regime_affinity = {}
+        for model_name in base_weights:
+            name_lower = model_name.lower()
+            affinity: dict[str, float] = {}
+            if "kalman" in name_lower or "var" in name_lower or "ema" in name_lower:
+                affinity = {"bull": 1.2, "low_vol": 1.2, "bear": 0.8,
+                            "high_vol": 0.8, "healthy": 1.1, "stressed": 0.9,
+                            "distress": 0.7}
+            elif "tree" in name_lower or "xgb" in name_lower or "forest" in name_lower:
+                affinity = {"bull": 0.9, "low_vol": 0.9, "bear": 1.2,
+                            "high_vol": 1.3, "healthy": 1.0, "stressed": 1.1,
+                            "distress": 1.2}
+            elif "garch" in name_lower:
+                affinity = {"bull": 0.8, "low_vol": 0.8, "bear": 1.1,
+                            "high_vol": 1.4, "healthy": 0.9, "stressed": 1.1,
+                            "distress": 1.1}
+            else:
+                affinity = {r: 1.0 for r in list(market_probs.keys()) + list(fund_probs.keys())}
+            model_regime_affinity[model_name] = affinity
+
+    # Compute blended weights: for each model, multiply base weight by
+    # the probability-weighted affinity score.
+    all_probs = {**market_probs, **fund_probs}
+    blended: dict[str, float] = {}
+
+    for model_name, base_w in base_weights.items():
+        affinity = model_regime_affinity.get(model_name, {})
+        score = 0.0
+        total_prob = 0.0
+        for regime, prob in all_probs.items():
+            aff = affinity.get(regime, 1.0)
+            score += prob * aff
+            total_prob += prob
+        if total_prob > 0:
+            score /= total_prob
+        else:
+            score = 1.0
+        blended[model_name] = base_w * score
+
+    # Normalise.
+    total = sum(blended.values())
+    if total > 0:
+        blended = {k: v / total for k, v in blended.items()}
+
+    return blended, True
+
+
+# ===========================================================================
+# Phase 3: Copula tail risk adjustment
+# ===========================================================================
+
+# Threshold above which copula joint crisis probability triggers band widening.
+COPULA_CRISIS_THRESHOLD: float = 0.10
+
+
+def compute_copula_tail_adjustment(
+    variable: str,
+    copula_result: Any | None,
+    *,
+    crisis_threshold: float = COPULA_CRISIS_THRESHOLD,
+    max_widening: float = 2.0,
+) -> float:
+    """Compute a band-widening multiplier from copula tail dependencies.
+
+    When copula analysis shows high joint crisis probability (multiple
+    variables crashing together), the uncertainty bands for all correlated
+    variables should be widened.
+
+    Parameters
+    ----------
+    variable:
+        Variable being predicted.
+    copula_result:
+        ``CopulaResult`` instance (or None).
+    crisis_threshold:
+        Joint crisis probability above which widening starts.
+    max_widening:
+        Maximum multiplier (caps the widening).
+
+    Returns
+    -------
+    Multiplier >= 1.0.  1.0 means no widening.
+    """
+    if copula_result is None:
+        return 1.0
+
+    try:
+        jcp = copula_result.joint_crisis_probability
+    except AttributeError:
+        return 1.0
+
+    if math.isnan(jcp) or jcp <= crisis_threshold:
+        return 1.0
+
+    # Check if this variable has high tail dependence with others.
+    try:
+        tail_deps = copula_result.tail_dependence
+    except AttributeError:
+        tail_deps = {}
+
+    # Find max tail dependence involving this variable.
+    max_tail = 0.0
+    for pair_key, dep_val in tail_deps.items():
+        if variable in str(pair_key):
+            max_tail = max(max_tail, dep_val)
+
+    # Widening proportional to joint crisis probability and tail dependence.
+    # Scale: jcp in [threshold, 1.0] -> factor in [1.0, max_widening].
+    crisis_excess = (jcp - crisis_threshold) / (1.0 - crisis_threshold + 1e-10)
+    tail_factor = max(max_tail, 0.3)  # floor at 0.3 so all vars get some widening
+    widening = 1.0 + crisis_excess * tail_factor * (max_widening - 1.0)
+
+    return min(widening, max_widening)
+
+
+# ===========================================================================
+# Phase 4: DTW analog ensemble channel
+# ===========================================================================
+
+
+def compute_dtw_analog_forecast(
+    variable: str,
+    last_value: float,
+    dtw_result: Any | None,
+    horizon_label: str,
+) -> tuple[float | None, float | None, float | None]:
+    """Derive an empirical forecast from DTW historical analogs.
+
+    Maps the analog's empirical return distribution onto the variable's
+    last observed value.
+
+    Parameters
+    ----------
+    variable:
+        Variable name (used for logging only -- analogs are price-based).
+    last_value:
+        Last observed value for the variable.
+    dtw_result:
+        ``DTWAnalogResult`` instance (or None).
+    horizon_label:
+        Horizon label (e.g. ``"1d"``).
+
+    Returns
+    -------
+    (analog_point, analog_lower, analog_upper) or (None, None, None)
+    if analogs are not available.
+    """
+    if dtw_result is None or not getattr(dtw_result, "available", False):
+        return None, None, None
+
+    analogs = getattr(dtw_result, "analogs", [])
+    if not analogs:
+        return None, None, None
+
+    if math.isnan(last_value) or last_value == 0:
+        return None, None, None
+
+    # Use the empirical return distribution from the analog result.
+    emp_mean = getattr(dtw_result, "empirical_return_mean", 0.0)
+    emp_p5 = getattr(dtw_result, "empirical_return_p5", 0.0)
+    emp_p95 = getattr(dtw_result, "empirical_return_p95", 0.0)
+
+    if math.isnan(emp_mean):
+        return None, None, None
+
+    # Scale by horizon (analogs are matched to the DTW forecast horizon,
+    # but we apply a sqrt(t) scaling if horizon differs).
+    horizon_days = HORIZONS.get(horizon_label, 1)
+    dtw_horizon = getattr(dtw_result, "forecast_horizon_days", horizon_days)
+    if dtw_horizon > 0 and dtw_horizon != horizon_days:
+        scale = math.sqrt(horizon_days / dtw_horizon)
+        emp_mean *= scale
+        emp_p5 *= scale
+        emp_p95 *= scale
+
+    analog_point = last_value * (1.0 + emp_mean)
+    analog_lower = last_value * (1.0 + emp_p5)
+    analog_upper = last_value * (1.0 + emp_p95)
+
+    return analog_point, analog_lower, analog_upper
+
+
+# ===========================================================================
+# Phase 5: Granger causal propagation
+# ===========================================================================
+
+
+def apply_granger_causal_propagation(
+    aggregated: dict[str, dict[str, float]],
+    granger_result: Any | None,
+    cache: pd.DataFrame,
+    *,
+    propagation_strength: float = 0.15,
+) -> tuple[dict[str, dict[str, float]], int]:
+    """Propagate forecast adjustments through the causal graph.
+
+    When variable A Granger-causes variable B, and A's forecast deviates
+    significantly from its baseline (last value), B's forecast is adjusted
+    proportionally to the causal link strength.
+
+    Parameters
+    ----------
+    aggregated:
+        ``{variable: {horizon: point_forecast}}`` from the base aggregation.
+    granger_result:
+        ``GrangerResult`` instance (or None).
+    cache:
+        Daily cache (to get last observed values for baseline comparison).
+    propagation_strength:
+        How much of the driver's deviation to propagate (0-1 scale).
+
+    Returns
+    -------
+    (adjusted_aggregated, n_adjustments)
+    """
+    if granger_result is None:
+        return aggregated, 0
+
+    if not getattr(granger_result, "fitted", False):
+        return aggregated, 0
+
+    significant_pairs = getattr(granger_result, "significant_pairs", [])
+    if not significant_pairs:
+        return aggregated, 0
+
+    n_adjustments = 0
+    # Use a snapshot of original values for deviation calculation to
+    # prevent feedback amplification when circular links exist (A->B, B->A).
+    original = {var: dict(horizons) for var, horizons in aggregated.items()}
+    adjusted = {var: dict(horizons) for var, horizons in aggregated.items()}
+
+    for pair in significant_pairs:
+        source = pair.get("source", pair.get("cause", ""))
+        target = pair.get("target", pair.get("effect", ""))
+        p_value = pair.get("p_value", 1.0)
+
+        if source not in original or target not in adjusted:
+            continue
+
+        # Get source's last observed value for baseline.
+        if source not in cache.columns:
+            continue
+        source_series = cache[source].dropna()
+        if len(source_series) == 0:
+            continue
+        source_baseline = float(source_series.iloc[-1])
+        if source_baseline == 0 or math.isnan(source_baseline):
+            continue
+
+        # Strength: stronger for lower p-values.
+        link_strength = propagation_strength * (1.0 - min(p_value, 1.0))
+
+        for h_label in original[source]:
+            if h_label not in adjusted[target]:
+                continue
+
+            # Always read source forecast from the ORIGINAL snapshot to
+            # avoid circular feedback amplification.
+            source_forecast = original[source][h_label]
+            target_forecast = adjusted[target][h_label]
+
+            # Skip NaN forecasts to prevent NaN propagation.
+            if math.isnan(source_forecast) or math.isnan(target_forecast):
+                continue
+
+            # Proportional deviation of source from baseline.
+            source_deviation = (source_forecast - source_baseline) / abs(source_baseline)
+
+            # Apply adjustment to target.
+            adjustment = target_forecast * source_deviation * link_strength
+            adjusted[target][h_label] = target_forecast + adjustment
+            n_adjustments += 1
+
+    return adjusted, n_adjustments
+
+
+# ===========================================================================
+# Phase 5b: SHAP explanation attachment
+# ===========================================================================
+
+
+def get_shap_explanation(
+    variable: str,
+    shap_result: Any | None,
+) -> tuple[str, list[str]]:
+    """Extract SHAP explanation for a variable.
+
+    Parameters
+    ----------
+    variable:
+        Variable name.
+    shap_result:
+        ``SHAPResult`` instance (or None).
+
+    Returns
+    -------
+    (narrative, top_drivers)
+    """
+    if shap_result is None:
+        return "", []
+
+    explanations = getattr(shap_result, "explanations", {})
+    expl = explanations.get(variable)
+    if expl is None:
+        return "", []
+
+    narrative = getattr(expl, "narrative", "")
+    top_features = getattr(expl, "top_features", [])
+
+    # top_features may be list of (feature_name, shap_value) tuples or strings.
+    drivers: list[str] = []
+    for item in top_features[:5]:
+        if isinstance(item, tuple):
+            drivers.append(str(item[0]))
+        else:
+            drivers.append(str(item))
+
+    return narrative, drivers
+
+
+# ===========================================================================
+# Phase 6: Recency-weighted RMSE from walk-forward
+# ===========================================================================
+
+
+def compute_recency_weighted_rmse(
+    variable: str,
+    model_name: str,
+    walk_forward_result: Any | None,
+    *,
+    window_days: int = 30,
+    decay_halflife: int = 10,
+) -> float:
+    """Compute exponentially-decayed RMSE from recent walk-forward errors.
+
+    Instead of using the static training-time RMSE, this uses the last
+    ``window_days`` of walk-forward prediction errors to compute a
+    recency-weighted RMSE that reflects recent model performance.
+
+    Parameters
+    ----------
+    variable:
+        Variable name.
+    model_name:
+        Model name to look up in walk-forward day errors.
+    walk_forward_result:
+        ``WalkForwardResult`` instance (or None).
+    window_days:
+        Number of recent days to consider.
+    decay_halflife:
+        Half-life (in days) for exponential decay weighting.
+
+    Returns
+    -------
+    Recency-weighted RMSE, or ``nan`` if not available.
+    """
+    if walk_forward_result is None:
+        return float("nan")
+
+    day_errors = getattr(walk_forward_result, "day_errors", [])
+    if not day_errors:
+        return float("nan")
+
+    # Filter to matching variable and model, take last N.
+    matching = [
+        de for de in day_errors
+        if getattr(de, "variable", "") == variable
+        and getattr(de, "model_name", "") == model_name
+    ]
+
+    if not matching:
+        return float("nan")
+
+    # Take most recent window_days entries.
+    recent = matching[-window_days:]
+    if not recent:
+        return float("nan")
+
+    # Compute exponentially-weighted squared errors.
+    n = len(recent)
+    weights = np.array([
+        math.exp(-i / max(decay_halflife, 1))
+        for i in range(n - 1, -1, -1)  # most recent gets highest weight
+    ])
+
+    sq_errors = np.array([
+        getattr(de, "squared_error", getattr(de, "error", 0.0) ** 2)
+        for de in recent
+    ])
+
+    # Filter out NaN.
+    mask = np.isfinite(sq_errors)
+    if not mask.any():
+        return float("nan")
+
+    weights = weights[mask]
+    sq_errors = sq_errors[mask]
+
+    w_sum = weights.sum()
+    if w_sum <= 0:
+        return float("nan")
+
+    wmse = (weights * sq_errors).sum() / w_sum
+    return float(math.sqrt(max(wmse, 0.0)))
+
+
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
@@ -582,6 +1217,10 @@ def save_predictions(
                 "model_used": pred.model_used,
                 "ensemble_weight": pred.ensemble_weight,
                 "survival_adjusted": pred.survival_adjusted,
+                "interval_source": pred.interval_source,
+                "analog_forecast": _safe_float(pred.analog_forecast),
+                "causal_adjustment": pred.causal_adjustment,
+                "regime_blend_applied": pred.regime_blend_applied,
             })
 
     parquet_path = cache_path / "predictions.parquet"
@@ -593,7 +1232,8 @@ def save_predictions(
         df = pd.DataFrame(columns=[
             "variable", "horizon", "point_forecast", "lower_ci",
             "upper_ci", "confidence", "model_used", "ensemble_weight",
-            "survival_adjusted",
+            "survival_adjusted", "interval_source", "analog_forecast",
+            "causal_adjustment", "regime_blend_applied",
         ])
         df.to_parquet(parquet_path, index=False)
 
@@ -627,6 +1267,14 @@ def save_predictions(
         },
         "fitted": result.fitted,
         "error": result.error,
+        # --- Full-potential upgrade metadata ---
+        "conformal_coverage": _safe_float(result.conformal_coverage),
+        "copula_tail_risk": _safe_float(result.copula_tail_risk),
+        "dtw_analogs_used": result.dtw_analogs_used,
+        "granger_adjustments_applied": result.granger_adjustments_applied,
+        "regime_blend_method": result.regime_blend_method,
+        "recency_weighted_rmse_used": result.recency_weighted_rmse_used,
+        "shap_available": result.shap_available,
     }
 
     json_path = cache_path / "prediction_summary.json"
@@ -1058,12 +1706,20 @@ def run_prediction_aggregation(
     save_to_cache: bool = True,
     cache_dir: str = CACHE_DIR,
     mode_weights: dict[str, dict[str, float]] | None = None,
+    # --- New optional inputs from sibling modules ---
+    conformal_result: Any | None = None,
+    dual_regime_result: Any | None = None,
+    copula_result: Any | None = None,
+    dtw_result: Any | None = None,
+    granger_result: Any | None = None,
+    shap_result: Any | None = None,
+    walk_forward_result: Any | None = None,
 ) -> PredictionAggregatorResult:
     """Run the full prediction aggregation pipeline.
 
     Combines forecasting results with Monte Carlo survival estimates
-    to produce final predictions with uncertainty bands and Technical
-    Alpha protection.
+    and optional outputs from sibling modules to produce final predictions
+    with uncertainty bands and Technical Alpha protection.
 
     Parameters
     ----------
@@ -1089,6 +1745,28 @@ def run_prediction_aggregation(
         provided and the cache contains survival timeline columns,
         ensemble weights are conditioned on the current survival mode
         with soft transition blending.
+    conformal_result:
+        ``ConformalResult`` from conformal prediction calibration.
+        When available, distribution-free intervals replace the
+        Gaussian RMSE-based bands.
+    dual_regime_result:
+        ``DualRegimeResult`` from regime mixer.  When available,
+        soft regime probability blending modulates ensemble weights.
+    copula_result:
+        ``CopulaResult`` from copula analysis.  When available and
+        joint crisis probability is high, uncertainty bands are widened.
+    dtw_result:
+        ``DTWAnalogResult`` from DTW historical analogs.  When available,
+        provides an independent empirical forecast channel.
+    granger_result:
+        ``GrangerResult`` from Granger causality analysis.  When
+        available, forecast adjustments propagate through the causal graph.
+    shap_result:
+        ``SHAPResult`` from explainability module.  When available,
+        narratives and top drivers are attached to each prediction.
+    walk_forward_result:
+        ``WalkForwardResult`` from walk-forward evaluation.  When
+        available, recency-weighted RMSE replaces static training RMSE.
 
     Returns
     -------
@@ -1141,6 +1819,26 @@ def run_prediction_aggregation(
     else:
         result.ensemble_weights = base_weights
 
+    # ------------------------------------------------------------------
+    # Phase 2: Regime probability blending (soft weights)
+    # ------------------------------------------------------------------
+    regime_blend_applied = False
+    if dual_regime_result is not None:
+        blended, regime_blend_applied = compute_regime_blended_weights(
+            result.ensemble_weights,
+            dual_regime_result,
+        )
+        if regime_blend_applied:
+            result.ensemble_weights = blended
+            result.regime_blend_method = "soft_probability"
+            logger.info(
+                "Regime probability blending applied to ensemble weights"
+            )
+        else:
+            result.regime_blend_method = "hard_label"
+    else:
+        result.regime_blend_method = "hard_label"
+
     # Count model availability.
     failed_flags = [
         forecast_result.model_failed_kalman,
@@ -1167,6 +1865,21 @@ def run_prediction_aggregation(
         return result
 
     # ------------------------------------------------------------------
+    # Phase 5a: Granger causal propagation
+    # ------------------------------------------------------------------
+    n_granger_adjustments = 0
+    if granger_result is not None:
+        aggregated, n_granger_adjustments = apply_granger_causal_propagation(
+            aggregated, granger_result, cache,
+        )
+        if n_granger_adjustments > 0:
+            result.granger_adjustments_applied = n_granger_adjustments
+            logger.info(
+                "Granger causal propagation: %d adjustments applied",
+                n_granger_adjustments,
+            )
+
+    # ------------------------------------------------------------------
     # Survival probabilities from Monte Carlo
     # ------------------------------------------------------------------
     mc_survival_by_horizon: dict[str, float] = {}
@@ -1175,6 +1888,43 @@ def run_prediction_aggregation(
         result.survival_probability_mean = mc_result.survival_probability_mean
         result.survival_probability_p5 = mc_result.survival_probability_p5
         result.survival_probability_p95 = mc_result.survival_probability_p95
+
+    # ------------------------------------------------------------------
+    # Phase 3: Copula tail risk
+    # ------------------------------------------------------------------
+    copula_tail_risk = 0.0
+    if copula_result is not None:
+        try:
+            copula_tail_risk = getattr(
+                copula_result, "joint_crisis_probability", 0.0,
+            )
+            if math.isnan(copula_tail_risk):
+                copula_tail_risk = 0.0
+            result.copula_tail_risk = copula_tail_risk
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Phase 4: DTW analog metadata
+    # ------------------------------------------------------------------
+    if dtw_result is not None and getattr(dtw_result, "available", False):
+        result.dtw_analogs_used = len(getattr(dtw_result, "analogs", []))
+
+    # ------------------------------------------------------------------
+    # Phase 5b: SHAP availability
+    # ------------------------------------------------------------------
+    if shap_result is not None:
+        result.shap_available = bool(
+            getattr(shap_result, "explanations", {})
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 1: Conformal coverage metadata
+    # ------------------------------------------------------------------
+    if conformal_result is not None:
+        result.conformal_coverage = getattr(
+            conformal_result, "coverage_level", None,
+        )
 
     # ------------------------------------------------------------------
     # Reference RMSE for confidence scoring
@@ -1200,11 +1950,29 @@ def run_prediction_aggregation(
     # Build predictions per variable per horizon
     # ------------------------------------------------------------------
     for var_name, var_forecasts in aggregated.items():
+        # Phase 6: Recency-weighted RMSE from walk-forward.
+        model_name = forecast_result.model_used.get(var_name, "unknown")
+        recency_rmse = compute_recency_weighted_rmse(
+            var_name, model_name, walk_forward_result,
+        )
         var_rmse = _get_best_rmse_for_variable(
             var_name, forecast_result.metrics,
         )
-        model_name = forecast_result.model_used.get(var_name, "unknown")
+        if not math.isnan(recency_rmse):
+            var_rmse = recency_rmse
+            result.recency_weighted_rmse_used = True
+
         model_weight = result.ensemble_weights.get(model_name, 0.0)
+
+        # Get last observed value for DTW analog forecasts.
+        last_value = float("nan")
+        if var_name in cache.columns:
+            vs = cache[var_name].dropna()
+            if len(vs) > 0:
+                last_value = float(vs.iloc[-1])
+
+        # Phase 5b: SHAP explanation for this variable.
+        explanation, top_drivers = get_shap_explanation(var_name, shap_result)
 
         horizon_preds: dict[str, HorizonPrediction] = {}
 
@@ -1216,15 +1984,63 @@ def run_prediction_aggregation(
             surv_prob = mc_survival_by_horizon.get(h_label, 1.0)
             survival_adjusted = surv_prob < 1.0
 
-            # Uncertainty bands.
-            lower, upper = compute_uncertainty_bands(
-                point,
-                var_rmse,
-                horizon_days,
-                survival_probability=surv_prob,
-                survival_risk_multiplier=survival_risk_multiplier,
-                z_score=z_score,
+            # ----------------------------------------------------------
+            # Phase 1: Try conformal intervals first.
+            # ----------------------------------------------------------
+            conf_lower, conf_upper, used_conformal = get_conformal_interval(
+                var_name, h_label, conformal_result,
             )
+            if used_conformal:
+                lower, upper = conf_lower, conf_upper
+                interval_source = "conformal"
+                # Still apply survival widening on top of conformal.
+                if survival_adjusted:
+                    surv_p = max(0.0, min(1.0, surv_prob))
+                    risk_factor = 1.0 + (1.0 - surv_p) * survival_risk_multiplier
+                    mid = (lower + upper) / 2.0
+                    half_width = (upper - lower) / 2.0
+                    lower = mid - half_width * risk_factor
+                    upper = mid + half_width * risk_factor
+            else:
+                # Fallback to RMSE-based bands.
+                lower, upper = compute_uncertainty_bands(
+                    point,
+                    var_rmse,
+                    horizon_days,
+                    survival_probability=surv_prob,
+                    survival_risk_multiplier=survival_risk_multiplier,
+                    z_score=z_score,
+                )
+                interval_source = "rmse"
+
+            # ----------------------------------------------------------
+            # Phase 3: Copula tail risk widening.
+            # ----------------------------------------------------------
+            copula_multiplier = compute_copula_tail_adjustment(
+                var_name, copula_result,
+            )
+            if copula_multiplier > 1.0:
+                mid = point if not math.isnan(point) else (lower + upper) / 2.0
+                lower = mid - (mid - lower) * copula_multiplier
+                upper = mid + (upper - mid) * copula_multiplier
+
+            # ----------------------------------------------------------
+            # Phase 4: DTW analog forecast.
+            # ----------------------------------------------------------
+            analog_point, analog_lower, analog_upper = compute_dtw_analog_forecast(
+                var_name, last_value, dtw_result, h_label,
+            )
+
+            # If analog is available, blend it into the point forecast
+            # with a small weight (analog as Bayesian prior).
+            causal_adj = 0.0
+            if analog_point is not None and not math.isnan(point):
+                analog_weight = min(0.15, 0.05 * result.dtw_analogs_used)
+                blended_point = (1.0 - analog_weight) * point + analog_weight * analog_point
+                causal_adj = blended_point - point
+                # Don't overwrite the point forecast itself -- record
+                # the analog influence as causal_adjustment for
+                # transparency.
 
             # Confidence score.
             confidence = compute_confidence_score(
@@ -1241,6 +2057,12 @@ def run_prediction_aggregation(
                 model_used=model_name,
                 ensemble_weight=model_weight,
                 survival_adjusted=survival_adjusted,
+                interval_source=interval_source,
+                explanation=explanation,
+                top_drivers=top_drivers,
+                analog_forecast=analog_point,
+                causal_adjustment=causal_adj,
+                regime_blend_applied=regime_blend_applied,
             )
             horizon_preds[h_label] = pred
 
@@ -1270,10 +2092,25 @@ def run_prediction_aggregation(
     # ------------------------------------------------------------------
     # Summary log
     # ------------------------------------------------------------------
+    extras = []
+    if result.conformal_coverage is not None:
+        extras.append(f"conformal={result.conformal_coverage:.0%}")
+    if result.copula_tail_risk > 0:
+        extras.append(f"copula_risk={result.copula_tail_risk:.4f}")
+    if result.dtw_analogs_used > 0:
+        extras.append(f"dtw_analogs={result.dtw_analogs_used}")
+    if result.granger_adjustments_applied > 0:
+        extras.append(f"granger_adj={result.granger_adjustments_applied}")
+    if result.shap_available:
+        extras.append("shap=yes")
+    if result.recency_weighted_rmse_used:
+        extras.append("recency_rmse=yes")
+    extras_str = ", ".join(extras) if extras else "none"
+
     logger.info(
         "Prediction aggregation complete: %d variables, %d horizons, "
         "%d models available (%d failed), "
-        "survival_mean=%.4f, regime='%s'",
+        "survival_mean=%.4f, regime='%s', blend='%s', extras=[%s]",
         len(result.variables_predicted),
         len(result.horizons),
         result.n_models_available,
@@ -1282,6 +2119,8 @@ def run_prediction_aggregation(
         if not math.isnan(result.survival_probability_mean)
         else -1.0,
         result.current_regime,
+        result.regime_blend_method,
+        extras_str,
     )
 
     return result

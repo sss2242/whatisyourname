@@ -233,24 +233,16 @@ def _score_liquidity(cache: pd.DataFrame) -> pd.Series:
             _normalize_series(cache["cash_ratio"], lower=0, upper=10)
         )
 
-    if "free_cash_flow_ttm" in cache.columns:
+    if "free_cash_flow_ttm_asof" in cache.columns:
         components.append(
-            _normalize_series(cache["free_cash_flow_ttm"])
-        )
-    elif "operating_cash_flow_asof" in cache.columns:
-        components.append(
-            _normalize_series(cache["operating_cash_flow_asof"])
+            _normalize_series(cache["free_cash_flow_ttm_asof"])
         )
     elif "operating_cash_flow" in cache.columns:
         components.append(
             _normalize_series(cache["operating_cash_flow"])
         )
 
-    if "cash_and_equivalents_asof" in cache.columns:
-        components.append(
-            _normalize_series(cache["cash_and_equivalents_asof"])
-        )
-    elif "cash_and_equivalents" in cache.columns:
+    if "cash_and_equivalents" in cache.columns:
         components.append(
             _normalize_series(cache["cash_and_equivalents"])
         )
@@ -366,18 +358,14 @@ def _score_growth(cache: pd.DataFrame) -> pd.Series:
     components: list[pd.Series] = []
 
     # Revenue growth trend
-    if "revenue_asof" in cache.columns:
-        rev = cache["revenue_asof"]
-        rev_growth = rev.pct_change(periods=_TREND_WINDOW)
-        components.append(_normalize_series(rev_growth))
-    elif "revenue" in cache.columns:
+    if "revenue" in cache.columns:
         rev = cache["revenue"]
         rev_growth = rev.pct_change(periods=_TREND_WINDOW)
         components.append(_normalize_series(rev_growth))
 
-    if "pe_ratio" in cache.columns:
+    if "pe_ratio_calc" in cache.columns:
         # Low PE -> potentially undervalued -> higher score
-        pe = cache["pe_ratio"].clip(lower=0, upper=200)
+        pe = cache["pe_ratio_calc"].clip(lower=0, upper=200)
         components.append(_normalize_series(pe, invert=True))
 
     if "ev_to_ebitda" in cache.columns:
@@ -431,7 +419,7 @@ def compute_altman_z_score(df: pd.DataFrame) -> AltmanZResult:
     retained_earnings = df.get("retained_earnings", pd.Series(np.nan, index=df.index))
     x2 = retained_earnings / ta
 
-    ebit = df.get("ebit", df.get("ebitda", pd.Series(np.nan, index=df.index)))
+    ebit = df.get("ebit", df.get("operating_income", df.get("ebitda", pd.Series(np.nan, index=df.index))))
     x3 = ebit / ta
 
     market_cap = df.get("market_cap", pd.Series(np.nan, index=df.index))

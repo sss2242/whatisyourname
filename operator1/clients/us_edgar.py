@@ -112,10 +112,18 @@ class USEdgarClient:
 
     def __init__(
         self,
-        user_agent: str = _DEFAULT_USER_AGENT,
+        user_agent: str = "",
         cache_dir: Path | str = _CACHE_DIR,
     ) -> None:
-        self._user_agent = user_agent
+        # Prefer EDGAR_IDENTITY env var (email), fall back to provided arg or default
+        self._user_agent = (
+            user_agent
+            or os.environ.get("EDGAR_IDENTITY", "")
+            or _DEFAULT_USER_AGENT
+        )
+        # SEC requires email in User-Agent; if EDGAR_IDENTITY is just an email, wrap it
+        if "@" in self._user_agent and "/" not in self._user_agent:
+            self._user_agent = f"Operator1/1.0 ({self._user_agent})"
         self._cache_dir = Path(cache_dir)
         self._edgar_initialized = False
         self._sec_api_client = None
@@ -391,7 +399,15 @@ class USEdgarClient:
                     "sic": data.get("sic", ""),
                 }
             except Exception as exc2:
-                raise USEdgarError("get_profile", f"Both methods failed for {identifier}: {exc2}") from exc2
+                # Third fallback: direct requests to SEC JSON endpoints (no library needed)
+                try:
+                    raw_profile = self._fetch_profile_direct_requests(identifier)
+                except Exception as exc3:
+                    raise USEdgarError(
+                        "get_profile",
+                        f"All three methods failed for {identifier}: "
+                        f"edgartools={exc}, sec-edgar-api={exc2}, direct={exc3}",
+                    ) from exc3
 
         # Translate to canonical profile format
         from operator1.clients.canonical_translator import translate_profile
@@ -400,6 +416,75 @@ class USEdgarClient:
         # Cache to disk
         self._write_cache(identifier, "profile.json", profile)
         return profile
+
+    def _fetch_profile_direct_requests(self, identifier: str) -> dict[str, Any]:
+        """Fetch profile using direct requests to SEC JSON endpoints.
+
+        This is the last-resort fallback when neither edgartools nor
+        sec-edgar-api is available or working. Uses only the stdlib
+        requests library with proper User-Agent headers.
+
+        SEC endpoints used:
+        - /files/company_tickers.json -- ticker-to-CIK mapping
+        - /cgi-bin/browse-edgar?action=getcompany&CIK=... -- submissions
+        - /api/xbrl/companyfacts/CIK{cik}.json -- company facts
+        """
+        import requests
+
+        headers = {"User-Agent": self._user_agent, "Accept": "application/json"}
+
+        # Step 1: Resolve ticker to CIK
+        resp = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        tickers_data = resp.json()
+
+        cik = ""
+        company_name = ""
+        ticker_upper = identifier.upper()
+        for entry in tickers_data.values():
+            if str(entry.get("ticker", "")).upper() == ticker_upper:
+                cik = str(entry["cik_str"]).zfill(10)
+                company_name = entry.get("title", "")
+                break
+            if str(entry.get("cik_str", "")) == identifier:
+                cik = str(entry["cik_str"]).zfill(10)
+                company_name = entry.get("title", "")
+                ticker_upper = str(entry.get("ticker", identifier)).upper()
+                break
+
+        if not cik:
+            raise USEdgarError("get_profile", f"Ticker/CIK not found: {identifier}")
+
+        # Step 2: Fetch company submissions for metadata
+        subs_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        resp = requests.get(subs_url, headers=headers, timeout=15)
+
+        raw_profile: dict[str, Any] = {
+            "name": company_name,
+            "ticker": ticker_upper,
+            "cik": cik,
+            "isin": "",
+            "country": "US",
+            "currency": "USD",
+        }
+
+        if resp.status_code == 200:
+            data = resp.json()
+            raw_profile.update({
+                "name": data.get("name", company_name),
+                "sector": data.get("sicDescription", ""),
+                "industry": data.get("sicDescription", ""),
+                "exchange": (data.get("exchanges") or [""])[0],
+                "fiscal_year_end": data.get("fiscalYearEnd", ""),
+                "sic": data.get("sic", ""),
+            })
+
+        logger.info("Direct requests profile for %s: %s", identifier, raw_profile.get("name"))
+        return raw_profile
 
     # -- Financial statements ------------------------------------------------
 
@@ -586,6 +671,52 @@ class USEdgarClient:
 
     # -- edgartools financial extraction -------------------------------------
 
+    # Metadata columns returned by edgartools as_dataframe=True (v5.15+).
+    # These are NOT period data and must be excluded when iterating columns.
+    _EDGARTOOLS_META_COLS = frozenset({
+        "label", "depth", "is_abstract", "is_total", "section", "confidence",
+    })
+
+    @staticmethod
+    def _parse_edgartools_period(col_name: str, fiscal_year_end: str = "") -> str | None:
+        """Convert edgartools period column names to ISO date strings.
+
+        edgartools v5.15+ uses names like 'FY 2025', 'Q1 2025', etc.
+        Older versions used actual date strings like '2025-09-30'.
+
+        Returns an ISO date string (YYYY-MM-DD) or None if unparseable.
+        """
+        import re
+        col = str(col_name).strip()
+
+        # Already a date string?
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", col):
+            return col
+
+        # FY YYYY -> fiscal year end date
+        fy_match = re.match(r"^FY\s+(\d{4})$", col)
+        if fy_match:
+            year = int(fy_match.group(1))
+            # Use fiscal year end month if available, else default Dec
+            if fiscal_year_end and "/" in fiscal_year_end:
+                parts = fiscal_year_end.split("/")
+                month, day = int(parts[0]), int(parts[1])
+            else:
+                month, day = 12, 31
+            return f"{year}-{month:02d}-{day:02d}"
+
+        # Q1/Q2/Q3/Q4 YYYY -> approximate quarter end
+        q_match = re.match(r"^Q(\d)\s+(\d{4})$", col)
+        if q_match:
+            quarter = int(q_match.group(1))
+            year = int(q_match.group(2))
+            # Approximate quarter-end dates
+            q_ends = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+            month, day = q_ends.get(quarter, (12, 31))
+            return f"{year}-{month:02d}-{day:02d}"
+
+        return None
+
     def _fetch_statement_edgartools(
         self,
         identifier: str,
@@ -595,12 +726,24 @@ class USEdgarClient:
 
         Returns a DataFrame with filing_date, report_date, and canonical
         field names, or None if extraction fails.
+
+        Handles edgartools v5.15+ DataFrame format where:
+        - Index contains XBRL concept names (e.g. 'RevenueFromContractWithCustomerExcludingAssessedTax')
+        - Metadata columns: label, depth, is_abstract, is_total, section, confidence
+        - Period columns: 'FY 2025', 'Q1 2025', etc. (or date strings in older versions)
         """
         self._init_edgartools()
         company = self._get_edgar_company(identifier)
 
         # Get filings to map report_date -> filing_date (PIT critical)
         filing_date_map = self._build_filing_date_map(company)
+
+        # Get fiscal year end for period date conversion
+        fiscal_year_end = str(getattr(company, "fiscal_year_end", "") or "")
+
+        # Build XBRL concept -> label mapping from the DataFrame's 'label' column
+        # so we can use human-readable names for concept mapping.
+        label_lookup: dict[str, str] = {}
 
         # Fetch both annual and quarterly for 2-year coverage
         rows: list[dict] = []
@@ -617,14 +760,11 @@ class USEdgarClient:
                     )
                 elif statement_type == "cashflow":
                     # edgartools v5.15+ renamed cash_flow() to cashflow_statement()
-                    # Docs: https://github.com/dgunning/edgartools CHANGELOG v5.15.0
-                    # Research: .roo/research/us-sec-edgar-2026-02-24.md Section 4
                     if hasattr(company, "cashflow_statement"):
                         result = company.cashflow_statement(
                             periods=periods, annual=annual, as_dataframe=True,
                         )
                     else:
-                        # Fallback for older edgartools versions (<5.15)
                         result = company.cash_flow(
                             periods=periods, annual=annual, as_dataframe=True,
                         )
@@ -638,11 +778,34 @@ class USEdgarClient:
                 if df.empty:
                     continue
 
-                # Process the DataFrame: columns are period end dates,
-                # rows are concept names
-                for col in df.columns:
-                    period_end = str(col)
-                    for concept_label, value in df[col].items():
+                # Build label lookup from the 'label' column if present
+                if "label" in df.columns:
+                    for xbrl_concept in df.index:
+                        lbl = df.at[xbrl_concept, "label"]
+                        if pd.notna(lbl):
+                            label_lookup[str(xbrl_concept)] = str(lbl)
+
+                # Identify period columns (exclude metadata columns)
+                period_cols = [
+                    c for c in df.columns
+                    if str(c).lower() not in self._EDGARTOOLS_META_COLS
+                    and self._parse_edgartools_period(str(c), fiscal_year_end) is not None
+                ]
+
+                if not period_cols:
+                    logger.debug(
+                        "No period columns found in %s (annual=%s). Columns: %s",
+                        statement_type, annual, list(df.columns),
+                    )
+                    continue
+
+                # Process each period column
+                for col in period_cols:
+                    period_end = self._parse_edgartools_period(str(col), fiscal_year_end)
+                    if not period_end:
+                        continue
+
+                    for xbrl_concept, value in df[col].items():
                         if pd.isna(value):
                             continue
                         canonical = self._map_edgartools_concept(
@@ -937,6 +1100,85 @@ class USEdgarClient:
 
         return None
 
+    @staticmethod
+    def _map_xbrl_concept(xbrl_name: str, statement_type: str) -> str | None:
+        """Map raw XBRL US-GAAP concept names to canonical field names.
+
+        edgartools v5.15+ uses XBRL concept names as DataFrame index,
+        e.g. 'RevenueFromContractWithCustomerExcludingAssessedTax'.
+        """
+        xbrl_lower = xbrl_name.lower()
+
+        if statement_type == "income":
+            xbrl_income = {
+                "revenuefromcontractwithcustomerexcludingassessedtax": "revenue",
+                "revenues": "revenue",
+                "salesrevenuenet": "revenue",
+                "revenuesfromexternalcustomersandpremiums": "revenue",
+                "costofgoodsandservicessold": "cost_of_revenue",
+                "costofrevenue": "cost_of_revenue",
+                "costofgoodssold": "cost_of_revenue",
+                "grossprofit": "gross_profit",
+                "operatingincomeloss": "operating_income",
+                "netincomeloss": "net_income",
+                "netincomelossdiluted": "net_income",
+                "netincomelossavailabletocommonstockholdersbasic": "net_income",
+                "incometaxexpensebenefit": "taxes",
+                "interestexpense": "interest_expense",
+                "sellinggeneralandadministrativeexpense": "sga_expense",
+                "researchanddevelopmentexpense": "research_and_development",
+                "earningspersharebasic": "eps_basic",
+                "earningspersharediluted": "eps_diluted",
+                "sellingandmarketingexpense": "sga_expense",
+                "generalandadministrativeexpense": "sga_expense",
+                "operatingexpenses": "operating_expenses",
+                "depreciationandamortization": "depreciation_amortization",
+            }
+            return xbrl_income.get(xbrl_lower)
+
+        if statement_type == "balance":
+            xbrl_balance = {
+                "assets": "total_assets",
+                "liabilities": "total_liabilities",
+                "stockholdersequity": "total_equity",
+                "liabilitiesandstockholdersequity": "total_liabilities_and_equity",
+                "assetscurrent": "current_assets",
+                "liabilitiescurrent": "current_liabilities",
+                "cashandcashequivalentsatcarryingvalue": "cash_and_equivalents",
+                "cashcashequivalentsandshortterminvestments": "cash_and_equivalents",
+                "longtermdebt": "long_term_debt",
+                "longtermdebtnoncurrent": "long_term_debt",
+                "shorttermborrowing": "short_term_debt",
+                "commercialpaper": "short_term_debt",
+                "retainedearningsaccumulateddeficit": "retained_earnings",
+                "goodwill": "goodwill",
+                "accountsreceivablenetcurrent": "receivables",
+                "inventorynet": "inventory",
+                "accountspayablecurrent": "payables",
+                "commonstocksharesoutstanding": "shares_outstanding",
+                "propertyplantandequipmentnet": "ppe_net",
+            }
+            return xbrl_balance.get(xbrl_lower)
+
+        if statement_type == "cashflow":
+            xbrl_cashflow = {
+                "netcashprovidedbyusedinoperatingactivities": "operating_cash_flow",
+                "netcashprovidedbyusedinoperatingactivitiescontinuingoperations": "operating_cash_flow",
+                "netcashprovidedbyusedininvestingactivities": "investing_cf",
+                "netcashprovidedbyusedininvestingactivitiescontinuingoperations": "investing_cf",
+                "netcashprovidedbyusedinfinancingactivities": "financing_cf",
+                "netcashprovidedbyusedinfinancingactivitiescontinuingoperations": "financing_cf",
+                "paymentstoacquirepropertyplantandequipment": "capex",
+                "depreciationdepletionandamortization": "depreciation_amortization",
+                "paymentsofdividends": "dividends_paid",
+                "paymentsofdividendscommonstock": "dividends_paid",
+                "paymentsforrepurchaseofcommonstock": "buybacks",
+                "stockbasedcompensation": "stock_based_comp",
+            }
+            return xbrl_cashflow.get(xbrl_lower)
+
+        return None
+
     # -- sec-edgar-api fallback extraction ------------------------------------
 
     def _fetch_statement_fallback(
@@ -955,7 +1197,12 @@ class USEdgarClient:
             facts = client.get_company_facts(cik)
         except Exception as exc:
             logger.error("Fallback companyfacts failed for %s: %s", identifier, exc)
-            return pd.DataFrame()
+            # Third fallback: direct requests to companyfacts endpoint
+            try:
+                facts = self._fetch_companyfacts_direct(identifier)
+            except Exception as exc2:
+                logger.error("Direct companyfacts also failed for %s: %s", identifier, exc2)
+                return pd.DataFrame()
 
         concept_map = {
             "income": _USGAAP_INCOME_CONCEPTS,
@@ -1041,3 +1288,45 @@ class USEdgarClient:
                     if isinstance(v, pd.Timestamp):
                         r[k] = v.isoformat()
             self._write_cache(identifier, filename, {"period_end": period_str, "rows": records})
+
+    def _fetch_companyfacts_direct(self, identifier: str) -> dict:
+        """Fetch companyfacts JSON using direct requests (no library needed).
+
+        This is the last-resort fallback when neither edgartools nor
+        sec-editor-api is available. Uses the SEC EDGAR XBRL API directly.
+
+        Endpoint: https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json
+        """
+        import requests
+
+        headers = {"User-Agent": self._user_agent, "Accept": "application/json"}
+
+        # Resolve ticker to CIK using the tickers JSON
+        resp = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        tickers_data = resp.json()
+
+        cik = ""
+        ticker_upper = identifier.upper()
+        for entry in tickers_data.values():
+            if str(entry.get("ticker", "")).upper() == ticker_upper:
+                cik = str(entry["cik_str"]).zfill(10)
+                break
+            if str(entry.get("cik_str", "")) == identifier:
+                cik = str(entry["cik_str"]).zfill(10)
+                break
+
+        if not cik:
+            raise USEdgarError("companyfacts", f"CIK not found for: {identifier}")
+
+        # Fetch companyfacts
+        facts_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        resp = requests.get(facts_url, headers=headers, timeout=30)
+        resp.raise_for_status()
+
+        logger.info("Direct companyfacts fetched for %s (CIK %s)", identifier, cik)
+        return resp.json()

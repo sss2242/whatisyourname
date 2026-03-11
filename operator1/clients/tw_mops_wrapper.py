@@ -129,7 +129,24 @@ class TWMopsClient:
         if cached:
             return cached
 
-        matches = self.search_company(identifier)
+        # Retry with backoff to handle TWSE rate limiting / transient
+        # timeouts during concurrent batch runs.
+        matches: list[dict[str, Any]] = []
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                matches = self.search_company(identifier)
+                if matches:
+                    break
+            except Exception as exc:
+                last_exc = exc
+                logger.debug(
+                    "MOPS get_profile attempt %d/3 for %s failed: %s",
+                    attempt, identifier, exc,
+                )
+            # Backoff: 1s, 2s, 4s between retries.
+            time.sleep(min(2 ** (attempt - 1), 4))
+
         raw_profile = {
             "name": matches[0]["name"] if matches else "",
             "ticker": identifier,

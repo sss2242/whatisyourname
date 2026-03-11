@@ -73,9 +73,35 @@ class CASedarClient:
         self._write_cache(identifier, "profile.json", profile)
         return profile
 
-    def get_income_statement(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
-    def get_balance_sheet(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
-    def get_cashflow_statement(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
-    def get_quotes(self, identifier: str) -> pd.DataFrame: return pd.DataFrame()
+    def get_income_statement(self, identifier: str) -> pd.DataFrame:
+        return self._fetch_financials(identifier, "income")
+
+    def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
+        return self._fetch_financials(identifier, "balance")
+
+    def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
+        return self._fetch_financials(identifier, "cashflow")
+
+    def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
+        """Fetch financials via SEDAR+ filing discovery only (PIT-compliant).
+
+        yfinance is NOT used for financial statements because it does not
+        provide true filing dates (sets filing_date = report_date).
+        """
+        try:
+            from operator1.clients.filing_discoverer import try_filing_extraction
+            df = try_filing_extraction(
+                ticker=identifier, market_id=self.market_id,
+                statement_type=statement_type, llm_client=None,
+            )
+            if df is not None and not df.empty:
+                return df
+        except Exception as exc:
+            logger.debug("SEDAR+ filing extraction failed for %s: %s", identifier, exc)
+        return pd.DataFrame()
+
+    def get_quotes(self, identifier: str) -> pd.DataFrame:
+        """SEDAR+ does not provide OHLCV data. Handled by ohlcv_provider."""
+        return pd.DataFrame()
     def get_peers(self, identifier: str) -> list[str]: return []
     def get_executives(self, identifier: str) -> list[dict[str, Any]]: return []

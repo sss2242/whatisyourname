@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -31,8 +32,38 @@ logger = logging.getLogger(__name__)
 
 _CACHE_DIR = Path("cache/jp_jquants")
 
-# V2 column name -> canonical field mapping (from research log Section 6)
+# J-Quants free plan: ~12 requests/minute.
+# Enforce an 8-second minimum interval between API calls to stay safe
+# (6s was too aggressive, caused 429 bursts during profile + financial fetch).
+_JQUANTS_MIN_INTERVAL = 8.0  # seconds between API calls
+_jquants_last_call: float = 0.0
+_jquants_eq_master_cache: Any = None  # cached equity master DataFrame
+
+
+def _jquants_throttle() -> None:
+    """Enforce minimum interval between J-Quants API calls."""
+    global _jquants_last_call
+    elapsed = time.monotonic() - _jquants_last_call
+    if elapsed < _JQUANTS_MIN_INTERVAL:
+        wait = _JQUANTS_MIN_INTERVAL - elapsed
+        logger.debug("J-Quants rate limit: waiting %.1fs", wait)
+        time.sleep(wait)
+    _jquants_last_call = time.monotonic()
+
+# V2 column name -> canonical field mapping
+# get_eq_master() uses short column names (V2 API): CoName, CoNameEn, S33, S33Nm, Mkt, MktNm
+# get_list() uses full column names: CompanyName, CompanyNameEnglish, Sector33Code, Sector33CodeName
+# get_fin_summary() / get_fins_statements() use: NetSales, OperatingProfit, Profit, TotalAssets, Equity, etc.
+
 _V2_INCOME_MAP = {
+    # get_fin_summary columns (FINS_STATEMENTS format)
+    "NetSales": "revenue",
+    "OperatingProfit": "operating_income",
+    "OrdinaryProfit": "pretax_income",
+    "Profit": "net_income",
+    "EarningsPerShare": "eps",
+    "DilutedEarningsPerShare": "eps_diluted",
+    # Legacy short names (kept for backward compat)
     "Sales": "revenue",
     "OP": "operating_income",
     "OdP": "pretax_income",
@@ -41,6 +72,10 @@ _V2_INCOME_MAP = {
 }
 
 _V2_BALANCE_MAP = {
+    # get_fin_summary columns
+    "TotalAssets": "total_assets",
+    "Equity": "total_equity",
+    # Legacy short names
     "TA": "total_assets",
     "TL": "total_liabilities",
     "Eq": "total_equity",
@@ -134,6 +169,7 @@ class JPJquantsClient:
 
         try:
             # Docs: jquantsapi/client_v2.py get_list() method
+            _jquants_throttle()
             df = self._client.get_list()
             if df.empty:
                 return []
@@ -150,11 +186,17 @@ class JPJquantsClient:
 
             results = []
             for _, row in df.head(50).iterrows():
+                # get_list() returns full names: CompanyName, CompanyNameEnglish, Sector33CodeName
+                # get_eq_master() returns short: CoName, CoNameEn, S33Nm
+                name = str(row.get("CompanyNameEnglish", "") or row.get("CoNameEn", "") or row.get("CompanyName", "") or row.get("CoName", ""))
+                sector = str(row.get("Sector33CodeName", "") or row.get("S33Nm", "") or row.get("Sector17CodeName", "") or row.get("S17Nm", ""))
+                ticker_code = str(row.get("Code", ""))[:4]
                 results.append({
-                    "identifier": str(row.get("Code", ""))[:4],
-                    "name": str(row.get("CompanyNameEnglish", row.get("CompanyName", ""))),
+                    "identifier": ticker_code,
+                    "ticker": ticker_code,
+                    "name": name,
                     "exchange": "TSE",
-                    "sector": str(row.get("S33NmEn", row.get("S17NmEn", ""))),
+                    "sector": sector,
                 })
             return results
 
@@ -178,26 +220,55 @@ class JPJquantsClient:
             return {}
 
         try:
-            # Normalize to 5-digit code (J-Quants uses 5 digits)
+            # Normalize to 5-digit code (J-Quants uses 5 digits: 7203 -> 72030)
             code = identifier.strip()
+            base4 = code[:4]  # keep the 4-digit code for matching
             if len(code) == 4:
                 code = code + "0"
 
             # Docs: jquantsapi/client_v2.py get_eq_master() method
-            df = self._client.get_eq_master(code=code)
+            _jquants_throttle()
+            try:
+                df = self._client.get_eq_master(code=code)
+            except TypeError:
+                # Older SDK may not support code param; fetch all and filter
+                df = self._client.get_eq_master()
+
             if df.empty:
                 return {}
 
-            row = df.iloc[0]
-            return {
-                "name": str(row.get("CompanyNameEnglish", row.get("CompanyName", ""))),
+            # Exact match on the 5-digit code first
+            code_col = "Code" if "Code" in df.columns else df.columns[0]
+            exact = df[df[code_col].astype(str) == code]
+            if exact.empty:
+                # Try matching on 4-digit prefix (some codes may differ)
+                exact = df[df[code_col].astype(str).str[:4] == base4]
+            if exact.empty:
+                logger.warning("J-Quants: no company found for code %s", code)
+                return {}
+
+            row = exact.iloc[0]
+            # V2 eq_master columns: CoName, CoNameEn, S33, S33Nm, Mkt, MktNm
+            profile = {
+                "name": str(row.get("CoNameEn", "") or row.get("CoName", "") or row.get("CompanyNameEnglish", "") or row.get("CompanyName", "")),
                 "ticker": str(row.get("Code", ""))[:4],
                 "exchange": "TSE",
-                "sector": str(row.get("S33NmEn", row.get("S17NmEn", ""))),
-                "market_segment": str(row.get("MktNmEn", row.get("Mkt", ""))),
+                "sector": str(row.get("S33Nm", "") or row.get("S33", "") or row.get("Sector33CodeName", "") or row.get("Sector33Code", "")),
+                "market_segment": str(row.get("MktNm", "") or row.get("Mkt", "") or row.get("MarketCodeName", "") or row.get("MarketCode", "")),
                 "country": "Japan",
                 "currency": "JPY",
             }
+
+            # Validate: ensure the returned company matches the requested code
+            returned_ticker = profile.get("ticker", "")
+            if returned_ticker and returned_ticker != base4:
+                logger.error(
+                    "J-Quants profile mismatch: requested %s but got %s (%s). "
+                    "Check code normalization.",
+                    base4, returned_ticker, profile.get("name"),
+                )
+
+            return profile
 
         except Exception as exc:
             logger.error("J-Quants get_profile failed for %s: %s", identifier, exc)
@@ -237,44 +308,83 @@ class JPJquantsClient:
         try:
             # Normalize to 5-digit code
             code = identifier.strip()
+            if not code:
+                logger.warning("J-Quants get_financials called with empty identifier")
+                return empty
             if len(code) == 4:
                 code = code + "0"
 
-            # Fetch financial summary for the date range
+            # Fetch financial summary for the date range.
+            # Use code parameter to avoid fetching ALL companies
+            # (get_fin_summary_range without code returns thousands of rows
+            # and exceeds free-tier rate limits).
             end_dt = datetime.now()
             start_dt = end_dt - timedelta(days=365 * years)
 
             # Docs: jquantsapi/client_v2.py get_fin_summary_range() method
-            df = self._client.get_fin_summary_range(
-                start_dt=start_dt,
-                end_dt=end_dt,
-            )
+            _jquants_throttle()
+            try:
+                # Try code-filtered fetch first (faster, less API load)
+                df = self._client.get_fin_summary_range(
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    code=code,
+                )
+            except TypeError:
+                # Fallback: older SDK versions may not support code param
+                df = self._client.get_fin_summary_range(
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                )
 
             if df.empty:
                 return empty
 
-            # Filter to this company
-            code_col = "Code" if "Code" in df.columns else "LocalCode"
-            if code_col in df.columns:
+            # Filter to this company (FINS uses LocalCode, others use Code)
+            code_col = None
+            for cc in ("LocalCode", "Code"):
+                if cc in df.columns:
+                    code_col = cc
+                    break
+            if code_col:
                 df = df[df[code_col].astype(str).str.startswith(code[:4])]
 
             if df.empty:
                 return empty
 
-            # Only keep annual reports (DocType containing "Annual" or FY end)
-            # J-Quants V2: CurPerType field indicates period type
-            if "CurPerType" in df.columns:
-                # Keep FY (full year) entries
-                annual_mask = df["CurPerType"].astype(str).str.contains("FY|Annual|4Q", case=False, na=True)
+            # Only keep annual/4Q reports
+            # FINS_STATEMENTS uses TypeOfCurrentPeriod (e.g. "FY", "1Q", "2Q", "3Q")
+            # Older format may use CurPerType
+            period_col = None
+            for pc in ("TypeOfCurrentPeriod", "CurPerType", "TypeOfDocument"):
+                if pc in df.columns:
+                    period_col = pc
+                    break
+
+            if period_col:
+                annual_mask = df[period_col].astype(str).str.contains("FY|Annual|4Q", case=False, na=True)
                 df_annual = df[annual_mask] if annual_mask.any() else df
-            elif "DocType" in df.columns:
-                df_annual = df
             else:
                 df_annual = df
 
-            # Determine date column for PIT
-            date_col = "DiscDate" if "DiscDate" in df_annual.columns else "DisclosedDate"
-            period_end_col = "CurPerEn" if "CurPerEn" in df_annual.columns else "CurrentPeriodEndDate"
+            # Determine date columns for PIT
+            # FINS_STATEMENTS: DisclosedDate, CurrentPeriodEndDate
+            # Older format: DiscDate, CurPerEn
+            date_col = None
+            for dc in ("DisclosedDate", "DiscDate"):
+                if dc in df_annual.columns:
+                    date_col = dc
+                    break
+            if not date_col:
+                date_col = "DisclosedDate"  # fallback
+
+            period_end_col = None
+            for pec in ("CurrentPeriodEndDate", "CurPerEn"):
+                if pec in df_annual.columns:
+                    period_end_col = pec
+                    break
+            if not period_end_col:
+                period_end_col = "CurrentPeriodEndDate"  # fallback
 
             # Build income statement
             income_rows = []
@@ -373,12 +483,19 @@ class JPJquantsClient:
             target_sector = profile["sector"]
 
             # Get all companies and filter by sector
+            _jquants_throttle()
             df = self._client.get_list()
             if df.empty:
                 return []
 
-            sector_col = "S33NmEn" if "S33NmEn" in df.columns else "S17NmEn"
-            if sector_col in df.columns:
+            # get_list() columns: Sector33CodeName, Sector17CodeName
+            # get_eq_master() columns: S33Nm, S17Nm
+            sector_col = None
+            for sc in ("Sector33CodeName", "S33Nm", "Sector17CodeName", "S17Nm"):
+                if sc in df.columns:
+                    sector_col = sc
+                    break
+            if sector_col:
                 peers_df = df[df[sector_col] == target_sector]
             else:
                 return []

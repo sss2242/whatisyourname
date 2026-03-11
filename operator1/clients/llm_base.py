@@ -50,6 +50,7 @@ _last_request_time_by_host: dict[str, float] = {}
 _LLM_HOST_RATE_LIMITS: dict[str, float] = {
     "generativelanguage.googleapis.com": 0.25,  # Gemini free tier
     "api.anthropic.com": 0.8,                   # Claude Tier 1
+    "openrouter.ai": 1.0,                       # OpenRouter (varies by model)
 }
 
 
@@ -101,18 +102,8 @@ GEMINI_MODELS: dict[str, dict[str, Any]] = {
         "report_capable": True,
         "tier": "stable",
     },
-    "gemini-1.5-pro": {
-        "max_output_tokens": 8192,
-        "context_window": 2097152,
-        "report_capable": True,
-        "tier": "stable",
-    },
-    "gemini-1.5-flash": {
-        "max_output_tokens": 8192,
-        "context_window": 1048576,
-        "report_capable": True,
-        "tier": "stable",
-    },
+    # NOTE: gemini-1.5-pro and gemini-1.5-flash removed -- deprecated from
+    # Gemini v1beta API as of early 2026.  Use gemini-2.0-flash or newer.
 }
 
 CLAUDE_MODELS: dict[str, dict[str, Any]] = {
@@ -144,23 +135,26 @@ CLAUDE_MODELS: dict[str, dict[str, Any]] = {
 
 
 def get_best_model(provider: str, model_registry: dict[str, dict[str, Any]]) -> str:
-    """Pick the best report-capable model from a provider's registry.
+    """Pick the best cost-effective report-capable model from a provider's registry.
 
-    Prefers models with higher max_output_tokens and stable tier.
+    Prefers stable/balanced tiers over flagship (Opus is $15/$75 per MTok --
+    too expensive for free-tier keys). The "fast" tier (Haiku at $0.25/$1.25)
+    is preferred over "flagship" (Opus) for cost efficiency.
+
     Returns the model name string.
     """
-    # Sort by: report_capable (True first), then max_output_tokens desc
     candidates = [
         (name, info)
         for name, info in model_registry.items()
         if info.get("report_capable", False)
     ]
     if not candidates:
-        # Fallback: just return the first model
         return next(iter(model_registry))
 
-    # Prefer stable/balanced tiers, then by max_output_tokens
-    tier_priority = {"flagship": 0, "balanced": 1, "stable": 2, "fast": 3, "preview": 4}
+    # Cost-aware priority: balanced > stable > fast > preview > flagship
+    # This ensures we pick Sonnet ($3/$15) or Haiku ($0.25/$1.25) over
+    # Opus ($15/$75) by default, saving 5-60x on API costs.
+    tier_priority = {"balanced": 0, "stable": 1, "fast": 2, "preview": 3, "flagship": 4}
     candidates.sort(
         key=lambda x: (
             tier_priority.get(x[1].get("tier", "stable"), 5),
@@ -357,11 +351,20 @@ class LLMClient(ABC):
     # High-level generate methods (use _execute_request internally)
     # ------------------------------------------------------------------
 
-    def _generate(self, prompt: str) -> str:
-        """Send a prompt and return the raw text response."""
+    def generate(self, prompt: str) -> str:
+        """Send a prompt and return the raw text response.
+
+        This is the public interface used by ``run.py`` for LLM-based
+        market routing and by ``PooledLLMClient`` for key rotation.
+        """
         cfg = get_global_config()
         timeout = cfg.get("timeout_s", 30)
         return self._execute_request(prompt, timeout=timeout)
+
+    # Keep private alias for backward compatibility with internal callers
+    def _generate(self, prompt: str) -> str:
+        """Send a prompt and return the raw text response."""
+        return self.generate(prompt)
 
     def _generate_with_config(
         self,
@@ -566,7 +569,7 @@ this information into actionable insights for sophisticated investors.
 
 ---
 
-REPORT STRUCTURE (MUST INCLUDE ALL 13 SECTIONS):
+REPORT STRUCTURE (MUST INCLUDE ALL 14 SECTIONS):
 
 1. EXECUTIVE SUMMARY
    - 3 bullet points summarizing key findings
@@ -672,7 +675,15 @@ investors understand the *quality* of each prediction.
     **Overall Ethical Score:** Combine all filters; is this investment suitable for ethical/Islamic investors?
     Universal lessons: Why these filters matter for ALL investors.
 
-11. RISK FACTORS & LIMITATIONS
+11. GEOPOLITICAL & CONFLICT RISK
+    - Country conflict status (active conflict zones, fragile state classification)
+    - Sanctions exposure (OFAC, EU, UN sanctions lists)
+    - Conflict intensity score (0-1 scale) and trend
+    - Supply chain exposure to conflict zones (linked entities in war zones)
+    - Revenue exposure to conflict regions
+    - Investment implications of geopolitical risk
+
+12. RISK FACTORS & LIMITATIONS
     - Model assumptions and their limitations
     - Key risks: company-specific, industry/sector, macro/country
     - Scenarios that could invalidate predictions
@@ -683,7 +694,7 @@ macro frequency reality (macro APIs provide monthly/quarterly data, aligned dail
 missingness summary, any modules that failed and how the report compensated. \
 Must be easy for a non-technical client to understand.
 
-12. INVESTMENT RECOMMENDATION
+13. INVESTMENT RECOMMENDATION
     **Recommendation:** [BUY / HOLD / SELL]
     **Confidence Level:** [High / Medium / Low]
     **12-Month Target Price:** with rationale
@@ -692,7 +703,7 @@ Must be easy for a non-technical client to understand.
     **Exit Strategy:** price targets for profits and stop-loss levels
     **Position Sizing:** suggested portfolio allocation based on risk profile
 
-13. APPENDIX
+14. APPENDIX
     - Methodology summary: all 23+ temporal modules used:
       * Regime Detection: HMM, GMM, PELT, Bayesian Change Point
       * Forecasting: Adaptive Kalman, GARCH, VAR, LSTM, Temporal Fusion Transformer (TFT)

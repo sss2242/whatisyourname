@@ -134,6 +134,41 @@ class ConformalCalibrator:
     def coverage(self) -> float:
         return self._coverage
 
+    def add_residual(self, residual: float, variable: str = "_global") -> None:
+        """Record a raw residual value for conformal calibration.
+
+        Convenience method that accepts a pre-computed residual (actual -
+        predicted) instead of separate predicted/actual values. Used by
+        ``main.py`` when feeding ``ForecastResult.residuals`` (a flat
+        list of floats) into the calibrator.
+
+        Parameters
+        ----------
+        residual:
+            The raw residual (actual - predicted). The absolute value is
+            used as the nonconformity score.
+        variable:
+            Optional variable name. Defaults to ``"_global"`` for
+            undifferentiated residuals.
+        """
+        if math.isnan(residual):
+            return
+        score = abs(residual)
+
+        if variable not in self._scores:
+            self._scores[variable] = []
+            self._alpha_t[variable] = self._alpha
+
+        scores = self._scores[variable]
+        scores.append(score)
+
+        # Trim to window
+        if len(scores) > self._max_window:
+            self._scores[variable] = scores[-self._max_window:]
+
+    # Backward-compatible alias used by older main.py callers
+    update = add_residual
+
     def add_score(
         self,
         variable: str,

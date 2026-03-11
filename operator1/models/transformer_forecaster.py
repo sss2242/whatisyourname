@@ -201,6 +201,25 @@ def train_transformer(
         result.error = f"Need >= 2 variables, got {len(available)}"
         return result
 
+    # Mixed-frequency awareness: add filing-timing features for
+    # quarterly/annual variables so the transformer's attention
+    # mechanism can distinguish stale from fresh observations.
+    try:
+        from operator1.models._frequency_classifier import (
+            classify_column_frequency,
+            add_filing_timing_features,
+        )
+        extra_timing = []
+        for v in available[:10]:
+            freq = classify_column_frequency(cache[v])
+            if freq in ("quarterly", "annual"):
+                new_cols = add_filing_timing_features(cache, v)
+                extra_timing.extend(new_cols)
+        if extra_timing:
+            available = available + [c for c in extra_timing if c in cache.columns]
+    except Exception:
+        pass  # graceful fallback
+
     data = cache[available].dropna()
     if len(data) < _MIN_OBS_TRANSFORMER:
         result.error = f"Insufficient data: {len(data)} rows (need >= {_MIN_OBS_TRANSFORMER})"
