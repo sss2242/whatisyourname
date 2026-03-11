@@ -730,9 +730,16 @@ def translate_financials(
     if statement_type:
         result["statement_type"] = statement_type
 
-    # 5. Drop rows where canonical_name is empty (unmapped concepts)
+    # 5. Log and drop rows where canonical_name is empty (unmapped concepts)
     if "canonical_name" in result.columns:
-        result = result[result["canonical_name"].astype(str).str.len() > 0]
+        _mask_empty = result["canonical_name"].astype(str).str.len() == 0
+        if _mask_empty.any() and "concept" in result.columns:
+            _unmapped = result.loc[_mask_empty, "concept"].unique().tolist()
+            logger.debug(
+                "Unmapped concepts dropped (%s, %s): %s",
+                market_id, statement_type, _unmapped[:20],
+            )
+        result = result[~_mask_empty]
 
     return result
 

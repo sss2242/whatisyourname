@@ -42,15 +42,21 @@ _V2_INCOME_MAP = {
 
 _V2_BALANCE_MAP = {
     "TA": "total_assets",
+    "TL": "total_liabilities",
     "Eq": "total_equity",
+    "CA": "current_assets",
+    "CL": "current_liabilities",
     "CashEq": "cash_and_equivalents",
     "BPS": "book_value_per_share",
+    # J-Quants V2 condensed summary may not have all of these;
+    # missing fields will be derived post-extraction or filled by
+    # the estimation engine.
 }
 
 _V2_CASHFLOW_MAP = {
-    "CFO": "operating_cashflow",
-    "CFI": "investing_cashflow",
-    "CFF": "financing_cashflow",
+    "CFO": "operating_cash_flow",  # must match cache_builder.STATEMENT_FIELDS
+    "CFI": "investing_cf",          # was "investing_cashflow" (wrong)
+    "CFF": "financing_cf",          # was "financing_cashflow" (wrong)
 }
 
 
@@ -294,6 +300,11 @@ class JPJquantsClient:
                     val = row.get(v2_col)
                     if pd.notna(val):
                         rec[canonical] = float(val)
+                # Derive missing fields from accounting identities
+                ta = rec.get("total_assets")
+                eq = rec.get("total_equity")
+                if ta is not None and eq is not None and "total_liabilities" not in rec:
+                    rec["total_liabilities"] = ta - eq
                 balance_rows.append(rec)
 
             # Build cash flow statement
