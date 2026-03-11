@@ -54,6 +54,7 @@ _REQUIRED_KEYS: dict[str, str] = {
     # LLM provider (at least one required for report generation)
     "GEMINI_API_KEY":          "LLM report generation (Google Gemini) -- https://aistudio.google.com/app/apikey",
     "ANTHROPIC_API_KEY":       "LLM report generation (Anthropic Claude) -- https://console.anthropic.com/",
+    "OPENROUTER_API_KEY":      "LLM report generation (OpenRouter, 200+ models) -- https://openrouter.ai/",
     # US market
     "EDGAR_IDENTITY":          "US SEC EDGAR email identity (required by SEC regulation) -- any valid email",
     # UK market
@@ -123,7 +124,7 @@ def load_secrets() -> dict[str, str]:
         secrets = _load_from_env()
 
     # Also collect numbered key variants (e.g. GEMINI_API_KEY_1, _2, _3)
-    for provider_key in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY"):
+    for provider_key in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"):
         extra_keys = []
         for i in range(1, 10):
             numbered = os.environ.get(f"{provider_key}_{i}", "").strip()
