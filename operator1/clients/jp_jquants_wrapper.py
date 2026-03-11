@@ -320,6 +320,23 @@ class JPJquantsClient:
                         rec[canonical] = float(val)
                 cashflow_rows.append(rec)
 
+            # Log unmapped J-Quants V2 columns for diagnostic purposes.
+            # J-Quants bypasses canonical_translator, so the global
+            # unmapped concept logging doesn't cover this wrapper.
+            _meta_cols = {
+                date_col, period_end_col, "Code", "LocalCode",
+                "CurPerType", "DocType", "DiscDate", "DisclosedDate",
+                "CurPerEn", "CurrentPeriodEndDate",
+            }
+            _all_mapped = set(_V2_INCOME_MAP) | set(_V2_BALANCE_MAP) | set(_V2_CASHFLOW_MAP)
+            _available = set(df_annual.columns) - _meta_cols
+            _unmapped = _available - _all_mapped
+            if _unmapped:
+                logger.debug(
+                    "J-Quants V2 unmapped columns (not in _V2_*_MAP): %s",
+                    sorted(_unmapped)[:20],
+                )
+
             return {
                 "income": pd.DataFrame(income_rows) if income_rows else pd.DataFrame(),
                 "balance": pd.DataFrame(balance_rows) if balance_rows else pd.DataFrame(),

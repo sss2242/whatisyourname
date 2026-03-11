@@ -902,6 +902,12 @@ def _map_concept(concept: str, concept_map: dict[str, str]) -> str:
     if concept_lower in _FIELD_ALIASES:
         return _FIELD_ALIASES[concept_lower]
 
+    # Case-insensitive match against concept map keys
+    # (handles FRS102/UK-GAAP/IFRS case variations like "CurrentAssets" vs "currentassets")
+    for key, canonical in concept_map.items():
+        if key.lower() == concept_lower or key.lower().replace(" ", "_") == concept_lower:
+            return _FIELD_ALIASES.get(canonical, canonical)
+
     # Try case-insensitive match on the concept value itself
     # (handles cases where the concept IS already the canonical name)
     all_canonical = (
