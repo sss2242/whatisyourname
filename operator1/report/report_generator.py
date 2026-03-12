@@ -1225,7 +1225,11 @@ def _build_technical_patterns(profile: dict[str, Any]) -> str:
     recent = patterns.get("recent_patterns", [])
     predicted = patterns.get("predicted_patterns_week", patterns.get("predicted_patterns", []))
 
-    lines.append("*(See attached price history chart with regime shading)*")
+    _has_ohlcv = profile.get("meta", {}).get("has_ohlcv", True)
+    if _has_ohlcv:
+        lines.append("*(See attached price history chart with regime shading)*")
+    else:
+        lines.append("*(Price history chart not available -- no OHLCV data for this company)*")
     lines.append("")
 
     if recent:
@@ -1289,7 +1293,10 @@ def _build_technical_patterns(profile: dict[str, Any]) -> str:
                     )
 
         lines.append("")
-        lines.append("*(See attached predicted candlestick charts)*")
+        if _has_ohlcv:
+            lines.append("*(See attached predicted candlestick charts)*")
+        else:
+            lines.append("*(Predicted candlestick charts not available -- no OHLCV data)*")
     else:
         lines.append("*(Predicted candlestick charts not available for this run)*")
 
@@ -3004,9 +3011,14 @@ def generate_charts(
     identity = profile.get("identity", {})
     company = identity.get("name", identity.get("ticker", ""))
 
+    # Check whether OHLCV price data is available.
+    # If not, skip price-dependent charts (price history, volatility, OHLC predictions)
+    # but still generate non-price charts (survival, financial health, sentiment, conflict).
+    _has_ohlcv = profile.get("meta", {}).get("has_ohlcv", "close" in cache.columns)
+
     # Chart 1: Price History with Regime Overlay
     try:
-        if "close" in cache.columns:
+        if _has_ohlcv and "close" in cache.columns:
             fig, ax = plt.subplots(figsize=(16, 7))
             ax.plot(cache.index, cache["close"], linewidth=1.5, color=_CHART_ACCENT, zorder=3)
             _apply_brand_style(fig, ax, f"{company} -- Closing Price (2Y)")
@@ -3098,9 +3110,9 @@ def generate_charts(
     except Exception as exc:
         logger.warning("Failed to generate survival timeline chart: %s", exc)
 
-    # Chart 3: 21-Day Realized Volatility
+    # Chart 3: 21-Day Realized Volatility (requires OHLCV data)
     try:
-        if "volatility_21d" in cache.columns:
+        if _has_ohlcv and "volatility_21d" in cache.columns:
             fig, ax = plt.subplots(figsize=(16, 5))
             ax.fill_between(
                 cache.index, 0, cache["volatility_21d"],
@@ -3169,9 +3181,9 @@ def generate_charts(
     except Exception as exc:
         logger.warning("Failed to generate sentiment chart: %s", exc)
 
-    # Chart 7: Predicted OHLC Candlestick (Next Month)
+    # Chart 7: Predicted OHLC Candlestick (Next Month) -- requires OHLCV
+    ohlc_data = profile.get("ohlc_predictions", {}) if _has_ohlcv else {}
     try:
-        ohlc_data = profile.get("ohlc_predictions", {})
         next_month = ohlc_data.get("next_month", {})
         series = next_month.get("series", [])
         if series and len(series) >= 5:
@@ -3226,9 +3238,9 @@ def generate_charts(
     except Exception as exc:
         logger.warning("Failed to generate predicted OHLC chart: %s", exc)
 
-    # Chart 8: Predicted OHLC Candlestick (Next Week)
+    # Chart 8: Predicted OHLC Candlestick (Next Week) -- requires OHLCV
     try:
-        next_week = ohlc_data.get("next_week", {})
+        next_week = ohlc_data.get("next_week", {}) if _has_ohlcv else {}
         week_series = next_week.get("series", [])
         if week_series and len(week_series) >= 3:
             fig, ax = plt.subplots(figsize=(12, 6))
@@ -3261,9 +3273,9 @@ def generate_charts(
     except Exception as exc:
         logger.warning("Failed to generate predicted week OHLC chart: %s", exc)
 
-    # Chart 9.5: Predicted OHLC Candlestick (Next Year -- aggregated weekly)
+    # Chart 9.5: Predicted OHLC Candlestick (Next Year) -- requires OHLCV
     try:
-        next_year = ohlc_data.get("next_year", {})
+        next_year = ohlc_data.get("next_year", {}) if _has_ohlcv else {}
         year_series = next_year.get("series", [])
         if year_series and len(year_series) >= 20:
             # Aggregate 252 daily candles into weekly bars for readability

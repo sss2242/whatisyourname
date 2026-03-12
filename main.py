@@ -2019,6 +2019,20 @@ Non-interactive examples:
         # OHLCV typically comes from yfinance or a per-region wrapper.
         profile["meta"]["ohlcv_source"] = _ohlcv_source_label
 
+        # Flag whether OHLCV data is available in the cache.
+        # Used by the report generator to decide whether to generate
+        # price-based charts and reference them in the report narrative.
+        _has_ohlcv = (
+            "close" in cache.columns
+            and cache["close"].notna().sum() >= 5
+        )
+        profile["meta"]["has_ohlcv"] = _has_ohlcv
+        if not _has_ohlcv:
+            logger.warning(
+                "No usable OHLCV data in cache -- price charts and "
+                "price-dependent models will be skipped in the report."
+            )
+
         # Inject macro data summary
         if macro_api_info:
             profile["meta"]["macro_source"] = macro_api_info.api_name
