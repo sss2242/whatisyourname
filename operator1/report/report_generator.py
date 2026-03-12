@@ -2988,8 +2988,18 @@ def generate_charts(
     _CHART_GREEN = "#1ea885"    # teal-green (calmer than neon)
     _CHART_GOLD = "#e8950a"     # warm amber warning
 
-    def _apply_brand_style(fig, ax, title: str) -> None:
-        """Apply Operator 1 brand theme to a chart."""
+    def _apply_brand_style(fig, ax, title: str, *, use_date_axis: bool = True) -> None:
+        """Apply Operator 1 brand theme to a chart.
+
+        Parameters
+        ----------
+        use_date_axis:
+            If True (default), format x-axis as calendar dates.
+            Set to False for charts that use integer or non-date x-axes
+            (e.g. predicted OHLC candlestick charts where x = "days ahead").
+            Without this flag, integer x-values get interpreted as matplotlib
+            date ordinals, producing nonsense dates like 1959-1960.
+        """
         fig.patch.set_facecolor(_CHART_BG)
         ax.set_facecolor(_CHART_BG)
         ax.set_title(title, color=_CHART_FG, fontsize=14, fontweight="bold", pad=12)
@@ -3001,8 +3011,9 @@ def generate_charts(
         ax.spines["bottom"].set_color(_CHART_GRID)
         ax.spines["left"].set_color(_CHART_GRID)
         ax.grid(True, color=_CHART_GRID, alpha=0.5, linewidth=0.5)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
-        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+        if use_date_axis:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+            ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
         for label in ax.get_xticklabels():
             label.set_rotation(45)
             label.set_ha("right")
@@ -3215,7 +3226,7 @@ def generate_charts(
                 lower = [m - r * (2 - conf) for m, r, conf in zip(mid_prices, ranges, confidences)]
                 ax.fill_between(dates, lower, upper, alpha=0.08, color=_CHART_ACCENT)
 
-                _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Month)")
+                _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Month)", use_date_axis=False)
                 ax.set_ylabel("Price ($)", color=_CHART_FG)
                 ax.set_xlabel("Trading Days Ahead", color=_CHART_FG)
 
@@ -3251,7 +3262,7 @@ def generate_charts(
                        color=color, edgecolor=color, alpha=0.85)
                 ax.plot([i, i], [l, h], color=color, linewidth=0.8)
 
-            _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Week)")
+            _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Week)", use_date_axis=False)
             ax.set_ylabel("Price ($)", color=_CHART_FG)
             ax.set_xlabel("Trading Days Ahead", color=_CHART_FG)
 
@@ -3312,7 +3323,7 @@ def generate_charts(
                 lower = [m - r * (2 - conf) for m, r, conf in zip(mid_prices, ranges, confidences)]
                 ax.fill_between(range(len(weekly_bars)), lower, upper, alpha=0.08, color=_CHART_ACCENT)
 
-                _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Year, Weekly)")
+                _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Year, Weekly)", use_date_axis=False)
                 ax.set_ylabel("Price ($)", color=_CHART_FG)
                 ax.set_xlabel("Weeks Ahead", color=_CHART_FG)
 
