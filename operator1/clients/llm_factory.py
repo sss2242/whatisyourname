@@ -5,11 +5,12 @@ variable) and returns the matching client.  Supported values:
 
 - ``gemini`` (default) -- Google Gemini via generativelanguage API
 - ``claude`` -- Anthropic Claude via Messages API
+- ``openrouter`` -- OpenRouter gateway (200+ models via OpenAI-compatible API)
 
 **Multi-key support**: Comma-separated API keys in ``.env`` are split
 into a pool.  On credit exhaustion (HTTP 400/402) or rate limiting
 (HTTP 429), the factory automatically rotates to the next key.  When
-all keys for one provider are exhausted, it falls back to the other
+all keys for one provider are exhausted, it falls back to another
 provider.
 
 **Cost-aware model selection**: By default picks the most cost-effective
@@ -44,7 +45,7 @@ def get_available_models(provider: str) -> list[dict[str, Any]]:
     Parameters
     ----------
     provider:
-        ``"gemini"`` or ``"claude"``.
+        ``"gemini"``, ``"claude"``, or ``"openrouter"``.
 
     Returns
     -------
@@ -268,27 +269,50 @@ def _build_single_client(
     api_key: str,
     model: str = "",
 ) -> LLMClient | None:
-    """Build a single LLM client for a given provider and key."""
+    """Build a single LLM client for a given provider and key.
+
+    Parameters
+    ----------
+    provider:
+        ``"gemini"``, ``"claude"``, or ``"openrouter"``.
+    api_key:
+        API key for the provider.
+    model:
+        Model name override. If empty, uses the provider's default.
+    """
     if not api_key:
         return None
+
+    kwargs: dict = {"api_key": api_key}
+    if model:
+        kwargs["model"] = model
 
     if provider == "gemini":
         try:
             from operator1.clients.gemini import GeminiClient
-            kwargs: dict = {"api_key": api_key}
-            if model:
-                kwargs["model"] = model
             return GeminiClient(**kwargs)
         except Exception as exc:
             logger.warning("Failed to build Gemini client: %s", exc)
             return None
 
-    client = ClaudeClient(**kwargs)
-    logger.info(
-        "Using Claude as LLM provider (model: %s, max_output: %d tokens)",
-        client.model_name, client.max_output_tokens,
-    )
-    return client
+    if provider == "claude":
+        try:
+            from operator1.clients.claude import ClaudeClient
+            return ClaudeClient(**kwargs)
+        except Exception as exc:
+            logger.warning("Failed to build Claude client: %s", exc)
+            return None
+
+    if provider == "openrouter":
+        try:
+            from operator1.clients.openrouter import OpenRouterClient
+            return OpenRouterClient(**kwargs)
+        except Exception as exc:
+            logger.warning("Failed to build OpenRouter client: %s", exc)
+            return None
+
+    logger.warning("Unknown provider '%s' in _build_single_client", provider)
+    return None
 
 
 def _build_openrouter(secrets: dict[str, str], model: str = "") -> LLMClient | None:

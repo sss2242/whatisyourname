@@ -1100,10 +1100,9 @@ Non-interactive examples:
         try:
             from operator1.steps.entity_discovery import discover_linked_entities
 
-            gemini_client = llm_client
             discovery_result = discover_linked_entities(
                 target_profile=target_profile,
-                gemini_client=gemini_client,
+                llm_client=llm_client,
                 pit_client=pit_client,
                 secrets=secrets,
             )
@@ -1332,7 +1331,7 @@ Non-interactive examples:
         from operator1.features.news_sentiment import compute_news_sentiment
         cache, _sent_result = compute_news_sentiment(
             cache,
-            gemini_client=llm_client,
+            llm_client=llm_client,
             symbol=ticker,
             market_id=market_id,
             company_name=company_name,
@@ -2177,7 +2176,7 @@ Non-interactive examples:
         try:
             all_reports = generate_all_reports(
                 profile=profile,
-                gemini_client=llm_client,
+                llm_client=llm_client,
                 cache=cache,
                 output_dir=Path(args.output_dir) / "report",
                 generate_pdf=args.pdf,
@@ -2227,7 +2226,7 @@ def _generate_report_only(args: argparse.Namespace, secrets: dict) -> int:
 
     report_output = generate_report(
         profile=profile,
-        gemini_client=llm_client,
+        llm_client=llm_client,
         output_dir=Path(args.output_dir) / "report",
         generate_pdf=args.pdf,
     )
