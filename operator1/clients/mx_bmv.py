@@ -50,19 +50,34 @@ class MXBmvClient:
         return profile
 
     def get_income_statement(self, identifier: str) -> pd.DataFrame:
-        """BMV has no free structured filing API. Returns empty for PIT compliance.
+        return self._fetch_financials(identifier, "income")
+
+    def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
+        return self._fetch_financials(identifier, "balance")
+
+    def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
+        return self._fetch_financials(identifier, "cashflow")
+
+    def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
+        """Fetch financials via BMV/EMISNET filing discovery only (PIT-compliant).
 
         yfinance is NOT used for financial statements because it does not
         provide true filing dates (sets filing_date = report_date).
         """
-        return pd.DataFrame()
-
-    def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
-        """BMV has no free structured filing API. Returns empty for PIT compliance."""
-        return pd.DataFrame()
-
-    def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
-        """BMV has no free structured filing API. Returns empty for PIT compliance."""
+        try:
+            from operator1.clients.filing_discoverer import try_filing_extraction
+            df = try_filing_extraction(
+                ticker=identifier,
+                market_id=self.market_id,
+                statement_type=statement_type,
+                llm_client=None,
+            )
+            if df is not None and not df.empty:
+                logger.info("BMV %s %s: %d rows from filing discovery",
+                           identifier, statement_type, len(df))
+                return df
+        except Exception as exc:
+            logger.debug("BMV filing discovery failed for %s: %s", identifier, exc)
         return pd.DataFrame()
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:
