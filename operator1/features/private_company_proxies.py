@@ -122,14 +122,28 @@ def compute_private_company_proxies(cache: pd.DataFrame) -> pd.DataFrame:
         logger.warning("  equity_value: cannot compute (no equity or assets/liabilities)")
 
     # --- Equity change rate (proxy for return_1d) ---
+    # The raw equity value is forward-filled from quarterly filings, so
+    # simple pct_change() would produce 0 for ~90% of days and a spike
+    # at quarter boundaries.  Instead, we interpolate between quarterly
+    # values to produce a smooth daily rate of change that temporal
+    # models (regime detection, Monte Carlo, forecasting) can consume.
     if "equity_value" in cache.columns and cache["equity_value"].notna().sum() >= 2:
         ev = cache["equity_value"]
-        # Compute daily change rate from the forward-filled quarterly equity values
-        cache["equity_change_rate"] = ev.pct_change().fillna(0.0)
-        # Clip extreme values from quarter transitions
-        cache["equity_change_rate"] = cache["equity_change_rate"].clip(-0.5, 0.5)
-        n_nonzero = (cache["equity_change_rate"] != 0).sum()
-        logger.info("  equity_change_rate: %d non-zero values", n_nonzero)
+        # Detect quarter transitions (where value changes)
+        ev_shifted = ev.shift(1)
+        is_new = ev.notna() & (ev != ev_shifted) & ev_shifted.notna()
+        # Get the distinct quarterly values at their transition points
+        quarterly_vals = ev.where(is_new | (ev.index == ev.first_valid_index()))
+        # Interpolate linearly between quarters to get smooth daily values
+        ev_smooth = quarterly_vals.interpolate(method="time")
+        # Fill any remaining NaN at the edges
+        ev_smooth = ev_smooth.ffill().bfill()
+        # Daily change rate from the smoothly interpolated series
+        cache["equity_change_rate"] = ev_smooth.pct_change().fillna(0.0)
+        # Clip extreme values
+        cache["equity_change_rate"] = cache["equity_change_rate"].clip(-0.1, 0.1)
+        n_nonzero = (cache["equity_change_rate"].abs() > 1e-8).sum()
+        logger.info("  equity_change_rate: %d non-zero values (smooth interpolation)", n_nonzero)
     else:
         cache["equity_change_rate"] = 0.0
         logger.warning("  equity_change_rate: defaulting to 0 (insufficient equity data)")
