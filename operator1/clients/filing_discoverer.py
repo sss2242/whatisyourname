@@ -303,6 +303,8 @@ class BSEFilingDiscoverer:
 # ---------------------------------------------------------------------------
 
 _ASX_MARKIT_BASE = "https://asx.api.markitdigital.com/asx-research/1.0"
+_ASX_CDN_BASE = "https://cdn-api.markitdigital.com/apiman-gateway/ASX/asx-research/1.0/file"
+_ASX_CDN_TOKEN = "83ff96335c2d45a094df02a206a39ff4"
 _ASX_HEADERS = {
     "Accept": "application/json",
     "User-Agent": "Operator1/1.0",
@@ -391,16 +393,21 @@ class ASXFilingDiscoverer:
             lower = headline.lower()
             if "annual" in lower or "appendix 4e" in lower:
                 filing_type = "annual"
-            elif "half year" in lower or "appendix 4d" in lower:
+            elif "half year" in lower or "appendix 4d" in lower or lower.startswith("hy"):
                 filing_type = "interim"
             else:
                 filing_type = "quarterly"
+
+            # Build download URL from CDN + documentKey
+            doc_url = ""
+            if doc_key:
+                doc_url = f"{_ASX_CDN_BASE}/{doc_key}?access_token={_ASX_CDN_TOKEN}"
 
             filing = FilingMetadata(
                 title=headline,
                 filing_date=filing_date,
                 report_date="",  # ASX doesn't provide this in the announcement
-                document_url="",  # Document download URL TBD
+                document_url=doc_url,
                 document_format="pdf",
                 filing_type=filing_type,
                 market_id="au_asx",
@@ -416,30 +423,36 @@ class ASXFilingDiscoverer:
         return result
 
     def download_filing(self, filing: FilingMetadata) -> bytes:
-        """Download an ASX filing document.
+        """Download an ASX filing document via the CDN endpoint.
 
-        Currently raises NotImplementedError as the MarkitDigital
-        document download URL pattern needs further investigation.
+        Uses the MarkitDigital CDN with access token to download PDFs
+        identified by their documentKey.
         """
-        if not filing.attachment_id:
-            raise ValueError("No document key in filing metadata")
+        # Prefer the pre-built document_url (CDN URL)
+        url = filing.document_url
+        if not url and filing.attachment_id:
+            url = f"{_ASX_CDN_BASE}/{filing.attachment_id}?access_token={_ASX_CDN_TOKEN}"
 
-        # Try the MarkitDigital document endpoint
-        try:
-            resp = requests.get(
-                f"{_ASX_MARKIT_BASE}/documents/{filing.attachment_id}",
-                headers=_ASX_HEADERS,
-                timeout=30,
-            )
-            if resp.status_code == 200 and resp.content[:4] == b"%PDF":
-                return resp.content
-        except Exception:
-            pass
+        if not url:
+            raise ValueError("No document URL or key in filing metadata")
 
-        raise NotImplementedError(
-            f"ASX document download not yet implemented for key {filing.attachment_id}. "
-            "The MarkitDigital document endpoint returns 404 for some documents."
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "Operator1/1.0", "Accept": "*/*"},
+            timeout=60,
         )
+        resp.raise_for_status()
+
+        if resp.content[:4] != b"%PDF":
+            raise ValueError(
+                f"Expected PDF but got {resp.headers.get('Content-Type', 'unknown')}"
+            )
+
+        logger.info(
+            "Downloaded ASX filing: %s (%d bytes)",
+            filing.title[:60], len(resp.content),
+        )
+        return resp.content
 
 
 # ---------------------------------------------------------------------------
