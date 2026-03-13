@@ -81,16 +81,35 @@ class AUAsxClient:
         return profile
 
     def get_income_statement(self, identifier: str) -> pd.DataFrame:
-        from operator1.clients.yfinance_backed import yf_get_financials
-        return yf_get_financials(identifier, self.market_id, "income", yf_suffix=".AX")
+        return self._fetch_financials(identifier, "income")
 
     def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
-        from operator1.clients.yfinance_backed import yf_get_financials
-        return yf_get_financials(identifier, self.market_id, "balance", yf_suffix=".AX")
+        return self._fetch_financials(identifier, "balance")
 
     def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
-        from operator1.clients.yfinance_backed import yf_get_financials
-        return yf_get_financials(identifier, self.market_id, "cashflow", yf_suffix=".AX")
+        return self._fetch_financials(identifier, "cashflow")
+
+    def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
+        """Fetch financials via ASX filing discovery only (PIT-compliant).
+
+        yfinance is NOT used for financial statements because it does not
+        provide true filing dates (sets filing_date = report_date).
+        """
+        try:
+            from operator1.clients.filing_discoverer import try_filing_extraction
+            df = try_filing_extraction(
+                ticker=identifier,
+                market_id=self.market_id,
+                statement_type=statement_type,
+                llm_client=None,
+            )
+            if df is not None and not df.empty:
+                logger.info("ASX %s %s: %d rows from filing discovery",
+                           identifier, statement_type, len(df))
+                return df
+        except Exception as exc:
+            logger.debug("ASX filing discovery failed for %s: %s", identifier, exc)
+        return pd.DataFrame()
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:
         """ASX does not provide OHLCV data. Handled by ohlcv_provider."""

@@ -11,9 +11,12 @@ Currently implemented:
   - ASXFilingDiscoverer (Australia) -- announcement discovery via MarkitDigital
   - HKEXFilingDiscoverer (Hong Kong) -- HKEX News title search + PDF download
   - SGXFilingDiscoverer (Singapore) -- SGX announcements API + PDF download
+  - TadawulFilingDiscoverer (Saudi Arabia) -- Tadawul disclosure API
+  - SEDARFilingDiscoverer (Canada) -- SEDAR+ document search
+  - JSEFilingDiscoverer (South Africa) -- JSE SENS announcement search
 
-Markets without structured APIs (BMV, JSE, SIX, Tadawul, DFM,
-SEDAR+) continue to use yfinance as fallback.
+Markets without structured APIs (SIX) use EU ESEF crossover.
+All other Tier 2 markets have filing discoverers wired in.
 """
 
 from __future__ import annotations
@@ -300,6 +303,8 @@ class BSEFilingDiscoverer:
 # ---------------------------------------------------------------------------
 
 _ASX_MARKIT_BASE = "https://asx.api.markitdigital.com/asx-research/1.0"
+_ASX_CDN_BASE = "https://cdn-api.markitdigital.com/apiman-gateway/ASX/asx-research/1.0/file"
+_ASX_CDN_TOKEN = "83ff96335c2d45a094df02a206a39ff4"
 _ASX_HEADERS = {
     "Accept": "application/json",
     "User-Agent": "Operator1/1.0",
@@ -388,16 +393,21 @@ class ASXFilingDiscoverer:
             lower = headline.lower()
             if "annual" in lower or "appendix 4e" in lower:
                 filing_type = "annual"
-            elif "half year" in lower or "appendix 4d" in lower:
+            elif "half year" in lower or "appendix 4d" in lower or lower.startswith("hy"):
                 filing_type = "interim"
             else:
                 filing_type = "quarterly"
+
+            # Build download URL from CDN + documentKey
+            doc_url = ""
+            if doc_key:
+                doc_url = f"{_ASX_CDN_BASE}/{doc_key}?access_token={_ASX_CDN_TOKEN}"
 
             filing = FilingMetadata(
                 title=headline,
                 filing_date=filing_date,
                 report_date="",  # ASX doesn't provide this in the announcement
-                document_url="",  # Document download URL TBD
+                document_url=doc_url,
                 document_format="pdf",
                 filing_type=filing_type,
                 market_id="au_asx",
@@ -413,30 +423,36 @@ class ASXFilingDiscoverer:
         return result
 
     def download_filing(self, filing: FilingMetadata) -> bytes:
-        """Download an ASX filing document.
+        """Download an ASX filing document via the CDN endpoint.
 
-        Currently raises NotImplementedError as the MarkitDigital
-        document download URL pattern needs further investigation.
+        Uses the MarkitDigital CDN with access token to download PDFs
+        identified by their documentKey.
         """
-        if not filing.attachment_id:
-            raise ValueError("No document key in filing metadata")
+        # Prefer the pre-built document_url (CDN URL)
+        url = filing.document_url
+        if not url and filing.attachment_id:
+            url = f"{_ASX_CDN_BASE}/{filing.attachment_id}?access_token={_ASX_CDN_TOKEN}"
 
-        # Try the MarkitDigital document endpoint
-        try:
-            resp = requests.get(
-                f"{_ASX_MARKIT_BASE}/documents/{filing.attachment_id}",
-                headers=_ASX_HEADERS,
-                timeout=30,
-            )
-            if resp.status_code == 200 and resp.content[:4] == b"%PDF":
-                return resp.content
-        except Exception:
-            pass
+        if not url:
+            raise ValueError("No document URL or key in filing metadata")
 
-        raise NotImplementedError(
-            f"ASX document download not yet implemented for key {filing.attachment_id}. "
-            "The MarkitDigital document endpoint returns 404 for some documents."
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "Operator1/1.0", "Accept": "*/*"},
+            timeout=60,
         )
+        resp.raise_for_status()
+
+        if resp.content[:4] != b"%PDF":
+            raise ValueError(
+                f"Expected PDF but got {resp.headers.get('Content-Type', 'unknown')}"
+            )
+
+        logger.info(
+            "Downloaded ASX filing: %s (%d bytes)",
+            filing.title[:60], len(resp.content),
+        )
+        return resp.content
 
 
 # ---------------------------------------------------------------------------
@@ -1052,6 +1068,567 @@ class SEDARFilingDiscoverer:
         return resp.content
 
 
+# ---------------------------------------------------------------------------
+# JSE South Africa Filing Discoverer
+# ---------------------------------------------------------------------------
+
+_JSE_SENS_URL = "https://senspdf.jse.co.za/documents/sensnews"
+_JSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+    "Accept": "application/json, text/html",
+    "Referer": "https://www.jse.co.za/",
+}
+
+
+def _parse_jse_report_date(title: str) -> str:
+    """Extract fiscal period end date from JSE SENS filing title.
+
+    Examples:
+      'Results for the Year Ended 31 December 2025'
+      'Interim Results for the Six Months Ended 30 June 2025'
+      'Financial Results for Year Ending 28 February 2026'
+    """
+    patterns = [
+        r"[Ee]nd(?:ed|ing)\s+(\d{1,2})\s+(\w+)\s+(\d{4})",
+        r"[Ee]nd(?:ed|ing)\s+(\w+)\s+(\d{1,2}),?\s+(\d{4})",
+    ]
+    months = {
+        "january": "01", "february": "02", "march": "03", "april": "04",
+        "may": "05", "june": "06", "july": "07", "august": "08",
+        "september": "09", "october": "10", "november": "11", "december": "12",
+    }
+    for pattern in patterns:
+        match = re.search(pattern, title, re.IGNORECASE)
+        if match:
+            groups = match.groups()
+            if groups[1].lower() in months:
+                # "31 December 2025"
+                return f"{groups[2]}-{months[groups[1].lower()]}-{int(groups[0]):02d}"
+            elif groups[0].lower() in months:
+                # "December 31, 2025"
+                return f"{groups[2]}-{months[groups[0].lower()]}-{int(groups[1]):02d}"
+    return ""
+
+
+def _classify_jse_filing_type(title: str) -> str:
+    """Classify JSE filing as annual, interim, or quarterly."""
+    lower = title.lower()
+    if "annual" in lower or "year ended" in lower or "year ending" in lower:
+        return "annual"
+    if "interim" in lower or "half" in lower or "six months" in lower:
+        return "interim"
+    if "quarter" in lower or "three months" in lower:
+        return "quarterly"
+    return "annual"
+
+
+class JSEFilingDiscoverer:
+    """Discovers financial result filings from JSE SENS.
+
+    JSE SENS (Stock Exchange News Service) publishes all company
+    announcements including financial results. Announcements include
+    PDF attachments with the actual financial statements.
+
+    The SENS system is the official disclosure platform for all
+    JSE-listed companies. Announcement dates are the true filing dates.
+    """
+
+    def discover_filings(
+        self,
+        ticker: str,
+        years: int = 2,
+    ) -> FilingDiscovery:
+        """Discover financial result filings from JSE SENS.
+
+        Parameters
+        ----------
+        ticker:
+            JSE ticker symbol (e.g. 'NPN' for Naspers, 'SOL' for Sasol).
+        years:
+            Number of years to search back.
+        """
+        result = FilingDiscovery(ticker=ticker, market_id="za_jse")
+
+        today = date.today()
+        from_date = today - timedelta(days=365 * years)
+
+        # Search SENS for financial results announcements
+        for search_term in ["financial results", "annual results", "interim results"]:
+            try:
+                resp = requests.get(
+                    _JSE_SENS_URL,
+                    params={
+                        "keyword": f"{ticker} {search_term}",
+                        "fromDate": from_date.strftime("%Y-%m-%d"),
+                        "toDate": today.strftime("%Y-%m-%d"),
+                        "pageSize": "20",
+                    },
+                    headers=_JSE_HEADERS,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+            except Exception as exc:
+                result.errors.append(f"JSE SENS search failed for '{search_term}': {exc}")
+                continue
+
+            # Try JSON response first
+            try:
+                data = resp.json()
+                records = []
+                if isinstance(data, dict):
+                    records = data.get("data", data.get("items", data.get("result", [])))
+                elif isinstance(data, list):
+                    records = data
+
+                for item in records:
+                    title_text = item.get("title", item.get("headline", item.get("subject", "")))
+                    ann_date = item.get("publishDate", item.get("date", item.get("releaseDate", "")))
+                    doc_url = item.get("pdfUrl", item.get("documentUrl", item.get("url", "")))
+                    doc_id = item.get("id", item.get("sensId", ""))
+
+                    if not title_text:
+                        continue
+
+                    # Filter to financial results only
+                    lower_title = title_text.lower()
+                    if not any(kw in lower_title for kw in [
+                        "financial result", "annual result", "interim result",
+                        "year ended", "year ending", "half year", "six months",
+                        "condensed", "audited", "reviewed",
+                    ]):
+                        continue
+
+                    filing_date = ""
+                    if ann_date:
+                        try:
+                            filing_date = str(ann_date)[:10]
+                        except Exception:
+                            pass
+
+                    # Build document URL
+                    if doc_url and not doc_url.startswith("http"):
+                        doc_url = f"https://senspdf.jse.co.za{doc_url}"
+
+                    report_date = _parse_jse_report_date(title_text)
+                    filing_type = _classify_jse_filing_type(title_text)
+
+                    filing = FilingMetadata(
+                        title=title_text,
+                        filing_date=filing_date,
+                        report_date=report_date,
+                        document_url=doc_url,
+                        document_format="pdf",
+                        filing_type=filing_type,
+                        market_id="za_jse",
+                        attachment_id=str(doc_id),
+                    )
+                    result.filings.append(filing)
+
+            except (ValueError, AttributeError):
+                # Not JSON -- try HTML parsing
+                html = resp.text
+                link_pattern = re.compile(
+                    r'href="([^"]*\.pdf)"',
+                    re.IGNORECASE,
+                )
+                date_pattern = re.compile(
+                    r'(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})',
+                )
+                title_pattern = re.compile(
+                    r'class="[^"]*(?:title|headline|subject)[^"]*"[^>]*>([^<]+)<',
+                    re.IGNORECASE,
+                )
+
+                links = link_pattern.findall(html)
+                dates = date_pattern.findall(html)
+                titles = title_pattern.findall(html)
+
+                for i, link in enumerate(links[:10]):
+                    doc_url = link if link.startswith("http") else f"https://senspdf.jse.co.za{link}"
+                    title_text = titles[i].strip() if i < len(titles) else search_term
+                    date_str = dates[i] if i < len(dates) else ""
+
+                    filing_date = ""
+                    if date_str:
+                        if "/" in date_str:
+                            try:
+                                parts = date_str.split("/")
+                                filing_date = f"{parts[2]}-{parts[1]}-{parts[0]}"
+                            except Exception:
+                                pass
+                        else:
+                            filing_date = date_str[:10]
+
+                    report_date = _parse_jse_report_date(title_text)
+                    filing_type = _classify_jse_filing_type(title_text)
+
+                    filing = FilingMetadata(
+                        title=title_text,
+                        filing_date=filing_date,
+                        report_date=report_date,
+                        document_url=doc_url,
+                        document_format="pdf",
+                        filing_type=filing_type,
+                        market_id="za_jse",
+                    )
+                    result.filings.append(filing)
+
+        # Dedup by document URL
+        seen_urls: set[str] = set()
+        unique: list[FilingMetadata] = []
+        for f in result.filings:
+            if f.document_url and f.document_url not in seen_urls:
+                seen_urls.add(f.document_url)
+                unique.append(f)
+            elif not f.document_url:
+                unique.append(f)
+        result.filings = unique
+
+        logger.info(
+            "JSE discovery for %s: found %d filings (%d annual, %d interim)",
+            ticker, len(result.filings),
+            len(result.annual_filings()), len(result.quarterly_filings()),
+        )
+        return result
+
+    def download_filing(self, filing: FilingMetadata) -> bytes:
+        """Download a JSE SENS filing document."""
+        if not filing.document_url:
+            raise ValueError("No document URL in filing metadata")
+
+        resp = requests.get(
+            filing.document_url,
+            headers=_JSE_HEADERS,
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        # Validate it's a PDF
+        if resp.content[:4] != b"%PDF":
+            raise ValueError(
+                f"Expected PDF but got {resp.headers.get('Content-Type', 'unknown')}"
+            )
+
+        logger.info(
+            "Downloaded JSE filing: %s (%d bytes)",
+            filing.title[:60], len(resp.content),
+        )
+        return resp.content
+
+
+# ---------------------------------------------------------------------------
+# BMV Mexico Filing Discoverer
+# ---------------------------------------------------------------------------
+
+_BMV_EMISNET_URL = "https://emisnet.bmv.com.mx/informacion-financiera"
+_BMV_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+    "Accept": "application/json, text/html",
+    "Referer": "https://www.bmv.com.mx/",
+}
+
+
+class BMVFilingDiscoverer:
+    """Discovers financial filings from BMV/CNBV (Mexico).
+
+    Uses the BMV EMISNET disclosure portal to find financial statement
+    announcements. EMISNET is the official electronic disclosure system
+    for all BMV-listed companies.
+
+    The BMV API is undocumented, so this discoverer tries multiple
+    endpoint patterns and falls back to HTML parsing.
+    """
+
+    def discover_filings(
+        self,
+        ticker: str,
+        years: int = 2,
+    ) -> FilingDiscovery:
+        """Discover financial filings from BMV EMISNET.
+
+        Parameters
+        ----------
+        ticker:
+            BMV ticker symbol (e.g. 'AMXL', 'WALMEX', 'FEMSAUBD').
+        years:
+            Number of years to search back.
+        """
+        result = FilingDiscovery(ticker=ticker, market_id="mx_bmv")
+
+        today = date.today()
+        from_date = today - timedelta(days=365 * years)
+
+        # Try the BMV issuer profile / financial info endpoints
+        for endpoint in [
+            f"https://www.bmv.com.mx/en/issuers/financial-information/{ticker}",
+            f"https://emisnet.bmv.com.mx/2009/emisoras_reportes.html?cb_emisora={ticker}&cb_tipo_doc=Informacion+Financiera",
+        ]:
+            try:
+                resp = requests.get(
+                    endpoint,
+                    headers=_BMV_HEADERS,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+            except Exception as exc:
+                result.errors.append(f"BMV endpoint failed: {exc}")
+                continue
+
+            # Try JSON first
+            try:
+                data = resp.json()
+                records = []
+                if isinstance(data, dict):
+                    records = data.get("data", data.get("items", data.get("result", [])))
+                elif isinstance(data, list):
+                    records = data
+
+                for item in records:
+                    title_text = item.get("title", item.get("descripcion", item.get("nombre", "")))
+                    ann_date = item.get("date", item.get("fecha", item.get("fechaPublicacion", "")))
+                    doc_url = item.get("url", item.get("archivo", item.get("documentUrl", "")))
+
+                    if not title_text:
+                        continue
+
+                    filing_date = str(ann_date)[:10] if ann_date else ""
+
+                    lower = title_text.lower()
+                    if "anual" in lower or "annual" in lower or "year" in lower:
+                        filing_type = "annual"
+                    elif "trimestral" in lower or "quarter" in lower:
+                        filing_type = "quarterly"
+                    elif "semestral" in lower or "interim" in lower:
+                        filing_type = "interim"
+                    else:
+                        filing_type = "quarterly"
+
+                    # Parse report date
+                    report_date = ""
+                    rd_match = re.search(
+                        r"(\d{4})[/-](\d{2})[/-](\d{2})", str(ann_date)
+                    )
+                    if rd_match:
+                        report_date = f"{rd_match.group(1)}-{rd_match.group(2)}-{rd_match.group(3)}"
+
+                    if doc_url and not doc_url.startswith("http"):
+                        doc_url = f"https://emisnet.bmv.com.mx{doc_url}"
+
+                    filing = FilingMetadata(
+                        title=title_text,
+                        filing_date=filing_date,
+                        report_date=report_date,
+                        document_url=doc_url,
+                        document_format="pdf",
+                        filing_type=filing_type,
+                        market_id="mx_bmv",
+                    )
+                    result.filings.append(filing)
+
+            except (ValueError, AttributeError):
+                # HTML response -- parse for PDF links
+                html = resp.text
+                link_pattern = re.compile(
+                    r'href="([^"]*\.pdf)"',
+                    re.IGNORECASE,
+                )
+                links = link_pattern.findall(html)
+                for link in links[:10]:
+                    doc_url = link if link.startswith("http") else f"https://emisnet.bmv.com.mx{link}"
+                    filing = FilingMetadata(
+                        title=f"{ticker} financial filing",
+                        document_url=doc_url,
+                        document_format="pdf",
+                        filing_type="quarterly",
+                        market_id="mx_bmv",
+                    )
+                    result.filings.append(filing)
+
+        # Dedup
+        seen: set[str] = set()
+        unique: list[FilingMetadata] = []
+        for f in result.filings:
+            key = f.document_url or f.title
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+        result.filings = unique
+
+        logger.info("BMV discovery for %s: found %d filings", ticker, len(result.filings))
+        return result
+
+    def download_filing(self, filing: FilingMetadata) -> bytes:
+        """Download a BMV/EMISNET filing document."""
+        if not filing.document_url:
+            raise ValueError("No document URL in filing metadata")
+        resp = requests.get(filing.document_url, headers=_BMV_HEADERS, timeout=30)
+        resp.raise_for_status()
+        if resp.content[:4] != b"%PDF":
+            raise ValueError(f"Not a PDF: {resp.headers.get('Content-Type', 'unknown')}")
+        return resp.content
+
+
+# ---------------------------------------------------------------------------
+# DFM/ADX UAE Filing Discoverer
+# ---------------------------------------------------------------------------
+
+_DFM_DISC_URL = "https://www.dfm.ae/api/DisclosureFilesApi/GetCompanyDisclosures"
+_ADX_DISC_URL = "https://www.adx.ae/api/disclosures"
+_DFM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+    "Accept": "application/json",
+    "Referer": "https://www.dfm.ae/",
+}
+
+
+class DFMFilingDiscoverer:
+    """Discovers financial filings from DFM and ADX (UAE).
+
+    Tries both Dubai Financial Market (DFM) and Abu Dhabi Securities
+    Exchange (ADX) disclosure APIs. Both exchanges publish company
+    financial statements through their disclosure portals.
+
+    UAE adopted IFRS for all listed companies, so standard IFRS
+    canonical mapping applies.
+    """
+
+    def discover_filings(
+        self,
+        ticker: str,
+        years: int = 2,
+    ) -> FilingDiscovery:
+        """Discover financial filings from DFM/ADX.
+
+        Parameters
+        ----------
+        ticker:
+            DFM or ADX ticker symbol (e.g. 'EMAAR', 'ETISALAT').
+        years:
+            Number of years to search back.
+        """
+        result = FilingDiscovery(ticker=ticker, market_id="ae_dfm")
+
+        today = date.today()
+        from_date = today - timedelta(days=365 * years)
+
+        # Try DFM disclosure API
+        for endpoint, exchange_name, headers in [
+            (_DFM_DISC_URL, "DFM", _DFM_HEADERS),
+            (_ADX_DISC_URL, "ADX", {**_DFM_HEADERS, "Referer": "https://www.adx.ae/"}),
+        ]:
+            try:
+                resp = requests.get(
+                    endpoint,
+                    params={
+                        "symbol": ticker,
+                        "companySymbol": ticker,
+                        "fromDate": from_date.strftime("%Y-%m-%d"),
+                        "toDate": today.strftime("%Y-%m-%d"),
+                        "category": "Financial",
+                        "pageSize": "20",
+                    },
+                    headers=headers,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+            except Exception as exc:
+                result.errors.append(f"{exchange_name} disclosure API failed: {exc}")
+                continue
+
+            try:
+                data = resp.json()
+                records = []
+                if isinstance(data, dict):
+                    records = data.get("data", data.get("items", data.get("disclosures", [])))
+                elif isinstance(data, list):
+                    records = data
+
+                for item in records:
+                    # Try both English and Arabic field names
+                    title_text = item.get("titleEn", item.get("title", item.get("subject", "")))
+                    ann_date = item.get("publishDate", item.get("date", item.get("disclosureDate", "")))
+                    doc_url = item.get("pdfUrl", item.get("fileUrl", item.get("documentUrl", "")))
+
+                    if not title_text:
+                        title_text = item.get("titleAr", "")
+                    if not title_text:
+                        continue
+
+                    # Filter financial disclosures
+                    lower = title_text.lower()
+                    if not any(kw in lower for kw in [
+                        "financial", "annual", "interim", "quarter",
+                        "result", "statement", "report",
+                        # Arabic keywords
+                        "مالي", "سنوي", "نتائج", "بيانات",
+                    ]):
+                        continue
+
+                    filing_date = str(ann_date)[:10] if ann_date else ""
+
+                    if "annual" in lower or "سنوي" in lower or "year" in lower:
+                        filing_type = "annual"
+                    elif "interim" in lower or "half" in lower or "six" in lower:
+                        filing_type = "interim"
+                    elif "quarter" in lower:
+                        filing_type = "quarterly"
+                    else:
+                        filing_type = "annual"
+
+                    if doc_url and not doc_url.startswith("http"):
+                        base = "https://www.dfm.ae" if exchange_name == "DFM" else "https://www.adx.ae"
+                        doc_url = f"{base}{doc_url}"
+
+                    filing = FilingMetadata(
+                        title=title_text,
+                        filing_date=filing_date,
+                        document_url=doc_url,
+                        document_format="pdf",
+                        filing_type=filing_type,
+                        market_id="ae_dfm",
+                    )
+                    result.filings.append(filing)
+
+            except (ValueError, AttributeError):
+                # HTML response -- try to find PDF links
+                html = resp.text
+                link_pattern = re.compile(r'href="([^"]*\.pdf)"', re.IGNORECASE)
+                for link in link_pattern.findall(html)[:10]:
+                    base = "https://www.dfm.ae" if exchange_name == "DFM" else "https://www.adx.ae"
+                    doc_url = link if link.startswith("http") else f"{base}{link}"
+                    filing = FilingMetadata(
+                        title=f"{ticker} financial disclosure ({exchange_name})",
+                        document_url=doc_url,
+                        document_format="pdf",
+                        filing_type="annual",
+                        market_id="ae_dfm",
+                    )
+                    result.filings.append(filing)
+
+        # Dedup
+        seen: set[str] = set()
+        unique: list[FilingMetadata] = []
+        for f in result.filings:
+            key = f.document_url or f.title
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+        result.filings = unique
+
+        logger.info("DFM/ADX discovery for %s: found %d filings", ticker, len(result.filings))
+        return result
+
+    def download_filing(self, filing: FilingMetadata) -> bytes:
+        """Download a DFM/ADX filing document."""
+        if not filing.document_url:
+            raise ValueError("No document URL in filing metadata")
+        resp = requests.get(filing.document_url, headers=_DFM_HEADERS, timeout=30)
+        resp.raise_for_status()
+        if resp.content[:4] != b"%PDF":
+            raise ValueError(f"Not a PDF: {resp.headers.get('Content-Type', 'unknown')}")
+        return resp.content
+
+
 DISCOVERER_REGISTRY: dict[str, type] = {
     "in_bse": BSEFilingDiscoverer,
     "au_asx": ASXFilingDiscoverer,
@@ -1059,6 +1636,9 @@ DISCOVERER_REGISTRY: dict[str, type] = {
     "sg_sgx": SGXFilingDiscoverer,
     "sa_tadawul": TadawulFilingDiscoverer,
     "ca_sedar": SEDARFilingDiscoverer,
+    "za_jse": JSEFilingDiscoverer,
+    "mx_bmv": BMVFilingDiscoverer,
+    "ae_dfm": DFMFilingDiscoverer,
 }
 
 

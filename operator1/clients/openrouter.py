@@ -23,12 +23,38 @@ from operator1.constants import OPENROUTER_BASE_URL
 
 logger = logging.getLogger(__name__)
 
-# Default model: free tier Gemini via OpenRouter
-_DEFAULT_MODEL = "google/gemini-2.0-flash-exp:free"
+# Default model: free Nvidia Nemotron via OpenRouter (tested working for extraction)
+_DEFAULT_MODEL = "nvidia/nemotron-nano-9b-v2:free"
 
 # Registry of known OpenRouter models with capabilities
 OPENROUTER_MODELS: dict[str, dict[str, Any]] = {
-    "google/gemini-2.0-flash-exp:free": {
+    # Free models (no credits needed)
+    "nvidia/nemotron-nano-9b-v2:free": {
+        "max_output_tokens": 4096,
+        "context_window": 32768,
+        "report_capable": True,
+        "tier": "free",
+    },
+    "nvidia/nemotron-3-super-120b-a12b:free": {
+        "max_output_tokens": 4096,
+        "context_window": 131072,
+        "report_capable": True,
+        "tier": "free",
+    },
+    "qwen/qwen3-next-80b-a3b-instruct:free": {
+        "max_output_tokens": 4096,
+        "context_window": 65536,
+        "report_capable": True,
+        "tier": "free",
+    },
+    # Paid models
+    "google/gemini-3.1-flash-lite-preview": {
+        "max_output_tokens": 8192,
+        "context_window": 1048576,
+        "report_capable": True,
+        "tier": "fast",
+    },
+    "google/gemini-3-flash-preview": {
         "max_output_tokens": 8192,
         "context_window": 1048576,
         "report_capable": True,

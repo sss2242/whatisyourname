@@ -171,8 +171,11 @@ def validate_model(
 ) -> str:
     """Validate a model name against the registry.
 
-    If the model is not in the registry, log a warning and return the
-    best available model instead.
+    If the model is in the registry, return it with full metadata logging.
+    If the model is NOT in the registry, accept it anyway with default
+    capabilities (4096 max tokens, 32768 context). This allows users to
+    specify any model their provider supports without being locked to
+    the hardcoded registry.
     """
     if model in model_registry:
         info = model_registry[model]
@@ -185,13 +188,21 @@ def validate_model(
         )
         return model
 
-    best = get_best_model(provider, model_registry)
-    logger.warning(
-        "%s model '%s' not in known registry. Using '%s' instead. "
+    # Accept unknown models with conservative defaults instead of
+    # falling back to a different (potentially expensive) model.
+    model_registry[model] = {
+        "max_output_tokens": 4096,
+        "context_window": 32768,
+        "report_capable": True,
+        "tier": "unknown",
+    }
+    logger.info(
+        "%s model '%s' not in known registry -- accepting with default "
+        "capabilities (max_output=4096, context=32768). "
         "Known models: %s",
-        provider, model, best, ", ".join(model_registry.keys()),
+        provider, model, ", ".join(model_registry.keys()),
     )
-    return best
+    return model
 
 
 # ---------------------------------------------------------------------------

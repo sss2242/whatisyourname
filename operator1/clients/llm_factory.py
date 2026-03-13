@@ -244,11 +244,21 @@ def create_llm_client(
 
     # Build the client
     if provider == "claude":
-        return _build_claude(secrets, model)
+        from operator1.secrets_loader import get_key_pool
+        keys = get_key_pool(secrets, "ANTHROPIC_API_KEY")
+        if not keys:
+            logger.info("No ANTHROPIC_API_KEY found; LLM features disabled.")
+            return None
+        return _build_single_client("claude", keys[0], model)
     elif provider == "openrouter":
         return _build_openrouter(secrets, model)
     else:
-        return _build_gemini(secrets, model)
+        from operator1.secrets_loader import get_key_pool
+        keys = get_key_pool(secrets, "GEMINI_API_KEY")
+        if not keys:
+            logger.info("No GEMINI_API_KEY found; LLM features disabled.")
+            return None
+        return _build_single_client("gemini", keys[0], model)
 
 
 def _auto_detect_provider(secrets: dict[str, str]) -> str:
