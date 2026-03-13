@@ -1226,8 +1226,11 @@ def _build_technical_patterns(profile: dict[str, Any]) -> str:
     predicted = patterns.get("predicted_patterns_week", patterns.get("predicted_patterns", []))
 
     _has_ohlcv = profile.get("meta", {}).get("has_ohlcv", True)
+    _is_priv = profile.get("meta", {}).get("is_private_company", False)
     if _has_ohlcv:
         lines.append("*(See attached price history chart with regime shading)*")
+    elif _is_priv:
+        lines.append("*(See attached equity trajectory chart -- private company, no market price data)*")
     else:
         lines.append("*(Price history chart not available -- no OHLCV data for this company)*")
     lines.append("")
@@ -3027,9 +3030,48 @@ def generate_charts(
     # but still generate non-price charts (survival, financial health, sentiment, conflict).
     _has_ohlcv = profile.get("meta", {}).get("has_ohlcv", "close" in cache.columns)
 
-    # Chart 1: Price History with Regime Overlay
+    # Chart 1: Price History (public) or Equity Trajectory (private)
+    _is_private = profile.get("meta", {}).get("is_private_company", False)
     try:
-        if _has_ohlcv and "close" in cache.columns:
+        if not _has_ohlcv and _is_private and "equity_value" in cache.columns:
+            # Private company: equity trajectory chart
+            fig, ax = plt.subplots(figsize=(16, 7))
+            ev = cache["equity_value"].dropna()
+            if len(ev) > 0:
+                ax.plot(ev.index, ev, linewidth=1.5, color=_CHART_ACCENT, zorder=3)
+                _apply_brand_style(fig, ax, f"{company} -- Book Equity Value (2Y)")
+                ax.set_ylabel("Total Equity ($)", color=_CHART_FG)
+
+                # Regime shading if available
+                if "regime_label" in cache.columns:
+                    regime_colors = {
+                        "bull": (_CHART_GREEN, "Improving"),
+                        "bear": (_CHART_RED, "Deteriorating"),
+                        "high_vol": (_CHART_GOLD, "Volatile"),
+                        "low_vol": ("#8b8694", "Stable"),
+                    }
+                    for regime, (color, label) in regime_colors.items():
+                        mask = cache["regime_label"] == regime
+                        if mask.any():
+                            ax.fill_between(
+                                cache.index,
+                                ev.min() * 0.98,
+                                ev.max() * 1.02,
+                                where=mask.reindex(cache.index, fill_value=False),
+                                alpha=0.15, color=color, label=label,
+                            )
+                    ax.legend(
+                        loc="upper left", fontsize=9, facecolor=_CHART_BG,
+                        edgecolor=_CHART_GRID, labelcolor=_CHART_FG,
+                    )
+
+                fig.tight_layout()
+                path = str(out / "price_history.png")
+                fig.savefig(path, dpi=180, facecolor=_CHART_BG)
+                plt.close(fig)
+                chart_paths.append(path)
+                logger.info("Generated chart: %s (private company equity trajectory)", path)
+        elif _has_ohlcv and "close" in cache.columns:
             fig, ax = plt.subplots(figsize=(16, 7))
             ax.plot(cache.index, cache["close"], linewidth=1.5, color=_CHART_ACCENT, zorder=3)
             _apply_brand_style(fig, ax, f"{company} -- Closing Price (2Y)")

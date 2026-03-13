@@ -1012,6 +1012,23 @@ Non-interactive examples:
     except Exception as exc:
         logger.warning("Feature engineering partially failed: %s", exc)
 
+    # Step 5a: Private company proxy variables (when no OHLCV data)
+    _is_private = False
+    try:
+        from operator1.features.private_company_proxies import (
+            is_private_company,
+            compute_private_company_proxies,
+        )
+        _is_private = is_private_company(cache)
+        if _is_private:
+            cache = compute_private_company_proxies(cache)
+            logger.info(
+                "Private company mode ACTIVE -- using financial statement "
+                "proxies for temporal models"
+            )
+    except Exception as exc:
+        logger.warning("Private company proxy computation failed: %s", exc)
+
     # Survival mode
     weights: dict = {f"tier{i}": 20.0 for i in range(1, 6)}
     try:
@@ -1382,7 +1399,11 @@ Non-interactive examples:
             # Early regime detection: runs HMM/GMM/PELT/BCP and adds regime
             # columns to cache. This replaces the separate regime detection
             # that used to run at the start of Step 6.
-            cache, early_regime_result = run_early_regime_detection(cache)
+            # In private company mode, use equity_change_rate instead of return_1d.
+            _regime_target = "equity_change_rate" if _is_private else "return_1d"
+            cache, early_regime_result = run_early_regime_detection(
+                cache, target_variable=_regime_target,
+            )
             if early_regime_result and early_regime_result.fitted:
                 regime_detector = early_regime_result.detector
                 logger.info("Early regime detection complete")
@@ -1579,10 +1600,14 @@ Non-interactive examples:
             logger.warning("Transfer entropy failed: %s", exc)
 
         # Cycle decomposition
+        # In private mode, use revenue or equity instead of close price.
+        _cycle_var = "equity_value" if _is_private else "close"
+        if _is_private and _cycle_var not in cache.columns:
+            _cycle_var = "revenue" if "revenue" in cache.columns else "total_equity"
         try:
             from operator1.models.cycle_decomposition import run_cycle_decomposition
-            cycle_result = run_cycle_decomposition(cache, variable="close")
-            logger.info("Cycle decomposition complete")
+            cycle_result = run_cycle_decomposition(cache, variable=_cycle_var)
+            logger.info("Cycle decomposition complete (variable=%s)", _cycle_var)
         except Exception as exc:
             logger.warning("Cycle decomposition failed: %s", exc)
 
@@ -1687,8 +1712,10 @@ Non-interactive examples:
             logger.warning("Walk-forward evaluation failed: %s", exc)
 
         # Monte Carlo
+        # In private mode, use equity_change_rate instead of return_1d.
         try:
-            mc_result = run_monte_carlo(cache)
+            _mc_returns = "equity_change_rate" if _is_private else "return_1d"
+            mc_result = run_monte_carlo(cache, returns_col=_mc_returns)
             logger.info("Monte Carlo simulation complete")
         except Exception as exc:
             logger.warning("Monte Carlo failed: %s", exc)
@@ -1784,7 +1811,12 @@ Non-interactive examples:
         # DTW analogs (before aggregation so results feed in)
         try:
             from operator1.models.dtw_analogs import find_historical_analogs
-            dtw_result = find_historical_analogs(cache)
+            _dtw_vars = None
+            if _is_private:
+                _dtw_vars = [c for c in ["equity_value", "revenue", "net_income",
+                             "total_debt", "operating_cash_flow"]
+                             if c in cache.columns and cache[c].notna().sum() > 30]
+            dtw_result = find_historical_analogs(cache, variables=_dtw_vars)
             logger.info("DTW analogs complete")
         except Exception as exc:
             logger.warning("DTW historical analogs failed: %s", exc)
@@ -2027,6 +2059,7 @@ Non-interactive examples:
             and cache["close"].notna().sum() >= 5
         )
         profile["meta"]["has_ohlcv"] = _has_ohlcv
+        profile["meta"]["is_private_company"] = _is_private
         if not _has_ohlcv:
             logger.warning(
                 "No usable OHLCV data in cache -- price charts and "
