@@ -481,6 +481,108 @@ class ExtractionResult:
     tokens_used: int = 0
 
 
+# ---------------------------------------------------------------------------
+# PDF page scoring helpers (used by extract_from_pdf)
+# ---------------------------------------------------------------------------
+
+# Keywords that indicate financial statement content
+_FINANCIAL_KEYWORDS = [
+    "income statement", "profit and loss", "profit or loss",
+    "statement of comprehensive income", "statement of profit",
+    "consolidated income", "results of operations",
+    "balance sheet", "statement of financial position",
+    "consolidated balance", "assets and liabilities",
+    "cash flow", "statement of cash flows", "consolidated cash flow",
+    "revenue", "total revenue", "net sales", "cost of sales",
+    "gross profit", "operating income", "operating profit",
+    "profit before tax", "net income", "net profit",
+    "total assets", "total liabilities", "total equity",
+    "shareholders equity", "current assets", "current liabilities",
+    "cash and cash equivalents", "operating activities",
+    "investing activities", "financing activities",
+    "earnings per share", "dividends per share",
+    "us$m", "us$ m", "a$m", "hk$m", "rm m", "r m",
+]
+
+# Keywords that indicate non-financial content (noise)
+_NOISE_KEYWORDS = [
+    "table of contents", "risk factors", "forward-looking",
+    "management discussion", "corporate governance",
+    "board of directors", "remuneration", "sustainability",
+    "environmental", "safety", "community",
+]
+
+
+def _score_page_for_financials(text: str) -> float:
+    """Score a single page for financial statement content."""
+    lower = text.lower()
+    score = 0.0
+
+    for kw in _FINANCIAL_KEYWORDS:
+        if kw in lower:
+            score += 2.0
+
+    # Bonus for pages with many numbers (financial tables)
+    number_count = len(re.findall(r'\d[\d,]+\.?\d*', text))
+    if number_count > 10:
+        score += number_count * 0.1
+
+    # Bonus for pipe-separated content (table extraction format)
+    pipe_count = text.count("|")
+    if pipe_count > 5:
+        score += pipe_count * 0.05
+
+    for kw in _NOISE_KEYWORDS:
+        if kw in lower:
+            score -= 1.0
+
+    return score
+
+
+def _select_top_pages(
+    page_texts: list[tuple[int, str]],
+    max_chars: int = 12000,
+) -> str:
+    """Score pages and select the highest-scoring ones up to max_chars.
+
+    Always includes page 0 (cover/summary) for metadata context,
+    then fills with the highest-scoring financial pages.
+    """
+    if not page_texts:
+        return ""
+
+    # Score each page
+    scored = [(pn, text, _score_page_for_financials(text)) for pn, text in page_texts]
+    scored.sort(key=lambda x: x[2], reverse=True)
+
+    selected: list[tuple[int, str]] = []
+    total_chars = 0
+
+    # Always include page 0 for metadata (report date, currency, period)
+    page_zero = next((s for s in scored if s[0] == 0), None)
+    if page_zero:
+        selected.append((page_zero[0], page_zero[1]))
+        total_chars += len(page_zero[1])
+
+    # Add highest-scoring pages
+    for page_num, text, score in scored:
+        if page_num == 0:
+            continue
+        if score <= 0:
+            continue
+        if total_chars + len(text) > max_chars:
+            remaining = max_chars - total_chars
+            if remaining > 200:
+                selected.append((page_num, text[:remaining]))
+            break
+        selected.append((page_num, text))
+        total_chars += len(text)
+
+    # Sort by page number for coherent reading order
+    selected.sort(key=lambda x: x[0])
+    return "\n\n".join(f"--- Page {pn + 1} ---\n{t}" for pn, t in selected)
+
+
 class LLMFilingExtractor:
     """Universal financial filing extractor using LLM."""
 
@@ -613,10 +715,10 @@ class LLMFilingExtractor:
 
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                # Extract text from all pages, focusing on financial tables
-                all_text = []
-                for page in pdf.pages:
-                    # Try table extraction first
+                # Extract text per page with table preference
+                page_texts: list[tuple[int, str]] = []
+                for i, page in enumerate(pdf.pages):
+                    page_parts = []
                     tables = page.extract_tables()
                     if tables:
                         for table in tables:
@@ -626,21 +728,32 @@ class LLMFilingExtractor:
                                         str(cell).strip() for cell in row if cell
                                     )
                                     if row_text:
-                                        all_text.append(row_text)
+                                        page_parts.append(row_text)
                     else:
-                        # Fall back to raw text
                         text = page.extract_text()
                         if text:
-                            all_text.append(text)
+                            page_parts.append(text)
+                    if page_parts:
+                        page_texts.append((i, "\n".join(page_parts)))
 
-                text = "\n".join(all_text)
-
-            if not text.strip():
+            if not page_texts:
                 result.error = "No text extracted from PDF"
                 return result
 
-            # Truncate to ~12K chars for LLM context
-            text = text[:12000]
+            # Smart page selection: score pages for financial content
+            # and select the top-scoring ones (up to 12K chars).
+            # This ensures financial statements (often buried in pages
+            # 20-60 of a 100+ page document) reach the LLM.
+            text = _select_top_pages(page_texts, max_chars=12000)
+
+            if not text.strip():
+                # Fallback: use first 12K chars
+                text = "\n".join(t for _, t in page_texts)[:12000]
+
+            logger.info(
+                "PDF smart selection: %d pages total, %d chars selected",
+                len(page_texts), len(text),
+            )
 
             return self._extract_via_llm(text, market_id, "pdf")
 
