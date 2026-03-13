@@ -1576,10 +1576,15 @@ Non-interactive examples:
                     cache, variables=_gc_vars,
                 )
                 if granger_result and granger_result.fitted:
+                    _granger_keep = (
+                        ["equity_value", "equity_change_rate", "financial_volatility"]
+                        if _is_private
+                        else ["close", "return_1d", "volatility_21d"]
+                    )
                     _extra_vars = prune_features_by_causality(
                         _extra_vars,
                         granger_result,
-                        always_keep=["close", "return_1d", "volatility_21d"],
+                        always_keep=_granger_keep,
                     )
                     logger.info(
                         "Granger causality: %d significant pairs, %d variables retained",
@@ -1874,7 +1879,8 @@ Non-interactive examples:
         # Sobol sensitivity
         try:
             from operator1.models.sensitivity import run_sensitivity_analysis
-            sobol_result = run_sensitivity_analysis(cache, target_variable="return_1d")
+            _sobol_target = "equity_change_rate" if _is_private else "return_1d"
+            sobol_result = run_sensitivity_analysis(cache, target_variable=_sobol_target)
             logger.info("Sobol sensitivity analysis complete")
         except Exception as exc:
             logger.warning("Sobol sensitivity failed: %s", exc)

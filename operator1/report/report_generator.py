@@ -2907,7 +2907,7 @@ def validate_gemini_report(
             "; ".join(issues[:5]),
         )
     else:
-        logger.info("Gemini report validation: all checks passed")
+        logger.info("LLM report validation: all checks passed")
 
     return is_valid, issues
 
