@@ -670,10 +670,18 @@ def _build_historical_section(
     Computes total return, annualised return/volatility, Sharpe ratio,
     max drawdown, and day-level statistics over the analysis window.
     """
-    if cache is None or cache.empty or "close" not in cache.columns:
+    # Use close price for public companies, equity_value for private companies.
+    _value_col = "close"
+    if "close" not in cache.columns or cache["close"].notna().sum() < 2:
+        if "equity_value" in cache.columns and cache["equity_value"].notna().sum() >= 2:
+            _value_col = "equity_value"
+        else:
+            return {"available": False}
+
+    if cache is None or cache.empty:
         return {"available": False}
 
-    close = cache["close"].dropna()
+    close = cache[_value_col].dropna()
     if len(close) < 2:
         return {"available": False}
 

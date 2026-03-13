@@ -618,11 +618,13 @@ def detect_regimes_and_breaks(
     bcp_hazard_lambda: float = 200.0,
     bcp_threshold: float = 0.5,
     random_state: int = 42,
+    target_variable: str = "return_1d",
 ) -> tuple[pd.DataFrame, RegimeDetector]:
     """Run all regime detection methods on a daily cache DataFrame.
 
-    Expects columns ``return_1d`` and ``volatility_21d`` to be present.
-    Adds regime classification and structural-break columns in-place.
+    Expects columns ``return_1d`` and ``volatility_21d`` to be present
+    (or their private company proxies: ``equity_change_rate`` and
+    ``financial_volatility``).
 
     Parameters
     ----------
@@ -638,6 +640,10 @@ def detect_regimes_and_breaks(
         BCP posterior probability threshold.
     random_state:
         Random seed.
+    target_variable:
+        Primary return variable for regime detection. Default is
+        ``"return_1d"`` for public companies. For private companies
+        without OHLCV data, use ``"equity_change_rate"``.
 
     Returns
     -------
@@ -651,9 +657,15 @@ def detect_regimes_and_breaks(
     # ------------------------------------------------------------------
     # Extract feature arrays
     # ------------------------------------------------------------------
-    returns_col = "return_1d"
-    vol_col = "volatility_21d"
-    close_col = "close"
+    # Support both public (return_1d/volatility_21d/close) and private
+    # company mode (equity_change_rate/financial_volatility/equity_value).
+    returns_col = target_variable
+    if target_variable == "equity_change_rate":
+        vol_col = "financial_volatility"
+        close_col = "equity_value"
+    else:
+        vol_col = "volatility_21d"
+        close_col = "close"
 
     if returns_col not in cache.columns:
         logger.warning("Column '%s' not found -- regime detection skipped", returns_col)
@@ -824,6 +836,7 @@ def run_early_regime_detection(
     bcp_hazard_lambda: float = 200.0,
     bcp_threshold: float = 0.5,
     random_state: int = 42,
+    target_variable: str = "return_1d",
 ) -> tuple[pd.DataFrame, EarlyRegimeResult]:
     """Run regime detection early in the pipeline (Step 5.5).
 
@@ -839,7 +852,12 @@ def run_early_regime_detection(
     Parameters
     ----------
     cache:
-        Daily cache DataFrame with ``return_1d`` and ``volatility_21d``.
+        Daily cache DataFrame with ``return_1d`` and ``volatility_21d``
+        (or ``equity_change_rate`` and ``financial_volatility`` for
+        private companies).
+    target_variable:
+        Primary return variable. ``"return_1d"`` for public companies,
+        ``"equity_change_rate"`` for private companies without OHLCV.
     n_regimes, pelt_penalty, bcp_hazard_lambda, bcp_threshold, random_state:
         Passed through to ``detect_regimes_and_breaks()``.
 
@@ -859,6 +877,7 @@ def run_early_regime_detection(
             bcp_hazard_lambda=bcp_hazard_lambda,
             bcp_threshold=bcp_threshold,
             random_state=random_state,
+            target_variable=target_variable,
         )
         early.detector = detector
 

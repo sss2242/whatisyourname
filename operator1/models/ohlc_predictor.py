@@ -219,18 +219,45 @@ def predict_ohlc_series(
 
     try:
         # Next day (Technical Alpha: mask everything except Low)
-        day1_candles = _generate_series(1, "1d")
-        if day1_candles:
-            masked = day1_candles[0]
-            result.next_day = OHLCCandle(
-                date=masked.date,
-                open=None,   # MASKED
-                high=None,   # MASKED
-                low=masked.low,  # VISIBLE
-                close=None,  # MASKED
-                volume=None,  # MASKED
-                confidence=masked.confidence,
-            )
+        # Generate many simulated next-day candles via Monte Carlo to find
+        # the most reliable Low estimate.  A single random sample gives an
+        # unreliable low; averaging across N simulations produces a robust
+        # estimate of the day's likely trough.
+        _N_NEXT_DAY_SIMS = 500
+        _sim_lows: list[float] = []
+        _sim_date: str = ""
+        for _sim_i in range(_N_NEXT_DAY_SIMS):
+            _sim_rng = np.random.default_rng(random_seed + _sim_i)
+            _sim_mu = horizon_mu.get("1d", mu)
+            _noise = sigma_daily * survival_mult
+            _sim_ret = _sim_mu + _sim_rng.normal(0, _noise)
+            _sim_ohlc = _estimate_daily_ohlc(last_close, _sim_ret, _noise, vol_ma, _sim_rng)
+            _sim_lows.append(_sim_ohlc["low"])
+            if not _sim_date:
+                _d = last_date + timedelta(days=1)
+                while hasattr(_d, "weekday") and _d.weekday() >= 5:
+                    _d += timedelta(days=1)
+                _sim_date = str(_d.date()) if hasattr(_d, "date") else str(_d)
+
+        # Use the 10th percentile of simulated lows as the estimated low
+        # (conservative: 90% of simulations stay above this level)
+        _robust_low = float(np.percentile(_sim_lows, 10))
+        _median_low = float(np.median(_sim_lows))
+        _confidence = max(0.1, 1.0 - (np.std(_sim_lows) / last_close) * 10)
+
+        result.next_day = OHLCCandle(
+            date=_sim_date,
+            open=None,   # MASKED
+            high=None,   # MASKED
+            low=round(_robust_low, 4),  # VISIBLE -- robust estimate from 500 simulations
+            close=None,  # MASKED
+            volume=None,  # MASKED
+            confidence=round(min(_confidence, 1.0), 4),
+        )
+        logger.info(
+            "Next-day Low estimate: %.4f (p10 of %d sims, median=%.4f, std=%.4f)",
+            _robust_low, _N_NEXT_DAY_SIMS, _median_low, float(np.std(_sim_lows)),
+        )
 
         # Next week (5 trading days, full OHLC)
         result.next_week = _generate_series(5, "5d")

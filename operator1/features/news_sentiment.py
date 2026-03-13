@@ -12,7 +12,7 @@ supplementary data scored by the LLM.
 Falls back to keyword-based scoring if the LLM is unavailable.
 
 Top-level entry point:
-    ``compute_news_sentiment(cache, symbol, gemini_client=None,
+    ``compute_news_sentiment(cache, symbol, llm_client=None,
                              market_id="", company_name="")``
 """
 
@@ -340,7 +340,7 @@ def compute_news_sentiment(
     cache: pd.DataFrame,
     *,
     _legacy_fmp_client: Any = None,
-    gemini_client: Any = None,
+    llm_client: Any = None,
     symbol: str = "",
     market_id: str = "",
     company_name: str = "",
@@ -358,7 +358,7 @@ def compute_news_sentiment(
         Daily cache DataFrame (DatetimeIndex).
     _legacy_fmp_client:
         Legacy parameter, ignored.
-    gemini_client:
+    llm_client:
         LLM client instance for AI sentiment scoring. Optional.
         Accepts GeminiClient, ClaudeClient, OpenRouterClient, or
         PooledLLMClient.
@@ -431,9 +431,9 @@ def compute_news_sentiment(
     headlines = articles["title"].fillna("").tolist()
 
     scores: list[float] = []
-    if gemini_client is not None and hasattr(gemini_client, "score_sentiment"):
+    if llm_client is not None and hasattr(llm_client, "score_sentiment"):
         try:
-            scores = gemini_client.score_sentiment(headlines)
+            scores = llm_client.score_sentiment(headlines)
             if len(scores) == len(headlines):
                 result.scoring_method = "gemini"
                 logger.info("Scored %d headlines via Gemini", len(scores))

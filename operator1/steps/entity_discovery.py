@@ -371,7 +371,7 @@ def _build_all_pit_clients(secrets: dict[str, str] | None = None) -> list[Equity
 def discover_linked_entities(
     target_profile: dict[str, Any],
     pit_client: EquityProvider,
-    gemini_client: LLMClient | None = None,
+    llm_client: LLMClient | None = None,
     target_isin: str = "",
     force_rebuild: bool | None = None,
     secrets: dict[str, str] | None = None,
@@ -389,8 +389,8 @@ def discover_linked_entities(
         Full profile dict from PIT provider (used for Gemini hints).
     pit_client:
         Initialised PIT data client for the target's market.
-    gemini_client:
-        Optional Gemini client.  If ``None``, skips LLM proposals and
+    llm_client:
+        Optional LLM client.  If ``None``, skips LLM proposals and
         goes straight to peer fallback for competitors.
     target_isin:
         Identifier of the verified target.
@@ -449,9 +449,9 @@ def discover_linked_entities(
     # 1. Get Gemini proposals (names only -- no financial data)
     # ------------------------------------------------------------------
     proposals: dict[str, list[str]] = {}
-    if gemini_client is not None:
+    if llm_client is not None:
         sector_hints = f"{target_sector}, country={target_country}"
-        proposals = gemini_client.propose_linked_entities(
+        proposals = llm_client.propose_linked_entities(
             target_profile, sector_hints=sector_hints,
         )
         logger.info(

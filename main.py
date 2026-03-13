@@ -1012,6 +1012,23 @@ Non-interactive examples:
     except Exception as exc:
         logger.warning("Feature engineering partially failed: %s", exc)
 
+    # Step 5a: Private company proxy variables (when no OHLCV data)
+    _is_private = False
+    try:
+        from operator1.features.private_company_proxies import (
+            is_private_company,
+            compute_private_company_proxies,
+        )
+        _is_private = is_private_company(cache)
+        if _is_private:
+            cache = compute_private_company_proxies(cache)
+            logger.info(
+                "Private company mode ACTIVE -- using financial statement "
+                "proxies for temporal models"
+            )
+    except Exception as exc:
+        logger.warning("Private company proxy computation failed: %s", exc)
+
     # Survival mode
     weights: dict = {f"tier{i}": 20.0 for i in range(1, 6)}
     try:
@@ -1100,10 +1117,9 @@ Non-interactive examples:
         try:
             from operator1.steps.entity_discovery import discover_linked_entities
 
-            gemini_client = llm_client
             discovery_result = discover_linked_entities(
                 target_profile=target_profile,
-                gemini_client=gemini_client,
+                llm_client=llm_client,
                 pit_client=pit_client,
                 secrets=secrets,
             )
@@ -1332,7 +1348,7 @@ Non-interactive examples:
         from operator1.features.news_sentiment import compute_news_sentiment
         cache, _sent_result = compute_news_sentiment(
             cache,
-            gemini_client=llm_client,
+            llm_client=llm_client,
             symbol=ticker,
             market_id=market_id,
             company_name=company_name,
@@ -1383,7 +1399,11 @@ Non-interactive examples:
             # Early regime detection: runs HMM/GMM/PELT/BCP and adds regime
             # columns to cache. This replaces the separate regime detection
             # that used to run at the start of Step 6.
-            cache, early_regime_result = run_early_regime_detection(cache)
+            # In private company mode, use equity_change_rate instead of return_1d.
+            _regime_target = "equity_change_rate" if _is_private else "return_1d"
+            cache, early_regime_result = run_early_regime_detection(
+                cache, target_variable=_regime_target,
+            )
             if early_regime_result and early_regime_result.fitted:
                 regime_detector = early_regime_result.detector
                 logger.info("Early regime detection complete")
@@ -1556,10 +1576,15 @@ Non-interactive examples:
                     cache, variables=_gc_vars,
                 )
                 if granger_result and granger_result.fitted:
+                    _granger_keep = (
+                        ["equity_value", "equity_change_rate", "financial_volatility"]
+                        if _is_private
+                        else ["close", "return_1d", "volatility_21d"]
+                    )
                     _extra_vars = prune_features_by_causality(
                         _extra_vars,
                         granger_result,
-                        always_keep=["close", "return_1d", "volatility_21d"],
+                        always_keep=_granger_keep,
                     )
                     logger.info(
                         "Granger causality: %d significant pairs, %d variables retained",
@@ -1580,10 +1605,14 @@ Non-interactive examples:
             logger.warning("Transfer entropy failed: %s", exc)
 
         # Cycle decomposition
+        # In private mode, use revenue or equity instead of close price.
+        _cycle_var = "equity_value" if _is_private else "close"
+        if _is_private and _cycle_var not in cache.columns:
+            _cycle_var = "revenue" if "revenue" in cache.columns else "total_equity"
         try:
             from operator1.models.cycle_decomposition import run_cycle_decomposition
-            cycle_result = run_cycle_decomposition(cache, variable="close")
-            logger.info("Cycle decomposition complete")
+            cycle_result = run_cycle_decomposition(cache, variable=_cycle_var)
+            logger.info("Cycle decomposition complete (variable=%s)", _cycle_var)
         except Exception as exc:
             logger.warning("Cycle decomposition failed: %s", exc)
 
@@ -1688,8 +1717,10 @@ Non-interactive examples:
             logger.warning("Walk-forward evaluation failed: %s", exc)
 
         # Monte Carlo
+        # In private mode, use equity_change_rate instead of return_1d.
         try:
-            mc_result = run_monte_carlo(cache)
+            _mc_returns = "equity_change_rate" if _is_private else "return_1d"
+            mc_result = run_monte_carlo(cache, returns_col=_mc_returns)
             logger.info("Monte Carlo simulation complete")
         except Exception as exc:
             logger.warning("Monte Carlo failed: %s", exc)
@@ -1785,7 +1816,12 @@ Non-interactive examples:
         # DTW analogs (before aggregation so results feed in)
         try:
             from operator1.models.dtw_analogs import find_historical_analogs
-            dtw_result = find_historical_analogs(cache)
+            _dtw_vars = None
+            if _is_private:
+                _dtw_vars = [c for c in ["equity_value", "revenue", "net_income",
+                             "total_debt", "operating_cash_flow"]
+                             if c in cache.columns and cache[c].notna().sum() > 30]
+            dtw_result = find_historical_analogs(cache, variables=_dtw_vars)
             logger.info("DTW analogs complete")
         except Exception as exc:
             logger.warning("DTW historical analogs failed: %s", exc)
@@ -1843,7 +1879,8 @@ Non-interactive examples:
         # Sobol sensitivity
         try:
             from operator1.models.sensitivity import run_sensitivity_analysis
-            sobol_result = run_sensitivity_analysis(cache, target_variable="return_1d")
+            _sobol_target = "equity_change_rate" if _is_private else "return_1d"
+            sobol_result = run_sensitivity_analysis(cache, target_variable=_sobol_target)
             logger.info("Sobol sensitivity analysis complete")
         except Exception as exc:
             logger.warning("Sobol sensitivity failed: %s", exc)
@@ -2020,6 +2057,21 @@ Non-interactive examples:
         # OHLCV typically comes from yfinance or a per-region wrapper.
         profile["meta"]["ohlcv_source"] = _ohlcv_source_label
 
+        # Flag whether OHLCV data is available in the cache.
+        # Used by the report generator to decide whether to generate
+        # price-based charts and reference them in the report narrative.
+        _has_ohlcv = (
+            "close" in cache.columns
+            and cache["close"].notna().sum() >= 5
+        )
+        profile["meta"]["has_ohlcv"] = _has_ohlcv
+        profile["meta"]["is_private_company"] = _is_private
+        if not _has_ohlcv:
+            logger.warning(
+                "No usable OHLCV data in cache -- price charts and "
+                "price-dependent models will be skipped in the report."
+            )
+
         # Inject macro data summary
         if macro_api_info:
             profile["meta"]["macro_source"] = macro_api_info.api_name
@@ -2177,7 +2229,7 @@ Non-interactive examples:
         try:
             all_reports = generate_all_reports(
                 profile=profile,
-                gemini_client=llm_client,
+                llm_client=llm_client,
                 cache=cache,
                 output_dir=Path(args.output_dir) / "report",
                 generate_pdf=args.pdf,
@@ -2227,7 +2279,7 @@ def _generate_report_only(args: argparse.Namespace, secrets: dict) -> int:
 
     report_output = generate_report(
         profile=profile,
-        gemini_client=llm_client,
+        llm_client=llm_client,
         output_dir=Path(args.output_dir) / "report",
         generate_pdf=args.pdf,
     )

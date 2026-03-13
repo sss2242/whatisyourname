@@ -13,7 +13,7 @@ covering data window, OHLCV source caveats, macro frequency, data
 missingness summary, and failed modules with mitigations.
 
 Top-level entry point:
-    ``generate_report(profile, gemini_client=None, ...)``
+    ``generate_report(profile, llm_client=None, ...)``
 
 Spec refs: Sec 18
 """
@@ -1225,7 +1225,14 @@ def _build_technical_patterns(profile: dict[str, Any]) -> str:
     recent = patterns.get("recent_patterns", [])
     predicted = patterns.get("predicted_patterns_week", patterns.get("predicted_patterns", []))
 
-    lines.append("*(See attached price history chart with regime shading)*")
+    _has_ohlcv = profile.get("meta", {}).get("has_ohlcv", True)
+    _is_priv = profile.get("meta", {}).get("is_private_company", False)
+    if _has_ohlcv:
+        lines.append("*(See attached price history chart with regime shading)*")
+    elif _is_priv:
+        lines.append("*(See attached equity trajectory chart -- private company, no market price data)*")
+    else:
+        lines.append("*(Price history chart not available -- no OHLCV data for this company)*")
     lines.append("")
 
     if recent:
@@ -1289,7 +1296,10 @@ def _build_technical_patterns(profile: dict[str, Any]) -> str:
                     )
 
         lines.append("")
-        lines.append("*(See attached predicted candlestick charts)*")
+        if _has_ohlcv:
+            lines.append("*(See attached predicted candlestick charts)*")
+        else:
+            lines.append("*(Predicted candlestick charts not available -- no OHLCV data)*")
     else:
         lines.append("*(Predicted candlestick charts not available for this run)*")
 
@@ -2897,7 +2907,7 @@ def validate_gemini_report(
             "; ".join(issues[:5]),
         )
     else:
-        logger.info("Gemini report validation: all checks passed")
+        logger.info("LLM report validation: all checks passed")
 
     return is_valid, issues
 
@@ -2981,8 +2991,18 @@ def generate_charts(
     _CHART_GREEN = "#1ea885"    # teal-green (calmer than neon)
     _CHART_GOLD = "#e8950a"     # warm amber warning
 
-    def _apply_brand_style(fig, ax, title: str) -> None:
-        """Apply Operator 1 brand theme to a chart."""
+    def _apply_brand_style(fig, ax, title: str, *, use_date_axis: bool = True) -> None:
+        """Apply Operator 1 brand theme to a chart.
+
+        Parameters
+        ----------
+        use_date_axis:
+            If True (default), format x-axis as calendar dates.
+            Set to False for charts that use integer or non-date x-axes
+            (e.g. predicted OHLC candlestick charts where x = "days ahead").
+            Without this flag, integer x-values get interpreted as matplotlib
+            date ordinals, producing nonsense dates like 1959-1960.
+        """
         fig.patch.set_facecolor(_CHART_BG)
         ax.set_facecolor(_CHART_BG)
         ax.set_title(title, color=_CHART_FG, fontsize=14, fontweight="bold", pad=12)
@@ -2994,8 +3014,9 @@ def generate_charts(
         ax.spines["bottom"].set_color(_CHART_GRID)
         ax.spines["left"].set_color(_CHART_GRID)
         ax.grid(True, color=_CHART_GRID, alpha=0.5, linewidth=0.5)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
-        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+        if use_date_axis:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+            ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
         for label in ax.get_xticklabels():
             label.set_rotation(45)
             label.set_ha("right")
@@ -3004,9 +3025,53 @@ def generate_charts(
     identity = profile.get("identity", {})
     company = identity.get("name", identity.get("ticker", ""))
 
-    # Chart 1: Price History with Regime Overlay
+    # Check whether OHLCV price data is available.
+    # If not, skip price-dependent charts (price history, volatility, OHLC predictions)
+    # but still generate non-price charts (survival, financial health, sentiment, conflict).
+    _has_ohlcv = profile.get("meta", {}).get("has_ohlcv", "close" in cache.columns)
+
+    # Chart 1: Price History (public) or Equity Trajectory (private)
+    _is_private = profile.get("meta", {}).get("is_private_company", False)
     try:
-        if "close" in cache.columns:
+        if not _has_ohlcv and _is_private and "equity_value" in cache.columns:
+            # Private company: equity trajectory chart
+            fig, ax = plt.subplots(figsize=(16, 7))
+            ev = cache["equity_value"].dropna()
+            if len(ev) > 0:
+                ax.plot(ev.index, ev, linewidth=1.5, color=_CHART_ACCENT, zorder=3)
+                _apply_brand_style(fig, ax, f"{company} -- Book Equity Value (2Y)")
+                ax.set_ylabel("Total Equity ($)", color=_CHART_FG)
+
+                # Regime shading if available
+                if "regime_label" in cache.columns:
+                    regime_colors = {
+                        "bull": (_CHART_GREEN, "Improving"),
+                        "bear": (_CHART_RED, "Deteriorating"),
+                        "high_vol": (_CHART_GOLD, "Volatile"),
+                        "low_vol": ("#8b8694", "Stable"),
+                    }
+                    for regime, (color, label) in regime_colors.items():
+                        mask = cache["regime_label"] == regime
+                        if mask.any():
+                            ax.fill_between(
+                                cache.index,
+                                ev.min() * 0.98,
+                                ev.max() * 1.02,
+                                where=mask.reindex(cache.index, fill_value=False),
+                                alpha=0.15, color=color, label=label,
+                            )
+                    ax.legend(
+                        loc="upper left", fontsize=9, facecolor=_CHART_BG,
+                        edgecolor=_CHART_GRID, labelcolor=_CHART_FG,
+                    )
+
+                fig.tight_layout()
+                path = str(out / "price_history.png")
+                fig.savefig(path, dpi=180, facecolor=_CHART_BG)
+                plt.close(fig)
+                chart_paths.append(path)
+                logger.info("Generated chart: %s (private company equity trajectory)", path)
+        elif _has_ohlcv and "close" in cache.columns:
             fig, ax = plt.subplots(figsize=(16, 7))
             ax.plot(cache.index, cache["close"], linewidth=1.5, color=_CHART_ACCENT, zorder=3)
             _apply_brand_style(fig, ax, f"{company} -- Closing Price (2Y)")
@@ -3098,9 +3163,9 @@ def generate_charts(
     except Exception as exc:
         logger.warning("Failed to generate survival timeline chart: %s", exc)
 
-    # Chart 3: 21-Day Realized Volatility
+    # Chart 3: 21-Day Realized Volatility (requires OHLCV data)
     try:
-        if "volatility_21d" in cache.columns:
+        if _has_ohlcv and "volatility_21d" in cache.columns:
             fig, ax = plt.subplots(figsize=(16, 5))
             ax.fill_between(
                 cache.index, 0, cache["volatility_21d"],
@@ -3169,9 +3234,9 @@ def generate_charts(
     except Exception as exc:
         logger.warning("Failed to generate sentiment chart: %s", exc)
 
-    # Chart 7: Predicted OHLC Candlestick (Next Month)
+    # Chart 7: Predicted OHLC Candlestick (Next Month) -- requires OHLCV
+    ohlc_data = profile.get("ohlc_predictions", {}) if _has_ohlcv else {}
     try:
-        ohlc_data = profile.get("ohlc_predictions", {})
         next_month = ohlc_data.get("next_month", {})
         series = next_month.get("series", [])
         if series and len(series) >= 5:
@@ -3203,7 +3268,7 @@ def generate_charts(
                 lower = [m - r * (2 - conf) for m, r, conf in zip(mid_prices, ranges, confidences)]
                 ax.fill_between(dates, lower, upper, alpha=0.08, color=_CHART_ACCENT)
 
-                _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Month)")
+                _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Month)", use_date_axis=False)
                 ax.set_ylabel("Price ($)", color=_CHART_FG)
                 ax.set_xlabel("Trading Days Ahead", color=_CHART_FG)
 
@@ -3226,9 +3291,9 @@ def generate_charts(
     except Exception as exc:
         logger.warning("Failed to generate predicted OHLC chart: %s", exc)
 
-    # Chart 8: Predicted OHLC Candlestick (Next Week)
+    # Chart 8: Predicted OHLC Candlestick (Next Week) -- requires OHLCV
     try:
-        next_week = ohlc_data.get("next_week", {})
+        next_week = ohlc_data.get("next_week", {}) if _has_ohlcv else {}
         week_series = next_week.get("series", [])
         if week_series and len(week_series) >= 3:
             fig, ax = plt.subplots(figsize=(12, 6))
@@ -3239,7 +3304,7 @@ def generate_charts(
                        color=color, edgecolor=color, alpha=0.85)
                 ax.plot([i, i], [l, h], color=color, linewidth=0.8)
 
-            _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Week)")
+            _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Week)", use_date_axis=False)
             ax.set_ylabel("Price ($)", color=_CHART_FG)
             ax.set_xlabel("Trading Days Ahead", color=_CHART_FG)
 
@@ -3261,9 +3326,9 @@ def generate_charts(
     except Exception as exc:
         logger.warning("Failed to generate predicted week OHLC chart: %s", exc)
 
-    # Chart 9.5: Predicted OHLC Candlestick (Next Year -- aggregated weekly)
+    # Chart 9.5: Predicted OHLC Candlestick (Next Year) -- requires OHLCV
     try:
-        next_year = ohlc_data.get("next_year", {})
+        next_year = ohlc_data.get("next_year", {}) if _has_ohlcv else {}
         year_series = next_year.get("series", [])
         if year_series and len(year_series) >= 20:
             # Aggregate 252 daily candles into weekly bars for readability
@@ -3300,7 +3365,7 @@ def generate_charts(
                 lower = [m - r * (2 - conf) for m, r, conf in zip(mid_prices, ranges, confidences)]
                 ax.fill_between(range(len(weekly_bars)), lower, upper, alpha=0.08, color=_CHART_ACCENT)
 
-                _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Year, Weekly)")
+                _apply_brand_style(fig, ax, f"{company} -- Predicted Price (Next Year, Weekly)", use_date_axis=False)
                 ax.set_ylabel("Price ($)", color=_CHART_FG)
                 ax.set_xlabel("Weeks Ahead", color=_CHART_FG)
 
@@ -3623,13 +3688,15 @@ def _generate_pdf(
 def generate_report(
     profile: dict[str, Any],
     *,
-    gemini_client: Any | None = None,
+    llm_client: Any | None = None,
     cache: pd.DataFrame | None = None,
     output_dir: str | Path | None = None,
     generate_pdf: bool = False,
     generate_chart_images: bool = True,
     tier: ReportTier = ReportTier.PREMIUM,
     mode: ReportMode = ReportMode.RESULTS,
+    # Backward-compatible alias (deprecated, use llm_client instead)
+    gemini_client: Any | None = None,
 ) -> dict[str, Any]:
     """Generate an analysis report from a company profile.
 
@@ -3637,10 +3704,10 @@ def generate_report(
     ----------
     profile:
         Company profile dict from ``build_company_profile()``.
-    gemini_client:
-        Optional ``GeminiClient`` instance.  If provided, the report
-        narrative is generated by Gemini.  Otherwise, a local template
-        is used.
+    llm_client:
+        Optional LLM client instance (Gemini, Claude, or OpenRouter).
+        If provided, the premium report narrative is generated by the LLM.
+        Otherwise, a local template is used.
     cache:
         Full feature table for chart generation.
     output_dir:
@@ -3667,6 +3734,10 @@ def generate_report(
         - ``tier``: the report tier used
         - ``mode``: the report mode used
     """
+    # Backward-compat: accept deprecated gemini_client kwarg
+    if llm_client is None and gemini_client is not None:
+        llm_client = gemini_client
+
     if output_dir is None:
         output_dir = Path(CACHE_DIR) / "report"
     out = Path(output_dir)
@@ -3674,34 +3745,37 @@ def generate_report(
 
     logger.info("Generating %s...", tier.label)
 
-    # Step 1: Generate narrative
+    # Step 1: Generate narrative via LLM (premium reports only)
     markdown = ""
-    # Only use Gemini for premium reports (it generates the full 22-section report)
-    if gemini_client is not None and tier == ReportTier.PREMIUM:
+    if llm_client is not None and tier == ReportTier.PREMIUM:
         try:
             profile_json = json.dumps(profile, indent=2, default=str)
-            markdown = gemini_client.generate_report(profile_json)
-            logger.info("%s narrative generated via Gemini.", tier.label)
+            markdown = llm_client.generate_report(profile_json)
+            logger.info(
+                "%s narrative generated via %s.",
+                tier.label,
+                getattr(llm_client, "provider_name", "LLM"),
+            )
         except Exception as exc:
             logger.warning(
-                "Gemini report generation failed (%s); using fallback template.",
+                "LLM report generation failed (%s); using fallback template.",
                 exc,
             )
             markdown = ""
 
-    # Fallback if Gemini produced nothing or tier is not premium
+    # Fallback if LLM produced nothing or tier is not premium
     if not markdown or not markdown.strip():
         markdown = _build_fallback_report(profile, tier=tier, mode=mode)
         logger.info("%s (%s mode) generated using local template.", tier.label, mode.label)
 
-    # Ensure LIMITATIONS section exists (append if Gemini missed it)
+    # Ensure LIMITATIONS section exists (append if LLM missed it)
     if "LIMITATIONS" not in markdown.upper():
         limitations = _build_limitations(profile)
         markdown += "\n\n---\n\n## LIMITATIONS\n\n" + limitations
         logger.info("Appended LIMITATIONS section to report.")
 
-    # Step 1b: Validate Gemini output (E2) -- premium only
-    if gemini_client is not None and tier == ReportTier.PREMIUM:
+    # Step 1b: Validate LLM output (E2) -- premium only
+    if llm_client is not None and tier == ReportTier.PREMIUM:
         is_valid, validation_issues = validate_gemini_report(markdown, profile)
         if not is_valid:
             logger.warning(
@@ -3756,12 +3830,14 @@ def generate_report(
 def generate_all_reports(
     profile: dict[str, Any],
     *,
-    gemini_client: Any | None = None,
+    llm_client: Any | None = None,
     cache: pd.DataFrame | None = None,
     output_dir: str | Path | None = None,
     generate_pdf: bool = False,
     generate_chart_images: bool = True,
     mode: ReportMode = ReportMode.RESULTS,
+    # Backward-compatible alias (deprecated, use llm_client instead)
+    gemini_client: Any | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Generate all three report tiers (Basic, Pro, Premium) at once.
 
@@ -3769,8 +3845,8 @@ def generate_all_reports(
     ----------
     profile:
         Company profile dict from ``build_company_profile()``.
-    gemini_client:
-        Optional ``GeminiClient`` for premium report narrative.
+    llm_client:
+        Optional LLM client (Gemini, Claude, or OpenRouter) for premium report narrative.
     cache:
         Full feature table for chart generation.
     output_dir:
@@ -3786,12 +3862,16 @@ def generate_all_reports(
     -------
     dict mapping tier name to the ``generate_report()`` result dict.
     """
+    # Backward-compat: accept deprecated gemini_client kwarg
+    if llm_client is None and gemini_client is not None:
+        llm_client = gemini_client
+
     results: dict[str, dict[str, Any]] = {}
 
     for tier in (ReportTier.BASIC, ReportTier.PRO, ReportTier.PREMIUM):
         results[tier.value] = generate_report(
             profile,
-            gemini_client=gemini_client,
+            llm_client=llm_client,
             cache=cache,
             output_dir=output_dir,
             generate_pdf=generate_pdf,
