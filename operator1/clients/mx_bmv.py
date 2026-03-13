@@ -50,16 +50,20 @@ class MXBmvClient:
         return profile
 
     def get_income_statement(self, identifier: str) -> pd.DataFrame:
-        from operator1.clients.yfinance_backed import yf_get_financials
-        return yf_get_financials(identifier, self.market_id, "income", yf_suffix=".MX")
+        """BMV has no free structured filing API. Returns empty for PIT compliance.
+
+        yfinance is NOT used for financial statements because it does not
+        provide true filing dates (sets filing_date = report_date).
+        """
+        return pd.DataFrame()
 
     def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
-        from operator1.clients.yfinance_backed import yf_get_financials
-        return yf_get_financials(identifier, self.market_id, "balance", yf_suffix=".MX")
+        """BMV has no free structured filing API. Returns empty for PIT compliance."""
+        return pd.DataFrame()
 
     def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
-        from operator1.clients.yfinance_backed import yf_get_financials
-        return yf_get_financials(identifier, self.market_id, "cashflow", yf_suffix=".MX")
+        """BMV has no free structured filing API. Returns empty for PIT compliance."""
+        return pd.DataFrame()
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:
         """BMV does not provide OHLCV data. Handled by ohlcv_provider."""
