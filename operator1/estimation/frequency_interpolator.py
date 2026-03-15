@@ -209,8 +209,9 @@ def _distribute_flow(
         else:
             period_start = sorted_dates[i - 1] + pd.Timedelta(days=1)
 
-        # Get business days in this period
-        period_mask = (daily_index > period_start) & (daily_index <= period_end)
+        # Get business days in this period (inclusive on both sides to
+        # avoid gaps at period boundaries that cause sum overshoot).
+        period_mask = (daily_index >= period_start) & (daily_index <= period_end)
         n_bdays = period_mask.sum()
 
         if n_bdays == 0:
