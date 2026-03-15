@@ -84,9 +84,10 @@ def classify_fundamental_regime(
         index=cache.index,
     )
 
-    # Score each dimension
+    # Score each dimension, tracking how many indicators are actually checked
     distress_score = pd.Series(0.0, index=cache.index)
     stress_score = pd.Series(0.0, index=cache.index)
+    n_indicators = 0
 
     # Current ratio
     if "current_ratio" in cache.columns:
@@ -96,6 +97,7 @@ def classify_fundamental_regime(
             (cr >= _FUND_THRESHOLDS["distress"]["current_ratio"])
             & (cr < _FUND_THRESHOLDS["stressed"]["current_ratio"])
         ).astype(float) * 0.5
+        n_indicators += 1
 
     # Debt-to-equity
     for de_col in ("debt_to_equity_abs", "debt_to_equity"):
@@ -106,9 +108,10 @@ def classify_fundamental_regime(
                 (de > _FUND_THRESHOLDS["stressed"]["debt_to_equity"])
                 & (de <= _FUND_THRESHOLDS["distress"]["debt_to_equity"])
             ).astype(float) * 0.5
+            n_indicators += 1
             break
 
-    # Drawdown
+    # Drawdown (uses equity_drawdown proxy when resolved via private company mode)
     if "drawdown_252d" in cache.columns:
         dd = cache["drawdown_252d"]
         distress_score += (dd < _FUND_THRESHOLDS["distress"]["drawdown_252d"]).astype(float)
@@ -116,10 +119,12 @@ def classify_fundamental_regime(
             (dd >= _FUND_THRESHOLDS["distress"]["drawdown_252d"])
             & (dd < _FUND_THRESHOLDS["stressed"]["drawdown_252d"])
         ).astype(float) * 0.5
+        n_indicators += 1
 
     # FCF yield
     if "fcf_yield" in cache.columns:
         distress_score += (cache["fcf_yield"] < 0).astype(float)
+        n_indicators += 1
 
     # Cash ratio
     if "cash_ratio" in cache.columns:
@@ -127,9 +132,13 @@ def classify_fundamental_regime(
         stress_score += (
             (cache["cash_ratio"] >= 0.1) & (cache["cash_ratio"] < 0.3)
         ).astype(float) * 0.3
+        n_indicators += 1
 
-    # Normalize scores to probabilities
-    max_possible = 4.0  # number of indicators checked
+    # Normalize scores to probabilities using the actual number of indicators
+    # checked, not a hardcoded constant.  This prevents bias toward "healthy"
+    # when some indicators are unavailable (e.g. private company mode before
+    # proxy resolution, or markets with sparse data).
+    max_possible = max(float(n_indicators), 1.0)
     distress_prob = (distress_score / max_possible).clip(0, 1)
     stress_prob = (stress_score / max_possible).clip(0, 1)
     healthy_prob = (1.0 - distress_prob - stress_prob).clip(0, 1)

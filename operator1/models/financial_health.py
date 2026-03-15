@@ -301,24 +301,35 @@ def _score_stability(cache: pd.DataFrame) -> pd.Series:
     """Tier 3 -- Market Stability score.
 
     Looks at: volatility_21d (inverted), drawdown_252d (inverted), volume.
+    Falls back to private company proxies (financial_volatility,
+    equity_drawdown, revenue_velocity) when OHLCV-derived columns are
+    missing.
     """
     components: list[pd.Series] = []
 
-    if "volatility_21d" in cache.columns:
-        components.append(
-            _normalize_series(cache["volatility_21d"], invert=True)
-        )
+    # Volatility: prefer volatility_21d, fall back to financial_volatility
+    for vol_col in ("volatility_21d", "financial_volatility"):
+        if vol_col in cache.columns and cache[vol_col].notna().any():
+            components.append(
+                _normalize_series(cache[vol_col], invert=True)
+            )
+            break
 
-    if "drawdown_252d" in cache.columns:
-        # Drawdown is typically negative; more negative = worse
-        components.append(
-            _normalize_series(cache["drawdown_252d"])
-        )
+    # Drawdown: prefer drawdown_252d, fall back to equity_drawdown
+    for dd_col in ("drawdown_252d", "equity_drawdown"):
+        if dd_col in cache.columns and cache[dd_col].notna().any():
+            components.append(
+                _normalize_series(cache[dd_col])
+            )
+            break
 
-    if "volume" in cache.columns:
-        components.append(
-            _normalize_series(cache["volume"])
-        )
+    # Volume: prefer volume, fall back to revenue_velocity
+    for vol_col in ("volume", "revenue_velocity"):
+        if vol_col in cache.columns and cache[vol_col].notna().any():
+            components.append(
+                _normalize_series(cache[vol_col])
+            )
+            break
 
     if not components:
         return pd.Series(np.nan, index=cache.index, name="fh_stability_score")

@@ -13,8 +13,18 @@ Proxy mapping:
     volume         -> revenue_velocity (rolling revenue change)
     market_cap     -> total_equity (book value proxy)
 
-Top-level entry point:
-    ``compute_private_company_proxies(cache)``
+Extended proxy mapping (new):
+    open           -> equity_value (same as close for private)
+    high           -> equity_value (same as close for private)
+    low            -> equity_value (same as close for private)
+    return_5d      -> revenue_momentum_5d (5-period revenue change)
+    return_21d     -> revenue_momentum_21d (21-period revenue change)
+    volatility_63d -> earnings_volatility (rolling std of net_income change)
+
+Top-level entry points:
+    ``compute_private_company_proxies(cache)`` -- adds proxy columns
+    ``resolve_proxies(cache)`` -- writes proxy values INTO standard column
+        names so downstream modules work without any code changes.
 
 The proxy columns are added alongside the standard column names so that
 downstream models (regime detection, forecasting, Monte Carlo) can consume
@@ -36,11 +46,21 @@ logger = logging.getLogger(__name__)
 # Used by downstream models to determine which variable to target.
 PROXY_MAP: dict[str, str] = {
     "close": "equity_value",
+    "open": "equity_value",
+    "high": "equity_value",
+    "low": "equity_value",
     "return_1d": "equity_change_rate",
     "volatility_21d": "financial_volatility",
     "drawdown_252d": "equity_drawdown",
     "volume": "revenue_velocity",
     "market_cap": "equity_value",
+}
+
+# Extended proxies that provide additional analytical signals.
+EXTENDED_PROXY_MAP: dict[str, str] = {
+    "return_5d": "revenue_momentum_5d",
+    "return_21d": "revenue_momentum_21d",
+    "volatility_63d": "earnings_volatility",
 }
 
 # Private mode forecast targets (replaces price-based targets)
@@ -66,6 +86,24 @@ PRIVATE_TIER_VARIABLES: dict[str, list[str]] = {
     "tier3": ["financial_volatility", "equity_drawdown"],
     "tier4": ["net_margin", "roe", "roa"],
     "tier5": ["revenue_growth_yoy", "earnings_growth_yoy"],
+}
+
+# Confidence scores for each proxy -- quantifies how trustworthy the proxy
+# is relative to the real OHLCV column it replaces.  Higher = more reliable.
+PROXY_CONFIDENCE: dict[str, float] = {
+    "equity_value": 0.85,             # directly from balance sheet
+    "equity_change_rate": 0.55,       # interpolated between quarters
+    "financial_volatility": 0.40,     # derived from interpolated data
+    "equity_drawdown": 0.75,          # straightforward peak-decline
+    "revenue_velocity": 0.65,         # direct from income statement
+    "enterprise_value_proxy": 0.70,   # composite of 3 balance sheet items
+    "implied_pe_proxy": 0.60,         # depends on net_income accuracy
+    "cash_burn_rate": 0.80,           # direct from cash flow statement
+    "debt_service_coverage": 0.75,    # direct from CF + interest
+    "revenue_momentum_5d": 0.50,      # interpolated short-term
+    "revenue_momentum_21d": 0.55,     # interpolated medium-term
+    "earnings_volatility": 0.45,      # derived from interpolated NI
+    "balance_sheet_leverage_change": 0.65,  # direct ratio change
 }
 
 
@@ -178,14 +216,167 @@ def compute_private_company_proxies(cache: pd.DataFrame) -> pd.DataFrame:
     else:
         cache["revenue_velocity"] = 0.0
 
+    # ------------------------------------------------------------------
+    # Extended proxies (new)
+    # ------------------------------------------------------------------
+
+    # --- Enterprise value proxy (equity + debt - cash) ---
+    _ev_components = []
+    if "equity_value" in cache.columns:
+        _ev_components.append(cache["equity_value"])
+    if "total_debt" in cache.columns:
+        _ev_components.append(cache["total_debt"])
+    elif "total_debt_asof" in cache.columns:
+        _ev_components.append(cache["total_debt_asof"])
+    if _ev_components:
+        ev_proxy = _ev_components[0].copy()
+        for c in _ev_components[1:]:
+            ev_proxy = ev_proxy.add(c, fill_value=0)
+        if "cash_and_equivalents" in cache.columns:
+            ev_proxy = ev_proxy.sub(cache["cash_and_equivalents"], fill_value=0)
+        cache["enterprise_value_proxy"] = ev_proxy
+        logger.info("  enterprise_value_proxy: computed")
+
+    # --- Implied P/E proxy (equity_value / net_income) ---
+    if "equity_value" in cache.columns and "net_income" in cache.columns:
+        ni = cache["net_income"]
+        # Avoid division by zero or very small values
+        safe_ni = ni.where(ni.abs() > 1e-6, other=np.nan)
+        cache["implied_pe_proxy"] = cache["equity_value"] / safe_ni
+        # Clip extreme values (P/E ratios above 200 or negative are not useful)
+        cache["implied_pe_proxy"] = cache["implied_pe_proxy"].clip(-200, 200)
+        logger.info("  implied_pe_proxy: computed")
+
+    # --- Cash burn rate (when OCF is negative: -OCF / cash) ---
+    if "operating_cash_flow" in cache.columns and "cash_and_equivalents" in cache.columns:
+        ocf = cache["operating_cash_flow"]
+        cash = cache["cash_and_equivalents"]
+        safe_cash = cash.where(cash.abs() > 1e-6, other=np.nan)
+        # Burn rate is positive when company is burning cash (negative OCF)
+        cache["cash_burn_rate"] = (-ocf / safe_cash).clip(-5, 5).fillna(0.0)
+        logger.info("  cash_burn_rate: computed")
+
+    # --- Debt service coverage (OCF / interest_expense) ---
+    if "operating_cash_flow" in cache.columns and "interest_expense" in cache.columns:
+        ie = cache["interest_expense"]
+        safe_ie = ie.where(ie.abs() > 1e-6, other=np.nan)
+        cache["debt_service_coverage"] = (cache["operating_cash_flow"] / safe_ie).clip(-50, 50)
+        logger.info("  debt_service_coverage: computed")
+
+    # --- Revenue momentum 5d and 21d (rolling revenue change) ---
+    if "revenue" in cache.columns and cache["revenue"].notna().sum() >= 2:
+        rev = cache["revenue"]
+        # Detect transitions and interpolate (same approach as equity_change_rate)
+        rev_shifted = rev.shift(1)
+        is_new_rev = rev.notna() & (rev != rev_shifted) & rev_shifted.notna()
+        quarterly_rev = rev.where(is_new_rev | (rev.index == rev.first_valid_index()))
+        rev_smooth = quarterly_rev.interpolate(method="time").ffill().bfill()
+        rev_pct = rev_smooth.pct_change().fillna(0.0).clip(-0.1, 0.1)
+        cache["revenue_momentum_5d"] = rev_pct.rolling(5, min_periods=1).mean()
+        cache["revenue_momentum_21d"] = rev_pct.rolling(21, min_periods=1).mean()
+        logger.info("  revenue_momentum_5d/21d: computed")
+
+    # --- Earnings volatility (rolling std of net_income change) ---
+    if "net_income" in cache.columns and cache["net_income"].notna().sum() >= 2:
+        ni = cache["net_income"]
+        ni_shifted = ni.shift(1)
+        is_new_ni = ni.notna() & (ni != ni_shifted) & ni_shifted.notna()
+        quarterly_ni = ni.where(is_new_ni | (ni.index == ni.first_valid_index()))
+        ni_smooth = quarterly_ni.interpolate(method="time").ffill().bfill()
+        ni_pct = ni_smooth.pct_change().fillna(0.0).clip(-0.5, 0.5)
+        cache["earnings_volatility"] = ni_pct.rolling(
+            window=63, min_periods=10
+        ).std() * np.sqrt(252)
+        cache["earnings_volatility"] = cache["earnings_volatility"].fillna(
+            ni_pct.expanding(min_periods=5).std() * np.sqrt(252)
+        )
+        logger.info("  earnings_volatility: computed")
+
+    # --- Balance sheet leverage change ---
+    if "debt_to_equity_abs" in cache.columns:
+        cache["balance_sheet_leverage_change"] = (
+            cache["debt_to_equity_abs"].pct_change().fillna(0.0).clip(-1.0, 1.0)
+        )
+        logger.info("  balance_sheet_leverage_change: computed")
+
     # --- Flag this cache as private company mode ---
     cache["is_private_company"] = True
 
+    # --- Store proxy confidence scores ---
+    for proxy_col, conf in PROXY_CONFIDENCE.items():
+        if proxy_col in cache.columns:
+            cache[f"proxy_confidence_{proxy_col}"] = conf
+
     n_proxies = sum(1 for col in PROXY_MAP.values() if col in cache.columns)
-    logger.info(
-        "Private company proxies: %d/%d proxy columns computed",
-        n_proxies, len(PROXY_MAP),
+    n_extended = sum(
+        1 for col in list(EXTENDED_PROXY_MAP.values()) + [
+            "enterprise_value_proxy", "implied_pe_proxy", "cash_burn_rate",
+            "debt_service_coverage", "balance_sheet_leverage_change",
+        ]
+        if col in cache.columns
     )
+    logger.info(
+        "Private company proxies: %d core + %d extended proxy columns computed",
+        n_proxies, n_extended,
+    )
+
+    return cache
+
+
+def resolve_proxies(cache: pd.DataFrame) -> pd.DataFrame:
+    """Write proxy values into standard OHLCV column names.
+
+    After calling this function, ``cache["close"]`` contains
+    ``equity_value``, ``cache["return_1d"]`` contains
+    ``equity_change_rate``, etc.  Downstream models work unchanged
+    because they find the standard column names populated.
+
+    This function is idempotent -- calling it multiple times has no
+    additional effect.  It only writes into columns that are either
+    missing or entirely NaN.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache DataFrame, after ``compute_private_company_proxies()``
+        has been called.
+
+    Returns
+    -------
+    The same cache DataFrame with standard columns populated from proxies.
+    """
+    if not is_private_company(cache):
+        return cache
+
+    resolved_count = 0
+
+    # Core proxy map
+    for standard, proxy in PROXY_MAP.items():
+        if proxy not in cache.columns:
+            continue
+        if standard not in cache.columns:
+            cache[standard] = cache[proxy]
+            resolved_count += 1
+        elif cache[standard].isna().all():
+            cache[standard] = cache[proxy]
+            resolved_count += 1
+
+    # Extended proxy map
+    for standard, proxy in EXTENDED_PROXY_MAP.items():
+        if proxy not in cache.columns:
+            continue
+        if standard not in cache.columns:
+            cache[standard] = cache[proxy]
+            resolved_count += 1
+        elif cache[standard].isna().all():
+            cache[standard] = cache[proxy]
+            resolved_count += 1
+
+    if resolved_count > 0:
+        logger.info(
+            "Proxy resolution: %d standard columns populated from proxies",
+            resolved_count,
+        )
 
     return cache
 
@@ -211,7 +402,24 @@ def get_proxy_variable(standard_name: str, cache: pd.DataFrame) -> str:
         proxy = PROXY_MAP[standard_name]
         if proxy in cache.columns:
             return proxy
+    if is_private_company(cache) and standard_name in EXTENDED_PROXY_MAP:
+        proxy = EXTENDED_PROXY_MAP[standard_name]
+        if proxy in cache.columns:
+            return proxy
     return standard_name
+
+
+def get_proxy_confidence(column_name: str) -> float:
+    """Return the confidence score for a proxy column.
+
+    Returns 1.0 for non-proxy columns (real OHLCV data).
+
+    Parameters
+    ----------
+    column_name:
+        Column name (either a proxy name or a standard name).
+    """
+    return PROXY_CONFIDENCE.get(column_name, 1.0)
 
 
 def get_forecast_targets(cache: pd.DataFrame) -> list[str]:

@@ -1018,13 +1018,18 @@ Non-interactive examples:
         from operator1.features.private_company_proxies import (
             is_private_company,
             compute_private_company_proxies,
+            resolve_proxies,
         )
         _is_private = is_private_company(cache)
         if _is_private:
             cache = compute_private_company_proxies(cache)
+            # Transparent resolution: write proxy values INTO standard
+            # column names (close, return_1d, volatility_21d, etc.) so
+            # all downstream models work without any code changes.
+            cache = resolve_proxies(cache)
             logger.info(
-                "Private company mode ACTIVE -- using financial statement "
-                "proxies for temporal models"
+                "Private company mode ACTIVE -- proxy values resolved into "
+                "standard columns for transparent downstream consumption"
             )
     except Exception as exc:
         logger.warning("Private company proxy computation failed: %s", exc)
