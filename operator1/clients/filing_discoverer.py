@@ -1737,6 +1737,20 @@ def try_filing_extraction(
         _extraction_cache[cache_key] = pd.DataFrame()
         return pd.DataFrame()
 
+    # Auto-create LLM client from environment secrets when not provided.
+    # All 9 Tier 2 clients pass llm_client=None because the LLM client
+    # is created in main.py but never threaded through the PIT client
+    # constructors.  This auto-creation fixes that wiring gap.
+    if llm_client is None:
+        try:
+            from operator1.clients.llm_factory import create_llm_client
+            from operator1.secrets_loader import load_secrets
+            llm_client = create_llm_client(load_secrets())
+            if llm_client is not None:
+                logger.debug("Auto-created LLM client for filing extraction")
+        except Exception as _llm_exc:
+            logger.debug("Could not auto-create LLM client: %s", _llm_exc)
+
     # Try to extract from the most recent filings
     try:
         from operator1.clients.llm_filing_extractor import LLMFilingExtractor
