@@ -511,8 +511,11 @@ def _classify_hkex_filing_type(title: str) -> str:
 class HKEXFilingDiscoverer:
     """Discovers financial result filings from HKEX News.
 
-    Uses the HKEX News title search to find annual/interim result
-    announcements, then extracts PDF document URLs for LLM extraction.
+    Primary method: Playwright headless browser (renders the JS-based
+    search page and extracts results from the rendered DOM).
+
+    Fallback: Direct HTTP title search (may return empty if HKEX
+    requires JS rendering for the session/ViewState tokens).
 
     HKEX stock codes are zero-padded to 5 digits (e.g. 00700 for Tencent,
     00005 for HSBC).
@@ -537,6 +540,38 @@ class HKEXFilingDiscoverer:
         # HKEX uses 5-digit zero-padded stock codes
         code = ticker.split(".")[0].strip().zfill(5)
 
+        # Primary method: undocumented HKEX JSON API (no browser needed).
+        # Uses the approach from github.com/simonplmak-cloud/hkex-filing-scraper:
+        # GET search page -> POST JSF form -> call JSON API endpoint.
+        try:
+            from operator1.clients.hkex_scraper import HKEXAPIScraper
+            scraper = HKEXAPIScraper()
+            pw_filings = scraper.search_filings(code, years=years)
+            if pw_filings:
+                for pf in pw_filings:
+                    result.filings.append(FilingMetadata(
+                        title=pf.title,
+                        filing_date=pf.release_date,
+                        report_date=pf.report_date,
+                        document_url=pf.document_url,
+                        document_format=pf.document_format,
+                        filing_type=pf.filing_type,
+                        market_id="hk_hkex",
+                    ))
+                logger.info(
+                    "HKEX Playwright discovery for %s: %d filings",
+                    code, len(result.filings),
+                )
+                return result
+            else:
+                logger.debug("HKEX API returned no results, falling back to HTTP")
+        except ImportError:
+            logger.debug("HKEX API scraper not available, falling back to HTTP search")
+        except Exception as exc:
+            logger.debug("HKEX API search failed: %s, falling back to HTTP", exc)
+
+        # Fallback: direct HTTP title search (may return empty if HKEX
+        # requires JS rendering for the session/ViewState tokens).
         today = date.today()
         from_date = today - timedelta(days=365 * years)
 
@@ -679,7 +714,11 @@ class HKEXFilingDiscoverer:
         return result
 
     def download_filing(self, filing: FilingMetadata) -> bytes:
-        """Download an HKEX filing document."""
+        """Download an HKEX filing document (PDF, HTML, or Excel).
+
+        HKEX documents are hosted as static files and don't require
+        the JSF session -- a direct GET with a browser User-Agent works.
+        """
         if not filing.document_url:
             raise ValueError("No document URL in filing metadata")
 
@@ -690,8 +729,11 @@ class HKEXFilingDiscoverer:
         )
         resp.raise_for_status()
 
-        # Validate it's a PDF
-        if resp.content[:4] != b"%PDF":
+        # Validate the content matches the expected format.
+        # PDF filings start with %PDF; HTML filings start with < or <!;
+        # Excel files start with PK (ZIP signature).
+        fmt = (filing.document_format or "").lower()
+        if fmt == "pdf" and resp.content[:4] != b"%PDF":
             raise ValueError(
                 f"Expected PDF but got {resp.headers.get('Content-Type', 'unknown')}"
             )
