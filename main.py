@@ -790,12 +790,27 @@ Non-interactive examples:
         idx = pd.date_range(start, end, freq="B", name="date")
         cache = pd.DataFrame(index=idx)
 
-    # Merge financial statement data using PIT filing_date (as-of join).
+    # Merge financial statement data using frequency-aware interpolation.
+    # Periodic filings (quarterly/semi-annual/annual) are interpolated
+    # to daily frequency respecting the nature of each variable:
+    #   - Stock variables (balance sheet): linear interpolation
+    #   - Flow variables (income/cashflow): distribute period totals
     # Columns are merged WITHOUT prefixes so that derived_variables.py
     # finds the expected canonical names (revenue, total_assets, etc.).
     # If the same column name exists in multiple statements, the first
     # non-null value wins (income > balance > cashflow priority).
     _merged_cols: set = set(cache.columns)
+    _interp_confidence: dict[str, pd.Series] = {}
+
+    # Import the frequency-aware interpolator
+    try:
+        from operator1.estimation.frequency_interpolator import (
+            interpolate_statement_to_daily,
+        )
+        _use_interpolator = True
+    except ImportError:
+        logger.warning("Frequency interpolator not available -- falling back to flat ffill")
+        _use_interpolator = False
 
     for label, stmt_df in [
         ("income", income_df),
@@ -819,7 +834,7 @@ Non-interactive examples:
             # Deduplicate: keep last row per date (most recent filing)
             stmt_df = stmt_df.drop_duplicates(subset=[date_col], keep="last")
 
-            # Forward-fill financial data onto the daily cache (as-of join)
+            # Extract numeric columns for merge
             numeric_cols = stmt_df.select_dtypes(include=["number"]).columns.tolist()
             # Exclude date-like columns from numeric merge
             numeric_cols = [c for c in numeric_cols if c != date_col and "date" not in c.lower()]
@@ -827,12 +842,24 @@ Non-interactive examples:
                 continue
 
             stmt_indexed = stmt_df.set_index(date_col)[numeric_cols]
-            # Forward-fill financial data onto the daily cache (as-of join).
-            # The quarterly filing dates don't exist in the daily index,
-            # so we union the indices first, then ffill, then select daily dates.
-            combined_idx = cache.index.union(stmt_indexed.index).sort_values()
-            stmt_aligned = stmt_indexed.reindex(combined_idx).ffill()
-            stmt_aligned = stmt_aligned.reindex(cache.index)
+
+            if _use_interpolator and len(stmt_indexed) >= 2:
+                # Frequency-aware interpolation: stock variables get linear
+                # interpolation, flow variables get period distribution.
+                stmt_aligned, conf_df = interpolate_statement_to_daily(
+                    stmt_indexed,
+                    daily_index=cache.index,
+                    market_id=market_id,
+                )
+                # Store confidence scores for later use
+                for col in conf_df.columns:
+                    _interp_confidence[col] = conf_df[col]
+            else:
+                # Fallback for single-filing or missing interpolator:
+                # flat forward-fill (original behavior).
+                combined_idx = cache.index.union(stmt_indexed.index).sort_values()
+                stmt_aligned = stmt_indexed.reindex(combined_idx).ffill()
+                stmt_aligned = stmt_aligned.reindex(cache.index)
 
             # Skip columns already in cache (first statement wins)
             new_cols = [c for c in stmt_aligned.columns if c not in _merged_cols]
@@ -843,6 +870,12 @@ Non-interactive examples:
             logger.info("Merged %s data: %d columns (%d new)", label, len(numeric_cols), len(new_cols))
         except Exception as exc:
             logger.warning("Failed to merge %s data: %s", label, exc)
+
+    # Store interpolation confidence in the cache for downstream models
+    for col, conf_series in _interp_confidence.items():
+        conf_col = f"interp_confidence_{col}"
+        if conf_col not in cache.columns:
+            cache[conf_col] = conf_series
 
     logger.info("Cache built: %d rows x %d columns", len(cache), len(cache.columns))
 
