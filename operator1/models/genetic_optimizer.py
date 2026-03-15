@@ -167,12 +167,18 @@ def run_genetic_optimization(
         result.error = "No data for genetic optimization"
         return result
 
-    # Build per-model prediction arrays from available forecast metrics
-    # Use return_1d as the target variable for optimization
+    # Build per-model prediction arrays from available forecast metrics.
+    # Prefer return_1d; fall back to equity_change_rate (private company
+    # proxy) or any other return-like column that exists.
     target_col = "return_1d"
     if target_col not in cache.columns:
-        result.error = "No return_1d column for fitness evaluation"
-        return result
+        for fallback in ("equity_change_rate", "log_return_1d"):
+            if fallback in cache.columns:
+                target_col = fallback
+                break
+        else:
+            result.error = "No return column (return_1d or proxy) for fitness evaluation"
+            return result
 
     actuals = cache[target_col].values[-validation_window:]
     if np.isnan(actuals).all():
@@ -192,13 +198,13 @@ def run_genetic_optimization(
         elif model_name == "baseline":
             # Baseline: last-value carry forward (return = 0 assumption)
             model_predictions["baseline"] = np.zeros(validation_window)
-        elif model_name == "kalman" and "return_1d" in cache.columns:
+        elif model_name == "kalman" and target_col in cache.columns:
             # Proxy: smoothed returns (EWM)
-            ew = cache["return_1d"].ewm(span=10).mean()
+            ew = cache[target_col].ewm(span=10).mean()
             model_predictions["kalman"] = ew.values[-validation_window:]
-        elif model_name == "var" and "return_1d" in cache.columns:
+        elif model_name == "var" and target_col in cache.columns:
             # Proxy: simple AR(1) prediction
-            shifted = cache["return_1d"].shift(1)
+            shifted = cache[target_col].shift(1)
             model_predictions["var"] = shifted.values[-validation_window:]
 
     # Seed initial population with inverse-RMSE weights from forecast_result

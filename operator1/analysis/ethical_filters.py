@@ -38,7 +38,12 @@ def compute_purchasing_power_filter(
     -------
     dict with keys: verdict, nominal_return, real_return, inflation_impact.
     """
+    # Use close price if available; fall back to equity_value proxy
+    # (private company mode resolves equity_value into close, but
+    # this fallback handles cases where resolution hasn't been called).
     close = cache.get("close")
+    if (close is None or close.dropna().empty or len(close.dropna()) < 2):
+        close = cache.get("equity_value")
     if close is None or close.dropna().empty or len(close.dropna()) < 2:
         return {
             "available": False,
@@ -175,7 +180,12 @@ def compute_gharar_filter(
     -------
     dict with keys: verdict, volatility_21d, stability_score, interpretation.
     """
+    # Use volatility_21d if available; fall back to financial_volatility
+    # proxy (private company mode resolves financial_volatility into
+    # volatility_21d, but this fallback handles unresolved cases).
     vol_series = cache.get("volatility_21d")
+    if vol_series is None or vol_series.dropna().empty:
+        vol_series = cache.get("financial_volatility")
     if vol_series is None or vol_series.dropna().empty:
         return {
             "available": False,

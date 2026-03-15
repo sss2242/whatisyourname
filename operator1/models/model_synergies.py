@@ -772,10 +772,15 @@ def apply_pre_forecasting_synergies(
     # Prune using unified network
     pruned_vars = extra_variables or []
     if unified["retained_variables"]:
+        # Include proxy variable names in always_keep so they survive
+        # causal pruning in private company mode (where close/return_1d
+        # are resolved from equity_value/equity_change_rate).
+        _keep = ["close", "return_1d", "volatility_21d",
+                 "equity_value", "equity_change_rate", "financial_volatility"]
         pruned_vars = prune_by_unified_network(
             pruned_vars,
             unified,
-            always_keep=["close", "return_1d", "volatility_21d"] + cycle_cols,
+            always_keep=_keep + cycle_cols,
         )
     metadata["variables_after_pruning"] = len(pruned_vars)
 
