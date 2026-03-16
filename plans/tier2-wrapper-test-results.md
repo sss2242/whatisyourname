@@ -14,7 +14,7 @@ Comprehensive test of all 15 Tier 2 market wrappers run on 2026-03-16.
 | `au_asx` | Australia | OK | OK | PARTIAL (ASX API down) | EMPTY (discoverer exists, no LLM) | OK (yfinance) | FAIL (ASX API returns non-JSON) |
 | `in_bse` | India | OK | OK | WORKING (yfinance .NS) | WORKING (BSE API, 40 rows) | OK (yfinance) | OK (BSE API) |
 | `cn_sse` | China | OK | OK | WORKING (baostock + yfinance) | EMPTY (baostock socket errors) | OK (baostock) | OK (baostock, by ticker only) |
-| `hk_hkex` | Hong Kong | OK | OK | WORKING (yfinance .HK) | EMPTY (discoverer exists, no LLM) | OK (yfinance) | FAIL (yfinance search broken) |
+| `hk_hkex` | Hong Kong | OK | OK | WORKING (yfinance .HK) | EMPTY (HKEX scraper broken, see below) | OK (yfinance) | FAIL (yfinance search broken) |
 | `sg_sgx` | Singapore | OK | OK | WORKING (yfinance .SI) | EMPTY (discoverer exists, no LLM) | OK (yfinance) | FAIL (SGX API down, yfinance fallback broken) |
 | `mx_bmv` | Mexico | OK | OK | WORKING (yfinance .MX) | EMPTY (discoverer exists, no LLM) | OK (yfinance) | FAIL (BMV API down, yfinance fallback broken) |
 | `za_jse` | South Africa | OK | OK | WORKING (yfinance .JO) | EMPTY (discoverer exists, no LLM) | OK (yfinance) | FAIL (JSE API down, yfinance fallback broken) |
@@ -113,3 +113,16 @@ The yfinance search fallback (`yf_search`) is broken because it constructs ticke
 - baostock (China) has a session management issue -- socket errors on financial data calls after the initial login/logout cycle.
 - `ch_six` (Switzerland) and the 4 ESEF-based markets (NL, ES, IT, SE) have no filing discoverer registered.
 - All wrappers correctly refuse to use yfinance for financial statements (no filing dates = no PIT compliance).
+
+### HKEX Scraper Deep Dive
+
+`hkex_scraper.py` implements the 3-step JSF session approach from the MIT-licensed `hkex-filing-scraper`:
+1. GET search page (gets JSESSIONID + ViewState)
+2. POST JSF form (bind date range to session)
+3. GET JSON API (titleSearchServlet.do)
+
+**Status: BROKEN.** The API returns `recordCnt: 0` because:
+- The JSF form ID is auto-generated per request (was `j_idt10`, now `j_idt13`/`j_idt15`). Fixed to extract dynamically.
+- Critical issue: most form inputs have **empty `name` attributes** in the server-rendered HTML. Their names are populated by client-side JavaScript before submission. Without JS execution, the POST sends only the form ID, loadMoreRange, and ViewState -- not the actual date range or filter parameters. The server receives an incomplete form and doesn't bind the search parameters.
+- The `hk_hkex.py` PIT client doesn't use this scraper -- it routes through `filing_discoverer.py` instead.
+- `hkex_scraper.py` exists as a standalone module but is currently not wired into the pipeline.
