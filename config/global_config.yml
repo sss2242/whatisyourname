@@ -52,5 +52,12 @@ llm_provider: ""
 #                 mistralai/mistral-large-latest, deepseek/deepseek-chat
 llm_model: ""
 
+# Filing extraction rate limiting
+# Controls how LLM extraction of PDF filings is paced to stay within
+# free-tier rate limits (e.g. Gemini 15 RPM per key).
+filing_extraction_max_filings: 8     # max filings to extract per ticker
+filing_extraction_stage_size: 2      # filings per stage
+filing_extraction_stage_pause_s: 15  # seconds pause between stages
+
 # Logging
 log_level: INFO

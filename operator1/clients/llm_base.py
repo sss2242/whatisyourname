@@ -322,7 +322,12 @@ class LLMClient(ABC):
                         self.provider_name, resp.status_code, error_detail,
                     )
 
-                # Retryable error -- backoff
+                # Retryable error -- backoff.
+                # For 429 (rate limit), fail fast after 2 attempts so the
+                # PooledLLMClient can rotate to the next API key quickly.
+                # For 5xx (server errors), use the full retry budget.
+                _max_attempts_for_code = 2 if resp.status_code == 429 else max_retries
+
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after:
                     try:
@@ -334,12 +339,21 @@ class LLMClient(ABC):
 
                 logger.warning(
                     "%s HTTP %d on attempt %d/%d for %s -- retrying in %.1fs",
-                    self.provider_name, resp.status_code, attempt, max_retries,
-                    _sanitise_url(url), wait,
+                    self.provider_name, resp.status_code, attempt,
+                    _max_attempts_for_code, _sanitise_url(url), wait,
                 )
                 last_exc = requests.HTTPError(
                     f"HTTP {resp.status_code}", response=resp,
                 )
+
+                if attempt >= _max_attempts_for_code:
+                    # Exhausted retries for this error type -- raise so
+                    # PooledLLMClient can rotate to the next key.
+                    raise RuntimeError(
+                        f"{self.provider_name}: HTTP {resp.status_code} "
+                        f"after {attempt} attempts (rate limited)"
+                    )
+
                 time.sleep(wait)
 
             except requests.RequestException as exc:

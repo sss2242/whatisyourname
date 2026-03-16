@@ -1706,29 +1706,76 @@ def try_filing_extraction(
         _extraction_cache[cache_key] = pd.DataFrame()
         return pd.DataFrame()
 
+    # Sort filings by priority: annual first, then interim, then quarterly.
+    # Most recent within each type first.  This ensures the most valuable
+    # filings (full-year annual results) are extracted even if rate limits
+    # prevent processing all filings.
+    _type_priority = {"annual": 0, "interim": 1, "quarterly": 2}
+    sorted_filings = sorted(
+        discovery.filings,
+        key=lambda f: (
+            _type_priority.get(f.filing_type, 3),
+            -(f.filing_date or "0"),  # newest first within type
+        ),
+    )
+
+    # Load extraction stage settings from config
+    from operator1.config_loader import get_global_config
+    _cfg = get_global_config()
+    _max_filings = _cfg.get("filing_extraction_max_filings", 8)
+    _stage_size = _cfg.get("filing_extraction_stage_size", 2)
+    _stage_pause = _cfg.get("filing_extraction_stage_pause_s", 15)
+
+    filings_to_extract = sorted_filings[:_max_filings]
+
+    # Split into stages to respect LLM rate limits.
+    # Between stages, pause to let the rate limit window reset.
+    # With 5 Gemini keys at 15 RPM each, 2 filings per stage uses
+    # 2 of 75 available RPM -- well within limits after a 15s pause.
+    stages = [
+        filings_to_extract[i:i + _stage_size]
+        for i in range(0, len(filings_to_extract), _stage_size)
+    ]
+
     all_records = []
+    extracted_count = 0
 
-    for filing in discovery.filings[:8]:  # Limit to 8 most recent
-        try:
-            pdf_bytes = discoverer.download_filing(filing)
-        except Exception as exc:
-            logger.debug("Download failed for %s: %s", filing.title[:40], exc)
-            continue
+    for stage_num, stage_filings in enumerate(stages):
+        if stage_num > 0 and _stage_pause > 0:
+            logger.info(
+                "Filing extraction stage %d/%d: pausing %.0fs for rate limit reset",
+                stage_num + 1, len(stages), _stage_pause,
+            )
+            time.sleep(_stage_pause)
 
-        try:
-            extraction = extractor.extract_from_pdf(pdf_bytes, market_id=market_id)
-            if extraction.success:
-                df = extractor.to_canonical_dataframe(extraction, market_id=market_id)
-                if not df.empty:
-                    # Override filing_date from discovery metadata (more reliable)
-                    if filing.filing_date:
-                        df["filing_date"] = pd.Timestamp(filing.filing_date)
-                    if filing.report_date:
-                        df["report_date"] = pd.Timestamp(filing.report_date)
-                    all_records.append(df)
-        except Exception as exc:
-            logger.debug("Extraction failed for %s: %s", filing.title[:40], exc)
-            continue
+        for filing in stage_filings:
+            try:
+                pdf_bytes = discoverer.download_filing(filing)
+            except Exception as exc:
+                logger.debug("Download failed for %s: %s", filing.title[:40], exc)
+                continue
+
+            try:
+                extraction = extractor.extract_from_pdf(pdf_bytes, market_id=market_id)
+                if extraction.success:
+                    df = extractor.to_canonical_dataframe(extraction, market_id=market_id)
+                    if not df.empty:
+                        # Override filing_date from discovery metadata (more reliable)
+                        if filing.filing_date:
+                            df["filing_date"] = pd.Timestamp(filing.filing_date)
+                        if filing.report_date:
+                            df["report_date"] = pd.Timestamp(filing.report_date)
+                        all_records.append(df)
+                        extracted_count += 1
+                        logger.info(
+                            "Extracted %s (%s, %s): %d records",
+                            filing.title[:50], filing.filing_type,
+                            filing.report_date or "unknown period",
+                            len(df),
+                        )
+            except Exception as exc:
+                logger.debug("Extraction failed for %s: %s", filing.title[:40], exc)
+                continue
 
     if not all_records:
         _extraction_cache[cache_key] = pd.DataFrame()
@@ -1737,8 +1784,9 @@ def try_filing_extraction(
     combined = pd.concat(all_records, ignore_index=True)
     _extraction_cache[cache_key] = combined
     logger.info(
-        "Filing extraction for %s/%s: %d records from %d filings (cached)",
-        market_id, ticker, len(combined), len(all_records),
+        "Filing extraction for %s/%s: %d records from %d/%d filings (%d stages, cached)",
+        market_id, ticker, len(combined), extracted_count,
+        len(filings_to_extract), len(stages),
     )
     return _filter_by_statement_type(combined, statement_type)
 
