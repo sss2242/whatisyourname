@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Protocol, runtime_checkable
@@ -512,11 +513,12 @@ def _classify_hkex_filing_type(title: str) -> str:
 class HKEXFilingDiscoverer:
     """Discovers financial result filings from HKEX News.
 
-    Primary method: Playwright headless browser (renders the JS-based
-    search page and extracts results from the rendered DOM).
+    Uses date-windowed queries to the HKEX JSON API.  The API limits
+    each request to ~2 weeks of data, so this discoverer automatically
+    splits a multi-year search into 2-week windows with title filters.
 
-    Fallback: Direct HTTP title search (may return empty if HKEX
-    requires JS rendering for the session/ViewState tokens).
+    No proxy is required -- the API works from any IP address as long
+    as individual date windows are kept under ~15 days.
 
     HKEX stock codes are zero-padded to 5 digits (e.g. 00700 for Tencent,
     00005 for HSBC).
@@ -541,184 +543,35 @@ class HKEXFilingDiscoverer:
         # HKEX uses 5-digit zero-padded stock codes
         code = ticker.split(".")[0].strip().zfill(5)
 
-        # Primary method: undocumented HKEX JSON API (no browser needed).
-        # Uses the approach from github.com/simonplmak-cloud/hkex-filing-scraper:
-        # GET search page -> POST JSF form -> call JSON API endpoint.
         try:
-            from operator1.clients.hkex_scraper import HKEXAPIScraper
-            scraper = HKEXAPIScraper()
-            pw_filings = scraper.search_filings(code, years=years)
-            if pw_filings:
-                for pf in pw_filings:
+            from operator1.clients.hkex_scraper import HKEXScraper
+            scraper = HKEXScraper()
+            filings = scraper.search_filings(code, years=years)
+            if filings:
+                for f in filings:
                     result.filings.append(FilingMetadata(
-                        title=pf.title,
-                        filing_date=pf.release_date,
-                        report_date=pf.report_date,
-                        document_url=pf.document_url,
-                        document_format=pf.document_format,
-                        filing_type=pf.filing_type,
+                        title=f.title,
+                        filing_date=f.release_date,
+                        report_date=f.report_date,
+                        document_url=f.document_url,
+                        document_format=f.document_format,
+                        filing_type=f.filing_type,
                         market_id="hk_hkex",
                     ))
                 logger.info(
-                    "HKEX Playwright discovery for %s: %d filings",
+                    "HKEX discovery for %s: %d filings (%d annual, %d interim)",
                     code, len(result.filings),
+                    len(result.annual_filings()), len(result.quarterly_filings()),
                 )
-                return result
             else:
-                logger.debug("HKEX API returned no results, falling back to HTTP")
+                logger.info("HKEX discovery for %s: no filings found", code)
         except ImportError:
-            logger.debug("HKEX API scraper not available, falling back to HTTP search")
+            result.errors.append("HKEX scraper module not available")
+            logger.warning("HKEX scraper not available (hkex_scraper.py missing)")
         except Exception as exc:
-            logger.debug("HKEX API search failed: %s, falling back to HTTP", exc)
+            result.errors.append(f"HKEX discovery failed: {exc}")
+            logger.warning("HKEX discovery failed for %s: %s", code, exc)
 
-        # Fallback: direct HTTP title search (may return empty if HKEX
-        # requires JS rendering for the session/ViewState tokens).
-        # Uses HKEX_PROXY if configured (HKEX geo-blocks non-HK IPs).
-        today = date.today()
-        from_date = today - timedelta(days=365 * years)
-
-        hkex_proxies = None
-        hkex_proxy_env = os.environ.get("HKEX_PROXY", "").strip()
-        if hkex_proxy_env:
-            hkex_proxies = {"http": hkex_proxy_env, "https": hkex_proxy_env}
-
-        # Search for annual and interim results
-        for search_term in ["annual results", "interim results"]:
-            try:
-                resp = requests.get(
-                    _HKEX_SEARCH_URL,
-                    params={
-                        "lang": "EN",
-                        "category": "0",
-                        "market": "SEHK",
-                        "searchType": "0",
-                        "documentType": "-1",
-                        "t1code": "-2",
-                        "t2Gcode": "-2",
-                        "t2code": "-2",
-                        "stockId": code,
-                        "from": from_date.strftime("%Y%m%d"),
-                        "to": today.strftime("%Y%m%d"),
-                        "title": search_term,
-                        "rowRange": "20",
-                        "sortDir": "desc",
-                        "sortByDate": "desc",
-                    },
-                    headers=_HKEX_HEADERS,
-                    proxies=hkex_proxies,
-                    timeout=15,
-                )
-                resp.raise_for_status()
-            except Exception as exc:
-                result.errors.append(f"HKEX search failed for '{search_term}': {exc}")
-                continue
-
-            # HKEX returns HTML with the results.  Parse the title search
-            # results which are in a structured table/JSON depending on the
-            # response format.  We try JSON first, then fall back to HTML regex.
-            try:
-                data = resp.json()
-                records = data.get("result", data.get("data", []))
-                if isinstance(records, list):
-                    for item in records:
-                        title_text = item.get("title", item.get("TITLE", ""))
-                        file_link = item.get("file_link", item.get("FILE_LINK", ""))
-                        date_str = item.get("release_date", item.get("RELEASE_DATE", ""))
-
-                        if not title_text:
-                            continue
-
-                        # Build document URL
-                        doc_url = ""
-                        if file_link:
-                            if file_link.startswith("http"):
-                                doc_url = file_link
-                            else:
-                                doc_url = f"https://www1.hkexnews.hk{file_link}"
-
-                        filing_date = ""
-                        if date_str:
-                            try:
-                                filing_date = str(date_str)[:10]
-                            except Exception:
-                                pass
-
-                        report_date = _parse_hkex_report_date(title_text)
-                        filing_type = _classify_hkex_filing_type(title_text)
-
-                        filing = FilingMetadata(
-                            title=title_text,
-                            filing_date=filing_date,
-                            report_date=report_date,
-                            document_url=doc_url,
-                            document_format="pdf",
-                            filing_type=filing_type,
-                            market_id="hk_hkex",
-                        )
-                        result.filings.append(filing)
-            except (ValueError, AttributeError):
-                # Not JSON -- try HTML parsing with regex
-                html = resp.text
-                # Pattern: look for links to PDF documents with dates
-                link_pattern = re.compile(
-                    r'href="([^"]*\.pdf)"[^>]*>.*?</a>',
-                    re.IGNORECASE | re.DOTALL,
-                )
-                date_pattern = re.compile(
-                    r'(\d{2}/\d{2}/\d{4})',
-                )
-                title_pattern = re.compile(
-                    r'class="[^"]*title[^"]*"[^>]*>([^<]+)<',
-                    re.IGNORECASE,
-                )
-
-                # Extract whatever structured info we can from HTML
-                links = link_pattern.findall(html)
-                dates = date_pattern.findall(html)
-                titles = title_pattern.findall(html)
-
-                for i, link in enumerate(links[:10]):
-                    doc_url = link if link.startswith("http") else f"https://www1.hkexnews.hk{link}"
-                    title_text = titles[i] if i < len(titles) else search_term
-                    date_str = dates[i] if i < len(dates) else ""
-                    filing_date = ""
-                    if date_str:
-                        try:
-                            parts = date_str.split("/")
-                            filing_date = f"{parts[2]}-{parts[1]}-{parts[0]}"
-                        except Exception:
-                            pass
-
-                    report_date = _parse_hkex_report_date(title_text)
-                    filing_type = _classify_hkex_filing_type(title_text)
-
-                    filing = FilingMetadata(
-                        title=title_text.strip(),
-                        filing_date=filing_date,
-                        report_date=report_date,
-                        document_url=doc_url,
-                        document_format="pdf",
-                        filing_type=filing_type,
-                        market_id="hk_hkex",
-                    )
-                    result.filings.append(filing)
-
-        # Dedup by document URL
-        seen_urls: set[str] = set()
-        unique: list[FilingMetadata] = []
-        for f in result.filings:
-            if f.document_url and f.document_url not in seen_urls:
-                seen_urls.add(f.document_url)
-                unique.append(f)
-            elif not f.document_url:
-                unique.append(f)
-        result.filings = unique
-
-        logger.info(
-            "HKEX discovery for %s: found %d filings (%d annual, %d interim)",
-            code, len(result.filings),
-            len(result.annual_filings()), len(result.quarterly_filings()),
-        )
         return result
 
     def download_filing(self, filing: FilingMetadata) -> bytes:
@@ -1728,6 +1581,45 @@ _STATEMENT_FIELD_MAP = {
 }
 
 
+import threading
+
+# Thread lock for extraction cache -- ensures only one thread does the
+# discovery + LLM extraction per ticker, while others wait and use the
+# cached result.  This prevents parallel statement fetches (income,
+# balance, cashflow) from sending concurrent LLM requests that would
+# overwhelm the API rate limit.
+_extraction_lock = threading.Lock()
+
+# Shared LLM client instance for filing extraction.  Created once on
+# first use and reused across all threads, so the PooledLLMClient's
+# key rotation state is shared (not duplicated per thread).
+_shared_llm_client: Any = None
+_shared_llm_client_lock = threading.Lock()
+
+
+def _get_shared_llm_client():
+    """Get or create a shared LLM client for filing extraction.
+
+    Thread-safe: uses a lock to ensure only one client is created.
+    The shared client enables consistent key rotation across threads.
+    """
+    global _shared_llm_client
+    if _shared_llm_client is not None:
+        return _shared_llm_client
+    with _shared_llm_client_lock:
+        if _shared_llm_client is not None:
+            return _shared_llm_client
+        try:
+            from operator1.clients.llm_factory import create_llm_client
+            from operator1.secrets_loader import load_secrets
+            _shared_llm_client = create_llm_client(load_secrets())
+            if _shared_llm_client is not None:
+                logger.debug("Created shared LLM client for filing extraction")
+        except Exception as exc:
+            logger.debug("Could not create shared LLM client: %s", exc)
+    return _shared_llm_client
+
+
 def try_filing_extraction(
     ticker: str,
     market_id: str,
@@ -1743,7 +1635,9 @@ def try_filing_extraction(
     4. Returns a canonical long-format DataFrame filtered by statement_type
 
     Uses a per-ticker cache so that multiple calls (income, balance,
-    cashflow) only trigger one discovery + download cycle.
+    cashflow) only trigger one discovery + download cycle.  Thread-safe:
+    when parallel threads request different statement types for the same
+    ticker, only one thread does the extraction and the others wait.
 
     Falls back to empty DataFrame if any step fails.
 
@@ -1758,18 +1652,29 @@ def try_filing_extraction(
         extracted data to only return fields relevant to the requested
         statement type.
     llm_client:
-        Optional LLM client for PDF extraction.
+        Optional LLM client for PDF extraction.  If None, uses a
+        shared module-level client (created once, reused across threads).
     """
     import pandas as pd
 
     cache_key = f"{market_id}:{ticker}"
 
-    # Check extraction cache first (avoids redundant API calls)
+    # Fast path: check cache without lock (safe for dict reads)
     if cache_key in _extraction_cache:
         combined = _extraction_cache[cache_key]
         if combined.empty:
             return pd.DataFrame()
         return _filter_by_statement_type(combined, statement_type)
+
+    # Slow path: acquire lock so only one thread does discovery + extraction.
+    # Other threads for the same ticker will wait here and then hit the cache.
+    with _extraction_lock:
+        # Double-check after acquiring lock (another thread may have finished)
+        if cache_key in _extraction_cache:
+            combined = _extraction_cache[cache_key]
+            if combined.empty:
+                return pd.DataFrame()
+            return _filter_by_statement_type(combined, statement_type)
 
     discoverer = get_discoverer(market_id)
     if discoverer is None:
@@ -1787,19 +1692,11 @@ def try_filing_extraction(
         _extraction_cache[cache_key] = pd.DataFrame()
         return pd.DataFrame()
 
-    # Auto-create LLM client from environment secrets when not provided.
-    # All 9 Tier 2 clients pass llm_client=None because the LLM client
-    # is created in main.py but never threaded through the PIT client
-    # constructors.  This auto-creation fixes that wiring gap.
+    # Use shared LLM client when not explicitly provided.
+    # The shared client is created once and reused across all threads,
+    # ensuring consistent key rotation and avoiding redundant connections.
     if llm_client is None:
-        try:
-            from operator1.clients.llm_factory import create_llm_client
-            from operator1.secrets_loader import load_secrets
-            llm_client = create_llm_client(load_secrets())
-            if llm_client is not None:
-                logger.debug("Auto-created LLM client for filing extraction")
-        except Exception as _llm_exc:
-            logger.debug("Could not auto-create LLM client: %s", _llm_exc)
+        llm_client = _get_shared_llm_client()
 
     # Try to extract from the most recent filings
     try:
@@ -1810,29 +1707,84 @@ def try_filing_extraction(
         _extraction_cache[cache_key] = pd.DataFrame()
         return pd.DataFrame()
 
+    # Sort filings by priority: annual first, then interim, then quarterly.
+    # Most recent within each type first.  This ensures the most valuable
+    # filings (full-year annual results) are extracted even if rate limits
+    # prevent processing all filings.
+    # Sort filings: annual first, then interim, then quarterly.
+    # Within each type, newest filing_date first.
+    # Using a tuple key: (type_priority ASC, filing_date DESC via reverse sort trick)
+    _type_priority = {"annual": 0, "interim": 1, "quarterly": 2}
+
+    def _filing_sort_key(f):
+        tp = _type_priority.get(f.filing_type, 3)
+        # Invert date string for descending order within each type:
+        # "2025-03-19" -> high sort value (newest first)
+        fd = f.filing_date or "0000-00-00"
+        # Use a tuple that sorts type ascending, date descending
+        # by making date negative via character complement
+        inverted_date = "".join(chr(255 - ord(c)) for c in fd)
+        return (tp, inverted_date)
+
+    sorted_filings = sorted(discovery.filings, key=_filing_sort_key)
+
+    # Load extraction stage settings from config
+    from operator1.config_loader import get_global_config
+    _cfg = get_global_config()
+    _max_filings = _cfg.get("filing_extraction_max_filings", 8)
+    _stage_size = _cfg.get("filing_extraction_stage_size", 2)
+    _stage_pause = _cfg.get("filing_extraction_stage_pause_s", 15)
+
+    filings_to_extract = sorted_filings[:_max_filings]
+
+    # Split into stages to respect LLM rate limits.
+    # Between stages, pause to let the rate limit window reset.
+    # With 5 Gemini keys at 15 RPM each, 2 filings per stage uses
+    # 2 of 75 available RPM -- well within limits after a 15s pause.
+    stages = [
+        filings_to_extract[i:i + _stage_size]
+        for i in range(0, len(filings_to_extract), _stage_size)
+    ]
+
     all_records = []
+    extracted_count = 0
 
-    for filing in discovery.filings[:8]:  # Limit to 8 most recent
-        try:
-            pdf_bytes = discoverer.download_filing(filing)
-        except Exception as exc:
-            logger.debug("Download failed for %s: %s", filing.title[:40], exc)
-            continue
+    for stage_num, stage_filings in enumerate(stages):
+        if stage_num > 0 and _stage_pause > 0:
+            logger.info(
+                "Filing extraction stage %d/%d: pausing %.0fs for rate limit reset",
+                stage_num + 1, len(stages), _stage_pause,
+            )
+            time.sleep(_stage_pause)
 
-        try:
-            extraction = extractor.extract_from_pdf(pdf_bytes, market_id=market_id)
-            if extraction.success:
-                df = extractor.to_canonical_dataframe(extraction, market_id=market_id)
-                if not df.empty:
-                    # Override filing_date from discovery metadata (more reliable)
-                    if filing.filing_date:
-                        df["filing_date"] = pd.Timestamp(filing.filing_date)
-                    if filing.report_date:
-                        df["report_date"] = pd.Timestamp(filing.report_date)
-                    all_records.append(df)
-        except Exception as exc:
-            logger.debug("Extraction failed for %s: %s", filing.title[:40], exc)
-            continue
+        for filing in stage_filings:
+            try:
+                pdf_bytes = discoverer.download_filing(filing)
+            except Exception as exc:
+                logger.debug("Download failed for %s: %s", filing.title[:40], exc)
+                continue
+
+            try:
+                extraction = extractor.extract_from_pdf(pdf_bytes, market_id=market_id)
+                if extraction.success:
+                    df = extractor.to_canonical_dataframe(extraction, market_id=market_id)
+                    if not df.empty:
+                        # Override filing_date from discovery metadata (more reliable)
+                        if filing.filing_date:
+                            df["filing_date"] = pd.Timestamp(filing.filing_date)
+                        if filing.report_date:
+                            df["report_date"] = pd.Timestamp(filing.report_date)
+                        all_records.append(df)
+                        extracted_count += 1
+                        logger.info(
+                            "Extracted %s (%s, %s): %d records",
+                            filing.title[:50], filing.filing_type,
+                            filing.report_date or "unknown period",
+                            len(df),
+                        )
+            except Exception as exc:
+                logger.debug("Extraction failed for %s: %s", filing.title[:40], exc)
+                continue
 
     if not all_records:
         _extraction_cache[cache_key] = pd.DataFrame()
@@ -1841,8 +1793,9 @@ def try_filing_extraction(
     combined = pd.concat(all_records, ignore_index=True)
     _extraction_cache[cache_key] = combined
     logger.info(
-        "Filing extraction for %s/%s: %d records from %d filings (cached)",
-        market_id, ticker, len(combined), len(all_records),
+        "Filing extraction for %s/%s: %d records from %d/%d filings (%d stages, cached)",
+        market_id, ticker, len(combined), extracted_count,
+        len(filings_to_extract), len(stages),
     )
     return _filter_by_statement_type(combined, statement_type)
 
