@@ -1,42 +1,39 @@
-"""HKEX filing scraper using the undocumented JSON API.
+"""HKEX filing scraper using date-windowed queries to the JSON API.
 
-HKEX's filing search (www1.hkexnews.hk/search/titlesearch.xhtml) is a
-JSF (JavaServer Faces) application.  Direct API calls return empty
-results unless the server session is initialized correctly.
+HKEX News (www1.hkexnews.hk) publishes all listed company announcements
+including financial results.  The search page exposes an undocumented
+JSON API endpoint (``titleSearchServlet.do``) that returns filing records.
 
-This module uses the approach discovered by the hkex-filing-scraper
-project (MIT, github.com/simonplmak-cloud/hkex-filing-scraper):
+**Key discovery:** The HKEX API imposes a server-side date range limit
+of approximately 2 weeks per query.  Requests spanning more than ~15
+days return ``recordCnt: 0`` and ``result: "null"``.  This is NOT a
+geo-blocking issue -- the API works from any IP address as long as the
+date window is kept small.
 
-**Why this is necessary:**
-    HKEX has no public REST API for filing search.  The titlesearch.xhtml
-    page is a JSF app that renders results via JavaScript.  Direct GET/POST
-    calls to the API endpoint return ``recordCnt: 0`` unless the JSF
-    server session has been properly initialized with date range parameters.
+**How it works:**
+    1. GET the search page to create a session (JSESSIONID cookie).
+    2. Issue multiple GET requests to the JSON API endpoint, each
+       covering a 2-week window, with ``searchType=1`` and a title
+       filter (e.g. ``"results"``) to narrow results to financial
+       announcements.
+    3. Filter results client-side by stock code.
+    4. Aggregate and deduplicate across all windows.
 
-**How the undocumented API works:**
-    1. GET the search page to create a JSF session (gets a JSESSIONID cookie)
-       and extract the ViewState token from the HTML.
-    2. POST the JSF form with ViewState + date range to "bind" the search
-       parameters to the server-side session.
-    3. GET the JSON API endpoint (titleSearchServlet.do) with the date range
-       params.  The server now recognizes the session and returns real results.
+**No proxy required.  No JSF session binding required.**
 
-**Important API quirks (learned from hkex-filing-scraper):**
-    - The API uses ``stockId=-1`` to fetch ALL stocks (not a specific code).
-      Filtering by stock code is done client-side after retrieval.
-    - The ``rowRange`` parameter is cumulative: to paginate, increase it
-      (e.g., 5000, 10000, 15000) rather than using offset/limit.
-    - Date format in the POST form is ``YYYYMMDD``, and ``from``/``to`` are
-      the field names (not ``startDate``/``endDate``).
-    - The response ``result`` field is a JSON string (not a JSON array),
-      so it needs ``json.loads()`` after ``json()`` parsing.
+**API quirks:**
+    - ``stockId=-1`` fetches ALL stocks; filtering is done client-side.
+    - ``searchType=1`` enables title search (much more efficient).
+    - The ``result`` field in the response is a JSON *string* (not an
+      array), so it needs ``json.loads()`` after ``response.json()``.
     - ``lang=E`` (not ``EN``) for the API endpoint.
+    - Date format is ``YYYYMMDD``.
 
-**No extra dependencies required** -- just ``requests`` and optionally
-``beautifulsoup4`` (both already in requirements).
+No extra dependencies required -- just ``requests`` (already in
+requirements).
 
 Usage:
-    scraper = HKEXAPIScraper()
+    scraper = HKEXScraper()
     filings = scraper.search_filings("00700", years=2)
     pdf_bytes = scraper.download_pdf(filings[0].document_url)
 
@@ -48,8 +45,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
@@ -58,46 +55,27 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-
-def _get_hkex_proxy() -> dict[str, str] | None:
-    """Read HKEX proxy from environment.
-
-    HKEX geo-blocks non-HK IPs.  Users can set ``HKEX_PROXY`` in their
-    ``.env`` file to route HKEX requests through an HK-based proxy.
-
-    Supported formats::
-
-        HKEX_PROXY=http://host:port
-        HKEX_PROXY=socks5://host:port
-        HKEX_PROXY=socks5://user:pass@host:port
-
-    Returns a ``requests``-compatible proxies dict, or None.
-    """
-    proxy = os.environ.get("HKEX_PROXY", "").strip()
-    if not proxy:
-        return None
-    return {"http": proxy, "https": proxy}
-
 # ---------------------------------------------------------------------------
 # HKEX URL constants
 # ---------------------------------------------------------------------------
-# The base URL for all HKEX News endpoints.
+
 _HKEX_BASE_URL = "https://www1.hkexnews.hk"
-
-# The JSF search page -- loading this creates the server-side session.
 _HKEX_SEARCH_PAGE = f"{_HKEX_BASE_URL}/search/titlesearch.xhtml"
-
-# The undocumented JSON API endpoint that returns filing records.
-# Only works after the session has been initialized via the search page.
 _HKEX_API_ENDPOINT = f"{_HKEX_BASE_URL}/search/titleSearchServlet.do"
 
-# Browser-like headers to avoid being blocked by HKEX's WAF.
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
 }
+
+# Maximum date range (days) per API request.  The HKEX server silently
+# rejects ranges wider than ~15 days by returning recordCnt=0.
+_MAX_WINDOW_DAYS = 14
+
+# Pause between API requests to avoid rate-limiting.
+_REQUEST_DELAY_S = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -223,15 +201,31 @@ def _parse_api_record(record: dict) -> HKEXFiling:
     )
 
 
+def _is_financial_filing(record: dict, filing: HKEXFiling) -> bool:
+    """Check whether a record is a financial result filing."""
+    long_text = record.get("LONG_TEXT", "").lower()
+    title_lower = filing.title.lower()
+    return bool(
+        ("result" in title_lower
+         or "financial" in title_lower
+         or "annual report" in title_lower
+         or "[results]" in long_text)
+        and filing.document_url
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main scraper class
 # ---------------------------------------------------------------------------
 
-class HKEXAPIScraper:
-    """Scrapes HKEX filing search results using the undocumented JSON API.
+class HKEXScraper:
+    """Scrapes HKEX filing search results using date-windowed API queries.
 
-    See module docstring for a detailed explanation of why this approach
-    is necessary and how the three-step session initialization works.
+    The HKEX JSON API limits each request to approximately 2 weeks of
+    data.  This scraper automatically splits a multi-year search into
+    2-week windows, using title filters to keep result counts manageable.
+
+    No proxy or JSF session binding is required.
     """
 
     def __init__(self) -> None:
@@ -240,145 +234,95 @@ class HKEXAPIScraper:
     def _get_session(self) -> requests.Session:
         """Create or return a persistent requests session.
 
-        A persistent session is needed because the HKEX API requires
-        the JSESSIONID cookie from the initial page load to be sent
-        with subsequent API calls.
-
-        If ``HKEX_PROXY`` is set in the environment, the session routes
-        all traffic through that proxy (needed because HKEX geo-blocks
-        non-HK IP addresses).
-
-        If ``HKEX_PROXY_NO_VERIFY=1`` is also set, SSL certificate
-        verification is disabled.  This is needed for transparent/
-        intercepting proxies that replace the server certificate.
-        Only use this for reading public filing data -- never for
-        endpoints that transmit credentials.
+        A persistent session reuses the JSESSIONID cookie from the
+        initial search page load, which the API endpoint requires.
         """
         if self._session is None:
             self._session = requests.Session()
             self._session.headers.update(_HEADERS)
-            proxies = _get_hkex_proxy()
-            if proxies:
-                self._session.proxies.update(proxies)
-                logger.info("HKEX scraper using proxy: %s", proxies.get("https", ""))
-                if os.environ.get("HKEX_PROXY_NO_VERIFY", "").strip() in ("1", "true", "yes"):
-                    self._session.verify = False
-                    logger.warning("HKEX scraper: SSL verification disabled (HKEX_PROXY_NO_VERIFY=1)")
-                    # Suppress InsecureRequestWarning
-                    import urllib3
-                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            # Load the search page to initialize the server session
+            try:
+                self._session.get(_HKEX_SEARCH_PAGE, timeout=30)
+            except Exception as exc:
+                logger.warning("HKEX: failed to load search page: %s", exc)
         return self._session
 
-    def _init_jsf_session(
+    def _query_window(
         self,
         session: requests.Session,
         from_yyyymmdd: str,
         to_yyyymmdd: str,
-    ) -> bool:
-        """Initialize the HKEX JSF server session with date range.
+        title_filter: str = "results",
+    ) -> list[dict]:
+        """Query a single date window and return raw API records.
 
-        This is the critical step that makes the JSON API work:
-        1. GET the search page (creates JSESSIONID cookie + ViewState)
-        2. POST the JSF form (binds date range to the server session)
+        Parameters
+        ----------
+        session:
+            Active requests session with JSESSIONID.
+        from_yyyymmdd:
+            Start date in YYYYMMDD format.
+        to_yyyymmdd:
+            End date in YYYYMMDD format.
+        title_filter:
+            Title search string to narrow results (e.g. "results",
+            "annual results").  Use empty string for no filter.
 
-        After this, the JSON API endpoint recognizes the session and
-        returns real results instead of empty arrays.
-
-        Returns True if initialization succeeded, False otherwise.
+        Returns
+        -------
+        List of raw record dicts from the HKEX API.
         """
-        # Step 1: GET the search page to create the JSF session.
-        # The params here set default search options on the server side.
         try:
-            page_resp = session.get(
-                _HKEX_SEARCH_PAGE,
+            resp = session.get(
+                _HKEX_API_ENDPOINT,
                 params={
                     "sortDir": "0",
-                    "sortByRecordDate": "on",
-                    "searchType": "0",
+                    "sortByOptions": "DateTime",
                     "category": "0",
+                    "market": "SEHK",
+                    "stockId": "-1",
+                    "documentType": "-1",
+                    "fromDate": from_yyyymmdd,
+                    "toDate": to_yyyymmdd,
+                    "title": title_filter,
+                    "searchType": "1" if title_filter else "0",
                     "t1code": "-2",
                     "t2Gcode": "-2",
                     "t2code": "-2",
-                    "documentType": "-1",
-                    "rowRange": "0",
-                    "lang": "EN",
+                    "rowRange": "5000",
+                    "lang": "E",
                 },
-                timeout=30,
-            )
-            page_resp.raise_for_status()
-        except Exception as exc:
-            logger.warning("HKEX: failed to load search page: %s", exc)
-            return False
-
-        # Extract the JSF ViewState token, form action URL, and form ID
-        # from HTML.  ViewState is required for the JSF form POST to be
-        # accepted.  The form ID is auto-generated by JSF (e.g. j_idt10,
-        # j_idt15) and can change between server deployments, so we must
-        # extract it dynamically rather than hardcoding it.
-        view_state = ""
-        form_action = ""
-        form_id = ""
-
-        try:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(page_resp.text, "html.parser")
-            vs_el = soup.find("input", {"name": "javax.faces.ViewState"})
-            if vs_el:
-                view_state = vs_el.get("value", "")
-            form_el = soup.find("form")
-            if form_el:
-                form_action = form_el.get("action", "")
-                form_id = form_el.get("id", "")
-        except ImportError:
-            # Fallback: regex extraction if beautifulsoup4 not available
-            vs_match = re.search(
-                r'javax\.faces\.ViewState.*?value="([^"]+)"', page_resp.text
-            )
-            if vs_match:
-                view_state = vs_match.group(1)
-            fa_match = re.search(r'<form[^>]*action="([^"]+)"', page_resp.text)
-            if fa_match:
-                form_action = fa_match.group(1)
-            fid_match = re.search(r'<form[^>]*id="([^"]+)"', page_resp.text)
-            if fid_match:
-                form_id = fid_match.group(1)
-
-        if not view_state:
-            logger.warning("HKEX: could not extract ViewState from search page")
-            return False
-
-        if not form_id:
-            logger.warning("HKEX: could not extract form ID from search page")
-            return False
-
-        # Step 2: POST the JSF form to bind the date range to the session.
-        # The hkex-filing-scraper project discovered that the form POST
-        # field names are "from" and "to" (YYYYMMDD format), and the
-        # form ID must match the JSF-generated id attribute on the <form>
-        # element (previously j_idt10, now dynamically extracted).
-        submit_url = (
-            f"{_HKEX_BASE_URL}{form_action}"
-            if form_action.startswith("/")
-            else _HKEX_SEARCH_PAGE
-        )
-
-        try:
-            session.post(
-                submit_url,
-                data={
-                    form_id: form_id,
-                    f"{form_id}:loadMoreRange": "100",
-                    "javax.faces.ViewState": view_state,
-                    "from": from_yyyymmdd,
-                    "to": to_yyyymmdd,
+                headers={
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Referer": _HKEX_SEARCH_PAGE,
+                    "X-Requested-With": "XMLHttpRequest",
                 },
-                timeout=30,
+                timeout=60,
             )
+            resp.raise_for_status()
+            data = resp.json()
         except Exception as exc:
-            logger.warning("HKEX: JSF form POST failed: %s", exc)
-            return False
+            logger.debug(
+                "HKEX API query failed for %s-%s: %s",
+                from_yyyymmdd, to_yyyymmdd, exc,
+            )
+            return []
 
-        return True
+        result_raw = data.get("result", "null")
+        if result_raw is None or result_raw == "null":
+            return []
+
+        if isinstance(result_raw, str):
+            try:
+                parsed = json.loads(result_raw)
+                return parsed if isinstance(parsed, list) else []
+            except json.JSONDecodeError:
+                return []
+
+        if isinstance(result_raw, list):
+            return result_raw
+
+        return []
 
     def search_filings(
         self,
@@ -386,6 +330,10 @@ class HKEXAPIScraper:
         years: int = 2,
     ) -> list[HKEXFiling]:
         """Search HKEX for financial result filings for a given stock.
+
+        Automatically paginates across 2-week date windows to cover the
+        requested time range, using title filters to keep each window's
+        result count within the API's limits.
 
         Parameters
         ----------
@@ -397,110 +345,44 @@ class HKEXAPIScraper:
 
         Returns
         -------
-        List of HKEXFiling objects for financial result announcements.
+        List of HKEXFiling objects for financial result announcements,
+        sorted by release date (newest first).
         """
-        # Normalize stock code to 5-digit zero-padded (HKEX standard)
         code = stock_code.split(".")[0].strip().zfill(5)
-
-        today = date.today()
-        from_date = today - timedelta(days=365 * years)
-        from_str = from_date.strftime("%Y%m%d")
-        to_str = today.strftime("%Y%m%d")
 
         session = self._get_session()
 
-        # Initialize the JSF session with our date range.
-        # This is the step that was missing from our earlier direct API calls.
-        if not self._init_jsf_session(session, from_str, to_str):
-            return []
+        today = date.today()
+        search_start = today - timedelta(days=365 * years)
 
-        # Step 3: Call the JSON API endpoint.
-        # Key findings from hkex-filing-scraper:
-        #   - Use stockId=-1 to fetch ALL stocks (client-side filter later)
-        #   - Use lang=E (not EN) for the API endpoint
-        #   - rowRange is cumulative (not page size)
-        #   - The "result" field is a JSON *string*, not an array
-        try:
-            api_resp = session.get(
-                _HKEX_API_ENDPOINT,
-                params={
-                    "sortDir": "0",
-                    "sortByOptions": "DateTime",
-                    "category": "0",
-                    "market": "SEHK",
-                    "stockId": "-1",       # All stocks, filter client-side
-                    "documentType": "-1",
-                    "fromDate": from_str,
-                    "toDate": to_str,
-                    "title": "",           # No title filter (get everything)
-                    "searchType": "0",
-                    "t1code": "-2",
-                    "t2Gcode": "-2",
-                    "t2code": "-2",
-                    "rowRange": "5000",    # Fetch up to 5000 records
-                    "lang": "E",           # Note: "E" not "EN"
-                },
-                headers={
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Referer": _HKEX_SEARCH_PAGE,
-                    "X-Requested-With": "XMLHttpRequest",
-                },
-                timeout=120,
-            )
-            api_resp.raise_for_status()
-            data = api_resp.json()
-        except Exception as exc:
-            logger.warning("HKEX: JSON API call failed: %s", exc)
-            return []
-
-        # Parse the result -- it's a JSON string inside the JSON response.
-        # data["result"] is a string like '[{"STOCK_CODE":"00700",...},...]'
-        # but may also be "null", None, or "[]" when no results found.
-        result_raw = data.get("result", "[]")
-        logger.debug("HKEX API raw keys: %s", list(data.keys()))
-        logger.debug("HKEX API result type: %s, first 200 chars: %s",
-                      type(result_raw).__name__,
-                      str(result_raw)[:200] if result_raw else "None")
-
-        records: list = []
-        if result_raw is None or result_raw == "null":
-            records = []
-        elif isinstance(result_raw, str):
-            try:
-                parsed = json.loads(result_raw)
-                records = parsed if isinstance(parsed, list) else []
-            except json.JSONDecodeError:
-                records = []
-        elif isinstance(result_raw, list):
-            records = result_raw
-
-        record_count = data.get("recordCnt", 0)
-        logger.info(
-            "HKEX API returned %d records (server says %d total)",
-            len(records), record_count,
-        )
-
-        # Filter to our target stock code and financial results only.
-        # The API returns ALL stocks' filings; we filter client-side.
+        # Iterate backward in 2-week windows with title filter
         all_filings: list[HKEXFiling] = []
-        for record in records:
-            raw_code = record.get("STOCK_CODE", "").split("<br/>")[0].strip()
-            if raw_code != code:
-                continue
+        current_end = today
+        window = timedelta(days=_MAX_WINDOW_DAYS)
+        request_count = 0
 
-            filing = _parse_api_record(record)
+        while current_end > search_start:
+            current_start = max(current_end - window, search_start)
+            from_str = current_start.strftime("%Y%m%d")
+            to_str = current_end.strftime("%Y%m%d")
 
-            # Keep only financial result filings (skip corporate actions, etc.)
-            long_text = record.get("LONG_TEXT", "").lower()
-            title_lower = filing.title.lower()
-            is_financial = (
-                "result" in title_lower
-                or "financial" in title_lower
-                or "annual report" in title_lower
-                or "[results]" in long_text
-            )
-            if is_financial and filing.document_url:
-                all_filings.append(filing)
+            records = self._query_window(session, from_str, to_str, "results")
+            request_count += 1
+
+            for record in records:
+                raw_code = record.get("STOCK_CODE", "").split("<br/>")[0].strip()
+                if raw_code != code:
+                    continue
+                filing = _parse_api_record(record)
+                if _is_financial_filing(record, filing):
+                    all_filings.append(filing)
+
+            # Move to next window (1-day gap to avoid overlap)
+            current_end = current_start - timedelta(days=1)
+
+            # Rate limiting
+            if request_count % 5 == 0:
+                time.sleep(_REQUEST_DELAY_S)
 
         # Dedup by document URL
         seen: set[str] = set()
@@ -510,14 +392,22 @@ class HKEXAPIScraper:
                 seen.add(f.document_url)
                 unique.append(f)
 
+        # Sort by release date (newest first)
+        unique.sort(key=lambda f: f.release_date, reverse=True)
+
         logger.info(
-            "HKEX search for %s: %d financial result filings (from %d total records)",
-            code, len(unique), len(records),
+            "HKEX search for %s: %d financial result filings "
+            "(%d API requests across %d-year window)",
+            code, len(unique), request_count, years,
         )
         return unique
 
     def download_pdf(self, url: str) -> bytes:
         """Download a filing PDF from HKEX.
+
+        HKEX documents are hosted as static files and do not require
+        session authentication -- a direct GET with standard headers
+        works from any IP address.
 
         Parameters
         ----------

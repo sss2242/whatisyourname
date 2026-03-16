@@ -512,11 +512,12 @@ def _classify_hkex_filing_type(title: str) -> str:
 class HKEXFilingDiscoverer:
     """Discovers financial result filings from HKEX News.
 
-    Primary method: Playwright headless browser (renders the JS-based
-    search page and extracts results from the rendered DOM).
+    Uses date-windowed queries to the HKEX JSON API.  The API limits
+    each request to ~2 weeks of data, so this discoverer automatically
+    splits a multi-year search into 2-week windows with title filters.
 
-    Fallback: Direct HTTP title search (may return empty if HKEX
-    requires JS rendering for the session/ViewState tokens).
+    No proxy is required -- the API works from any IP address as long
+    as individual date windows are kept under ~15 days.
 
     HKEX stock codes are zero-padded to 5 digits (e.g. 00700 for Tencent,
     00005 for HSBC).
@@ -541,184 +542,35 @@ class HKEXFilingDiscoverer:
         # HKEX uses 5-digit zero-padded stock codes
         code = ticker.split(".")[0].strip().zfill(5)
 
-        # Primary method: undocumented HKEX JSON API (no browser needed).
-        # Uses the approach from github.com/simonplmak-cloud/hkex-filing-scraper:
-        # GET search page -> POST JSF form -> call JSON API endpoint.
         try:
-            from operator1.clients.hkex_scraper import HKEXAPIScraper
-            scraper = HKEXAPIScraper()
-            pw_filings = scraper.search_filings(code, years=years)
-            if pw_filings:
-                for pf in pw_filings:
+            from operator1.clients.hkex_scraper import HKEXScraper
+            scraper = HKEXScraper()
+            filings = scraper.search_filings(code, years=years)
+            if filings:
+                for f in filings:
                     result.filings.append(FilingMetadata(
-                        title=pf.title,
-                        filing_date=pf.release_date,
-                        report_date=pf.report_date,
-                        document_url=pf.document_url,
-                        document_format=pf.document_format,
-                        filing_type=pf.filing_type,
+                        title=f.title,
+                        filing_date=f.release_date,
+                        report_date=f.report_date,
+                        document_url=f.document_url,
+                        document_format=f.document_format,
+                        filing_type=f.filing_type,
                         market_id="hk_hkex",
                     ))
                 logger.info(
-                    "HKEX Playwright discovery for %s: %d filings",
+                    "HKEX discovery for %s: %d filings (%d annual, %d interim)",
                     code, len(result.filings),
+                    len(result.annual_filings()), len(result.quarterly_filings()),
                 )
-                return result
             else:
-                logger.debug("HKEX API returned no results, falling back to HTTP")
+                logger.info("HKEX discovery for %s: no filings found", code)
         except ImportError:
-            logger.debug("HKEX API scraper not available, falling back to HTTP search")
+            result.errors.append("HKEX scraper module not available")
+            logger.warning("HKEX scraper not available (hkex_scraper.py missing)")
         except Exception as exc:
-            logger.debug("HKEX API search failed: %s, falling back to HTTP", exc)
+            result.errors.append(f"HKEX discovery failed: {exc}")
+            logger.warning("HKEX discovery failed for %s: %s", code, exc)
 
-        # Fallback: direct HTTP title search (may return empty if HKEX
-        # requires JS rendering for the session/ViewState tokens).
-        # Uses HKEX_PROXY if configured (HKEX geo-blocks non-HK IPs).
-        today = date.today()
-        from_date = today - timedelta(days=365 * years)
-
-        hkex_proxies = None
-        hkex_proxy_env = os.environ.get("HKEX_PROXY", "").strip()
-        if hkex_proxy_env:
-            hkex_proxies = {"http": hkex_proxy_env, "https": hkex_proxy_env}
-
-        # Search for annual and interim results
-        for search_term in ["annual results", "interim results"]:
-            try:
-                resp = requests.get(
-                    _HKEX_SEARCH_URL,
-                    params={
-                        "lang": "EN",
-                        "category": "0",
-                        "market": "SEHK",
-                        "searchType": "0",
-                        "documentType": "-1",
-                        "t1code": "-2",
-                        "t2Gcode": "-2",
-                        "t2code": "-2",
-                        "stockId": code,
-                        "from": from_date.strftime("%Y%m%d"),
-                        "to": today.strftime("%Y%m%d"),
-                        "title": search_term,
-                        "rowRange": "20",
-                        "sortDir": "desc",
-                        "sortByDate": "desc",
-                    },
-                    headers=_HKEX_HEADERS,
-                    proxies=hkex_proxies,
-                    timeout=15,
-                )
-                resp.raise_for_status()
-            except Exception as exc:
-                result.errors.append(f"HKEX search failed for '{search_term}': {exc}")
-                continue
-
-            # HKEX returns HTML with the results.  Parse the title search
-            # results which are in a structured table/JSON depending on the
-            # response format.  We try JSON first, then fall back to HTML regex.
-            try:
-                data = resp.json()
-                records = data.get("result", data.get("data", []))
-                if isinstance(records, list):
-                    for item in records:
-                        title_text = item.get("title", item.get("TITLE", ""))
-                        file_link = item.get("file_link", item.get("FILE_LINK", ""))
-                        date_str = item.get("release_date", item.get("RELEASE_DATE", ""))
-
-                        if not title_text:
-                            continue
-
-                        # Build document URL
-                        doc_url = ""
-                        if file_link:
-                            if file_link.startswith("http"):
-                                doc_url = file_link
-                            else:
-                                doc_url = f"https://www1.hkexnews.hk{file_link}"
-
-                        filing_date = ""
-                        if date_str:
-                            try:
-                                filing_date = str(date_str)[:10]
-                            except Exception:
-                                pass
-
-                        report_date = _parse_hkex_report_date(title_text)
-                        filing_type = _classify_hkex_filing_type(title_text)
-
-                        filing = FilingMetadata(
-                            title=title_text,
-                            filing_date=filing_date,
-                            report_date=report_date,
-                            document_url=doc_url,
-                            document_format="pdf",
-                            filing_type=filing_type,
-                            market_id="hk_hkex",
-                        )
-                        result.filings.append(filing)
-            except (ValueError, AttributeError):
-                # Not JSON -- try HTML parsing with regex
-                html = resp.text
-                # Pattern: look for links to PDF documents with dates
-                link_pattern = re.compile(
-                    r'href="([^"]*\.pdf)"[^>]*>.*?</a>',
-                    re.IGNORECASE | re.DOTALL,
-                )
-                date_pattern = re.compile(
-                    r'(\d{2}/\d{2}/\d{4})',
-                )
-                title_pattern = re.compile(
-                    r'class="[^"]*title[^"]*"[^>]*>([^<]+)<',
-                    re.IGNORECASE,
-                )
-
-                # Extract whatever structured info we can from HTML
-                links = link_pattern.findall(html)
-                dates = date_pattern.findall(html)
-                titles = title_pattern.findall(html)
-
-                for i, link in enumerate(links[:10]):
-                    doc_url = link if link.startswith("http") else f"https://www1.hkexnews.hk{link}"
-                    title_text = titles[i] if i < len(titles) else search_term
-                    date_str = dates[i] if i < len(dates) else ""
-                    filing_date = ""
-                    if date_str:
-                        try:
-                            parts = date_str.split("/")
-                            filing_date = f"{parts[2]}-{parts[1]}-{parts[0]}"
-                        except Exception:
-                            pass
-
-                    report_date = _parse_hkex_report_date(title_text)
-                    filing_type = _classify_hkex_filing_type(title_text)
-
-                    filing = FilingMetadata(
-                        title=title_text.strip(),
-                        filing_date=filing_date,
-                        report_date=report_date,
-                        document_url=doc_url,
-                        document_format="pdf",
-                        filing_type=filing_type,
-                        market_id="hk_hkex",
-                    )
-                    result.filings.append(filing)
-
-        # Dedup by document URL
-        seen_urls: set[str] = set()
-        unique: list[FilingMetadata] = []
-        for f in result.filings:
-            if f.document_url and f.document_url not in seen_urls:
-                seen_urls.add(f.document_url)
-                unique.append(f)
-            elif not f.document_url:
-                unique.append(f)
-        result.filings = unique
-
-        logger.info(
-            "HKEX discovery for %s: found %d filings (%d annual, %d interim)",
-            code, len(result.filings),
-            len(result.annual_filings()), len(result.quarterly_filings()),
-        )
         return result
 
     def download_filing(self, filing: FilingMetadata) -> bytes:
