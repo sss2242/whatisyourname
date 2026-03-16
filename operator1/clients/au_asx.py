@@ -1,41 +1,62 @@
-"""Australia ASX PIT client -- uses ASX undocumented API.
+"""Australia ASX PIT client -- uses ASX MarkitDigital API + filing discovery.
 
-Primary: ASX API (https://www.asx.com.au/asx/1/share/)
+Primary profile: ASX MarkitDigital API (asx.api.markitdigital.com)
+Primary financials: Filing discovery + LLM extraction from ASX PDFs
+OHLCV: Handled by ohlcv_provider.py (yfinance .AX suffix)
+
 Coverage: ~2,200+ listed companies, ~$1.8T market cap.
+
+NOTE: The old ASX API (asx.com.au/asx/1/) returns 404 as of 2026.
+The MarkitDigital API is the current ASX data provider.
 """
 
 from __future__ import annotations
 
-import json, logging, os
+import json
+import logging
 from datetime import date
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from operator1.http_utils import cached_get, HTTPError
+import requests
 
 logger = logging.getLogger(__name__)
-_ASX_BASE = "https://www.asx.com.au/asx/1"
+
+# ASX MarkitDigital API (same API used by the ASX website and filing discoverer)
+_MARKIT_BASE = "https://asx.api.markitdigital.com/asx-research/1.0"
+_MARKIT_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "Operator1/1.0",
+}
+
 _CACHE_DIR = Path("cache/au_asx")
 
 
 class AUAsxClient:
-    """PIT client for Australian ASX equities."""
+    """PIT client for Australian ASX equities.
+
+    Uses the ASX MarkitDigital API for profile and company search.
+    Uses filing discovery + LLM extraction for financial statements.
+    No yfinance dependency -- all data comes from ASX-native sources.
+    """
 
     def __init__(self, cache_dir: Path | str = _CACHE_DIR) -> None:
         self._cache_dir = Path(cache_dir)
-        self._headers = {"Accept": "application/json", "User-Agent": "Operator1/1.0"}
 
     def _cache_path(self, identifier: str, fn: str) -> Path:
         return self._cache_dir / identifier.upper() / fn
 
     def _read_cache(self, identifier: str, fn: str) -> dict | None:
         p = self._cache_path(identifier, fn)
-        if not p.exists(): return None
+        if not p.exists():
+            return None
         try:
-            if fn == "profile.json" and (date.today() - date.fromtimestamp(p.stat().st_mtime)).days > 7: return None
+            if fn == "profile.json" and (date.today() - date.fromtimestamp(p.stat().st_mtime)).days > 7:
+                return None
             return json.loads(p.read_text(encoding="utf-8"))
-        except Exception: return None
+        except Exception:
+            return None
 
     def _write_cache(self, identifier: str, fn: str, data: dict) -> None:
         p = self._cache_path(identifier, fn)
@@ -43,38 +64,92 @@ class AUAsxClient:
         p.write_text(json.dumps(data, default=str, indent=2), encoding="utf-8")
 
     @property
-    def market_id(self) -> str: return "au_asx"
+    def market_id(self) -> str:
+        return "au_asx"
+
     @property
-    def market_name(self) -> str: return "Australia (ASX) -- ASX API"
+    def market_name(self) -> str:
+        return "Australia (ASX)"
+
+    # -- Company discovery ---------------------------------------------------
 
     def list_companies(self, query: str = "") -> list[dict[str, Any]]:
+        """Search companies via ASX MarkitDigital directory API."""
         try:
-            data = cached_get(f"{_ASX_BASE}/share/list", headers=self._headers)
-            items = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
-            companies = [{"ticker": i.get("code", ""), "name": i.get("name", i.get("display_name", "")),
-                         "cik": i.get("code", ""), "exchange": "ASX", "country": "AU",
-                         "market_id": self.market_id} for i in items]
+            url = f"{_MARKIT_BASE}/companies/directory"
+            resp = requests.get(url, headers=_MARKIT_HEADERS, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("data", []) if isinstance(data, dict) else []
+            companies = [
+                {
+                    "ticker": i.get("symbol", ""),
+                    "name": i.get("displayName", i.get("name", "")),
+                    "cik": i.get("symbol", ""),
+                    "exchange": "ASX",
+                    "country": "AU",
+                    "market_id": self.market_id,
+                }
+                for i in items
+            ]
             if query:
                 q = query.lower()
-                companies = [c for c in companies if q in c["ticker"].lower() or q in c["name"].lower()]
+                companies = [
+                    c for c in companies
+                    if q in c["ticker"].lower() or q in c["name"].lower()
+                ]
             return companies
-        except Exception: return []
+        except Exception as exc:
+            logger.debug("ASX company list failed: %s", exc)
+            return []
 
-    def search_company(self, name: str) -> list[dict[str, Any]]: return self.list_companies(query=name)
+    def search_company(self, name: str) -> list[dict[str, Any]]:
+        return self.list_companies(query=name)
+
+    # -- Company profile -----------------------------------------------------
 
     def get_profile(self, identifier: str) -> dict[str, Any]:
+        """Fetch company profile from ASX MarkitDigital header API.
+
+        Returns sector, industry, market cap, and listing date directly
+        from the exchange -- no yfinance dependency.
+        """
         cached = self._read_cache(identifier, "profile.json")
-        if cached: return cached
+        if cached:
+            return cached
+
+        raw: dict[str, Any] = {
+            "name": "",
+            "ticker": identifier.upper(),
+            "isin": "",
+            "country": "AU",
+            "sector": "",
+            "industry": "",
+            "exchange": "ASX",
+            "currency": "AUD",
+            "cik": identifier,
+        }
+
+        # Primary: ASX MarkitDigital header endpoint
         try:
-            data = cached_get(f"{_ASX_BASE}/share/{identifier}", headers=self._headers)
-            raw = {"name": data.get("name", data.get("display_name", "")),
-                   "ticker": identifier.upper(), "isin": "", "country": "AU",
-                   "sector": data.get("industry_group_name", ""),
-                   "industry": data.get("industry_group_name", ""),
-                   "exchange": "ASX", "currency": "AUD", "cik": identifier}
-        except Exception:
-            raw = {"name": "", "ticker": identifier, "isin": "", "country": "AU",
-                   "sector": "", "industry": "", "exchange": "ASX", "currency": "AUD", "cik": identifier}
+            url = f"{_MARKIT_BASE}/companies/{identifier.upper()}/header"
+            resp = requests.get(url, headers=_MARKIT_HEADERS, timeout=10)
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            raw["name"] = data.get("displayName", "")
+            raw["sector"] = data.get("sector", data.get("industryGroup", ""))
+            raw["industry"] = data.get("industryGroup", "")
+            if data.get("marketCap"):
+                raw["market_cap"] = data["marketCap"]
+            if data.get("dateListed"):
+                raw["date_listed"] = data["dateListed"]
+            logger.info(
+                "ASX profile for %s: %s (sector=%s)",
+                identifier, raw["name"], raw["sector"],
+            )
+        except Exception as exc:
+            logger.info("ASX MarkitDigital profile failed for %s: %s", identifier, exc)
+
         from operator1.clients.canonical_translator import translate_profile
         profile = translate_profile(raw, self.market_id)
         self._write_cache(identifier, "profile.json", profile)
