@@ -247,6 +247,12 @@ class HKEXAPIScraper:
         If ``HKEX_PROXY`` is set in the environment, the session routes
         all traffic through that proxy (needed because HKEX geo-blocks
         non-HK IP addresses).
+
+        If ``HKEX_PROXY_NO_VERIFY=1`` is also set, SSL certificate
+        verification is disabled.  This is needed for transparent/
+        intercepting proxies that replace the server certificate.
+        Only use this for reading public filing data -- never for
+        endpoints that transmit credentials.
         """
         if self._session is None:
             self._session = requests.Session()
@@ -255,6 +261,12 @@ class HKEXAPIScraper:
             if proxies:
                 self._session.proxies.update(proxies)
                 logger.info("HKEX scraper using proxy: %s", proxies.get("https", ""))
+                if os.environ.get("HKEX_PROXY_NO_VERIFY", "").strip() in ("1", "true", "yes"):
+                    self._session.verify = False
+                    logger.warning("HKEX scraper: SSL verification disabled (HKEX_PROXY_NO_VERIFY=1)")
+                    # Suppress InsecureRequestWarning
+                    import urllib3
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         return self._session
 
     def _init_jsf_session(
