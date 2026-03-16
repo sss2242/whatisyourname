@@ -22,6 +22,7 @@ All other Tier 2 markets have filing discoverers wired in.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -572,8 +573,14 @@ class HKEXFilingDiscoverer:
 
         # Fallback: direct HTTP title search (may return empty if HKEX
         # requires JS rendering for the session/ViewState tokens).
+        # Uses HKEX_PROXY if configured (HKEX geo-blocks non-HK IPs).
         today = date.today()
         from_date = today - timedelta(days=365 * years)
+
+        hkex_proxies = None
+        hkex_proxy_env = os.environ.get("HKEX_PROXY", "").strip()
+        if hkex_proxy_env:
+            hkex_proxies = {"http": hkex_proxy_env, "https": hkex_proxy_env}
 
         # Search for annual and interim results
         for search_term in ["annual results", "interim results"]:
@@ -598,6 +605,7 @@ class HKEXFilingDiscoverer:
                         "sortByDate": "desc",
                     },
                     headers=_HKEX_HEADERS,
+                    proxies=hkex_proxies,
                     timeout=15,
                 )
                 resp.raise_for_status()

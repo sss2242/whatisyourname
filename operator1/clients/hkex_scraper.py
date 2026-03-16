@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -56,6 +57,26 @@ from typing import Any
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+def _get_hkex_proxy() -> dict[str, str] | None:
+    """Read HKEX proxy from environment.
+
+    HKEX geo-blocks non-HK IPs.  Users can set ``HKEX_PROXY`` in their
+    ``.env`` file to route HKEX requests through an HK-based proxy.
+
+    Supported formats::
+
+        HKEX_PROXY=http://host:port
+        HKEX_PROXY=socks5://host:port
+        HKEX_PROXY=socks5://user:pass@host:port
+
+    Returns a ``requests``-compatible proxies dict, or None.
+    """
+    proxy = os.environ.get("HKEX_PROXY", "").strip()
+    if not proxy:
+        return None
+    return {"http": proxy, "https": proxy}
 
 # ---------------------------------------------------------------------------
 # HKEX URL constants
@@ -222,10 +243,18 @@ class HKEXAPIScraper:
         A persistent session is needed because the HKEX API requires
         the JSESSIONID cookie from the initial page load to be sent
         with subsequent API calls.
+
+        If ``HKEX_PROXY`` is set in the environment, the session routes
+        all traffic through that proxy (needed because HKEX geo-blocks
+        non-HK IP addresses).
         """
         if self._session is None:
             self._session = requests.Session()
             self._session.headers.update(_HEADERS)
+            proxies = _get_hkex_proxy()
+            if proxies:
+                self._session.proxies.update(proxies)
+                logger.info("HKEX scraper using proxy: %s", proxies.get("https", ""))
         return self._session
 
     def _init_jsf_session(
