@@ -1580,6 +1580,45 @@ _STATEMENT_FIELD_MAP = {
 }
 
 
+import threading
+
+# Thread lock for extraction cache -- ensures only one thread does the
+# discovery + LLM extraction per ticker, while others wait and use the
+# cached result.  This prevents parallel statement fetches (income,
+# balance, cashflow) from sending concurrent LLM requests that would
+# overwhelm the API rate limit.
+_extraction_lock = threading.Lock()
+
+# Shared LLM client instance for filing extraction.  Created once on
+# first use and reused across all threads, so the PooledLLMClient's
+# key rotation state is shared (not duplicated per thread).
+_shared_llm_client: Any = None
+_shared_llm_client_lock = threading.Lock()
+
+
+def _get_shared_llm_client():
+    """Get or create a shared LLM client for filing extraction.
+
+    Thread-safe: uses a lock to ensure only one client is created.
+    The shared client enables consistent key rotation across threads.
+    """
+    global _shared_llm_client
+    if _shared_llm_client is not None:
+        return _shared_llm_client
+    with _shared_llm_client_lock:
+        if _shared_llm_client is not None:
+            return _shared_llm_client
+        try:
+            from operator1.clients.llm_factory import create_llm_client
+            from operator1.secrets_loader import load_secrets
+            _shared_llm_client = create_llm_client(load_secrets())
+            if _shared_llm_client is not None:
+                logger.debug("Created shared LLM client for filing extraction")
+        except Exception as exc:
+            logger.debug("Could not create shared LLM client: %s", exc)
+    return _shared_llm_client
+
+
 def try_filing_extraction(
     ticker: str,
     market_id: str,
@@ -1595,7 +1634,9 @@ def try_filing_extraction(
     4. Returns a canonical long-format DataFrame filtered by statement_type
 
     Uses a per-ticker cache so that multiple calls (income, balance,
-    cashflow) only trigger one discovery + download cycle.
+    cashflow) only trigger one discovery + download cycle.  Thread-safe:
+    when parallel threads request different statement types for the same
+    ticker, only one thread does the extraction and the others wait.
 
     Falls back to empty DataFrame if any step fails.
 
@@ -1610,18 +1651,29 @@ def try_filing_extraction(
         extracted data to only return fields relevant to the requested
         statement type.
     llm_client:
-        Optional LLM client for PDF extraction.
+        Optional LLM client for PDF extraction.  If None, uses a
+        shared module-level client (created once, reused across threads).
     """
     import pandas as pd
 
     cache_key = f"{market_id}:{ticker}"
 
-    # Check extraction cache first (avoids redundant API calls)
+    # Fast path: check cache without lock (safe for dict reads)
     if cache_key in _extraction_cache:
         combined = _extraction_cache[cache_key]
         if combined.empty:
             return pd.DataFrame()
         return _filter_by_statement_type(combined, statement_type)
+
+    # Slow path: acquire lock so only one thread does discovery + extraction.
+    # Other threads for the same ticker will wait here and then hit the cache.
+    with _extraction_lock:
+        # Double-check after acquiring lock (another thread may have finished)
+        if cache_key in _extraction_cache:
+            combined = _extraction_cache[cache_key]
+            if combined.empty:
+                return pd.DataFrame()
+            return _filter_by_statement_type(combined, statement_type)
 
     discoverer = get_discoverer(market_id)
     if discoverer is None:
@@ -1639,19 +1691,11 @@ def try_filing_extraction(
         _extraction_cache[cache_key] = pd.DataFrame()
         return pd.DataFrame()
 
-    # Auto-create LLM client from environment secrets when not provided.
-    # All 9 Tier 2 clients pass llm_client=None because the LLM client
-    # is created in main.py but never threaded through the PIT client
-    # constructors.  This auto-creation fixes that wiring gap.
+    # Use shared LLM client when not explicitly provided.
+    # The shared client is created once and reused across all threads,
+    # ensuring consistent key rotation and avoiding redundant connections.
     if llm_client is None:
-        try:
-            from operator1.clients.llm_factory import create_llm_client
-            from operator1.secrets_loader import load_secrets
-            llm_client = create_llm_client(load_secrets())
-            if llm_client is not None:
-                logger.debug("Auto-created LLM client for filing extraction")
-        except Exception as _llm_exc:
-            logger.debug("Could not auto-create LLM client: %s", _llm_exc)
+        llm_client = _get_shared_llm_client()
 
     # Try to extract from the most recent filings
     try:
