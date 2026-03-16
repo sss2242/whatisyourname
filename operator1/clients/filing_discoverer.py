@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Protocol, runtime_checkable
@@ -1710,14 +1711,22 @@ def try_filing_extraction(
     # Most recent within each type first.  This ensures the most valuable
     # filings (full-year annual results) are extracted even if rate limits
     # prevent processing all filings.
+    # Sort filings: annual first, then interim, then quarterly.
+    # Within each type, newest filing_date first.
+    # Using a tuple key: (type_priority ASC, filing_date DESC via reverse sort trick)
     _type_priority = {"annual": 0, "interim": 1, "quarterly": 2}
-    sorted_filings = sorted(
-        discovery.filings,
-        key=lambda f: (
-            _type_priority.get(f.filing_type, 3),
-            -(f.filing_date or "0"),  # newest first within type
-        ),
-    )
+
+    def _filing_sort_key(f):
+        tp = _type_priority.get(f.filing_type, 3)
+        # Invert date string for descending order within each type:
+        # "2025-03-19" -> high sort value (newest first)
+        fd = f.filing_date or "0000-00-00"
+        # Use a tuple that sorts type ascending, date descending
+        # by making date negative via character complement
+        inverted_date = "".join(chr(255 - ord(c)) for c in fd)
+        return (tp, inverted_date)
+
+    sorted_filings = sorted(discovery.filings, key=_filing_sort_key)
 
     # Load extraction stage settings from config
     from operator1.config_loader import get_global_config
