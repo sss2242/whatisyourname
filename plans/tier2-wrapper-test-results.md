@@ -116,13 +116,25 @@ The yfinance search fallback (`yf_search`) is broken because it constructs ticke
 
 ### HKEX Scraper Deep Dive
 
-`hkex_scraper.py` implements the 3-step JSF session approach from the MIT-licensed `hkex-filing-scraper`:
-1. GET search page (gets JSESSIONID + ViewState)
-2. POST JSF form (bind date range to session)
-3. GET JSON API (titleSearchServlet.do)
+`hkex_scraper.py` was built following the MIT-licensed `hkex-filing-scraper` approach. After reverse-engineering the actual HKEX page JavaScript (`titlesearch_research.js`), the real architecture is:
 
-**Status: BROKEN.** The API returns `recordCnt: 0` because:
-- The JSF form ID is auto-generated per request (was `j_idt10`, now `j_idt13`/`j_idt15`). Fixed to extract dynamically.
-- Critical issue: most form inputs have **empty `name` attributes** in the server-rendered HTML. Their names are populated by client-side JavaScript before submission. Without JS execution, the POST sends only the form ID, loadMoreRange, and ViewState -- not the actual date range or filter parameters. The server receives an incomplete form and doesn't bind the search parameters.
-- The `hk_hkex.py` PIT client doesn't use this scraper -- it routes through `filing_discoverer.py` instead.
-- `hkex_scraper.py` exists as a standalone module but is currently not wired into the pipeline.
+**Actual HKEX architecture** (NOT JSF as previously assumed):
+- Page is a jQuery/AJAX app, not a JSF application
+- `titlesearch_research.js` defines `loadMore()` -> `getTitleSearchCriteria()` -> `searchAgain()`
+- `getTitleSearchCriteria()` reads hidden inputs: `#startDate`, `#endDate`, `#stockId`, `#selectedSecurities`, `#selectedDocType`, `#newsTitle`, `#searchTypeInt`, `#tierOneId`, `#tierTwoGpId`, `#tierTwoId`, `#lang`
+- `searchAgain()` fires `$.ajax GET` to `titleSearchServlet.do` with those params
+- Date format in hidden fields: `YYYY-MM-DD` (dashes stripped to `YYYYMMDD` before sending)
+
+**Status: GEO-BLOCKED.** Tested with Playwright (full headless Chrome with JS execution):
+- Set all hidden input fields correctly via `document.getElementById()`
+- Called `loadMore()` which triggered real AJAX request with correct params
+- Server returned `recordCnt: 0` and `result: "null"`
+- Even loading the page normally in headless Chrome shows "Total records found: 0"
+- **HKEX blocks non-HK IP addresses** at the server level. Returns 200 with empty results for foreign IPs.
+
+**Code fixes applied:**
+- Fixed JSF form ID extraction (now dynamic instead of hardcoded `j_idt10`)
+
+**Notes:**
+- `hk_hkex.py` doesn't use this scraper -- routes through `filing_discoverer.py` instead
+- To make HKEX work: needs to be run from an HK-based IP or via HK proxy
