@@ -74,18 +74,27 @@ class AUAsxClient:
     # -- Company discovery ---------------------------------------------------
 
     def list_companies(self, query: str = "") -> list[dict[str, Any]]:
-        """Search companies via ASX MarkitDigital directory API."""
+        """Search companies via ASX MarkitDigital directory API.
+
+        The directory endpoint returns paginated results with up to 1,841+
+        companies.  When a query is provided, we fetch the full list and
+        filter client-side (the API has no search parameter).
+        """
         try:
+            # Fetch all companies (API supports up to ~2000 per page)
             url = f"{_MARKIT_BASE}/companies/directory"
-            resp = requests.get(url, headers=_MARKIT_HEADERS, timeout=15)
+            params = {"page": 0, "itemsPerPage": 2500}
+            resp = requests.get(url, headers=_MARKIT_HEADERS, params=params, timeout=20)
             resp.raise_for_status()
-            data = resp.json()
-            items = data.get("data", []) if isinstance(data, dict) else []
+            payload = resp.json()
+            # Structure: {"data": {"items": [...], "count": N}}
+            items = payload.get("data", {}).get("items", [])
             companies = [
                 {
                     "ticker": i.get("symbol", ""),
-                    "name": i.get("displayName", i.get("name", "")),
+                    "name": i.get("displayName", ""),
                     "cik": i.get("symbol", ""),
+                    "sector": i.get("industry", ""),
                     "exchange": "ASX",
                     "country": "AU",
                     "market_id": self.market_id,
