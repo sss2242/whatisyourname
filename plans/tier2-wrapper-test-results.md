@@ -105,10 +105,61 @@ The yfinance search fallback (`yf_search`) is broken because it constructs ticke
 
 ---
 
+## Fixes Applied (2026-03-16)
+
+### Fix 1: Filing Discoverer Lock Scope (Critical)
+
+The `_extraction_lock` in `try_filing_extraction()` only covered the cache double-check. The actual discovery + download + LLM extraction ran outside the lock, so 3 parallel threads (income/balance/cashflow) all independently ran the full extraction pipeline. Fixed by moving the entire extraction pipeline inside the `with _extraction_lock:` block. Affects all 9 tier 2 wrappers + KR DART fallback.
+
+### Fix 2: ASX Profile + Company Search
+
+The old ASX API (`asx.com.au/asx/1/share/`) returns 404 as of 2026. Replaced with ASX MarkitDigital API (`asx.api.markitdigital.com`):
+- **Profile**: Returns name, sector, market cap directly from the exchange. Tested with 10 top ASX companies (BHP, CBA, CSL, WBC, NAB, ANZ, FMG, WES, MQG, RIO) -- 100% success.
+- **Company search**: 1,841 companies from MarkitDigital directory API with client-side filtering.
+- **No yfinance dependency** for profile or search.
+
+### Fix 3: SEDAR+ Filing Discovery (Major)
+
+The SEDAR+ REST API (`/csa-party/searchCompany`, `/csa-party/records/companyDocuments`) is blocked by F5 BIG-IP WAF. However, the Catalyst form submission mechanism works:
+1. GET `/csa-party/service/create.html?service=searchDocuments` -- returns form with session-specific action URL
+2. POST to `viewInstance/update.html?id=SESSION_HASH` with `FilingIdentifier`, `FilingCategory`, `FilingType`, date range
+3. Parse HTML results with BeautifulSoup -- entity names, filing dates, document links
+4. Download PDFs via session-bound `resource.html` URLs (Content-Type: application/pdf)
+
+**Tested live**: Royal Bank of Canada returns 60 filings (30 annual, 30 interim). PDF download confirmed (142KB).
+
+**Rate limiting**: 5s delay between requests, 120s download timeout (SEDAR+ CDN is slow).
+
+**Community research**: No Python API wrapper exists for SEDAR+ on PyPI or GitHub. Two community projects (pudo/sedar, andrewharrop/SEDARPlus) both use Selenium. This is the first pure-requests implementation.
+
+### Updated Summary Table (Post-Fixes)
+
+| Market | Profile | Search | Discovery | PDF Download | Financial Statements |
+|--------|---------|--------|-----------|-------------|---------------------|
+| `in_bse` India | BSE API | BSE API | BSE discoverer | Works | **Native BSE API** |
+| `au_asx` Australia | **MarkitDigital (FIXED)** | **MarkitDigital (FIXED)** | ASX discoverer | Works (3.5MB) | Needs LLM |
+| `ca_sedar` Canada | Needs work | Needs work | **Form POST (FIXED)** | **Works (142KB)** | Needs LLM |
+| `hk_hkex` Hong Kong | yfinance .HK | yfinance .HK | HKEX News | Works | Needs LLM |
+| `sg_sgx` Singapore | yfinance .SI | SGX API | SGX discoverer | Untested | Needs LLM |
+| `sa_tadawul` Saudi | yfinance .SR | Tadawul API | Tadawul discoverer | Untested | Needs LLM |
+| `cn_sse` China | baostock | baostock | baostock | Socket errors | Socket errors |
+| `ch_six` Switzerland | yfinance .SW | Broken | EU ESEF crossover | N/A | ESEF only |
+| `nl_esef` Netherlands | ESEF partial | ESEF (0 results) | N/A | N/A | ESEF (0 results) |
+| `es_esef` Spain | ESEF partial | ESEF (0 results) | N/A | N/A | ESEF (0 results) |
+| `it_esef` Italy | ESEF partial | ESEF (0 results) | N/A | N/A | ESEF (0 results) |
+| `se_esef` Sweden | ESEF partial | ESEF (0 results) | N/A | N/A | ESEF (0 results) |
+| `za_jse` South Africa | yfinance .JO | Broken | JSE discoverer (broken) | Untested | Needs fix |
+| `mx_bmv` Mexico | yfinance .MX | Broken | BMV discoverer (broken) | Untested | Needs fix |
+| `ae_dfm` UAE | yfinance .AE | Broken | DFM discoverer (broken) | Untested | Needs fix |
+
+---
+
 ## Observations
 
 - India (`in_bse`) is the only Tier 2 market with a fully working native financial API that doesn't need an LLM.
-- Most native API endpoints (SEDAR+, ASX, SGX, Tadawul, BMV, JSE, SIX, DFM) return HTML instead of JSON -- likely changed endpoints or anti-scraping measures.
+- Australia (`au_asx`) now has full profile + search from MarkitDigital API plus working filing discovery and PDF download.
+- Canada (`ca_sedar`) now has working filing discovery via form POST (bypassing WAF-blocked REST API) and confirmed PDF download.
+- Most remaining broken endpoints (SGX, Tadawul, BMV, JSE, DFM) return HTML instead of JSON -- likely changed endpoints or anti-scraping measures.
 - The yfinance search fallback in `yfinance_backed.py` constructs invalid ticker strings (e.g. "Tencent.HK") causing 404 errors.
 - baostock (China) has a session management issue -- socket errors on financial data calls after the initial login/logout cycle.
 - `ch_six` (Switzerland) and the 4 ESEF-based markets (NL, ES, IT, SE) have no filing discoverer registered.
