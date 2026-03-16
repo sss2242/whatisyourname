@@ -1668,6 +1668,9 @@ def try_filing_extraction(
 
     # Slow path: acquire lock so only one thread does discovery + extraction.
     # Other threads for the same ticker will wait here and then hit the cache.
+    # IMPORTANT: The entire extraction pipeline must run inside the lock so
+    # that parallel calls (income, balance, cashflow) share results via cache
+    # instead of each running discovery + download + LLM extraction independently.
     with _extraction_lock:
         # Double-check after acquiring lock (another thread may have finished)
         if cache_key in _extraction_cache:
@@ -1676,127 +1679,166 @@ def try_filing_extraction(
                 return pd.DataFrame()
             return _filter_by_statement_type(combined, statement_type)
 
-    discoverer = get_discoverer(market_id)
-    if discoverer is None:
-        return pd.DataFrame()
+        discoverer = get_discoverer(market_id)
+        if discoverer is None:
+            logger.info("No filing discoverer registered for %s", market_id)
+            return pd.DataFrame()
 
-    try:
-        discovery = discoverer.discover_filings(ticker, years=2)
-    except Exception as exc:
-        logger.warning("Filing discovery failed for %s/%s: %s", market_id, ticker, exc)
-        _extraction_cache[cache_key] = pd.DataFrame()
-        return pd.DataFrame()
+        try:
+            discovery = discoverer.discover_filings(ticker, years=2)
+        except Exception as exc:
+            logger.warning("Filing discovery failed for %s/%s: %s", market_id, ticker, exc)
+            _extraction_cache[cache_key] = pd.DataFrame()
+            return pd.DataFrame()
 
-    if not discovery.has_filings:
-        logger.info("No filings discovered for %s/%s", market_id, ticker)
-        _extraction_cache[cache_key] = pd.DataFrame()
-        return pd.DataFrame()
+        if not discovery.has_filings:
+            logger.info("No filings discovered for %s/%s", market_id, ticker)
+            _extraction_cache[cache_key] = pd.DataFrame()
+            return pd.DataFrame()
 
-    # Use shared LLM client when not explicitly provided.
-    # The shared client is created once and reused across all threads,
-    # ensuring consistent key rotation and avoiding redundant connections.
-    if llm_client is None:
-        llm_client = _get_shared_llm_client()
+        logger.info(
+            "Filing discovery for %s/%s: %d filings found, starting extraction",
+            market_id, ticker, len(discovery.filings),
+        )
 
-    # Try to extract from the most recent filings
-    try:
-        from operator1.clients.llm_filing_extractor import LLMFilingExtractor
-        extractor = LLMFilingExtractor(llm_client)
-    except ImportError:
-        logger.debug("LLMFilingExtractor not available")
-        _extraction_cache[cache_key] = pd.DataFrame()
-        return pd.DataFrame()
+        # Use shared LLM client when not explicitly provided.
+        # The shared client is created once and reused across all threads,
+        # ensuring consistent key rotation and avoiding redundant connections.
+        if llm_client is None:
+            llm_client = _get_shared_llm_client()
 
-    # Sort filings by priority: annual first, then interim, then quarterly.
-    # Most recent within each type first.  This ensures the most valuable
-    # filings (full-year annual results) are extracted even if rate limits
-    # prevent processing all filings.
-    # Sort filings: annual first, then interim, then quarterly.
-    # Within each type, newest filing_date first.
-    # Using a tuple key: (type_priority ASC, filing_date DESC via reverse sort trick)
-    _type_priority = {"annual": 0, "interim": 1, "quarterly": 2}
-
-    def _filing_sort_key(f):
-        tp = _type_priority.get(f.filing_type, 3)
-        # Invert date string for descending order within each type:
-        # "2025-03-19" -> high sort value (newest first)
-        fd = f.filing_date or "0000-00-00"
-        # Use a tuple that sorts type ascending, date descending
-        # by making date negative via character complement
-        inverted_date = "".join(chr(255 - ord(c)) for c in fd)
-        return (tp, inverted_date)
-
-    sorted_filings = sorted(discovery.filings, key=_filing_sort_key)
-
-    # Load extraction stage settings from config
-    from operator1.config_loader import get_global_config
-    _cfg = get_global_config()
-    _max_filings = _cfg.get("filing_extraction_max_filings", 8)
-    _stage_size = _cfg.get("filing_extraction_stage_size", 2)
-    _stage_pause = _cfg.get("filing_extraction_stage_pause_s", 15)
-
-    filings_to_extract = sorted_filings[:_max_filings]
-
-    # Split into stages to respect LLM rate limits.
-    # Between stages, pause to let the rate limit window reset.
-    # With 5 Gemini keys at 15 RPM each, 2 filings per stage uses
-    # 2 of 75 available RPM -- well within limits after a 15s pause.
-    stages = [
-        filings_to_extract[i:i + _stage_size]
-        for i in range(0, len(filings_to_extract), _stage_size)
-    ]
-
-    all_records = []
-    extracted_count = 0
-
-    for stage_num, stage_filings in enumerate(stages):
-        if stage_num > 0 and _stage_pause > 0:
+        if llm_client is None:
             logger.info(
-                "Filing extraction stage %d/%d: pausing %.0fs for rate limit reset",
-                stage_num + 1, len(stages), _stage_pause,
+                "No LLM client available for filing extraction (%s/%s) -- "
+                "set GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENROUTER_API_KEY",
+                market_id, ticker,
             )
-            time.sleep(_stage_pause)
+            _extraction_cache[cache_key] = pd.DataFrame()
+            return pd.DataFrame()
 
-        for filing in stage_filings:
-            try:
-                pdf_bytes = discoverer.download_filing(filing)
-            except Exception as exc:
-                logger.debug("Download failed for %s: %s", filing.title[:40], exc)
-                continue
+        # Try to extract from the most recent filings
+        try:
+            from operator1.clients.llm_filing_extractor import LLMFilingExtractor
+            extractor = LLMFilingExtractor(llm_client)
+        except ImportError:
+            logger.info("LLMFilingExtractor not available for %s/%s", market_id, ticker)
+            _extraction_cache[cache_key] = pd.DataFrame()
+            return pd.DataFrame()
 
-            try:
-                extraction = extractor.extract_from_pdf(pdf_bytes, market_id=market_id)
-                if extraction.success:
-                    df = extractor.to_canonical_dataframe(extraction, market_id=market_id)
-                    if not df.empty:
-                        # Override filing_date from discovery metadata (more reliable)
-                        if filing.filing_date:
-                            df["filing_date"] = pd.Timestamp(filing.filing_date)
-                        if filing.report_date:
-                            df["report_date"] = pd.Timestamp(filing.report_date)
-                        all_records.append(df)
-                        extracted_count += 1
+        # Sort filings by priority: annual first, then interim, then quarterly.
+        # Within each type, newest filing_date first.
+        _type_priority = {"annual": 0, "interim": 1, "quarterly": 2}
+
+        def _filing_sort_key(f):
+            tp = _type_priority.get(f.filing_type, 3)
+            # Sort date descending within each type using character complement
+            fd = f.filing_date or "0000-00-00"
+            inverted_date = "".join(chr(255 - ord(c)) for c in fd)
+            return (tp, inverted_date)
+
+        sorted_filings = sorted(discovery.filings, key=_filing_sort_key)
+
+        # Load extraction stage settings from config
+        from operator1.config_loader import get_global_config
+        _cfg = get_global_config()
+        _max_filings = _cfg.get("filing_extraction_max_filings", 8)
+        _stage_size = _cfg.get("filing_extraction_stage_size", 2)
+        _stage_pause = _cfg.get("filing_extraction_stage_pause_s", 15)
+
+        filings_to_extract = sorted_filings[:_max_filings]
+
+        # Split into stages to respect LLM rate limits.
+        # Between stages, pause to let the rate limit window reset.
+        stages = [
+            filings_to_extract[i:i + _stage_size]
+            for i in range(0, len(filings_to_extract), _stage_size)
+        ]
+
+        logger.info(
+            "Filing extraction for %s/%s: processing %d filings in %d stages",
+            market_id, ticker, len(filings_to_extract), len(stages),
+        )
+
+        all_records = []
+        extracted_count = 0
+        download_failures = 0
+        extraction_failures = 0
+
+        for stage_num, stage_filings in enumerate(stages):
+            if stage_num > 0 and _stage_pause > 0:
+                logger.info(
+                    "Filing extraction stage %d/%d: pausing %.0fs for rate limit reset",
+                    stage_num + 1, len(stages), _stage_pause,
+                )
+                time.sleep(_stage_pause)
+
+            for filing in stage_filings:
+                try:
+                    pdf_bytes = discoverer.download_filing(filing)
+                except Exception as exc:
+                    download_failures += 1
+                    logger.info(
+                        "PDF download failed for %s/%s '%s': %s",
+                        market_id, ticker, filing.title[:40], exc,
+                    )
+                    continue
+
+                try:
+                    extraction = extractor.extract_from_pdf(pdf_bytes, market_id=market_id)
+                    if extraction.success:
+                        df = extractor.to_canonical_dataframe(extraction, market_id=market_id)
+                        if not df.empty:
+                            # Override filing_date from discovery metadata (more reliable)
+                            if filing.filing_date:
+                                df["filing_date"] = pd.Timestamp(filing.filing_date)
+                            if filing.report_date:
+                                df["report_date"] = pd.Timestamp(filing.report_date)
+                            all_records.append(df)
+                            extracted_count += 1
+                            logger.info(
+                                "Extracted %s (%s, %s): %d records",
+                                filing.title[:50], filing.filing_type,
+                                filing.report_date or "unknown period",
+                                len(df),
+                            )
+                    else:
+                        extraction_failures += 1
                         logger.info(
-                            "Extracted %s (%s, %s): %d records",
-                            filing.title[:50], filing.filing_type,
-                            filing.report_date or "unknown period",
-                            len(df),
+                            "LLM extraction returned no data for %s/%s '%s'",
+                            market_id, ticker, filing.title[:40],
                         )
-            except Exception as exc:
-                logger.debug("Extraction failed for %s: %s", filing.title[:40], exc)
-                continue
+                except Exception as exc:
+                    extraction_failures += 1
+                    logger.info(
+                        "LLM extraction failed for %s/%s '%s': %s",
+                        market_id, ticker, filing.title[:40], exc,
+                    )
+                    continue
 
-    if not all_records:
-        _extraction_cache[cache_key] = pd.DataFrame()
+        if not all_records:
+            logger.info(
+                "Filing extraction for %s/%s: 0 records extracted "
+                "(%d download failures, %d extraction failures out of %d filings)",
+                market_id, ticker, download_failures, extraction_failures,
+                len(filings_to_extract),
+            )
+            _extraction_cache[cache_key] = pd.DataFrame()
+            return pd.DataFrame()
+
+        combined = pd.concat(all_records, ignore_index=True)
+        _extraction_cache[cache_key] = combined
+        logger.info(
+            "Filing extraction for %s/%s: %d records from %d/%d filings "
+            "(%d stages, %d download failures, %d extraction failures, cached)",
+            market_id, ticker, len(combined), extracted_count,
+            len(filings_to_extract), len(stages),
+            download_failures, extraction_failures,
+        )
+
+    # Return filtered result (cache was populated inside the lock)
+    combined = _extraction_cache.get(cache_key, pd.DataFrame())
+    if combined.empty:
         return pd.DataFrame()
-
-    combined = pd.concat(all_records, ignore_index=True)
-    _extraction_cache[cache_key] = combined
-    logger.info(
-        "Filing extraction for %s/%s: %d records from %d/%d filings (%d stages, cached)",
-        market_id, ticker, len(combined), extracted_count,
-        len(filings_to_extract), len(stages),
-    )
     return _filter_by_statement_type(combined, statement_type)
 
 
