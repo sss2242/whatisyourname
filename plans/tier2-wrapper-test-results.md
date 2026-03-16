@@ -105,21 +105,11 @@ The yfinance search fallback (`yf_search`) is broken because it constructs ticke
 
 ---
 
-## Recommendations
+## Observations
 
-### High Priority
-
-1. **Fix yfinance search fallback** in `yfinance_backed.py`: Use `yfinance.search()` or `yfinance.Tickers()` instead of constructing fake ticker strings.
-2. **Add yfinance financial statement fallback** with a `pit_compliant=False` flag for markets where filing discovery isn't available. Users can opt in to non-PIT data when no LLM is configured.
-3. **Fix baostock financial data** in `cn_sse.py`: The socket error ("Bad file descriptor") suggests the baostock connection is being closed prematurely. Need to keep the session alive across calls.
-
-### Medium Priority
-
-4. **Update SEDAR+ API endpoint**: The current `sedarplus.ca/csa-party/searchCompany` returns HTML. The correct API may be at a different path.
-5. **Update ASX API endpoint**: `asx.com.au/asx/1/share/list` returns HTML. May need to use the MarkitDigital API instead.
-6. **Add filing discoverers** for `ch_six` and the 4 ESEF markets.
-
-### Low Priority
-
-7. **Add browser-like session handling** for APIs that require cookies (SGX, Tadawul, BMV, JSE, DFM).
-8. **Consider headless scraping** for markets with anti-bot protection.
+- India (`in_bse`) is the only Tier 2 market with a fully working native financial API that doesn't need an LLM.
+- Most native API endpoints (SEDAR+, ASX, SGX, Tadawul, BMV, JSE, SIX, DFM) return HTML instead of JSON -- likely changed endpoints or anti-scraping measures.
+- The yfinance search fallback in `yfinance_backed.py` constructs invalid ticker strings (e.g. "Tencent.HK") causing 404 errors.
+- baostock (China) has a session management issue -- socket errors on financial data calls after the initial login/logout cycle.
+- `ch_six` (Switzerland) and the 4 ESEF-based markets (NL, ES, IT, SE) have no filing discoverer registered.
+- All wrappers correctly refuse to use yfinance for financial statements (no filing dates = no PIT compliance).
