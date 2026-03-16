@@ -850,18 +850,76 @@ class TadawulFilingDiscoverer:
 
 _SEDAR_BASE = "https://www.sedarplus.ca/csa-party"
 _SEDAR_HEADERS = {
-    "User-Agent": "Operator1/1.0",
-    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html, application/pdf, */*",
 }
+
+# Delay between SEDAR+ requests to avoid rate-limiting.
+# SEDAR+ throttles after ~5 rapid requests.
+_SEDAR_REQUEST_DELAY_S = 5.0
+
+# Download timeout -- SEDAR+ CDN is extremely slow.
+_SEDAR_DOWNLOAD_TIMEOUT_S = 120
 
 
 class SEDARFilingDiscoverer:
     """Discovers financial filings from SEDAR+ (Canada).
 
-    Uses the SEDAR+ document search API to find financial statements.
-    SEDAR+ is the official Canadian securities filing system operated
-    by the Canadian Securities Administrators (CSA).
+    Uses the Catalyst form POST mechanism to search for filings.
+    The SEDAR+ REST API is WAF-blocked, but the HTML form submission
+    works reliably.
+
+    Flow:
+        1. GET the search form page to establish a session and get
+           the session-specific form action URL.
+        2. POST to the form action with filing criteria (company name,
+           category, date range).
+        3. Parse the HTML result page with BeautifulSoup to extract
+           filing metadata and document download links.
+        4. Download PDFs via session-bound resource.html URLs.
+
+    Rate limiting: 5s delay between requests. SEDAR+ CDN is slow
+    (~60s for a 400KB PDF).
     """
+
+    def __init__(self) -> None:
+        self._session: requests.Session | None = None
+        self._form_action: str = ""
+
+    def _ensure_session(self) -> requests.Session:
+        """Create a session and get the form action URL."""
+        if self._session is not None and self._form_action:
+            return self._session
+
+        self._session = requests.Session()
+        self._session.headers.update(_SEDAR_HEADERS)
+
+        resp = self._session.get(
+            f"{_SEDAR_BASE}/service/create.html",
+            params={
+                "targetAppCode": "csa-party",
+                "service": "searchDocuments",
+                "_locale": "en",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        # Extract session-specific form action URL
+        import re as _re
+        match = _re.search(
+            r'action="(https://www\.sedarplus\.ca/csa-party/viewInstance/update\.html\?id=[^"]+)"',
+            resp.text,
+        )
+        if not match:
+            raise RuntimeError("Could not find SEDAR+ form action URL")
+
+        self._form_action = match.group(1).replace("&amp;", "&")
+        logger.debug("SEDAR+ session established, form action: %s", self._form_action[:80])
+        return self._session
 
     def discover_filings(
         self,
@@ -870,104 +928,152 @@ class SEDARFilingDiscoverer:
     ) -> FilingDiscovery:
         result = FilingDiscovery(ticker=ticker, market_id="ca_sedar")
 
-        # First resolve ticker to SEDAR entity ID
-        entity_id = self._resolve_entity(ticker)
-        if not entity_id:
-            result.errors.append(f"Could not resolve {ticker} on SEDAR+")
-            return result
-
         today = date.today()
         from_date = today - timedelta(days=365 * years)
 
         try:
-            data = cached_get(
-                f"{_SEDAR_BASE}/records/companyDocuments",
-                params={
-                    "entityId": entity_id,
-                    "category": "Annual Financial Statements",
-                    "fromDate": from_date.strftime("%Y-%m-%d"),
-                    "toDate": today.strftime("%Y-%m-%d"),
-                    "pageSize": "10",
-                },
-                headers=_SEDAR_HEADERS,
-            )
+            session = self._ensure_session()
         except Exception as exc:
-            result.errors.append(f"SEDAR+ document search failed: {exc}")
-            # Try interim too
-            data = None
+            result.errors.append(f"SEDAR+ session failed: {exc}")
+            return result
 
-        for category in ["Annual Financial Statements", "Interim Financial Statements"]:
+        time.sleep(_SEDAR_REQUEST_DELAY_S)
+
+        # Search for annual + interim financial statements
+        for filing_type_label in [
+            "Annual financial statements",
+            "Interim financial statements/report",
+        ]:
             try:
-                if data is None or (category != "Annual Financial Statements"):
-                    data = cached_get(
-                        f"{_SEDAR_BASE}/records/companyDocuments",
-                        params={
-                            "entityId": entity_id,
-                            "category": category,
-                            "fromDate": from_date.strftime("%Y-%m-%d"),
-                            "toDate": today.strftime("%Y-%m-%d"),
-                            "pageSize": "10",
-                        },
-                        headers=_SEDAR_HEADERS,
-                    )
-            except Exception:
+                resp = session.post(
+                    self._form_action,
+                    data={
+                        "FilingIdentifier": ticker,
+                        "FilingCategory": "Continuous disclosure",
+                        "FilingType": filing_type_label,
+                        "SubmissionDate": from_date.strftime("%d/%m/%Y"),
+                        "SubmissionDate2": today.strftime("%d/%m/%Y"),
+                        "nodeW285ac": "search",
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+            except Exception as exc:
+                result.errors.append(f"SEDAR+ search failed for {filing_type_label}: {exc}")
+                time.sleep(_SEDAR_REQUEST_DELAY_S)
                 continue
 
-            items = []
-            if isinstance(data, dict):
-                items = data.get("documents", data.get("data", data.get("result", [])))
-            elif isinstance(data, list):
-                items = data
+            # Parse results with BeautifulSoup
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(resp.text, "html.parser")
+                self._parse_results(soup, result, filing_type_label)
+            except ImportError:
+                result.errors.append("beautifulsoup4 not installed")
+                break
+            except Exception as exc:
+                result.errors.append(f"SEDAR+ parse failed: {exc}")
 
-            for item in items:
-                title = item.get("title", item.get("name", ""))
-                filing_dt = item.get("filingDate", item.get("date", ""))
-                doc_url = item.get("documentUrl", item.get("url", ""))
-                doc_id = item.get("documentId", item.get("id", ""))
+            time.sleep(_SEDAR_REQUEST_DELAY_S)
 
-                if not title:
-                    continue
-
-                is_annual = "annual" in category.lower()
-
-                filing = FilingMetadata(
-                    title=title,
-                    filing_date=str(filing_dt)[:10] if filing_dt else "",
-                    document_url=doc_url if doc_url and doc_url.startswith("http") else "",
-                    document_format="pdf",
-                    filing_type="annual" if is_annual else "interim",
-                    market_id="ca_sedar",
-                    attachment_id=str(doc_id),
-                )
-                result.filings.append(filing)
-
-            data = None  # Reset for next category
-
-        logger.info("SEDAR+ discovery for %s: found %d filings", ticker, len(result.filings))
+        logger.info(
+            "SEDAR+ discovery for %s: found %d filings (%d annual, %d interim)",
+            ticker, len(result.filings),
+            len(result.annual_filings()), len(result.quarterly_filings()),
+        )
         return result
 
-    def _resolve_entity(self, ticker: str) -> str:
-        """Resolve a ticker to a SEDAR+ entity ID."""
-        try:
-            data = cached_get(
-                f"{_SEDAR_BASE}/searchCompany",
-                params={"searchText": ticker},
-                headers=_SEDAR_HEADERS,
+    def _parse_results(
+        self,
+        soup,
+        result: FilingDiscovery,
+        filing_type_label: str,
+    ) -> None:
+        """Parse SEDAR+ Catalyst HTML results into FilingMetadata objects."""
+        is_annual = "annual" in filing_type_label.lower()
+
+        # Find document download links (resource.html URLs)
+        doc_links = soup.find_all("a", href=lambda h: h and "resource.html" in h)
+
+        for a_tag in doc_links:
+            title = a_tag.get_text(strip=True) or ""
+            href = a_tag.get("href", "")
+            if not href or not title:
+                continue
+
+            # Only include PDF documents
+            if ".pdf" not in title.lower():
+                continue
+
+            # Extract entity name and date from surrounding HTML
+            entity_name = ""
+            filing_date_str = ""
+            parent_block = a_tag.find_parent(
+                "div", class_=lambda c: c and "csaFilingDocuments" in str(c) and "page" in str(c)
             )
-            items = data if isinstance(data, list) else data.get("results", []) if isinstance(data, dict) else []
-            if items:
-                return str(items[0].get("sedarId", items[0].get("entityId", "")))
-        except Exception:
-            pass
-        return ""
+            if parent_block:
+                entity_div = parent_block.find(
+                    "div", class_=lambda c: c and "filingEntities" in str(c)
+                )
+                if entity_div:
+                    entity_name = entity_div.get_text(strip=True)
+                date_div = parent_block.find(
+                    "div", class_=lambda c: c and "SubmissionDate" in str(c) and "Attribute" in str(c)
+                )
+                if date_div:
+                    date_text = date_div.get_text(strip=True)
+                    # Parse "16 Mar 2026 11:05 EDT" -> "2026-03-16"
+                    import re as _re
+                    dm = _re.search(r"(\d{1,2})\s+(\w{3})\s+(\d{4})", date_text)
+                    if dm:
+                        _months = {
+                            "Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04",
+                            "May": "05", "Jun": "06", "Jul": "07", "Aug": "08",
+                            "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12",
+                        }
+                        mon = _months.get(dm.group(2), "01")
+                        filing_date_str = f"{dm.group(3)}-{mon}-{int(dm.group(1)):02d}"
+
+            filing = FilingMetadata(
+                title=f"{entity_name}: {title}" if entity_name else title,
+                filing_date=filing_date_str,
+                document_url=href,
+                document_format="pdf",
+                filing_type="annual" if is_annual else "interim",
+                market_id="ca_sedar",
+            )
+            result.filings.append(filing)
 
     def download_filing(self, filing: FilingMetadata) -> bytes:
+        """Download a SEDAR+ filing PDF via session-bound resource URL.
+
+        SEDAR+ CDN is slow -- downloads can take 60-120 seconds for
+        a typical filing PDF. The resource.html URLs are session-bound
+        and require the same session cookies used during discovery.
+        """
         if not filing.document_url:
             raise ValueError("No document URL in filing metadata")
-        resp = requests.get(filing.document_url, headers=_SEDAR_HEADERS, timeout=30)
+
+        session = self._ensure_session()
+        time.sleep(_SEDAR_REQUEST_DELAY_S)
+
+        resp = session.get(
+            filing.document_url,
+            timeout=_SEDAR_DOWNLOAD_TIMEOUT_S,
+            allow_redirects=True,
+        )
         resp.raise_for_status()
-        if resp.content[:4] != b"%PDF":
-            raise ValueError(f"Not a PDF: {resp.headers.get('Content-Type', 'unknown')}")
+
+        ct = resp.headers.get("Content-Type", "")
+        if "pdf" not in ct and resp.content[:4] != b"%PDF":
+            raise ValueError(
+                f"Expected PDF but got {ct} ({len(resp.content)} bytes)"
+            )
+
+        logger.info(
+            "Downloaded SEDAR+ filing: %s (%d bytes)",
+            filing.title[:60], len(resp.content),
+        )
         return resp.content
 
 
