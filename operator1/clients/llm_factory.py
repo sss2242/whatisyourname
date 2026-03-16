@@ -270,7 +270,12 @@ def create_llm_client(
             return None
         return _build_pooled_or_single("claude", keys, model, secrets)
     elif provider == "openrouter":
-        return _build_openrouter(secrets, model)
+        from operator1.secrets_loader import get_key_pool
+        keys = get_key_pool(secrets, "OPENROUTER_API_KEY")
+        if not keys:
+            logger.info("No OPENROUTER_API_KEY found; LLM features disabled.")
+            return None
+        return _build_pooled_or_single("openrouter", keys, model, secrets)
     else:
         from operator1.secrets_loader import get_key_pool
         keys = get_key_pool(secrets, "GEMINI_API_KEY")
