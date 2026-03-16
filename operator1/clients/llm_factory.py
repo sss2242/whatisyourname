@@ -35,6 +35,25 @@ logger = logging.getLogger(__name__)
 # Supported provider identifiers (case-insensitive)
 _SUPPORTED_PROVIDERS = ("gemini", "claude", "openrouter")
 
+# Error message substrings that indicate key exhaustion or rate limiting.
+# When PooledLLMClient catches an exception containing any of these, it
+# rotates to the next API key instead of re-raising.
+_EXHAUSTION_ERRORS = (
+    "429",
+    "rate limit",
+    "rate_limit",
+    "quota exceeded",
+    "resource exhausted",
+    "resource_exhausted",
+    "too many requests",
+    "billing",
+    "credit",
+    "all retries exhausted",
+    "all 5 retries exhausted",
+    "insufficient_quota",
+    "exceeded your current quota",
+)
+
 
 def get_available_models(provider: str) -> list[dict[str, Any]]:
     """Return a list of available models for the given provider.
@@ -249,7 +268,7 @@ def create_llm_client(
         if not keys:
             logger.info("No ANTHROPIC_API_KEY found; LLM features disabled.")
             return None
-        return _build_single_client("claude", keys[0], model)
+        return _build_pooled_or_single("claude", keys, model, secrets)
     elif provider == "openrouter":
         return _build_openrouter(secrets, model)
     else:
@@ -258,7 +277,60 @@ def create_llm_client(
         if not keys:
             logger.info("No GEMINI_API_KEY found; LLM features disabled.")
             return None
-        return _build_single_client("gemini", keys[0], model)
+        return _build_pooled_or_single("gemini", keys, model, secrets)
+
+
+def _build_pooled_or_single(
+    provider: str,
+    keys: list[str],
+    model: str,
+    secrets: dict[str, str],
+) -> LLMClient | PooledLLMClient | None:
+    """Build a PooledLLMClient if multiple keys exist, else a single client.
+
+    When multiple API keys are provided (comma-separated in .env), this
+    creates one client per key and wraps them in a PooledLLMClient that
+    auto-rotates on rate limiting or credit exhaustion.
+
+    Also builds fallback clients from the alternate provider if available.
+    """
+    # Build one client per key for the primary provider
+    primary_clients: list[LLMClient] = []
+    for key in keys:
+        client = _build_single_client(provider, key, model)
+        if client is not None:
+            primary_clients.append(client)
+
+    if not primary_clients:
+        logger.info("No working %s clients built; LLM features disabled.", provider)
+        return None
+
+    # Single key: return the client directly (no pooling overhead)
+    if len(primary_clients) == 1:
+        return primary_clients[0]
+
+    # Multiple keys: build fallback clients from alternate provider
+    fallback_clients: list[LLMClient] = []
+    if provider == "gemini":
+        from operator1.secrets_loader import get_key_pool
+        alt_keys = get_key_pool(secrets, "ANTHROPIC_API_KEY")
+        for ak in alt_keys:
+            fc = _build_single_client("claude", ak, "")
+            if fc:
+                fallback_clients.append(fc)
+    elif provider == "claude":
+        from operator1.secrets_loader import get_key_pool
+        alt_keys = get_key_pool(secrets, "GEMINI_API_KEY")
+        for ak in alt_keys:
+            fc = _build_single_client("gemini", ak, "")
+            if fc:
+                fallback_clients.append(fc)
+
+    logger.info(
+        "PooledLLMClient: %d %s keys + %d fallback keys",
+        len(primary_clients), provider, len(fallback_clients),
+    )
+    return PooledLLMClient(primary_clients, fallback_clients or None)
 
 
 def _auto_detect_provider(secrets: dict[str, str]) -> str:
