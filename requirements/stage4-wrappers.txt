@@ -40,6 +40,7 @@ banxicoapi==1.0.2
 
 # Filing extraction
 pdfplumber==0.11.9
+camelot-py[base]==1.0.9    # High-accuracy PDF table extraction (MIT)
 
 # News sentiment
 gnews==0.4.3
