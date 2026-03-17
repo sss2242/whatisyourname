@@ -226,6 +226,7 @@ class INBseClient:
         If no LLM key is set, the filing discoverer logs which env var
         to configure and returns empty.
         """
+        # Path 1: Filing discoverer + LLM extraction (best quality)
         try:
             from operator1.clients.filing_discoverer import try_filing_extraction
             df = try_filing_extraction(
@@ -240,9 +241,78 @@ class INBseClient:
                 )
                 return df
         except Exception as exc:
-            logger.warning("BSE filing extraction failed for %s/%s: %s", identifier, statement_type, exc)
+            logger.debug("BSE LLM extraction failed for %s/%s: %s", identifier, statement_type, exc)
 
-        return pd.DataFrame()
+        # Path 2: Fuzzy PDF parser fallback (no LLM needed)
+        logger.info(
+            "BSE %s/%s: LLM unavailable, trying fuzzy PDF parser",
+            identifier, statement_type,
+        )
+        return self._fetch_financials_fuzzy(identifier, statement_type)
+
+    def _fetch_financials_fuzzy(self, identifier: str, statement_type: str) -> pd.DataFrame:
+        """Fallback: extract financials using fuzzy PDF parser (no LLM).
+
+        Discovers filings via BSE announcements API, downloads PDFs,
+        and uses fuzzy string matching to identify financial line items
+        in pdfplumber table output.  Handles Indian number formats
+        (lakhs, crores, parenthetical negatives).
+        """
+        try:
+            from operator1.clients.fuzzy_pdf_parser import extract_financials_from_pdf
+        except ImportError:
+            logger.debug("fuzzy_pdf_parser not available")
+            return pd.DataFrame()
+
+        # Discover filings via BSE announcements API
+        try:
+            from operator1.clients.filing_discoverer import BSEFilingDiscoverer
+            discoverer = BSEFilingDiscoverer()
+            discovery = discoverer.discover_filings(identifier, years=2)
+            if not discovery.has_filings:
+                return pd.DataFrame()
+        except Exception as exc:
+            logger.debug("BSE filing discovery failed for fuzzy fallback: %s", exc)
+            return pd.DataFrame()
+
+        all_rows: list[dict] = []
+        for filing in discovery.filings[:8]:
+            try:
+                pdf_bytes = discoverer.download_filing(filing)
+                rows = extract_financials_from_pdf(
+                    pdf_bytes,
+                    filing_date=filing.filing_date or "",
+                    report_date=filing.report_date or "",
+                    statement_type=statement_type,
+                )
+                all_rows.extend(rows)
+            except Exception as exc:
+                logger.debug("Fuzzy extraction failed for filing %s: %s", filing.filing_date, exc)
+
+        if not all_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_rows)
+        for col in ("filing_date", "report_date"):
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=730)
+        if "report_date" in df.columns:
+            mask = df["report_date"].notna() & (df["report_date"] >= cutoff)
+            df = df[mask]
+
+        if df.empty:
+            return pd.DataFrame()
+
+        from operator1.clients.canonical_translator import translate_financials
+        result = translate_financials(df, self.market_id, statement_type)
+        if not result.empty:
+            logger.info(
+                "BSE %s/%s: %d rows from fuzzy PDF parser (no LLM)",
+                identifier, statement_type, len(result),
+            )
+        return result
 
     # -- Price data -----------------------------------------------------------
 
