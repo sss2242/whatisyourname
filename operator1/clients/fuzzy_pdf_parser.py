@@ -130,6 +130,106 @@ _CASHFLOW_CONCEPTS: list[tuple[str, str]] = [
 
 _ALL_CONCEPTS = _INCOME_CONCEPTS + _BALANCE_CONCEPTS + _CASHFLOW_CONCEPTS
 
+# ---------------------------------------------------------------------------
+# Per-market additional concept patterns.
+# Indian SEBI results use specific terminology not found in IFRS filings.
+# These supplement the base dictionaries when market_id is provided.
+# ---------------------------------------------------------------------------
+
+_MARKET_HINTS: dict[str, list[tuple[str, str]]] = {
+    "in_bse": [
+        # Indian SEBI-format specific labels
+        ("value of sales & services", "revenue"),
+        ("less: gst recovered", "cost_of_revenue"),
+        ("other income", "revenue"),
+        ("cost of materials consumed", "cost_of_revenue"),
+        ("purchase of stock-in-trade", "cost_of_revenue"),
+        ("changes in inventories", "cost_of_revenue"),
+        ("employee benefit expense", "sga_expenses"),
+        ("employee benefits expense", "sga_expenses"),
+        ("finance costs", "interest_expense"),
+        ("depreciation and amortisation expense", "sga_expenses"),
+        ("profit/(loss) before exceptional items and tax", "ebit"),
+        ("exceptional items", "interest_expense"),
+        ("profit/(loss) before tax", "ebit"),
+        ("profit/(loss) for the period", "net_income"),
+        ("total comprehensive income for the period", "net_income"),
+        ("paid-up equity share capital", "shares_outstanding"),
+        ("other equity", "retained_earnings"),
+        ("other equity excluding revaluation reserve", "retained_earnings"),
+        ("net worth", "total_equity"),
+        ("earnings per equity share", "eps"),
+        ("segment revenue", "revenue"),
+        ("segment results", "operating_income"),
+        ("segment assets", "total_assets"),
+        ("segment liabilities", "total_liabilities"),
+        ("capital employed", "total_assets"),
+        ("debt service coverage ratio", "interest_expense"),
+        ("interest service coverage ratio", "interest_expense"),
+        ("debt equity ratio", "total_debt"),
+        # Consolidated specific
+        ("profit attributable to owners", "net_income"),
+        ("profit attributable to non-controlling interests", "net_income"),
+    ],
+    "hk_hkex": [
+        # Hong Kong HKFRS / IFRS labels
+        ("turnover", "revenue"),
+        ("profit from operations", "operating_income"),
+        ("profit attributable to equity holders", "net_income"),
+        ("profit attributable to shareholders", "net_income"),
+        ("total comprehensive income attributable", "net_income"),
+        ("bank balances and cash", "cash_and_equivalents"),
+        ("bank borrowings", "total_debt"),
+        ("trade and other receivables", "receivables"),
+        ("trade and other payables", "payables"),
+        ("share capital", "shares_outstanding"),
+    ],
+    "sg_sgx": [
+        # Singapore SFRS / IFRS labels
+        ("turnover", "revenue"),
+        ("profit from operations", "operating_income"),
+        ("profit attributable to equity holders", "net_income"),
+        ("cash and short-term deposits", "cash_and_equivalents"),
+        ("trade and other receivables", "receivables"),
+        ("trade and other payables", "payables"),
+    ],
+    "sa_tadawul": [
+        # Saudi IFRS labels (English versions of Arabic terms)
+        ("sales", "revenue"),
+        ("cost of sales", "cost_of_revenue"),
+        ("gross profit", "gross_profit"),
+        ("operating profit", "operating_income"),
+        ("zakat", "taxes"),
+        ("zakat and income tax", "taxes"),
+        ("net profit for the period", "net_income"),
+        ("total shareholders equity", "total_equity"),
+        ("retained earnings", "retained_earnings"),
+    ],
+    "ca_sedar": [
+        # Canadian IFRS labels
+        ("revenues", "revenue"),
+        ("cost of sales", "cost_of_revenue"),
+        ("selling general and administrative", "sga_expenses"),
+        ("income before income taxes", "ebit"),
+        ("provision for income taxes", "taxes"),
+        ("net earnings", "net_income"),
+        ("net income attributable to shareholders", "net_income"),
+        ("total shareholders equity", "total_equity"),
+        ("retained earnings", "retained_earnings"),
+    ],
+    "au_asx": [
+        # Australian AASB / IFRS labels
+        ("sales revenue", "revenue"),
+        ("cost of sales", "cost_of_revenue"),
+        ("profit before income tax", "ebit"),
+        ("income tax expense", "taxes"),
+        ("net profit after tax", "net_income"),
+        ("profit attributable to members", "net_income"),
+        ("total shareholders equity", "total_equity"),
+        ("retained profits", "retained_earnings"),
+    ],
+}
+
 # Keywords that indicate a page has financial content
 _FINANCIAL_KEYWORDS = [
     "revenue", "profit", "loss", "income", "expense", "assets",
@@ -153,6 +253,7 @@ def extract_financials_from_pdf(
     filing_date: str = "",
     report_date: str = "",
     statement_type: str = "",
+    market_id: str = "",
     similarity_threshold: float = 0.65,
 ) -> list[dict[str, Any]]:
     """Extract financial line items from a PDF using fuzzy matching.
@@ -171,6 +272,10 @@ def extract_financials_from_pdf(
     statement_type:
         If set ('income', 'balance', 'cashflow'), only match concepts
         for that statement type.  If empty, match all.
+    market_id:
+        Market identifier (e.g. 'in_bse', 'hk_hkex').  When provided,
+        market-specific concept patterns are prepended to the dictionary
+        for higher-priority matching of regional terminology.
     similarity_threshold:
         Minimum SequenceMatcher ratio to accept a fuzzy match (0-1).
         Lower = more permissive, higher = stricter.
@@ -180,13 +285,22 @@ def extract_financials_from_pdf(
     List of dicts with keys: concept, value, filing_date, report_date.
     """
     if statement_type == "income":
-        concepts = _INCOME_CONCEPTS
+        concepts = list(_INCOME_CONCEPTS)
     elif statement_type == "balance":
-        concepts = _BALANCE_CONCEPTS
+        concepts = list(_BALANCE_CONCEPTS)
     elif statement_type == "cashflow":
-        concepts = _CASHFLOW_CONCEPTS
+        concepts = list(_CASHFLOW_CONCEPTS)
     else:
-        concepts = _ALL_CONCEPTS
+        concepts = list(_ALL_CONCEPTS)
+
+    # Prepend market-specific hints (higher priority = checked first)
+    market_hints = _MARKET_HINTS.get(market_id, [])
+    if market_hints:
+        concepts = market_hints + concepts
+        logger.debug(
+            "Fuzzy parser: added %d market hints for %s",
+            len(market_hints), market_id,
+        )
 
     # Try camelot first (best table extraction quality)
     rows = _extract_with_camelot(pdf_bytes, concepts, filing_date, report_date, similarity_threshold)

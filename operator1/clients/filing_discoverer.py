@@ -1771,6 +1771,7 @@ def _try_fuzzy_extraction(
             pdf_bytes,
             filing_date=filing.filing_date or "",
             report_date=filing.report_date or "",
+            market_id=market_id,
         )
         if rows:
             df = pd.DataFrame(rows)
