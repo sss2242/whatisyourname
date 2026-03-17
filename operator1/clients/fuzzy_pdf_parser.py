@@ -28,7 +28,6 @@ from __future__ import annotations
 import io
 import logging
 import re
-from difflib import SequenceMatcher
 from typing import Any
 
 import pandas as pd
@@ -511,25 +510,68 @@ def _extract_from_table(
     report_date: str,
     threshold: float,
 ) -> list[dict]:
-    """Fuzzy-match table rows against financial concepts."""
-    rows: list[dict] = []
+    """Fuzzy-match table rows against financial concepts.
 
+    Uses column scoring to identify the most likely "current period"
+    value column before extraction.  This prevents cross-column
+    contamination where OCR garbage in adjacent columns gets picked
+    up instead of the correct number.
+
+    Indian SEBI-format PDFs typically have:
+    - Col 0: Labels (Particulars)
+    - Cols 1-2: Sometimes empty or OCR artifacts
+    - Col 3: Current quarter (most populated with valid numbers)
+    - Col 4+: Prior periods
+    """
+    rows: list[dict] = []
+    if not table or len(table) < 2:
+        return rows
+
+    # Step 1: Score each column by how many valid numbers it contains.
+    # The "current period" column has the most valid numbers.
+    n_cols = max(len(r) for r in table if r)
+    col_valid_counts = [0] * n_cols
+
+    for row in table:
+        if not row:
+            continue
+        for ci in range(1, min(len(row), n_cols)):
+            if row[ci] is None:
+                continue
+            val = _parse_indian_number(str(row[ci]).strip())
+            if val is not None and abs(val) >= 1.0:
+                col_valid_counts[ci] += 1
+
+    # Pick the column with the most valid numbers (skip col 0 = labels)
+    if sum(col_valid_counts[1:]) == 0:
+        return rows
+
+    best_col = max(range(1, len(col_valid_counts)), key=lambda i: col_valid_counts[i])
+
+    # Step 2: Extract values only from the identified best column
     for row in table:
         if not row or not row[0]:
             continue
 
-        # Clean the label cell
         label = _clean_label(str(row[0]))
         if not label or len(label) < 3:
             continue
 
-        # Fuzzy match against concept patterns
         best_match = _fuzzy_match_concept(label, concepts, threshold)
         if not best_match or best_match in seen:
             continue
 
-        # Extract numeric value from the first non-empty value cell
-        value = _extract_number_from_row(row[1:])
+        # Primary: get value from the best column
+        value = None
+        if best_col < len(row) and row[best_col] is not None:
+            value = _parse_indian_number(str(row[best_col]).strip())
+
+        # Fallback: try adjacent column if best_col is empty for this row
+        if value is None and best_col + 1 < len(row) and row[best_col + 1] is not None:
+            value = _parse_indian_number(str(row[best_col + 1]).strip())
+        if value is None and best_col - 1 >= 1 and row[best_col - 1] is not None:
+            value = _parse_indian_number(str(row[best_col - 1]).strip())
+
         if value is None:
             continue
 
@@ -598,25 +640,49 @@ def _fuzzy_match_concept(
 ) -> str | None:
     """Find the best matching canonical concept for a label.
 
-    Uses exact substring match first (fast), then falls back to
-    SequenceMatcher ratio for fuzzy matching.
+    Uses exact substring match first (fast), then rapidfuzz WRatio
+    for fuzzy matching (combines ratio, partial_ratio, token_sort_ratio,
+    and token_set_ratio with optimal weights).
+
+    Falls back to difflib if rapidfuzz is not installed.
 
     Returns the canonical field name, or None if no match.
     """
-    # Exact substring match (fast path)
+    # Exact substring match (fast path -- no fuzzy overhead)
     for pattern, canonical in concepts:
         if pattern in label:
             return canonical
 
-    # Fuzzy match (slow path)
+    # Build choices dict for rapidfuzz: {pattern: canonical}
+    choices = {pattern: canonical for pattern, canonical in concepts}
+
+    # Try rapidfuzz (much faster and more accurate than difflib)
+    try:
+        from rapidfuzz import process, fuzz
+        # WRatio is the best general-purpose scorer -- it automatically
+        # picks the best combination of ratio, partial_ratio,
+        # token_sort_ratio, and token_set_ratio.
+        result = process.extractOne(
+            label,
+            choices.keys(),
+            scorer=fuzz.WRatio,
+            score_cutoff=threshold * 100,  # rapidfuzz uses 0-100 scale
+        )
+        if result is not None:
+            matched_pattern, score, _ = result
+            return choices[matched_pattern]
+        return None
+    except ImportError:
+        pass
+
+    # Fallback: difflib SequenceMatcher
+    from difflib import SequenceMatcher
     best_ratio = 0.0
     best_canonical = None
 
     for pattern, canonical in concepts:
-        # Only fuzzy-match if lengths are somewhat similar
         if abs(len(label) - len(pattern)) > max(len(pattern), len(label)) * 0.5:
             continue
-
         ratio = SequenceMatcher(None, label, pattern).ratio()
         if ratio > best_ratio and ratio >= threshold:
             best_ratio = ratio
