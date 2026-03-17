@@ -1,12 +1,18 @@
-"""India BSE/NSE PIT client -- uses yfinance + BSE API.
+"""India BSE/NSE PIT client -- BSE filing discovery + LLM extraction.
 
-Primary: yfinance (profile, financials via .NS suffix -- works globally)
-Fallback: Direct BSE India API (https://api.bseindia.com/BseIndiaAPI/api)
+Primary financials: try_filing_extraction() from filing_discoverer.py
+    - BSE AnnSubCategoryGetData API discovers filings (works globally)
+    - BSEFilingDiscoverer downloads PDFs from bseindia.com
+    - LLMFilingExtractor with Ind AS taxonomy hints extracts structured data
+    - Smart page selection: scores pages for financial tables, skips noise
+    - Per-ticker caching: income/balance/cashflow share one extraction call
+    - Rate-limited staged extraction respects LLM RPM limits
 
-OHLCV: handled separately via ohlcv_nselib.py + ohlcv_provider.py
+Profile: yfinance (.NS/.BO) for sector/industry metadata only.
+OHLCV: handled separately via ohlcv_provider.py (yfinance/nselib).
 
-Note: jugaad-data was removed because it depends on NSE endpoints that
-geo-block non-Indian IPs and frequently change their anti-scraping measures.
+No date range limit: BSE announcements API returns all filings for the
+full 2-year window in a single request (unlike HKEX which needs windowing).
 
 Coverage: ~5,500+ listed companies on BSE/NSE, ~$4T market cap.
 """
@@ -15,35 +21,49 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import re
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from operator1.http_utils import cached_get, HTTPError
-
 logger = logging.getLogger(__name__)
 
 _BSE_BASE = "https://api.bseindia.com/BseIndiaAPI/api"
 _CACHE_DIR = Path("cache/in_bse")
 
+# Headers for BSE API requests
+_BSE_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.bseindia.com/",
+}
+
 
 class INBseClient:
-    """PIT client for Indian BSE/NSE equities using yfinance + BSE API.
+    """PIT client for Indian BSE/NSE equities.
 
-    Implements the ``PITClient`` protocol. Uses yfinance as primary
-    data source for profile, financial data. BSE API for company search.
+    Financial statements are extracted via the filing discoverer pipeline:
+    BSE AnnSubCategoryGetData -> PDF download -> LLM extraction with
+    Ind AS taxonomy hints -> canonical long-format DataFrame.
+
+    The LLM extractor uses smart page selection (_select_top_pages)
+    to find pages with financial tables and skip auditor reports,
+    governance sections, and other noise.  The Ind AS taxonomy hints
+    in llm_filing_extractor.py guide the LLM on what to look for
+    (Revenue from Operations, Profit Before Tax, Total Assets, etc.)
+    and warn about lakhs/crores unit conventions.
+
+    When no LLM key is available, returns empty (the filing discoverer
+    logs a clear message about which env var to set).
     """
 
     def __init__(self, cache_dir: Path | str = _CACHE_DIR) -> None:
         self._cache_dir = Path(cache_dir)
-        self._headers = {
-            "Accept": "application/json",
-            "User-Agent": "Operator1/1.0",
-            "Referer": "https://www.bseindia.com/",
-        }
 
     def _cache_path(self, identifier: str, fn: str) -> Path:
         return self._cache_dir / identifier.upper() / fn
@@ -70,33 +90,46 @@ class INBseClient:
 
     @property
     def market_name(self) -> str:
-        return "India (BSE / NSE) -- yfinance"
+        return "India (BSE / NSE)"
 
     # -- Company discovery ---------------------------------------------------
 
     def list_companies(self, query: str = "") -> list[dict[str, Any]]:
-        """List Indian companies from BSE API search."""
+        """List Indian companies from BSE API search.
+
+        Uses the BSE Suggest endpoint which works globally.
+        Falls back to yfinance search if BSE API is unreachable.
+        """
         if not query:
             return []
         try:
-            data = cached_get(
+            import requests
+            resp = requests.get(
                 f"{_BSE_BASE}/Suggest/Getstockdata/{query}",
-                headers=self._headers,
+                headers=_BSE_HEADERS,
+                timeout=15,
             )
-            items = data if isinstance(data, list) else []
+            resp.raise_for_status()
+            items = resp.json() if resp.text.strip().startswith("[") else []
             return [
                 {
-                    "ticker": i.get("scrip_cd", ""),
+                    "ticker": str(i.get("scrip_cd", "")),
                     "name": i.get("scripname", ""),
-                    "cik": i.get("scrip_cd", ""),
+                    "cik": str(i.get("scrip_cd", "")),
                     "exchange": "BSE",
                     "country": "IN",
                     "market_id": self.market_id,
                 }
                 for i in items
+                if isinstance(i, dict)
             ]
-        except Exception:
-            return []
+        except Exception as exc:
+            logger.debug("BSE company search failed: %s", exc)
+            try:
+                from operator1.clients.yfinance_backed import yf_search
+                return yf_search(query, self.market_id, "IN", "BSE", yf_suffix=".NS")
+            except Exception:
+                return []
 
     def search_company(self, name: str) -> list[dict[str, Any]]:
         return self.list_companies(query=name)
@@ -104,6 +137,11 @@ class INBseClient:
     # -- Company profile -----------------------------------------------------
 
     def get_profile(self, identifier: str) -> dict[str, Any]:
+        """Fetch company profile.
+
+        Uses yfinance for rich metadata (sector, industry, market cap).
+        Profile is cached for 7 days.
+        """
         cached = self._read_cache(identifier, "profile.json")
         if cached:
             return cached
@@ -124,12 +162,7 @@ class INBseClient:
             "lei": "",
         }
 
-        # Primary: yfinance for rich profile data
         self._enrich_from_yfinance(identifier, raw)
-
-        # Fallback: BSE API for basic info
-        if not raw.get("name"):
-            self._enrich_from_bse_api(identifier, raw)
 
         from operator1.clients.canonical_translator import translate_profile
         profile = translate_profile(raw, self.market_id)
@@ -137,11 +170,10 @@ class INBseClient:
         return profile
 
     def _enrich_from_yfinance(self, identifier: str, raw: dict) -> None:
-        """Enrich profile with yfinance data (.NS suffix for NSE)."""
+        """Enrich profile with yfinance data (.NS/.BO suffix)."""
         try:
             import yfinance as yf
 
-            # Try NSE (.NS) first, then BSE (.BO)
             for suffix in [".NS", ".BO"]:
                 yf_ticker = f"{identifier}{suffix}"
                 t = yf.Ticker(yf_ticker)
@@ -165,150 +197,36 @@ class INBseClient:
         except Exception as exc:
             logger.debug("yfinance profile failed for %s: %s", identifier, exc)
 
-    def _enrich_from_bse_api(self, identifier: str, raw: dict) -> None:
-        """Fallback: BSE API for basic profile."""
-        try:
-            data = cached_get(
-                f"{_BSE_BASE}/StockReachGraph/stockData/{identifier}",
-                headers=self._headers,
-            )
-            if isinstance(data, dict):
-                raw["name"] = data.get("comp_name", "")
-                raw["isin"] = data.get("isin_code", "")
-                raw["sector"] = data.get("sector_name", "")
-                raw["industry"] = data.get("industry", "")
-        except Exception as exc:
-            logger.debug("BSE profile failed for %s: %s", identifier, exc)
-
     # -- Financial statements ------------------------------------------------
 
     def get_income_statement(self, identifier: str) -> pd.DataFrame:
-        """Fetch income statements from BSE India financial results API."""
+        """Fetch income statements via BSE filing discovery + LLM extraction."""
         return self._fetch_financials(identifier, "income")
 
     def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
-        """Fetch balance sheets from BSE India financial results API."""
+        """Fetch balance sheets via BSE filing discovery + LLM extraction."""
         return self._fetch_financials(identifier, "balance")
 
     def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
-        """Fetch cash flow statements from BSE India financial results API."""
+        """Fetch cash flow statements via BSE filing discovery + LLM extraction."""
         return self._fetch_financials(identifier, "cashflow")
 
     def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
-        """Fetch financial data from BSE India API.
+        """Fetch financial data via the filing discoverer pipeline.
 
-        Uses the StockReach/FinancialResult endpoint which provides
-        quarterly and annual results for listed companies.
+        Delegates entirely to try_filing_extraction() which handles:
+        1. BSE AnnSubCategoryGetData API for filing discovery (2yr window)
+        2. PDF download from bseindia.com/xml-data/corpfiling/AttachLive/
+        3. Smart page selection (scores pages for financial tables)
+        4. LLM extraction with Ind AS taxonomy hints
+        5. Canonical translation to long-format DataFrame
+        6. Per-ticker caching (all 3 statement types share one extraction)
+        7. Rate-limited staged extraction (respects LLM RPM limits)
 
-        The BSE API returns JSON with financial line items that we
-        map through the canonical translator using _IFRS_MAP
-        (India uses Ind AS, which is IFRS-converged).
+        If no LLM key is set, the filing discoverer logs which env var
+        to configure and returns empty.
         """
-        # Map statement types to BSE API parameters
-        _bse_type_map = {
-            "income": "Profit & Loss",
-            "balance": "Balance Sheet",
-            "cashflow": "Cash Flow",
-        }
-
-        bse_type = _bse_type_map.get(statement_type, "")
-        if not bse_type:
-            return pd.DataFrame()
-
-        try:
-            # BSE financial results endpoint
-            data = cached_get(
-                f"{_BSE_BASE}/FinancialResult/CompanyResults",
-                params={
-                    "scripcode": identifier,
-                    "Ession_Flag": bse_type,
-                },
-                headers=self._headers,
-            )
-
-            if not data or not isinstance(data, (list, dict)):
-                logger.debug("BSE financials empty for %s/%s", identifier, statement_type)
-                return pd.DataFrame()
-
-            items = data if isinstance(data, list) else data.get("Table", [])
-            if not items:
-                return pd.DataFrame()
-
-            rows: list[dict] = []
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                # BSE returns fields like "from_date", "to_date", field name, value
-                report_date = item.get("to_date", item.get("ToDate", ""))
-                filing_date = item.get("from_date", item.get("FromDate", report_date))
-
-                # Each item may have multiple key-value financial fields
-                # or it may be a single row with a "ParticularsDesc" + "Value" pattern
-                concept = item.get("ParticularsDesc", item.get("particulars", ""))
-                value = item.get("Value", item.get("value", item.get("Amount", None)))
-
-                if concept and value is not None:
-                    try:
-                        rows.append({
-                            "concept": str(concept).strip(),
-                            "value": float(str(value).replace(",", "")),
-                            "filing_date": filing_date,
-                            "report_date": report_date,
-                        })
-                    except (ValueError, TypeError):
-                        pass
-
-            if not rows:
-                # Alternative: try flat structure where columns ARE the financial fields
-                if isinstance(items, list) and items and isinstance(items[0], dict):
-                    for item in items:
-                        report_date = item.get("to_date", item.get("ToDate", ""))
-                        filing_date = item.get("from_date", item.get("FromDate", report_date))
-                        for key, val in item.items():
-                            if key.lower() in ("to_date", "from_date", "todate", "fromdate",
-                                               "scripcode", "scrip_code", "company_name"):
-                                continue
-                            if val is not None:
-                                try:
-                                    rows.append({
-                                        "concept": str(key).strip(),
-                                        "value": float(str(val).replace(",", "")),
-                                        "filing_date": filing_date,
-                                        "report_date": report_date,
-                                    })
-                                except (ValueError, TypeError):
-                                    pass
-
-            if not rows:
-                return pd.DataFrame()
-
-            df = pd.DataFrame(rows)
-            for col in ("filing_date", "report_date"):
-                if col in df.columns:
-                    df[col] = pd.to_datetime(df[col], errors="coerce")
-
-            # Filter to 2-year window
-            cutoff = pd.Timestamp.now() - pd.Timedelta(days=730)
-            if "report_date" in df.columns:
-                df = df[df["report_date"] >= cutoff]
-
-            from operator1.clients.canonical_translator import translate_financials
-            return translate_financials(df, self.market_id, statement_type)
-
-        except Exception as exc:
-            logger.debug("BSE financials failed for %s/%s: %s", identifier, statement_type, exc)
-            return pd.DataFrame()
-
-    # -- Price data -----------------------------------------------------------
-
-    def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
-        """Try BSE filing discovery first, fall back to yfinance.
-
-        The filing discoverer finds actual PDF filings from BSE's
-        disclosure system and extracts structured data via LLM. This
-        provides true Point-in-Time data with accurate filing dates.
-        """
-        # Try BSE filing discovery + LLM extraction first
+        # Path 1: Filing discoverer + LLM extraction (best quality)
         try:
             from operator1.clients.filing_discoverer import try_filing_extraction
             df = try_filing_extraction(
@@ -318,60 +236,89 @@ class INBseClient:
             )
             if df is not None and not df.empty:
                 logger.info(
-                    "BSE filing extraction succeeded for %s/%s: %d records",
+                    "BSE %s/%s: %d rows from filing discoverer + LLM",
                     identifier, statement_type, len(df),
                 )
                 return df
         except Exception as exc:
-            logger.debug("BSE filing extraction failed for %s: %s", identifier, exc)
+            logger.debug("BSE LLM extraction failed for %s/%s: %s", identifier, statement_type, exc)
 
-        # Fallback to yfinance
-        return self._fetch_financials_yf(identifier, statement_type)
+        # Path 2: Fuzzy PDF parser fallback (no LLM needed)
+        logger.info(
+            "BSE %s/%s: LLM unavailable, trying fuzzy PDF parser",
+            identifier, statement_type,
+        )
+        return self._fetch_financials_fuzzy(identifier, statement_type)
 
-    def _fetch_financials_yf(self, identifier: str, statement_type: str) -> pd.DataFrame:
-        """Fetch financial statements via yfinance Ticker object."""
+    def _fetch_financials_fuzzy(self, identifier: str, statement_type: str) -> pd.DataFrame:
+        """Fallback: extract financials using fuzzy PDF parser (no LLM).
+
+        Discovers filings via BSE announcements API, downloads PDFs,
+        and uses fuzzy string matching to identify financial line items
+        in pdfplumber table output.  Handles Indian number formats
+        (lakhs, crores, parenthetical negatives).
+        """
         try:
-            import yfinance as yf
-            t = yf.Ticker(f"{identifier}.NS")
-
-            fetch_map = {
-                "income": t.financials,
-                "balance": t.balance_sheet,
-                "cashflow": t.cashflow,
-            }
-
-            df = fetch_map.get(statement_type)
-            if df is None or df.empty:
-                return pd.DataFrame()
-
-            # yfinance returns columns as dates, rows as concepts
-            # Transpose to get: rows = periods, columns = concepts
-            df = df.T
-            df = df.reset_index()
-            df = df.rename(columns={"index": "report_date"})
-            df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
-            df["filing_date"] = df["report_date"] + pd.Timedelta(days=60)
-
-            # Melt to long format for the translator
-            id_cols = ["report_date", "filing_date"]
-            value_cols = [c for c in df.columns if c not in id_cols]
-            long = df.melt(id_vars=id_cols, value_vars=value_cols,
-                           var_name="concept", value_name="value")
-
-            from operator1.clients.canonical_translator import translate_financials
-            return translate_financials(long, self.market_id, statement_type)
-
-        except Exception as exc:
-            logger.debug("yfinance financials failed for %s/%s: %s", identifier, statement_type, exc)
+            from operator1.clients.fuzzy_pdf_parser import extract_financials_from_pdf
+        except ImportError:
+            logger.debug("fuzzy_pdf_parser not available")
             return pd.DataFrame()
+
+        # Discover filings via BSE announcements API
+        try:
+            from operator1.clients.filing_discoverer import BSEFilingDiscoverer
+            discoverer = BSEFilingDiscoverer()
+            discovery = discoverer.discover_filings(identifier, years=2)
+            if not discovery.has_filings:
+                return pd.DataFrame()
+        except Exception as exc:
+            logger.debug("BSE filing discovery failed for fuzzy fallback: %s", exc)
+            return pd.DataFrame()
+
+        all_rows: list[dict] = []
+        for filing in discovery.filings[:8]:
+            try:
+                pdf_bytes = discoverer.download_filing(filing)
+                rows = extract_financials_from_pdf(
+                    pdf_bytes,
+                    filing_date=filing.filing_date or "",
+                    report_date=filing.report_date or "",
+                    statement_type=statement_type,
+                )
+                all_rows.extend(rows)
+            except Exception as exc:
+                logger.debug("Fuzzy extraction failed for filing %s: %s", filing.filing_date, exc)
+
+        if not all_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_rows)
+        for col in ("filing_date", "report_date"):
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=730)
+        if "report_date" in df.columns:
+            mask = df["report_date"].notna() & (df["report_date"] >= cutoff)
+            df = df[mask]
+
+        if df.empty:
+            return pd.DataFrame()
+
+        from operator1.clients.canonical_translator import translate_financials
+        result = translate_financials(df, self.market_id, statement_type)
+        if not result.empty:
+            logger.info(
+                "BSE %s/%s: %d rows from fuzzy PDF parser (no LLM)",
+                identifier, statement_type, len(result),
+            )
+        return result
 
     # -- Price data -----------------------------------------------------------
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:
         """BSE does not provide OHLCV data. Handled by ohlcv_provider."""
         return pd.DataFrame()
-
-    # -- Peers / related entities --------------------------------------------
 
     def get_peers(self, identifier: str) -> list[str]:
         return []
