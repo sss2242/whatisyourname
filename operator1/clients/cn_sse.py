@@ -292,9 +292,15 @@ class CNSseClient:
     def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
         """Fetch Chinese financial ratios via baostock.
 
-        Note: baostock provides financial ratios (margins, ratios, EPS)
-        rather than raw line items. For full financial statements,
-        yfinance can supplement via Ticker.financials / .balance_sheet.
+        baostock provides financial ratios (margins, ratios, EPS) per
+        quarter with true publication dates (pubDate) for PIT compliance.
+        Each query requires a fresh login/logout session to avoid
+        "Bad file descriptor" socket errors from stale connections.
+
+        Maps statement_type to baostock query functions:
+        - income -> query_profit_data (margins, net profit, EPS, revenue)
+        - balance -> query_balance_data (current ratio, quick ratio, etc.)
+        - cashflow -> query_cash_flow_data (CFO, capex, FCF ratios)
         """
         if not self._baostock_available:
             return pd.DataFrame()
@@ -303,41 +309,10 @@ class CNSseClient:
             import baostock as bs
             bs_code = _to_baostock_code(identifier)
 
-            # Normalize to canonical format with filing_date and report_date.
-            # akshare returns wide format: columns are Chinese line item names,
-            # rows are reporting periods. We need to melt/unpivot into long
-            # format with a 'concept' column for translate_financials to map.
-            if "报告日" in df.columns:
-                date_col = "报告日"
-            elif df.columns[0] not in ("report_date",):
-                date_col = df.columns[0]
-            else:
-                date_col = "report_date"
-
-            # Identify value columns (everything except the date column)
-            value_cols = [c for c in df.columns if c != date_col]
-
-            if not value_cols:
+            lg = bs.login()
+            if lg.error_code != "0":
+                logger.warning("baostock login failed: %s", lg.error_msg)
                 return pd.DataFrame()
-
-            # Melt wide -> long: each Chinese column name becomes a 'concept' row
-            long_df = df.melt(
-                id_vars=[date_col],
-                value_vars=value_cols,
-                var_name="concept",
-                value_name="value",
-            )
-            long_df = long_df.rename(columns={date_col: "report_date"})
-            long_df["report_date"] = pd.to_datetime(long_df["report_date"], errors="coerce")
-            long_df["filing_date"] = long_df["report_date"] + pd.Timedelta(days=45)  # Estimate
-            long_df["value"] = pd.to_numeric(long_df["value"], errors="coerce")
-            long_df = long_df.dropna(subset=["value"])
-
-            from operator1.clients.canonical_translator import translate_financials
-            return translate_financials(long_df, self.market_id, statement_type)
-
-            current_year = date.today().year
-            all_rows = []
 
             query_fn = {
                 "income": bs.query_profit_data,
@@ -349,14 +324,20 @@ class CNSseClient:
                 bs.logout()
                 return pd.DataFrame()
 
+            current_year = date.today().year
+            all_rows = []
+
             # Fetch last 3 years of quarterly data
             for year in range(current_year - 2, current_year + 1):
                 for quarter in [1, 2, 3, 4]:
-                    rs = query_fn(code=bs_code, year=year, quarter=quarter)
-                    while rs.next():
-                        row = rs.get_row_data()
-                        row_dict = dict(zip(rs.fields, row))
-                        all_rows.append(row_dict)
+                    try:
+                        rs = query_fn(code=bs_code, year=year, quarter=quarter)
+                        while rs.next():
+                            row = rs.get_row_data()
+                            row_dict = dict(zip(rs.fields, row))
+                            all_rows.append(row_dict)
+                    except Exception:
+                        continue
 
             bs.logout()
 
@@ -365,13 +346,26 @@ class CNSseClient:
 
             df = pd.DataFrame(all_rows)
 
-            # Add filing/report dates from statDate
-            if "statDate" in df.columns:
-                df["report_date"] = pd.to_datetime(df["statDate"], errors="coerce")
-                df["filing_date"] = df["report_date"] + pd.Timedelta(days=45)
-
+            # Use pubDate as filing_date (true PIT date from baostock)
             if "pubDate" in df.columns:
                 df["filing_date"] = pd.to_datetime(df["pubDate"], errors="coerce")
+
+            if "statDate" in df.columns:
+                df["report_date"] = pd.to_datetime(df["statDate"], errors="coerce")
+                # Only estimate filing_date if pubDate was missing
+                if "filing_date" not in df.columns or df["filing_date"].isna().all():
+                    df["filing_date"] = df["report_date"] + pd.Timedelta(days=45)
+
+            # Convert numeric columns
+            skip_cols = {"code", "pubDate", "statDate", "report_date", "filing_date"}
+            for col in df.columns:
+                if col not in skip_cols:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            logger.info(
+                "baostock %s/%s: %d quarterly rows fetched",
+                identifier, statement_type, len(df),
+            )
 
             from operator1.clients.canonical_translator import translate_financials
             return translate_financials(df, self.market_id, statement_type)
@@ -379,6 +373,7 @@ class CNSseClient:
         except Exception as exc:
             logger.debug("baostock financials failed for %s/%s: %s", identifier, statement_type, exc)
             try:
+                import baostock as bs
                 bs.logout()
             except Exception:
                 pass
