@@ -308,6 +308,9 @@ def extract_financials_from_pdf(
     if not rows:
         rows = _extract_with_pdfplumber(pdf_bytes, concepts, filing_date, report_date, similarity_threshold)
 
+    # Post-extraction validation: remove obviously wrong values
+    rows = _validate_extracted_rows(rows)
+
     if rows:
         logger.info(
             "Fuzzy PDF parser: %d concepts extracted (threshold=%.2f)",
@@ -582,6 +585,60 @@ def _extract_from_table(
             "report_date": report_date,
         })
         seen.add(best_match)
+
+    # Post-extraction validation: remove obviously wrong values
+    rows = _validate_extracted_rows(rows)
+    return rows
+
+
+def _validate_extracted_rows(rows: list[dict]) -> list[dict]:
+    """Remove extracted values that fail basic sanity checks.
+
+    Rules:
+    - Goodwill and intangible_assets must be non-negative
+    - total_assets must not equal total_liabilities exactly (segment confusion)
+    - gross_profit must be at least 1% of revenue if both present
+    - If total_assets < total_equity, drop total_assets (likely segment value)
+    """
+    if not rows:
+        return rows
+
+    values = {r["concept"]: r["value"] for r in rows}
+
+    to_remove: set[str] = set()
+
+    # Goodwill and intangibles can't be negative
+    if values.get("goodwill", 0) < 0:
+        to_remove.add("goodwill")
+    if values.get("intangible_assets", 0) < 0:
+        to_remove.add("intangible_assets")
+
+    # If total_assets == total_liabilities exactly, both are likely
+    # from the same "Total Equity and Liabilities" or segment row
+    ta = values.get("total_assets")
+    tl = values.get("total_liabilities")
+    if ta is not None and tl is not None and ta == tl:
+        to_remove.add("total_liabilities")
+        # Also check if total_assets is actually "segment assets" (too big)
+        te = values.get("total_equity")
+        if te is not None and ta > te * 5:
+            to_remove.add("total_assets")
+
+    # If total_assets < total_equity, it's a segment value not real total_assets
+    if ta is not None and values.get("total_equity") is not None:
+        if ta < values["total_equity"]:
+            to_remove.add("total_assets")
+
+    # gross_profit should be a reasonable fraction of revenue
+    rev = values.get("revenue")
+    gp = values.get("gross_profit")
+    if rev is not None and gp is not None and rev > 0:
+        if gp / rev < 0.01 or gp > rev:
+            to_remove.add("gross_profit")
+
+    if to_remove:
+        rows = [r for r in rows if r["concept"] not in to_remove]
+        logger.debug("Validation removed: %s", to_remove)
 
     return rows
 
