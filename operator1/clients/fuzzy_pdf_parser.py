@@ -640,6 +640,87 @@ def _validate_extracted_rows(rows: list[dict]) -> list[dict]:
         rows = [r for r in rows if r["concept"] not in to_remove]
         logger.debug("Validation removed: %s", to_remove)
 
+    # Accounting identity derivation:
+    # Total Assets = Total Liabilities + Total Equity
+    # If we have two of three, derive the third.
+    # If the extracted total_assets fails this check, replace it.
+    rows = _apply_accounting_identities(rows)
+
+    return rows
+
+
+def _apply_accounting_identities(rows: list[dict]) -> list[dict]:
+    """Apply double-entry bookkeeping identities to validate and derive values.
+
+    Identity: Total Assets = Total Liabilities + Total Equity
+
+    Cases:
+    1. All three present but don't balance -> trust equity + liabilities,
+       recompute assets (equity is usually the most reliable from PDFs).
+    2. Assets and equity present but no liabilities -> derive liabilities.
+    3. Equity and liabilities present but no assets -> derive assets.
+    4. Only equity or only assets present -> keep as-is (can't validate).
+    """
+    if not rows:
+        return rows
+
+    values = {r["concept"]: r for r in rows}
+    ta_row = values.get("total_assets")
+    tl_row = values.get("total_liabilities")
+    te_row = values.get("total_equity")
+
+    ta = ta_row["value"] if ta_row else None
+    tl = tl_row["value"] if tl_row else None
+    te = te_row["value"] if te_row else None
+
+    # Get a reference filing_date/report_date from any existing row
+    ref = rows[0] if rows else {}
+    fd = ref.get("filing_date", "")
+    rd = ref.get("report_date", "")
+
+    if te is not None and tl is not None:
+        # We have equity and liabilities -- derive or validate assets
+        derived_ta = te + tl
+        if ta is not None:
+            # Check if extracted total_assets is reasonably close to identity
+            if derived_ta > 0 and abs(ta - derived_ta) / derived_ta > 0.1:
+                # More than 10% off -- replace with derived value
+                logger.debug(
+                    "Accounting identity fix: total_assets %.0f -> %.0f "
+                    "(= equity %.0f + liabilities %.0f)",
+                    ta, derived_ta, te, tl,
+                )
+                ta_row["value"] = derived_ta
+        else:
+            # Derive total_assets from identity
+            rows.append({
+                "concept": "total_assets",
+                "value": derived_ta,
+                "filing_date": fd,
+                "report_date": rd,
+            })
+            logger.debug(
+                "Accounting identity derived: total_assets = %.0f "
+                "(equity %.0f + liabilities %.0f)",
+                derived_ta, te, tl,
+            )
+
+    elif te is not None and ta is not None and tl is None:
+        # Derive total_liabilities from identity
+        derived_tl = ta - te
+        if derived_tl >= 0:
+            rows.append({
+                "concept": "total_liabilities",
+                "value": derived_tl,
+                "filing_date": fd,
+                "report_date": rd,
+            })
+            logger.debug(
+                "Accounting identity derived: total_liabilities = %.0f "
+                "(assets %.0f - equity %.0f)",
+                derived_tl, ta, te,
+            )
+
     return rows
 
 
