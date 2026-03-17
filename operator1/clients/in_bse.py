@@ -8,13 +8,27 @@ Primary financials: try_filing_extraction() from filing_discoverer.py
     - Per-ticker caching: income/balance/cashflow share one extraction call
     - Rate-limited staged extraction respects LLM RPM limits
 
-Profile: yfinance (.NS/.BO) for sector/industry metadata only.
+Company search: BSE ListofScripData API (works globally, returns all
+    ~4,800 active equity scrips). Client-side fuzzy search by company
+    name, scrip_id (ticker), or scrip code. No yfinance dependency.
+
+Profile: BSE ComHeadernew API (works globally) for sector, industry,
+    ISIN, EPS, PE, market cap. No yfinance dependency for core metadata.
+
 OHLCV: handled separately via ohlcv_provider.py (yfinance/nselib).
 
 No date range limit: BSE announcements API returns all filings for the
 full 2-year window in a single request (unlike HKEX which needs windowing).
 
-Coverage: ~5,500+ listed companies on BSE/NSE, ~$4T market cap.
+BSE API access notes:
+    - Suggest/Getstockdata: BLOCKED globally (302 -> error_Bse.html)
+    - StockQuote, EQPeerGp: BLOCKED globally
+    - ListofScripData: WORKS globally (full company directory, ~1.7MB)
+    - ComHeadernew: WORKS globally (per-scrip detail with ISIN, sector)
+    - FinancialResult: WORKS globally (quarterly results HTML table)
+    - AnnSubCategoryGetData: WORKS globally (filing announcements)
+
+Coverage: ~4,800+ listed companies on BSE, ~$4T market cap.
 """
 
 from __future__ import annotations
@@ -42,6 +56,114 @@ _BSE_HEADERS = {
     ),
     "Referer": "https://www.bseindia.com/",
 }
+
+# Module-level cache for the full BSE company directory.
+# Fetched once per process from ListofScripData (works globally).
+_scrip_directory: list[dict[str, Any]] | None = None
+_scrip_directory_ttl_hours: int = 24
+_scrip_directory_fetched_at: float = 0.0
+
+
+def _get_scrip_directory() -> list[dict[str, Any]]:
+    """Fetch and cache the full BSE equity scrip directory.
+
+    Uses the ListofScripData endpoint which works globally (unlike
+    Suggest/Getstockdata which is geo-blocked).  Returns ~4,800 active
+    equity scrips with scrip code, name, ISIN, market cap, and scrip_id.
+
+    The directory is cached in-memory for 24 hours.
+    """
+    import time
+    global _scrip_directory, _scrip_directory_fetched_at
+
+    now = time.time()
+    if (
+        _scrip_directory is not None
+        and (now - _scrip_directory_fetched_at) < _scrip_directory_ttl_hours * 3600
+    ):
+        return _scrip_directory
+
+    try:
+        import requests
+        resp = requests.get(
+            f"{_BSE_BASE}/ListofScripData/w",
+            params={
+                "Group": "",
+                "Atea": "",
+                "segment": "Equity",
+                "status": "Active",
+            },
+            headers=_BSE_HEADERS,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and len(data) > 100:
+            _scrip_directory = data
+            _scrip_directory_fetched_at = now
+            logger.info("BSE scrip directory loaded: %d companies", len(data))
+            return data
+    except Exception as exc:
+        logger.warning("Failed to fetch BSE scrip directory: %s", exc)
+
+    return _scrip_directory or []
+
+
+def _search_scrip_directory(
+    query: str,
+    directory: list[dict[str, Any]],
+    max_results: int = 20,
+) -> list[dict[str, Any]]:
+    """Search the BSE scrip directory by name, scrip_id, or scrip code.
+
+    Matches against:
+    - ``scrip_id`` (ticker symbol, e.g. TCS, RELIANCE, INFY) -- exact match first
+    - ``Scrip_Name`` (company name) -- case-insensitive substring
+    - ``SCRIP_CD`` (scrip code, e.g. 500325) -- exact prefix match
+    - ``Issuer_Name`` (full issuer name) -- case-insensitive substring
+
+    Returns results sorted by market cap (largest first).
+    """
+    if not query or not directory:
+        return []
+
+    q_lower = query.strip().lower()
+    q_stripped = query.strip()
+
+    # Phase 1: Exact scrip_id match (highest priority)
+    exact_id = [
+        d for d in directory
+        if d.get("scrip_id", "").lower() == q_lower
+    ]
+    if exact_id:
+        return exact_id[:max_results]
+
+    # Phase 2: Exact scrip code match
+    exact_code = [
+        d for d in directory
+        if d.get("SCRIP_CD", "") == q_stripped
+    ]
+    if exact_code:
+        return exact_code[:max_results]
+
+    # Phase 3: Substring match on name/issuer + scrip_id contains
+    matches = []
+    for d in directory:
+        name = d.get("Scrip_Name", "").lower()
+        issuer = d.get("Issuer_Name", "").lower()
+        sid = d.get("scrip_id", "").lower()
+        if q_lower in name or q_lower in issuer or q_lower in sid:
+            matches.append(d)
+
+    # Sort by market cap (descending) for relevance
+    def _mktcap(d: dict) -> float:
+        try:
+            return float(d.get("Mktcap", 0) or 0)
+        except (ValueError, TypeError):
+            return 0.0
+
+    matches.sort(key=_mktcap, reverse=True)
+    return matches[:max_results]
 
 
 class INBseClient:
@@ -95,41 +217,38 @@ class INBseClient:
     # -- Company discovery ---------------------------------------------------
 
     def list_companies(self, query: str = "") -> list[dict[str, Any]]:
-        """List Indian companies from BSE API search.
+        """List Indian companies from BSE ListofScripData directory.
 
-        Uses the BSE Suggest endpoint which works globally.
-        Falls back to yfinance search if BSE API is unreachable.
+        Uses the BSE ListofScripData endpoint which works globally
+        (unlike Suggest/Getstockdata which returns 302 from non-IN IPs).
+        The full directory (~4,800 scrips) is fetched once and cached
+        in-memory for 24 hours.  Client-side search matches by:
+        - scrip_id (ticker): exact match (e.g. TCS, RELIANCE, INFY)
+        - Scrip_Name / Issuer_Name: substring match (e.g. "Tata", "Infosys")
+        - SCRIP_CD (scrip code): exact match (e.g. 500325)
+
+        No yfinance dependency.  All data is PIT-sourced from BSE.
         """
         if not query:
             return []
-        try:
-            import requests
-            resp = requests.get(
-                f"{_BSE_BASE}/Suggest/Getstockdata/{query}",
-                headers=_BSE_HEADERS,
-                timeout=15,
-            )
-            resp.raise_for_status()
-            items = resp.json() if resp.text.strip().startswith("[") else []
-            return [
-                {
-                    "ticker": str(i.get("scrip_cd", "")),
-                    "name": i.get("scripname", ""),
-                    "cik": str(i.get("scrip_cd", "")),
-                    "exchange": "BSE",
-                    "country": "IN",
-                    "market_id": self.market_id,
-                }
-                for i in items
-                if isinstance(i, dict)
-            ]
-        except Exception as exc:
-            logger.debug("BSE company search failed: %s", exc)
-            try:
-                from operator1.clients.yfinance_backed import yf_search
-                return yf_search(query, self.market_id, "IN", "BSE", yf_suffix=".NS")
-            except Exception:
-                return []
+        directory = _get_scrip_directory()
+        if not directory:
+            return []
+
+        matches = _search_scrip_directory(query, directory)
+        return [
+            {
+                "ticker": d.get("scrip_id", d.get("SCRIP_CD", "")),
+                "name": d.get("Scrip_Name", ""),
+                "cik": str(d.get("SCRIP_CD", "")),
+                "isin": d.get("ISIN_NUMBER", ""),
+                "exchange": "BSE",
+                "country": "IN",
+                "sector": "",
+                "market_id": self.market_id,
+            }
+            for d in matches
+        ]
 
     def search_company(self, name: str) -> list[dict[str, Any]]:
         return self.list_companies(query=name)
@@ -137,9 +256,12 @@ class INBseClient:
     # -- Company profile -----------------------------------------------------
 
     def get_profile(self, identifier: str) -> dict[str, Any]:
-        """Fetch company profile.
+        """Fetch company profile from BSE ComHeadernew API.
 
-        Uses yfinance for rich metadata (sector, industry, market cap).
+        Uses the ComHeadernew endpoint (works globally) for sector,
+        industry, ISIN, EPS, PE, market cap.  Enriches with company
+        name from the scrip directory.  No yfinance dependency.
+
         Profile is cached for 7 days.
         """
         cached = self._read_cache(identifier, "profile.json")
@@ -162,40 +284,85 @@ class INBseClient:
             "lei": "",
         }
 
-        self._enrich_from_yfinance(identifier, raw)
+        self._enrich_from_bse(identifier, raw)
 
         from operator1.clients.canonical_translator import translate_profile
         profile = translate_profile(raw, self.market_id)
         self._write_cache(identifier, "profile.json", profile)
         return profile
 
-    def _enrich_from_yfinance(self, identifier: str, raw: dict) -> None:
-        """Enrich profile with yfinance data (.NS/.BO suffix)."""
+    def _enrich_from_bse(self, identifier: str, raw: dict) -> None:
+        """Enrich profile using BSE native APIs (no yfinance).
+
+        Uses two BSE endpoints that work globally:
+        1. ComHeadernew: sector, industry, ISIN, EPS, PE ratios
+        2. ListofScripData (scrip directory): company name, market cap
+
+        The scrip code may be provided as a numeric code (500325) or
+        a ticker symbol (RELIANCE).  If a ticker is given, we resolve
+        it to a scrip code via the directory first.
+        """
+        scrip_code = identifier.strip()
+
+        # If identifier looks like a ticker (non-numeric), resolve via directory
+        if not scrip_code.isdigit():
+            directory = _get_scrip_directory()
+            matches = [
+                d for d in directory
+                if d.get("scrip_id", "").lower() == scrip_code.lower()
+            ]
+            if matches:
+                scrip_code = str(matches[0].get("SCRIP_CD", ""))
+                raw["name"] = matches[0].get("Scrip_Name", "")
+                raw["isin"] = matches[0].get("ISIN_NUMBER", "")
+                raw["ticker"] = matches[0].get("scrip_id", identifier)
+                try:
+                    raw["market_cap"] = str(float(matches[0].get("Mktcap", 0) or 0) * 1e7)
+                except (ValueError, TypeError):
+                    pass
+            else:
+                logger.debug("BSE: ticker %s not found in scrip directory", identifier)
+                return
+
+        # Enrich name from scrip directory if we have a scrip code
+        if not raw["name"]:
+            directory = _get_scrip_directory()
+            dir_match = [d for d in directory if d.get("SCRIP_CD", "") == scrip_code]
+            if dir_match:
+                raw["name"] = dir_match[0].get("Scrip_Name", "")
+                raw["isin"] = dir_match[0].get("ISIN_NUMBER", "")
+                raw["ticker"] = dir_match[0].get("scrip_id", identifier)
+                try:
+                    raw["market_cap"] = str(float(dir_match[0].get("Mktcap", 0) or 0) * 1e7)
+                except (ValueError, TypeError):
+                    pass
+
+        # Fetch detailed info from ComHeadernew (works globally)
         try:
-            import yfinance as yf
-
-            for suffix in [".NS", ".BO"]:
-                yf_ticker = f"{identifier}{suffix}"
-                t = yf.Ticker(yf_ticker)
-                info = t.info or {}
-
-                if info.get("longName") or info.get("shortName"):
-                    raw["name"] = info.get("longName") or info.get("shortName") or ""
-                    raw["sector"] = info.get("sector", "")
-                    raw["industry"] = info.get("industry", "")
-                    mc = info.get("marketCap")
-                    if mc:
-                        raw["market_cap"] = str(mc)
-                    shares = info.get("sharesOutstanding")
-                    if shares:
-                        raw["shares_outstanding"] = str(shares)
-                    raw["isin"] = info.get("isin", "")
-                    raw["exchange"] = info.get("exchange", "NSI")
-                    logger.info("yfinance enriched %s via %s: %s", identifier, yf_ticker, raw["name"])
-                    break
-
+            import requests
+            resp = requests.get(
+                f"{_BSE_BASE}/ComHeadernew/w",
+                params={"quotession": "", "scripcode": scrip_code},
+                headers=_BSE_HEADERS,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            info = resp.json()
+            if isinstance(info, dict) and info.get("SecurityCode"):
+                raw["sector"] = info.get("Sector", "")
+                raw["industry"] = info.get("IndustryNew", "")
+                raw["sub_industry"] = info.get("ISubGroup", "")
+                if info.get("ISIN"):
+                    raw["isin"] = info["ISIN"]
+                if info.get("SecurityId"):
+                    raw["ticker"] = info["SecurityId"]
+                raw["cik"] = str(info.get("SecurityCode", scrip_code))
+                logger.info(
+                    "BSE ComHeadernew enriched %s: %s (%s / %s)",
+                    scrip_code, raw["name"], raw["sector"], raw["industry"],
+                )
         except Exception as exc:
-            logger.debug("yfinance profile failed for %s: %s", identifier, exc)
+            logger.debug("BSE ComHeadernew failed for %s: %s", scrip_code, exc)
 
     # -- Financial statements ------------------------------------------------
 
