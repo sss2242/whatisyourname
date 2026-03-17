@@ -549,11 +549,34 @@ def _llm_resolve_company(
     if not llm_provider:
         return None
 
+    # Market-specific LLM resolution instructions
+    _LLM_MARKET_HINTS: dict[str, str] = {
+        "cn_sse": (
+            "The data source (baostock) only accepts Chinese stock ticker codes "
+            "(e.g. 600519 for Kweichow Moutai) or Chinese company names "
+            "(e.g. 贵州茅台). If the user provided an English name, please "
+            "return the 6-digit SSE/SZSE ticker code."
+        ),
+        "in_bse": (
+            "The data source (BSE India) accepts BSE scrip codes "
+            "(e.g. 500325 for Reliance), NSE ticker symbols (e.g. RELIANCE, TCS, INFY), "
+            "or company names. Please return the BSE ticker symbol."
+        ),
+        "ca_sedar": (
+            "The data source (TMX/TSX) accepts TSX ticker symbols "
+            "(e.g. RY for Royal Bank, SHOP for Shopify, ENB for Enbridge). "
+            "Please return the TSX ticker symbol."
+        ),
+    }
+    extra_hint = _LLM_MARKET_HINTS.get(market_id, "")
+
+    hint_block = f"\n\n{extra_hint}" if extra_hint else ""
     prompt = (
         f"I am searching for the company '{company}' on the "
         f"{market.country} {market.exchange} exchange (data source: {market.pit_api_name}).\n\n"
         f"The search failed. Can you tell me the correct ticker symbol or "
-        f"official company name that this exchange/data source would recognize?\n\n"
+        f"official company name that this exchange/data source would recognize?"
+        f"{hint_block}\n\n"
         f"Return ONLY the ticker or name -- no explanation, no punctuation, no quotes."
     )
 
@@ -744,6 +767,9 @@ def main() -> int:
         "tw_mops": "Enter a Taiwan stock code (2330) or company name (TSMC)",
         "br_cvm": "Enter a ticker (PETR4) or company name (Petrobras)",
         "cl_cmf": "Enter a ticker (SQM-B) or company name (SQM)",
+        "cn_sse": "Enter a ticker code (600519) or Chinese name (贵州茅台). English names will be resolved via LLM.",
+        "in_bse": "Enter a BSE scrip code (500325), ticker (RELIANCE), or company name (Tata Steel)",
+        "ca_sedar": "Enter a TSX symbol (RY, SHOP, ENB) or company name (Royal Bank)",
     }
     hint = _INPUT_HINTS.get(market_id, "Enter a ticker or company name")
 
