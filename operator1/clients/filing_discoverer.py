@@ -1726,6 +1726,81 @@ def _get_shared_llm_client():
     return _shared_llm_client
 
 
+def _try_fuzzy_extraction(
+    discoverer,
+    discovery,
+    cache_key: str,
+    market_id: str,
+    ticker: str,
+) -> "pd.DataFrame":
+    """Try fuzzy PDF parser on discovered filings (no LLM needed).
+
+    Downloads PDFs and uses camelot-py + fuzzy string matching to
+    extract financial data.  Returns a combined DataFrame in canonical
+    long format, or empty DataFrame if extraction fails.
+
+    This is called automatically when no LLM key is available, giving
+    all 9 filing-discoverer-backed markets a no-LLM fallback.
+    """
+    import pandas as pd
+
+    try:
+        from operator1.clients.fuzzy_pdf_parser import extract_financials_from_pdf
+    except ImportError:
+        logger.debug("fuzzy_pdf_parser not available for fallback")
+        return pd.DataFrame()
+
+    _type_priority = {"annual": 0, "interim": 1, "quarterly": 2}
+
+    def _sort_key(f):
+        tp = _type_priority.get(f.filing_type, 3)
+        fd = f.filing_date or "0000-00-00"
+        return (tp, "".join(chr(255 - ord(c)) for c in fd))
+
+    sorted_filings = sorted(discovery.filings, key=_sort_key)[:8]
+
+    all_records = []
+    for filing in sorted_filings:
+        try:
+            pdf_bytes = discoverer.download_filing(filing)
+        except Exception as exc:
+            logger.debug("PDF download failed for fuzzy fallback: %s", exc)
+            continue
+
+        rows = extract_financials_from_pdf(
+            pdf_bytes,
+            filing_date=filing.filing_date or "",
+            report_date=filing.report_date or "",
+        )
+        if rows:
+            df = pd.DataFrame(rows)
+            # Add canonical_name column (same as concept for fuzzy parser)
+            if "canonical_name" not in df.columns and "concept" in df.columns:
+                df["canonical_name"] = df["concept"]
+            df["market_id"] = market_id
+            df["currency"] = ""  # Will be filled by translator
+            all_records.append(df)
+            logger.info(
+                "Fuzzy extracted %d concepts from %s (%s, %s)",
+                len(rows), filing.title[:40] if filing.title else "?",
+                filing.filing_type, filing.report_date or "?",
+            )
+
+    if not all_records:
+        return pd.DataFrame()
+
+    combined = pd.concat(all_records, ignore_index=True)
+    for col in ("filing_date", "report_date"):
+        if col in combined.columns:
+            combined[col] = pd.to_datetime(combined[col], errors="coerce")
+
+    logger.info(
+        "Fuzzy PDF fallback for %s/%s: %d records from %d/%d filings",
+        market_id, ticker, len(combined), len(all_records), len(sorted_filings),
+    )
+    return combined
+
+
 def try_filing_extraction(
     ticker: str,
     market_id: str,
@@ -1815,8 +1890,20 @@ def try_filing_extraction(
 
         if llm_client is None:
             logger.info(
-                "No LLM client available for filing extraction (%s/%s) -- "
-                "set GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENROUTER_API_KEY",
+                "No LLM client available for %s/%s -- trying fuzzy PDF parser fallback",
+                market_id, ticker,
+            )
+            # Fuzzy PDF parser fallback: uses camelot-py + fuzzy string
+            # matching to extract financial data from PDFs without an LLM.
+            fuzzy_df = _try_fuzzy_extraction(discoverer, discovery, cache_key, market_id, ticker)
+            if not fuzzy_df.empty:
+                _extraction_cache[cache_key] = fuzzy_df
+                return _filter_by_statement_type(fuzzy_df, statement_type)
+
+            logger.info(
+                "Fuzzy PDF parser also returned empty for %s/%s -- "
+                "set GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENROUTER_API_KEY "
+                "for LLM-based extraction",
                 market_id, ticker,
             )
             _extraction_cache[cache_key] = pd.DataFrame()
