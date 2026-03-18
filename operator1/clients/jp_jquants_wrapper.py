@@ -162,7 +162,7 @@ class JPJquantsClient:
         if _jquants_eq_master_cache is not None:
             return _jquants_eq_master_cache
 
-        # Check disk cache
+        # Check disk cache (works even without API client)
         cache_path = self._cache_dir / "eq_master.parquet"
         if cache_path.exists():
             age_hours = (time.time() - cache_path.stat().st_mtime) / 3600
@@ -170,6 +170,14 @@ class JPJquantsClient:
                 try:
                     _jquants_eq_master_cache = pd.read_parquet(cache_path)
                     logger.debug("J-Quants eq_master loaded from disk cache (%d rows)", len(_jquants_eq_master_cache))
+                    return _jquants_eq_master_cache
+                except Exception:
+                    pass
+            # Cache expired but still return it if no client available
+            elif not self._client:
+                try:
+                    _jquants_eq_master_cache = pd.read_parquet(cache_path)
+                    logger.debug("J-Quants eq_master loaded from stale disk cache (%d rows)", len(_jquants_eq_master_cache))
                     return _jquants_eq_master_cache
                 except Exception:
                     pass
@@ -212,31 +220,27 @@ class JPJquantsClient:
         -------
         List of dicts with keys: identifier, name, exchange, sector.
         """
-        if not self._client:
-            logger.warning("J-Quants client not available")
-            return []
-
         try:
             df = self._get_eq_master_cached()
             if df.empty:
                 return []
 
             # Filter by query if provided
+            # Handle both column name patterns:
+            #   get_eq_master(): CoName, CoNameEn, S33Nm
+            #   get_list():      CompanyName, CompanyNameEnglish, Sector33CodeName
             if query:
-                query_lower = query.lower()
-                mask = (
-                    df.get("Code", pd.Series(dtype=str)).astype(str).str.contains(query, case=False, na=False) |
-                    df.get("CompanyName", pd.Series(dtype=str)).astype(str).str.contains(query, case=False, na=False) |
-                    df.get("CompanyNameEnglish", pd.Series(dtype=str)).astype(str).str.contains(query, case=False, na=False)
-                )
+                name_cols = [c for c in ("CoNameEn", "CoName", "CompanyNameEnglish", "CompanyName") if c in df.columns]
+                mask = df.get("Code", pd.Series(dtype=str)).astype(str).str.contains(query, case=False, na=False)
+                for col in name_cols:
+                    mask = mask | df[col].astype(str).str.contains(query, case=False, na=False)
                 df = df[mask]
 
             results = []
             for _, row in df.head(50).iterrows():
-                # get_list() returns full names: CompanyName, CompanyNameEnglish, Sector33CodeName
-                # get_eq_master() returns short: CoName, CoNameEn, S33Nm
-                name = str(row.get("CompanyNameEnglish", "") or row.get("CoNameEn", "") or row.get("CompanyName", "") or row.get("CoName", ""))
-                sector = str(row.get("Sector33CodeName", "") or row.get("S33Nm", "") or row.get("Sector17CodeName", "") or row.get("S17Nm", ""))
+                # Handle both column name patterns
+                name = str(row.get("CoNameEn", "") or row.get("CompanyNameEnglish", "") or row.get("CoName", "") or row.get("CompanyName", ""))
+                sector = str(row.get("S33NmEn", "") or row.get("S33Nm", "") or row.get("Sector33CodeName", ""))
                 ticker_code = str(row.get("Code", ""))[:4]
                 results.append({
                     "identifier": ticker_code,
@@ -263,9 +267,6 @@ class JPJquantsClient:
         -------
         Dict with company profile fields.
         """
-        if not self._client:
-            return {}
-
         try:
             # Normalize to 5-digit code (J-Quants uses 5 digits: 7203 -> 72030)
             code = identifier.strip()
@@ -363,30 +364,23 @@ class JPJquantsClient:
             if len(code) == 4:
                 code = code + "0"
 
-            # Fetch financial summary for the date range.
-            # Use code parameter to avoid fetching ALL companies
-            # (get_fin_summary_range without code returns thousands of rows
-            # and exceeds free-tier rate limits).
-            end_dt = datetime.now()
-            start_dt = end_dt - timedelta(days=365 * years)
-
-            # Docs: jquantsapi/client_v2.py get_fin_summary_range() method
-            # The SDK has built-in CSV caching: when cache_dir is set,
-            # it saves each day's response as a gzipped CSV and reads
-            # from disk on subsequent calls.  This eliminates API calls
-            # (and the 8-second throttle) for dates already fetched.
-            os.makedirs(_FIN_SUMMARY_CACHE_DIR, exist_ok=True)
+            # Use get_fin_summary(code=X) instead of get_fin_summary_range().
+            # get_fin_summary returns ALL financial summaries for a single
+            # company in ONE API call (~8 rows).  get_fin_summary_range
+            # iterates day-by-day over the date range, making hundreds of
+            # calls even with caching on first run.
+            #
+            # The single-call approach is dramatically faster:
+            #   get_fin_summary(code=X):      1 API call, ~2s
+            #   get_fin_summary_range(2 years): ~730 API calls, ~100min
             _jquants_throttle()
             try:
-                # Try code-filtered fetch first (faster, less API load)
-                df = self._client.get_fin_summary_range(
-                    start_dt=start_dt,
-                    end_dt=end_dt,
-                    code=code,
-                    cache_dir=_FIN_SUMMARY_CACHE_DIR,
-                )
+                df = self._client.get_fin_summary(code=code)
             except TypeError:
-                # Fallback: older SDK versions may not support code/cache_dir
+                # Fallback: older SDK versions may not support code param
+                end_dt = datetime.now()
+                start_dt = end_dt - timedelta(days=365 * years)
+                os.makedirs(_FIN_SUMMARY_CACHE_DIR, exist_ok=True)
                 try:
                     df = self._client.get_fin_summary_range(
                         start_dt=start_dt,
@@ -457,8 +451,11 @@ class JPJquantsClient:
                 }
                 for v2_col, canonical in _V2_INCOME_MAP.items():
                     val = row.get(v2_col)
-                    if pd.notna(val):
-                        rec[canonical] = float(val)
+                    if pd.notna(val) and str(val).strip() != "":
+                        try:
+                            rec[canonical] = float(val)
+                        except (ValueError, TypeError):
+                            pass
                 income_rows.append(rec)
 
             # Build balance sheet
@@ -470,8 +467,11 @@ class JPJquantsClient:
                 }
                 for v2_col, canonical in _V2_BALANCE_MAP.items():
                     val = row.get(v2_col)
-                    if pd.notna(val):
-                        rec[canonical] = float(val)
+                    if pd.notna(val) and str(val).strip() != "":
+                        try:
+                            rec[canonical] = float(val)
+                        except (ValueError, TypeError):
+                            pass
                 # Derive missing fields from accounting identities
                 ta = rec.get("total_assets")
                 eq = rec.get("total_equity")
@@ -488,8 +488,11 @@ class JPJquantsClient:
                 }
                 for v2_col, canonical in _V2_CASHFLOW_MAP.items():
                     val = row.get(v2_col)
-                    if pd.notna(val):
-                        rec[canonical] = float(val)
+                    if pd.notna(val) and str(val).strip() != "":
+                        try:
+                            rec[canonical] = float(val)
+                        except (ValueError, TypeError):
+                            pass
                 cashflow_rows.append(rec)
 
             # Log unmapped J-Quants V2 columns for diagnostic purposes.
@@ -533,9 +536,6 @@ class JPJquantsClient:
         -------
         List of dicts with peer company info.
         """
-        if not self._client:
-            return []
-
         try:
             # Get the target company's sector
             profile = self.get_profile(identifier)
@@ -549,10 +549,9 @@ class JPJquantsClient:
             if df.empty:
                 return []
 
-            # get_list() columns: Sector33CodeName, Sector17CodeName
-            # get_eq_master() columns: S33Nm, S17Nm
+            # Handle both column name patterns
             sector_col = None
-            for sc in ("Sector33CodeName", "S33Nm", "Sector17CodeName", "S17Nm"):
+            for sc in ("S33Nm", "Sector33CodeName", "S17Nm", "Sector17CodeName"):
                 if sc in df.columns:
                     sector_col = sc
                     break
@@ -568,9 +567,10 @@ class JPJquantsClient:
 
             results = []
             for _, row in peers_df.head(limit).iterrows():
+                name = str(row.get("CoNameEn", "") or row.get("CompanyNameEnglish", "") or row.get("CoName", "") or row.get("CompanyName", ""))
                 results.append({
                     "identifier": str(row.get("Code", ""))[:4],
-                    "name": str(row.get("CompanyNameEnglish", row.get("CompanyName", ""))),
+                    "name": name,
                     "exchange": "TSE",
                     "sector": str(row.get(sector_col, "")),
                 })
