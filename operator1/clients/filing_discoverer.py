@@ -1163,11 +1163,14 @@ class SEDARFilingDiscoverer:
 # JSE South Africa Filing Discoverer
 # ---------------------------------------------------------------------------
 
-_JSE_SENS_URL = "https://senspdf.jse.co.za/documents/sensnews"
+_JSE_PORTAL_BASE = "https://clientportal.jse.co.za"
+_JSE_SENS_URL = f"{_JSE_PORTAL_BASE}/_vti_bin/JSE/SENSService.svc/GetSensAnnouncementForDates"
 _JSE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-    "Accept": "application/json, text/html",
-    "Referer": "https://www.jse.co.za/",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Content-Type": "application/json",
 }
 
 
@@ -1214,187 +1217,161 @@ def _classify_jse_filing_type(title: str) -> str:
 
 
 class JSEFilingDiscoverer:
-    """Discovers financial result filings from JSE SENS.
+    """Discovers financial result filings from JSE SENS via WCF API.
 
-    JSE SENS (Stock Exchange News Service) publishes all company
-    announcements including financial results. Announcements include
-    PDF attachments with the actual financial statements.
+    Uses the JSE Client Portal WCF service to fetch SENS announcements
+    **per issuer** via ``GetSensAnnouncementsByIssuerMasterId``.  This
+    is a single API call that returns all recent announcements for one
+    company (analogous to J-Quants' ``get_financials()``).
 
-    The SENS system is the official disclosure platform for all
-    JSE-listed companies. Announcement dates are the true filing dates.
+    Each announcement includes a ``PDFPath`` field with a direct URL to
+    the filing PDF on ``senspdf.jse.co.za``.
+
+    The fast path requires resolving the ticker to a MasterID first
+    via the issuer directory (also a single API call, cached).
     """
+
+    def _resolve_master_id(self, ticker: str) -> int | None:
+        """Resolve a JSE ticker to a MasterID via the issuer directory."""
+        try:
+            resp = requests.post(
+                f"{_JSE_PORTAL_BASE}/_vti_bin/JSE/CustomerRoleService.svc/GetAllIssuers",
+                json={"filterLongName": "", "filterType": "Equity Issuer"},
+                headers=_JSE_HEADERS,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            issuers = resp.json()
+            if isinstance(issuers, list):
+                ticker_upper = ticker.strip().upper()
+                for issuer in issuers:
+                    if (issuer.get("AlphaCode", "").upper() == ticker_upper
+                            or issuer.get("CustomerAlphaCode", "").upper() == ticker_upper):
+                        return issuer.get("MasterID")
+        except Exception as exc:
+            logger.debug("JSE issuer resolution failed for %s: %s", ticker, exc)
+        return None
 
     def discover_filings(
         self,
         ticker: str,
         years: int = 2,
     ) -> FilingDiscovery:
-        """Discover financial result filings from JSE SENS.
+        """Discover financial result filings from JSE SENS (fast, single API call).
 
         Parameters
         ----------
         ticker:
             JSE ticker symbol (e.g. 'NPN' for Naspers, 'SOL' for Sasol).
         years:
-            Number of years to search back.
+            Number of years to search back (used for date filtering).
         """
         result = FilingDiscovery(ticker=ticker, market_id="za_jse")
 
-        today = date.today()
-        from_date = today - timedelta(days=365 * years)
+        # Step 1: Resolve ticker to MasterID
+        master_id = self._resolve_master_id(ticker)
+        if master_id is None:
+            result.errors.append(f"Could not resolve JSE ticker '{ticker}' to MasterID")
+            return result
 
-        # Search SENS for financial results announcements
-        for search_term in ["financial results", "annual results", "interim results"]:
-            try:
-                resp = requests.get(
-                    _JSE_SENS_URL,
-                    params={
-                        "keyword": f"{ticker} {search_term}",
-                        "fromDate": from_date.strftime("%Y-%m-%d"),
-                        "toDate": today.strftime("%Y-%m-%d"),
-                        "pageSize": "20",
-                    },
-                    headers=_JSE_HEADERS,
-                    timeout=15,
-                )
-                resp.raise_for_status()
-            except Exception as exc:
-                result.errors.append(f"JSE SENS search failed for '{search_term}': {exc}")
+        # Step 2: Get SENS announcements for this issuer (single API call)
+        try:
+            resp = requests.post(
+                f"{_JSE_PORTAL_BASE}/_vti_bin/JSE/SENSService.svc/GetSensAnnouncementsByIssuerMasterId",
+                json={"issuerMasterId": master_id},
+                headers=_JSE_HEADERS,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            result.errors.append(f"JSE SENS API failed: {exc}")
+            return result
+
+        # Extract announcements from the WCF response
+        result_key = next(iter(data.keys()), None) if isinstance(data, dict) else None
+        announcements = data.get(result_key, data) if result_key else data
+        if not isinstance(announcements, list):
+            announcements = []
+
+        cutoff = date.today() - timedelta(days=365 * years)
+
+        for ann in announcements:
+            headline = ann.get("FlashHeadline", "")
+            pdf_path = ann.get("PDFPath", "")
+            ann_id = ann.get("AnnouncementId", "")
+            ref = ann.get("AnnouncementReferenceNumber", "")
+
+            # Parse announcement date from .NET JSON date format
+            # Format: "/Date(1773843357873+0200)/"
+            filing_date = ""
+            raw_date = ann.get("AcknowledgeDateTime", "")
+            if raw_date and "/Date(" in str(raw_date):
+                try:
+                    ts_match = re.search(r"/Date\((\d+)", str(raw_date))
+                    if ts_match:
+                        ts_ms = int(ts_match.group(1))
+                        from datetime import datetime as _dt, timezone as _tz
+                        dt = _dt.fromtimestamp(ts_ms / 1000, tz=_tz.utc)
+                        filing_date = dt.strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+
+            # Apply date cutoff
+            if filing_date and filing_date < cutoff.isoformat():
                 continue
 
-            # Try JSON response first
-            try:
-                data = resp.json()
-                records = []
-                if isinstance(data, dict):
-                    records = data.get("data", data.get("items", data.get("result", [])))
-                elif isinstance(data, list):
-                    records = data
+            report_date = _parse_jse_report_date(headline)
+            filing_type = _classify_jse_filing_type(headline)
 
-                for item in records:
-                    title_text = item.get("title", item.get("headline", item.get("subject", "")))
-                    ann_date = item.get("publishDate", item.get("date", item.get("releaseDate", "")))
-                    doc_url = item.get("pdfUrl", item.get("documentUrl", item.get("url", "")))
-                    doc_id = item.get("id", item.get("sensId", ""))
+            filing = FilingMetadata(
+                title=headline,
+                filing_date=filing_date,
+                report_date=report_date,
+                document_url=pdf_path,
+                document_format="pdf",
+                filing_type=filing_type,
+                market_id="za_jse",
+                attachment_id=ann_id or ref,
+            )
+            result.filings.append(filing)
 
-                    if not title_text:
-                        continue
-
-                    # Filter to financial results only
-                    lower_title = title_text.lower()
-                    if not any(kw in lower_title for kw in [
-                        "financial result", "annual result", "interim result",
-                        "year ended", "year ending", "half year", "six months",
-                        "condensed", "audited", "reviewed",
-                    ]):
-                        continue
-
-                    filing_date = ""
-                    if ann_date:
-                        try:
-                            filing_date = str(ann_date)[:10]
-                        except Exception:
-                            pass
-
-                    # Build document URL
-                    if doc_url and not doc_url.startswith("http"):
-                        doc_url = f"https://senspdf.jse.co.za{doc_url}"
-
-                    report_date = _parse_jse_report_date(title_text)
-                    filing_type = _classify_jse_filing_type(title_text)
-
-                    filing = FilingMetadata(
-                        title=title_text,
-                        filing_date=filing_date,
-                        report_date=report_date,
-                        document_url=doc_url,
-                        document_format="pdf",
-                        filing_type=filing_type,
-                        market_id="za_jse",
-                        attachment_id=str(doc_id),
-                    )
-                    result.filings.append(filing)
-
-            except (ValueError, AttributeError):
-                # Not JSON -- try HTML parsing
-                html = resp.text
-                link_pattern = re.compile(
-                    r'href="([^"]*\.pdf)"',
-                    re.IGNORECASE,
-                )
-                date_pattern = re.compile(
-                    r'(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})',
-                )
-                title_pattern = re.compile(
-                    r'class="[^"]*(?:title|headline|subject)[^"]*"[^>]*>([^<]+)<',
-                    re.IGNORECASE,
-                )
-
-                links = link_pattern.findall(html)
-                dates = date_pattern.findall(html)
-                titles = title_pattern.findall(html)
-
-                for i, link in enumerate(links[:10]):
-                    doc_url = link if link.startswith("http") else f"https://senspdf.jse.co.za{link}"
-                    title_text = titles[i].strip() if i < len(titles) else search_term
-                    date_str = dates[i] if i < len(dates) else ""
-
-                    filing_date = ""
-                    if date_str:
-                        if "/" in date_str:
-                            try:
-                                parts = date_str.split("/")
-                                filing_date = f"{parts[2]}-{parts[1]}-{parts[0]}"
-                            except Exception:
-                                pass
-                        else:
-                            filing_date = date_str[:10]
-
-                    report_date = _parse_jse_report_date(title_text)
-                    filing_type = _classify_jse_filing_type(title_text)
-
-                    filing = FilingMetadata(
-                        title=title_text,
-                        filing_date=filing_date,
-                        report_date=report_date,
-                        document_url=doc_url,
-                        document_format="pdf",
-                        filing_type=filing_type,
-                        market_id="za_jse",
-                    )
-                    result.filings.append(filing)
-
-        # Dedup by document URL
+        # Dedup by PDF URL
         seen_urls: set[str] = set()
         unique: list[FilingMetadata] = []
         for f in result.filings:
-            if f.document_url and f.document_url not in seen_urls:
-                seen_urls.add(f.document_url)
-                unique.append(f)
-            elif not f.document_url:
+            key = f.document_url or f.attachment_id or f.title
+            if key not in seen_urls:
+                seen_urls.add(key)
                 unique.append(f)
         result.filings = unique
 
         logger.info(
-            "JSE discovery for %s: found %d filings (%d annual, %d interim)",
-            ticker, len(result.filings),
+            "JSE SENS discovery for %s (MasterID=%d): %d filings (%d annual, %d interim)",
+            ticker, master_id, len(result.filings),
             len(result.annual_filings()), len(result.quarterly_filings()),
         )
         return result
 
     def download_filing(self, filing: FilingMetadata) -> bytes:
-        """Download a JSE SENS filing document."""
+        """Download a JSE SENS filing PDF.
+
+        PDFs are served as static files from senspdf.jse.co.za.
+        No authentication required.
+        """
         if not filing.document_url:
             raise ValueError("No document URL in filing metadata")
 
         resp = requests.get(
             filing.document_url,
-            headers=_JSE_HEADERS,
+            headers={
+                "User-Agent": _JSE_HEADERS["User-Agent"],
+                "Accept": "application/pdf",
+            },
             timeout=30,
         )
         resp.raise_for_status()
 
-        # Validate it's a PDF
         if resp.content[:4] != b"%PDF":
             raise ValueError(
                 f"Expected PDF but got {resp.headers.get('Content-Type', 'unknown')}"
@@ -1411,131 +1388,245 @@ class JSEFilingDiscoverer:
 # BMV Mexico Filing Discoverer
 # ---------------------------------------------------------------------------
 
-_BMV_EMISNET_URL = "https://emisnet.bmv.com.mx/informacion-financiera"
+_BMV_BASE_URL = "https://www.bmv.com.mx"
+_BMV_TOKEN_URL = f"{_BMV_BASE_URL}/rest/tokenservice/token"
+_BMV_SEARCH_URL = f"{_BMV_BASE_URL}/api/searchservice/v1"
 _BMV_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-    "Accept": "application/json, text/html",
-    "Referer": "https://www.bmv.com.mx/",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
 }
 
 
 class BMVFilingDiscoverer:
-    """Discovers financial filings from BMV/CNBV (Mexico).
+    """Discovers financial filings from BMV (Mexico).
 
-    Uses the BMV EMISNET disclosure portal to find financial statement
-    announcements. EMISNET is the official electronic disclosure system
-    for all BMV-listed companies.
+    Uses the BMV WSO2 API Gateway search endpoint to find financial
+    filings and corporate documents. The API requires a Bearer token
+    obtained from a public endpoint (no API key needed).
 
-    The BMV API is undocumented, so this discoverer tries multiple
-    endpoint patterns and falls back to HTML parsing.
+    The BMV search API returns an ElasticSearch-backed response with
+    company instruments and associated documents (quarterly records,
+    issuer events, corporate actions, etc.). Document PDFs are served
+    from ``bmv.com.mx/docs-pub/`` and ``bmv.com.mx/docs-dig/`` paths.
+
+    This is analogous to the HKEX approach: obtain a session token,
+    then query a JSON search API, then download static PDFs.
     """
+
+    def __init__(self) -> None:
+        self._token: str = ""
+        self._token_time: float = 0.0
+
+    def _get_token(self) -> str:
+        """Obtain or refresh the BMV API Bearer token."""
+        import time as _time
+        now = _time.time()
+        if self._token and (now - self._token_time) < 3600:
+            return self._token
+        try:
+            resp = requests.get(_BMV_TOKEN_URL, headers=_BMV_HEADERS, timeout=15)
+            resp.raise_for_status()
+            self._token = resp.json()["response"]["access_token"]
+            self._token_time = now
+        except Exception as exc:
+            logger.warning("BMV token acquisition failed: %s", exc)
+            if not self._token:
+                raise
+        return self._token
+
+    def _search(self, term: str, search_type: str = "busquedaPanel", lang: str = "es") -> dict:
+        """Execute a BMV search API call."""
+        token = self._get_token()
+        parts = term.strip().split(" ", 1)
+        payload = {
+            "lang": lang,
+            "payload": {
+                "term": parts[0],
+                "term2": parts[1] if len(parts) > 1 else "",
+                "termT": term.strip(),
+                "searchType": search_type,
+            },
+        }
+        try:
+            resp = requests.post(
+                _BMV_SEARCH_URL,
+                json=payload,
+                headers={
+                    **_BMV_HEADERS,
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            logger.debug("BMV search failed for '%s': %s", term, exc)
+            return {}
 
     def discover_filings(
         self,
         ticker: str,
         years: int = 2,
     ) -> FilingDiscovery:
-        """Discover financial filings from BMV EMISNET.
+        """Discover financial filings from BMV search API.
 
         Parameters
         ----------
         ticker:
-            BMV ticker symbol (e.g. 'AMXL', 'WALMEX', 'FEMSAUBD').
+            BMV ticker symbol (e.g. 'AMX', 'WALMEX', 'CEMEX', 'BIMBO').
         years:
-            Number of years to search back.
+            Number of years to search back (used for filtering).
         """
         result = FilingDiscovery(ticker=ticker, market_id="mx_bmv")
 
         today = date.today()
-        from_date = today - timedelta(days=365 * years)
+        cutoff = today - timedelta(days=365 * years)
 
-        # Try the BMV issuer profile / financial info endpoints
-        for endpoint in [
-            f"https://www.bmv.com.mx/en/issuers/financial-information/{ticker}",
-            f"https://emisnet.bmv.com.mx/2009/emisoras_reportes.html?cb_emisora={ticker}&cb_tipo_doc=Informacion+Financiera",
-        ]:
+        # Search using busquedaPanel (returns documents alongside instruments)
+        try:
+            data = self._search(ticker, "busquedaPanel", "es")
+        except Exception as exc:
+            result.errors.append(f"BMV API unavailable: {exc}")
+            return result
+
+        # Extract documents from the response
+        panel = data.get("response", {}).get("busquedaPanel", {})
+        if not isinstance(panel, dict):
+            result.errors.append("BMV search returned unexpected format")
+            return result
+
+        # Navigate to documents section
+        doc_hits: list[dict] = []
+        try:
+            doc_hits = (
+                panel
+                .get("busquedaGeneral", {})
+                .get("instrumentosEmisoras", {})
+                .get("instrumentos", {})
+                .get("coincidenciaParcialInstrumentos", {})
+                .get("documentos", {})
+                .get("hits", [])
+            )
+        except (AttributeError, TypeError):
+            pass
+
+        for hit in doc_hits:
+            src = hit.get("_source", {})
+            doc_bin = src.get("documento_binario", {})
+
+            # Build document URL
+            doc_url = doc_bin.get("url_documento", "")
+            if doc_url and not doc_url.startswith("http"):
+                doc_url = f"{_BMV_BASE_URL}{doc_url}"
+
+            # Extract title (strip HTML tags)
+            title = src.get("descripccion_documento", "")
+            title = re.sub(r"<[^>]+>", "", title).strip()
+
+            tag = src.get("tag_en", src.get("tag_es", ""))
+            company = src.get("cve_empresa", "")
+
+            # Skip documents not related to this ticker
+            if company and company.upper() != ticker.upper():
+                # Allow partial match (e.g. search for "AMX" finds "AMX" company docs)
+                if ticker.upper() not in company.upper():
+                    continue
+
+            # Classify filing type from tag and title
+            tag_lower = tag.lower()
+            title_lower = title.lower()
+            if "annual" in tag_lower or "anual" in title_lower or "annual" in title_lower:
+                filing_type = "annual"
+            elif "quarterly" in tag_lower or "trimestral" in title_lower:
+                filing_type = "quarterly"
+            elif "interim" in tag_lower or "semestral" in title_lower:
+                filing_type = "interim"
+            else:
+                filing_type = "quarterly"
+
+            # Check if this is a financial filing (not just any corporate event)
+            is_financial = any(kw in tag_lower for kw in (
+                "quarterly", "annual", "financial", "results",
+            )) or any(kw in title_lower for kw in (
+                "trimestral", "anual", "financier", "resultados",
+                "constancia", "estado de resultado", "balance",
+            ))
+
+            # Parse filing date from document metadata
+            filing_date = str(src.get("fecha_publicacion", ""))[:10]
+
+            # Parse report date from title if present
+            report_date = ""
+            # Look for period patterns like "4-2025" or "2025"
+            period_match = re.search(r"(\d{1,2})\s*[-/]\s*(\d{4})", title)
+            if period_match:
+                quarter = int(period_match.group(1))
+                year = int(period_match.group(2))
+                # Map quarter to period end date
+                quarter_ends = {1: "03-31", 2: "06-30", 3: "09-30", 4: "12-31"}
+                report_date = f"{year}-{quarter_ends.get(quarter, '12-31')}"
+            else:
+                year_match = re.search(r"\b(20\d{2})\b", title)
+                if year_match:
+                    report_date = f"{year_match.group(1)}-12-31"
+
+            # Determine document format
+            doc_format = "pdf"
+            if doc_url.endswith((".xlsx", ".xls")):
+                doc_format = "excel"
+            elif doc_url.endswith((".htm", ".html")):
+                doc_format = "html"
+
+            filing = FilingMetadata(
+                title=title or f"{ticker} {tag}",
+                filing_date=filing_date,
+                report_date=report_date,
+                document_url=doc_url,
+                document_format=doc_format,
+                filing_type=filing_type,
+                market_id="mx_bmv",
+            )
+            result.filings.append(filing)
+
+        # Also try English search for additional coverage
+        if len(result.filings) < 3:
             try:
-                resp = requests.get(
-                    endpoint,
-                    headers=_BMV_HEADERS,
-                    timeout=15,
-                )
-                resp.raise_for_status()
-            except Exception as exc:
-                result.errors.append(f"BMV endpoint failed: {exc}")
-                continue
-
-            # Try JSON first
-            try:
-                data = resp.json()
-                records = []
-                if isinstance(data, dict):
-                    records = data.get("data", data.get("items", data.get("result", [])))
-                elif isinstance(data, list):
-                    records = data
-
-                for item in records:
-                    title_text = item.get("title", item.get("descripcion", item.get("nombre", "")))
-                    ann_date = item.get("date", item.get("fecha", item.get("fechaPublicacion", "")))
-                    doc_url = item.get("url", item.get("archivo", item.get("documentUrl", "")))
-
-                    if not title_text:
-                        continue
-
-                    filing_date = str(ann_date)[:10] if ann_date else ""
-
-                    lower = title_text.lower()
-                    if "anual" in lower or "annual" in lower or "year" in lower:
-                        filing_type = "annual"
-                    elif "trimestral" in lower or "quarter" in lower:
-                        filing_type = "quarterly"
-                    elif "semestral" in lower or "interim" in lower:
-                        filing_type = "interim"
-                    else:
-                        filing_type = "quarterly"
-
-                    # Parse report date
-                    report_date = ""
-                    rd_match = re.search(
-                        r"(\d{4})[/-](\d{2})[/-](\d{2})", str(ann_date)
+                data_en = self._search(ticker, "busquedaPanel", "en")
+                panel_en = data_en.get("response", {}).get("busquedaPanel", {})
+                if isinstance(panel_en, dict):
+                    doc_hits_en = (
+                        panel_en
+                        .get("busquedaGeneral", {})
+                        .get("instrumentosEmisoras", {})
+                        .get("instrumentos", {})
+                        .get("coincidenciaParcialInstrumentos", {})
+                        .get("documentos", {})
+                        .get("hits", [])
                     )
-                    if rd_match:
-                        report_date = f"{rd_match.group(1)}-{rd_match.group(2)}-{rd_match.group(3)}"
+                    existing_urls = {f.document_url for f in result.filings}
+                    for hit in doc_hits_en:
+                        src = hit.get("_source", {})
+                        doc_bin = src.get("documento_binario", {})
+                        doc_url = doc_bin.get("url_documento", "")
+                        if doc_url and not doc_url.startswith("http"):
+                            doc_url = f"{_BMV_BASE_URL}{doc_url}"
+                        if doc_url and doc_url not in existing_urls:
+                            title = re.sub(r"<[^>]+>", "", src.get("descripccion_documento", "")).strip()
+                            filing = FilingMetadata(
+                                title=title or f"{ticker} filing",
+                                document_url=doc_url,
+                                document_format="pdf",
+                                filing_type="quarterly",
+                                market_id="mx_bmv",
+                            )
+                            result.filings.append(filing)
+            except Exception:
+                pass
 
-                    if doc_url and not doc_url.startswith("http"):
-                        doc_url = f"https://emisnet.bmv.com.mx{doc_url}"
-
-                    filing = FilingMetadata(
-                        title=title_text,
-                        filing_date=filing_date,
-                        report_date=report_date,
-                        document_url=doc_url,
-                        document_format="pdf",
-                        filing_type=filing_type,
-                        market_id="mx_bmv",
-                    )
-                    result.filings.append(filing)
-
-            except (ValueError, AttributeError):
-                # HTML response -- parse for PDF links
-                html = resp.text
-                link_pattern = re.compile(
-                    r'href="([^"]*\.pdf)"',
-                    re.IGNORECASE,
-                )
-                links = link_pattern.findall(html)
-                for link in links[:10]:
-                    doc_url = link if link.startswith("http") else f"https://emisnet.bmv.com.mx{link}"
-                    filing = FilingMetadata(
-                        title=f"{ticker} financial filing",
-                        document_url=doc_url,
-                        document_format="pdf",
-                        filing_type="quarterly",
-                        market_id="mx_bmv",
-                    )
-                    result.filings.append(filing)
-
-        # Dedup
+        # Dedup by document URL
         seen: set[str] = set()
         unique: list[FilingMetadata] = []
         for f in result.filings:
@@ -1549,7 +1640,12 @@ class BMVFilingDiscoverer:
         return result
 
     def download_filing(self, filing: FilingMetadata) -> bytes:
-        """Download a BMV/EMISNET filing document."""
+        """Download a BMV filing document.
+
+        BMV documents are served as static files from bmv.com.mx/docs-pub/
+        and bmv.com.mx/docs-dig/ paths. No authentication required for
+        document download.
+        """
         if not filing.document_url:
             raise ValueError("No document URL in filing metadata")
         resp = requests.get(filing.document_url, headers=_BMV_HEADERS, timeout=30)
