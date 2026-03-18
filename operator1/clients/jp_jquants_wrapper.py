@@ -31,6 +31,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 _CACHE_DIR = Path("cache/jp_jquants")
+_FIN_SUMMARY_CACHE_DIR = str(Path("cache/jp_jquants/fin_summary_csv"))
 
 # J-Quants free plan: ~12 requests/minute.
 # Enforce an 8-second minimum interval between API calls to stay safe
@@ -150,8 +151,56 @@ class JPJquantsClient:
     # PITClient protocol methods
     # ------------------------------------------------------------------
 
+    def _get_eq_master_cached(self) -> pd.DataFrame:
+        """Get equity master with disk + memory caching.
+
+        First checks in-memory cache, then disk cache (Parquet),
+        then fetches from API.  Disk cache expires after 24 hours.
+        Eliminates repeated API calls for company search/profile.
+        """
+        global _jquants_eq_master_cache
+        if _jquants_eq_master_cache is not None:
+            return _jquants_eq_master_cache
+
+        # Check disk cache
+        cache_path = self._cache_dir / "eq_master.parquet"
+        if cache_path.exists():
+            age_hours = (time.time() - cache_path.stat().st_mtime) / 3600
+            if age_hours < 24:
+                try:
+                    _jquants_eq_master_cache = pd.read_parquet(cache_path)
+                    logger.debug("J-Quants eq_master loaded from disk cache (%d rows)", len(_jquants_eq_master_cache))
+                    return _jquants_eq_master_cache
+                except Exception:
+                    pass
+
+        # Fetch from API
+        if not self._client:
+            return pd.DataFrame()
+
+        _jquants_throttle()
+        try:
+            df = self._client.get_list()
+        except Exception:
+            df = pd.DataFrame()
+
+        if not df.empty:
+            _jquants_eq_master_cache = df
+            # Save to disk
+            try:
+                self._cache_dir.mkdir(parents=True, exist_ok=True)
+                df.to_parquet(cache_path, index=False)
+                logger.info("J-Quants eq_master cached to disk (%d rows)", len(df))
+            except Exception as exc:
+                logger.debug("Failed to cache eq_master to disk: %s", exc)
+
+        return df
+
     def list_companies(self, query: str = "") -> list[dict]:
         """Search or list Japanese companies via J-Quants equity master.
+
+        Uses disk-cached equity master (24h TTL) to avoid repeated API
+        calls.  Only fetches from J-Quants API if no cache exists.
 
         Parameters
         ----------
@@ -168,9 +217,7 @@ class JPJquantsClient:
             return []
 
         try:
-            # Docs: jquantsapi/client_v2.py get_list() method
-            _jquants_throttle()
-            df = self._client.get_list()
+            df = self._get_eq_master_cached()
             if df.empty:
                 return []
 
@@ -226,13 +273,15 @@ class JPJquantsClient:
             if len(code) == 4:
                 code = code + "0"
 
-            # Docs: jquantsapi/client_v2.py get_eq_master() method
-            _jquants_throttle()
-            try:
-                df = self._client.get_eq_master(code=code)
-            except TypeError:
-                # Older SDK may not support code param; fetch all and filter
-                df = self._client.get_eq_master()
+            # Use the cached equity master to avoid an extra API call.
+            # Falls back to direct API call if cache is empty.
+            df = self._get_eq_master_cached()
+            if df.empty and self._client:
+                _jquants_throttle()
+                try:
+                    df = self._client.get_eq_master(code=code)
+                except TypeError:
+                    df = self._client.get_eq_master()
 
             if df.empty:
                 return {}
@@ -322,6 +371,11 @@ class JPJquantsClient:
             start_dt = end_dt - timedelta(days=365 * years)
 
             # Docs: jquantsapi/client_v2.py get_fin_summary_range() method
+            # The SDK has built-in CSV caching: when cache_dir is set,
+            # it saves each day's response as a gzipped CSV and reads
+            # from disk on subsequent calls.  This eliminates API calls
+            # (and the 8-second throttle) for dates already fetched.
+            os.makedirs(_FIN_SUMMARY_CACHE_DIR, exist_ok=True)
             _jquants_throttle()
             try:
                 # Try code-filtered fetch first (faster, less API load)
@@ -329,13 +383,21 @@ class JPJquantsClient:
                     start_dt=start_dt,
                     end_dt=end_dt,
                     code=code,
+                    cache_dir=_FIN_SUMMARY_CACHE_DIR,
                 )
             except TypeError:
-                # Fallback: older SDK versions may not support code param
-                df = self._client.get_fin_summary_range(
-                    start_dt=start_dt,
-                    end_dt=end_dt,
-                )
+                # Fallback: older SDK versions may not support code/cache_dir
+                try:
+                    df = self._client.get_fin_summary_range(
+                        start_dt=start_dt,
+                        end_dt=end_dt,
+                        cache_dir=_FIN_SUMMARY_CACHE_DIR,
+                    )
+                except TypeError:
+                    df = self._client.get_fin_summary_range(
+                        start_dt=start_dt,
+                        end_dt=end_dt,
+                    )
 
             if df.empty:
                 return empty
@@ -482,9 +544,8 @@ class JPJquantsClient:
 
             target_sector = profile["sector"]
 
-            # Get all companies and filter by sector
-            _jquants_throttle()
-            df = self._client.get_list()
+            # Get all companies from cached master (no extra API call)
+            df = self._get_eq_master_cached()
             if df.empty:
                 return []
 
