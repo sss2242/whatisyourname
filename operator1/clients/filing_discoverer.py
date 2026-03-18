@@ -614,19 +614,50 @@ class HKEXFilingDiscoverer:
 # SGX Singapore Filing Discoverer
 # ---------------------------------------------------------------------------
 
-_SGX_ANN_URL = "https://api.sgx.com/announcements/v1.0"
+_SGX_REPORTS_URL = "https://api.sgx.com/financialreports/v1.0"
+_SGX_LINKS_BASE = "https://links.sgx.com"
 _SGX_ANN_HEADERS = {
-    "User-Agent": "Operator1/1.0",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
     "Accept": "application/json",
 }
 
 
 class SGXFilingDiscoverer:
-    """Discovers financial result filings from SGX announcements API.
+    """Discovers financial report filings from SGX Financial Reports API.
 
-    SGX provides a public announcements endpoint that returns JSON
-    with filing metadata including PDF attachment URLs.
+    Uses the public ``api.sgx.com/financialreports/v1.0`` endpoint which
+    returns annual/sustainability reports with PDF download links.  Works
+    globally without authentication.
+
+    Flow:
+        1. Query ``financialreports/v1.0?companyname={NAME}`` for filings.
+        2. Each filing has a ``url`` field pointing to an HTML document page.
+        3. The document page contains ``<a>`` links to actual PDF files on
+           ``links.sgx.com``.
+        4. Download the PDF directly.
+
+    Coverage: 1,369 unique companies, 12,674+ total reports.
     """
+
+    def _resolve_company_name(self, ticker: str) -> str:
+        """Resolve a ticker code to the full company name used by SGX.
+
+        The financial reports API filters by company name, not ticker.
+        We use the securities directory to map ticker -> company name.
+        """
+        try:
+            from operator1.clients.sg_sgx import _get_securities_directory, _search_securities
+            directory = _get_securities_directory()
+            if directory:
+                matches = _search_securities(ticker, directory, max_results=1)
+                if matches and matches[0].get("n"):
+                    return matches[0]["n"]
+        except Exception:
+            pass
+        return ticker
 
     def discover_filings(
         self,
@@ -635,104 +666,122 @@ class SGXFilingDiscoverer:
     ) -> FilingDiscovery:
         result = FilingDiscovery(ticker=ticker, market_id="sg_sgx")
 
+        from datetime import datetime
+
         today = date.today()
-        from_date = today - timedelta(days=365 * years)
+        cutoff = today - timedelta(days=365 * years)
+
+        # Resolve ticker to company name for the API query
+        company_name = self._resolve_company_name(ticker)
 
         try:
-            data = cached_get(
-                _SGX_ANN_URL,
+            resp = requests.get(
+                _SGX_REPORTS_URL,
                 params={
-                    "company": ticker,
-                    "category": "FINANCIAL_RESULTS",
-                    "pagesize": "20",
+                    "companyname": company_name,
                     "pagestart": "0",
-                    "from": from_date.strftime("%Y-%m-%d"),
-                    "to": today.strftime("%Y-%m-%d"),
+                    "pagesize": "50",
                 },
                 headers=_SGX_ANN_HEADERS,
+                timeout=30,
             )
+            resp.raise_for_status()
+            data = resp.json()
         except Exception as exc:
-            result.errors.append(f"SGX API request failed: {exc}")
+            result.errors.append(f"SGX Financial Reports API failed: {exc}")
             return result
 
-        items = []
-        if isinstance(data, dict):
-            items = data.get("data", data.get("result", []))
-        elif isinstance(data, list):
-            items = data
+        items = data.get("data", [])
+        if not items:
+            # Try with the raw ticker as company name
+            if company_name != ticker:
+                try:
+                    resp2 = requests.get(
+                        _SGX_REPORTS_URL,
+                        params={
+                            "companyname": ticker,
+                            "pagestart": "0",
+                            "pagesize": "50",
+                        },
+                        headers=_SGX_ANN_HEADERS,
+                        timeout=30,
+                    )
+                    resp2.raise_for_status()
+                    items = resp2.json().get("data", [])
+                except Exception:
+                    pass
 
         if not items:
-            result.errors.append("No financial result filings found on SGX")
+            result.errors.append(f"No financial reports found on SGX for {company_name}")
             return result
 
         for item in items:
-            title_text = item.get("title", item.get("headline", ""))
-            ann_date = item.get("date", item.get("announcementDate", ""))
-            attachments = item.get("attachments", [])
+            title_text = item.get("title", "")
+            company = item.get("companyName", "")
+            doc_date_ms = item.get("documentDate", 0)
+            doc_url = item.get("url", "")
 
-            if not title_text:
+            if not title_text or not doc_url:
                 continue
 
-            # Determine filing type from title
+            # Parse document date from epoch milliseconds
+            filing_date = ""
+            report_date = ""
+            if doc_date_ms:
+                try:
+                    dt = datetime.fromtimestamp(doc_date_ms / 1000)
+                    filing_date = dt.strftime("%Y-%m-%d")
+                    report_date = filing_date  # SGX reports use fiscal year end
+                except (ValueError, OSError):
+                    pass
+
+            # Filter by date range
+            if report_date and report_date < cutoff.isoformat():
+                continue
+
+            # Classify filing type from title
             lower = title_text.lower()
-            if "full year" in lower or "annual" in lower:
+            if "annual" in lower:
                 filing_type = "annual"
-            elif "half year" in lower or "six months" in lower:
+            elif "sustainability" in lower:
+                filing_type = "annual"  # sustainability reports align with annual
+            elif "interim" in lower or "half" in lower:
                 filing_type = "interim"
-            elif "quarter" in lower or "three months" in lower:
+            elif "quarter" in lower:
                 filing_type = "quarterly"
             else:
                 filing_type = "annual"
 
-            # Parse report date from title
-            report_date = ""
-            rd_match = re.search(r"[Ee]nded\s+(\d{1,2})\s+(\w+)\s+(\d{4})", title_text)
-            if rd_match:
-                months = {
-                    "january": "01", "february": "02", "march": "03", "april": "04",
-                    "may": "05", "june": "06", "july": "07", "august": "08",
-                    "september": "09", "october": "10", "november": "11", "december": "12",
-                }
-                m = rd_match.group(2).lower()
-                if m in months:
-                    report_date = f"{rd_match.group(3)}-{months[m]}-{int(rd_match.group(1)):02d}"
-
-            filing_date = str(ann_date)[:10] if ann_date else ""
-
-            # Get PDF URL from attachments
-            doc_url = ""
-            for att in attachments if isinstance(attachments, list) else []:
-                url = att.get("url", att.get("fileUrl", ""))
-                if url and url.lower().endswith(".pdf"):
-                    doc_url = url if url.startswith("http") else f"https://api.sgx.com{url}"
-                    break
-
-            if not doc_url and isinstance(item.get("url", ""), str):
-                doc_url = item["url"]
-
             filing = FilingMetadata(
-                title=title_text,
+                title=f"{company} - {title_text}",
                 filing_date=filing_date,
                 report_date=report_date,
                 document_url=doc_url,
                 document_format="pdf",
                 filing_type=filing_type,
                 market_id="sg_sgx",
+                attachment_id=item.get("id", ""),
             )
             result.filings.append(filing)
 
         logger.info(
-            "SGX discovery for %s: found %d filings (%d annual, %d interim)",
-            ticker, len(result.filings),
+            "SGX discovery for %s (%s): found %d filings (%d annual, %d interim)",
+            ticker, company_name, len(result.filings),
             len(result.annual_filings()), len(result.quarterly_filings()),
         )
         return result
 
     def download_filing(self, filing: FilingMetadata) -> bytes:
-        """Download an SGX filing document."""
+        """Download an SGX filing PDF.
+
+        SGX document URLs point to HTML pages containing links to the
+        actual PDF files.  This method fetches the HTML page, extracts
+        the first PDF link, and downloads the PDF.
+        """
         if not filing.document_url:
             raise ValueError("No document URL in filing metadata")
 
+        # Step 1: Fetch the document page (HTML with PDF links)
         resp = requests.get(
             filing.document_url,
             headers=_SGX_ANN_HEADERS,
@@ -740,16 +789,49 @@ class SGXFilingDiscoverer:
         )
         resp.raise_for_status()
 
-        if resp.content[:4] != b"%PDF":
+        # If the response is already a PDF, return it directly
+        if resp.content[:4] == b"%PDF":
+            logger.info(
+                "Downloaded SGX filing (direct PDF): %s (%d bytes)",
+                filing.title[:60], len(resp.content),
+            )
+            return resp.content
+
+        # Step 2: Parse HTML page for PDF links
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(resp.text, "html.parser")
+            pdf_links = [
+                a["href"] for a in soup.find_all("a", href=True)
+                if a["href"].endswith(".pdf")
+            ]
+        except ImportError:
+            # Fallback: regex extraction if BeautifulSoup unavailable
+            pdf_links = re.findall(r'href="([^"]+\.pdf)"', resp.text)
+
+        if not pdf_links:
             raise ValueError(
-                f"Expected PDF but got {resp.headers.get('Content-Type', 'unknown')}"
+                f"No PDF links found on document page: {filing.document_url}"
+            )
+
+        # Step 3: Download the first PDF
+        pdf_url = pdf_links[0]
+        if pdf_url.startswith("/"):
+            pdf_url = _SGX_LINKS_BASE + pdf_url
+
+        pdf_resp = requests.get(pdf_url, headers=_SGX_ANN_HEADERS, timeout=60)
+        pdf_resp.raise_for_status()
+
+        if pdf_resp.content[:4] != b"%PDF":
+            raise ValueError(
+                f"Expected PDF but got {pdf_resp.headers.get('Content-Type', 'unknown')}"
             )
 
         logger.info(
-            "Downloaded SGX filing: %s (%d bytes)",
-            filing.title[:60], len(resp.content),
+            "Downloaded SGX filing: %s (%d bytes, from %s)",
+            filing.title[:60], len(pdf_resp.content), pdf_url.split("/")[-1],
         )
-        return resp.content
+        return pdf_resp.content
 
 
 # ---------------------------------------------------------------------------
