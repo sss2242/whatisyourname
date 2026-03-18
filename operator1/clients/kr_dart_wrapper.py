@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
 
