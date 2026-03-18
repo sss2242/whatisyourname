@@ -15,7 +15,7 @@ Current state of all 15 Tier 2 market wrappers based on code review.
 | 7 | **Saudi Arabia** `sa_tadawul` | yfinance (.SR) | Tadawul API (broken) | Filing discovery + LLM only | yfinance (.SR) | TadawulFilingDiscoverer (registered) |
 | 8 | **Switzerland** `ch_six` | yfinance (.SW) | Broken | None | yfinance (.SW) | None registered |
 | 9 | **South Africa** `za_jse` | **JSE WCF API (ISIN, sector, market cap) + yfinance** | **JSE Issuer Directory (298 equity issuers)** | **JSE SENS per-issuer API (instant) + LLM extraction** | yfinance (.JO) | **JSEFilingDiscoverer (WCF SENS API, per-issuer fast path, PDF download confirmed)** |
-| 10 | **Mexico** `mx_bmv` | **BMV WSO2 Search API + yfinance** | **BMV Search API (150+ issuers, token-based)** | **BMV Search API (filing discovery) + LLM extraction** | yfinance (.MX) | **BMVFilingDiscoverer (token-based search API, PDF download confirmed)** |
+| 10 | **Mexico** `mx_bmv` | **BMV WSO2 Search API + yfinance** | **BMV Search API (244 issuers, token-based)** | **BMV XBRL JSON (native, no LLM needed, 5,817 ZIPs)** | yfinance (.MX) | **BMVFilingDiscoverer (token-based search API) + XBRL fast path** |
 | 11 | **UAE** `ae_dfm` | yfinance (.AE) | DFM API (broken) | Filing discovery + LLM only | yfinance (.AE) | DFMFilingDiscoverer (registered, untested) |
 | 12 | **Netherlands** `nl_esef` | ESEF partial | ESEF API (0 results) | ESEF API (0 results) | yfinance | None registered |
 | 13 | **Spain** `es_esef` | ESEF partial | ESEF API (0 results) | ESEF API (0 results) | yfinance | None registered |
@@ -74,12 +74,12 @@ Current state of all 15 Tier 2 market wrappers based on code review.
 - No authentication required (public SharePoint WCF endpoints)
 - Financials: need LLM client for PDF extraction (discovery + download both work)
 
-**Mexico (`mx_bmv`)** -- newly fixed (HKEX pattern applied)
+**Mexico (`mx_bmv`)** -- newly fixed (HKEX pattern + XBRL extraction)
 - Profile: BMV WSO2 Search API (name, ticker, series, market, status, company IDs) + yfinance supplement for sector/industry
-- Search: BMV Search API via ElasticSearch backend (150+ issuers, dual search type: `busquedaClaveCotizacion` for instruments, `busquedaPanel` for documents). All major tickers confirmed: AMX, WALMEX, CEMEX, BIMBO, FEMSA.
-- Filing discovery: BMVFilingDiscoverer uses `busquedaPanel` search type which returns quarterly records, issuer events, corporate docs with PDF URLs on `docs-pub/` and `docs-dig/` paths.
-- Token-based auth: `GET /rest/tokenservice/token` returns Bearer token (no API key needed). Same WSO2 API Manager pattern as enterprise search.
-- Financials: need LLM client for PDF extraction (discovery + download both work, 99KB WALMEX PDF confirmed)
+- Search: BMV Search API via ElasticSearch backend (244 issuers, dual search type: `busquedaClaveCotizacion` for instruments, `busquedaPanel` for documents). All major tickers confirmed: AMX, WALMEX, CEMEX, BIMBO, FEMSA.
+- **Financials: BMV XBRL JSON extraction (fast path, NO LLM NEEDED)**. The BMV XBRL page contains 5,817 XBRL JSON ZIPs for 244 issuers. Each ZIP (~767KB) contains structured IFRS financial data extracted directly. Tested: WALMEX (115 income rows, 114 balance rows, 55 cashflow rows), AMX, CEMEX -- all with revenue, total_assets, cash, EPS, etc.
+- Filing discovery (fallback): BMVFilingDiscoverer uses `busquedaPanel` search type for PDF documents.
+- Token-based auth: `GET /rest/tokenservice/token` returns Bearer token (no API key needed).
 
 ### Filing discovery working (scraper fixed)
 
@@ -120,6 +120,6 @@ All 15 markets return daily OHLCV data via yfinance or regional wrappers (baosto
 |-----------|---------|---------|--------|
 | Profile | IN, CN, AU, CA, SG, **MX**, **ZA** + 4 via yfinance | NL, ES, IT, SE (ESEF partial) | -- |
 | Company Search | IN, CN, AU, CA, SG, **MX**, **ZA** | -- | HK (yfinance only), SA, CH, AE, NL, ES, IT, SE |
-| Financial Statements | IN (native), CN (akshare) | AU, CA, HK, SG, **MX**, SA, **ZA**, AE (need LLM) | CH, NL, ES, IT, SE (no path) |
+| Financial Statements | IN (native), CN (akshare), **MX (XBRL JSON)** | AU, CA, HK, SG, SA, **ZA**, AE (need LLM) | CH, NL, ES, IT, SE (no path) |
 | OHLCV | All 15 | -- | -- |
 | Filing Discovery | IN, AU, CA, HK, SG, **MX**, SA, **ZA**, AE | -- | CH, NL, ES, IT, SE (none registered) |
