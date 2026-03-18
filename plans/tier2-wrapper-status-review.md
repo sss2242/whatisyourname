@@ -11,7 +11,7 @@ Current state of all 15 Tier 2 market wrappers based on code review.
 | 3 | **Canada** `ca_sedar` | TMX GraphQL API | TMX Directory (2,900 TSX + 1,800 TSXV) | Filing discovery + LLM only | yfinance (.TO) | SEDARFilingDiscoverer (Catalyst form POST, bypasses WAF) |
 | 4 | **Hong Kong** `hk_hkex` | yfinance (.HK) | yfinance (.HK) | Filing discovery + LLM only | yfinance (.HK) | HKEXScraper (date-windowed JSON API, works globally) |
 | 5 | **China** `cn_sse` | baostock + yfinance | baostock (8,600+ securities, ticker only) | akshare/Sina Finance (primary, PIT dates) + baostock fallback | baostock | N/A (uses akshare directly) |
-| 6 | **Singapore** `sg_sgx` | yfinance (.SI) | SGX API (broken) | Filing discovery + LLM only | yfinance (.SI) | SGXFilingDiscoverer (registered) |
+| 6 | **Singapore** `sg_sgx` | **SGX Securities API + yfinance** | **SGX Securities API (561 stocks)** | **SGX Financial Reports API (discovery) + LLM extraction** | yfinance (.SI) | **SGXFilingDiscoverer (financialreports API, PDF download confirmed)** |
 | 7 | **Saudi Arabia** `sa_tadawul` | yfinance (.SR) | Tadawul API (broken) | Filing discovery + LLM only | yfinance (.SR) | TadawulFilingDiscoverer (registered) |
 | 8 | **Switzerland** `ch_six` | yfinance (.SW) | Broken | None | yfinance (.SW) | None registered |
 | 9 | **South Africa** `za_jse` | yfinance (.JO) | JSE API (broken) | Filing discovery + LLM only | yfinance (.JO) | JSEFilingDiscoverer (registered, untested) |
@@ -42,6 +42,12 @@ Current state of all 15 Tier 2 market wrappers based on code review.
 - Profile: baostock basic info + yfinance supplement
 - Chinese field names mapped to canonical schema (48 fields across 3 statements)
 - Works globally (Sina Finance is not geo-blocked)
+
+**Singapore (`sg_sgx`)** -- newly fixed
+- Profile: SGX Securities API (name, ticker, currency, board) + yfinance supplement for sector/industry
+- Search: SGX Securities API directory (561 stocks, client-side fuzzy match by ticker or name)
+- Filing discovery: SGX Financial Reports API (12,674 reports, `companyname` filter). Two-step PDF download (HTML page -> PDF links). DBS Annual Report 2025 = 8.3MB valid PDF.
+- Financials: need LLM client for PDF content extraction (discovery + download both work)
 
 ### Profile + Search working (native APIs)
 
@@ -74,12 +80,12 @@ All 15 markets return daily OHLCV data via yfinance or regional wrappers (baosto
 ## What Doesn't Work
 
 ### Financial statements (10/15 need LLM)
-- AU, CA, HK, SG, SA, ZA, MX, AE: have filing discoverers but need an LLM client (Gemini/Claude/OpenRouter API key) to extract structured data from PDFs
+- AU, CA, HK, SG, SA, ZA, MX, AE: have filing discoverers (discovery + PDF download work) but need an LLM client (Gemini/Claude/OpenRouter API key) to extract structured data from PDFs
 - CH, NL, ES, IT, SE: no filing discoverer registered, no native financial API
 - yfinance intentionally NOT used for financials (no filing dates = no PIT compliance)
 
-### Company search (7/15 broken)
-- SG (SGX API unreachable), SA (Tadawul returns HTML), ZA (JSE API broken), MX (BMV API broken), AE (DFM API broken), CH (SIX API broken): native APIs return HTML or are unreachable
+### Company search (6/15 broken)
+- SA (Tadawul returns HTML), ZA (JSE API broken), MX (BMV API broken), AE (DFM API broken), CH (SIX API broken): native APIs return HTML or are unreachable
 - NL, ES, IT, SE: ESEF API returns 0 results for company name searches
 
 ### ESEF markets (4/15 barely functional)
@@ -93,8 +99,8 @@ All 15 markets return daily OHLCV data via yfinance or regional wrappers (baosto
 
 | Capability | Working | Partial | Broken |
 |-----------|---------|---------|--------|
-| Profile | IN, CN, AU, CA + 7 via yfinance | NL, ES, IT, SE (ESEF partial) | -- |
-| Company Search | IN, CN, AU, CA | -- | HK (yfinance only), SG, SA, CH, ZA, MX, AE, NL, ES, IT, SE |
+| Profile | IN, CN, AU, CA, SG + 6 via yfinance | NL, ES, IT, SE (ESEF partial) | -- |
+| Company Search | IN, CN, AU, CA, SG | -- | HK (yfinance only), SA, CH, ZA, MX, AE, NL, ES, IT, SE |
 | Financial Statements | IN (native), CN (akshare) | AU, CA, HK, SG, SA, ZA, MX, AE (need LLM) | CH, NL, ES, IT, SE (no path) |
 | OHLCV | All 15 | -- | -- |
 | Filing Discovery | IN, AU, CA, HK, SG, SA, ZA, MX, AE | -- | CH, NL, ES, IT, SE (none registered) |
