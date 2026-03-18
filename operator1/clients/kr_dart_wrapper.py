@@ -59,6 +59,14 @@ class KRDartClient:
     Implements the ``PITClient`` protocol. Uses dart-fss as primary
     library with direct DART API as fallback.
 
+    **Cross-statement caching**: The DART ``fnlttSinglAcntAll.json``
+    endpoint returns ALL financial line items (income + balance + cashflow)
+    in a single response.  On the first call for any statement type, we
+    fetch all periods at once (8 API calls for 2 years x 4 periods) and
+    cache the combined result.  Subsequent calls for the same company
+    but different statement types are served from cache, reducing total
+    API calls from 36 (3 types x 12 periods) to 8.
+
     Parameters
     ----------
     api_key:
@@ -77,6 +85,9 @@ class KRDartClient:
         self._cache_dir = Path(cache_dir)
         self._dart_fss_available = False
         self._corp_list_cache: list[dict[str, Any]] | None = None
+        # Cross-statement cache: identifier -> {all raw rows from fnlttSinglAcntAll}
+        # Populated on first financial fetch, reused for all 3 statement types.
+        self._financial_cache: dict[str, pd.DataFrame] = {}
 
         # Initialize dart-fss if available
         if self._api_key:
@@ -441,31 +452,40 @@ class KRDartClient:
             logger.debug("dart-fss extract_fs failed: %s", exc)
             return None
 
-    def _fetch_via_direct_api_financials(
-        self, identifier: str, statement_type: str,
-    ) -> pd.DataFrame:
-        """Fallback: use DART fnlttSinglAcntAll.json endpoint."""
+    def _fetch_all_financials_bulk(self, identifier: str) -> pd.DataFrame:
+        """Fetch ALL financial line items in one batch (cross-statement cache).
+
+        Makes 8 API calls (2 years x 4 periods) and caches the combined
+        result.  The ``fnlttSinglAcntAll.json`` endpoint returns income,
+        balance sheet, and cash flow items together -- there's no need to
+        call it separately per statement type.
+
+        Returns the full raw DataFrame with ALL statement types combined.
+        Subsequent calls for the same identifier return from cache.
+        """
+        # Return from cache if already fetched
+        if identifier in self._financial_cache:
+            cached = self._financial_cache[identifier]
+            logger.debug("DART cross-statement cache hit for %s (%d rows)", identifier, len(cached))
+            return cached
+
         from operator1.http_utils import cached_get
 
         corp_code = self._resolve_corp_code(identifier)
         if not corp_code:
+            self._financial_cache[identifier] = pd.DataFrame()
             return pd.DataFrame()
-
-        # DART financial statement types
-        fs_div_map = {
-            "income": "IS",   # Income Statement
-            "balance": "BS",  # Balance Sheet
-            "cashflow": "CF", # Cash Flow
-        }
-        fs_div = fs_div_map.get(statement_type, "IS")
 
         rows: list[dict] = []
         current_year = date.today().year
+        api_calls = 0
 
-        for year in range(current_year - 2, current_year + 1):
+        # Fetch 2 years x 4 periods = 8 API calls (was 12 per statement type)
+        for year in range(current_year - 1, current_year + 1):
             for reprt_code in ["11011", "11014", "11012", "11013"]:
                 # 11011=annual, 11014=Q3, 11012=semi, 11013=Q1
                 try:
+                    _dart_throttle()
                     data = cached_get(
                         f"{_DART_BASE}/fnlttSinglAcntAll.json",
                         params={
@@ -476,15 +496,21 @@ class KRDartClient:
                             "fs_div": "CFS",  # Consolidated
                         },
                     )
+                    api_calls += 1
 
                     items = data.get("list", []) if isinstance(data, dict) else []
                     for item in items:
                         account_name = item.get("account_nm", "")
-                        canonical = self._map_dart_concept(account_name, statement_type)
-                        if not canonical:
+                        sj_div = item.get("sj_div", "")  # BS, IS, CF, SCE
+
+                        # Map to ALL statement types at once (not filtered)
+                        for st in ("income", "balance", "cashflow"):
+                            canonical = self._map_dart_concept(account_name, st)
+                            if canonical:
+                                break
+                        else:
                             continue
 
-                        # Get current period amount
                         value_str = item.get("thstrm_amount", "")
                         if not value_str or value_str == "-":
                             continue
@@ -495,8 +521,6 @@ class KRDartClient:
                             continue
 
                         is_annual = reprt_code == "11011"
-                        # rcept_dt is the filing (receipt) date; rcept_no is
-                        # just the document ID and will fail to parse as a date.
                         filing_dt = item.get("rcept_dt", "") or ""
                         rows.append({
                             "concept": canonical,
@@ -505,11 +529,13 @@ class KRDartClient:
                             "report_date": f"{year}-12-31" if is_annual else f"{year}-{['03','06','09','12'][int(reprt_code[-1])-1]}-30",
                             "period_type": "annual" if is_annual else "quarterly",
                             "form": "Annual" if is_annual else "Quarterly",
+                            "sj_div": sj_div,
                         })
                 except Exception:
                     continue
 
         if not rows:
+            self._financial_cache[identifier] = pd.DataFrame()
             return pd.DataFrame()
 
         df = pd.DataFrame(rows)
@@ -517,11 +543,7 @@ class KRDartClient:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
 
-        # Pre-filter duplicates: keep only the latest amendment per
-        # (concept, report_date).  DART returns multiple filings for the
-        # same period (original + amendments), and the downstream
-        # reconciliation layer removes them anyway -- but pre-filtering
-        # here avoids 96% wasted rows (e.g. 186 -> 7).
+        # Dedup: keep latest amendment per (concept, report_date)
         _before = len(df)
         if "concept" in df.columns and "report_date" in df.columns:
             df = (
@@ -532,14 +554,37 @@ class KRDartClient:
             )
             _after = len(df)
             if _before != _after:
-                logger.info("DART dedup: %d -> %d rows (removed %d duplicates)",
+                logger.info("DART bulk dedup: %d -> %d rows (removed %d duplicates)",
                             _before, _after, _before - _after)
 
-        # Cache filings
+        self._financial_cache[identifier] = df
+        logger.info(
+            "DART bulk fetch for %s: %d rows from %d API calls (cached for all statement types)",
+            identifier, len(df), api_calls,
+        )
+
+        # Cache filings to disk
         self._cache_filings(identifier, df)
+        return df
+
+    def _fetch_via_direct_api_financials(
+        self, identifier: str, statement_type: str,
+    ) -> pd.DataFrame:
+        """Fetch financials via DART API with cross-statement caching.
+
+        On first call, fetches ALL financial data in bulk (8 API calls
+        for 2 years x 4 periods).  On subsequent calls for the same
+        company, serves from the in-memory cache -- zero additional
+        API calls.  This reduces total API usage from 36 calls
+        (3 statement types x 12 periods) to 8 calls.
+        """
+        # Get or populate the bulk cache
+        all_df = self._fetch_all_financials_bulk(identifier)
+        if all_df.empty:
+            return pd.DataFrame()
 
         from operator1.clients.canonical_translator import translate_financials
-        return translate_financials(df, self.market_id, statement_type)
+        return translate_financials(all_df, self.market_id, statement_type)
 
     def _map_dart_concept(self, concept: str, statement_type: str) -> str | None:
         """Map DART Korean account name to canonical name.
