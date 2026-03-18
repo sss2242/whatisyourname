@@ -613,17 +613,153 @@ class KRDartClient:
         return None
 
     def _resolve_corp_code(self, identifier: str) -> str:
-        """Resolve a stock code or name to a DART corp_code."""
+        """Resolve a stock code or name to a DART corp_code.
+
+        Resolution order:
+        1. Search the cached corp list (from dart-fss or previous bulk download)
+        2. Download and parse ``corpCode.xml`` bulk ZIP (same approach as dart-fss)
+        3. Return empty string if all paths fail
+        """
+        # Try cached corp list first
         matches = self.list_companies(query=identifier)
         if matches:
             return matches[0].get("corp_code", "")
 
-        # Try direct search
+        # Try direct search by stock_code
         if identifier.isdigit():
             all_companies = self.list_companies()
             for c in all_companies:
                 if c.get("ticker") == identifier:
                     return c.get("corp_code", "")
+
+        # Fallback: download corpCode.xml bulk ZIP from DART API
+        # This is the same approach dart-fss uses internally.
+        # The ZIP contains ~100K companies with stock_code -> corp_code mapping.
+        if self._api_key:
+            corp_code = self._resolve_via_corp_code_xml(identifier)
+            if corp_code:
+                return corp_code
+
+        return ""
+
+    def _resolve_via_corp_code_xml(self, identifier: str) -> str:
+        """Download corpCode.xml bulk ZIP and find corp_code for identifier.
+
+        The DART ``corpCode.xml`` endpoint returns a ~5MB ZIP containing
+        an XML file with all ~100K registered companies. Each entry has:
+        - ``corp_code``: 8-digit DART unique ID
+        - ``corp_name``: Korean company name
+        - ``stock_code``: 6-digit exchange ticker (empty for unlisted)
+        - ``modify_date``: last update date
+
+        This is cached on disk to avoid re-downloading on each call.
+        """
+        import zipfile
+        import io
+        import xml.etree.ElementTree as ET
+
+        cache_path = self._cache_dir / "_corpcode_map.json"
+
+        # Try disk cache first (valid for 7 days)
+        if cache_path.exists():
+            try:
+                age_days = (date.today() - date.fromtimestamp(cache_path.stat().st_mtime)).days
+                if age_days < 7:
+                    import json as _json
+                    mapping = _json.loads(cache_path.read_text(encoding="utf-8"))
+                    # Search by stock_code or corp_name
+                    result = mapping.get(identifier, "")
+                    if result:
+                        logger.debug("corpCode cache hit: %s -> %s", identifier, result)
+                        return result
+                    # Search by name substring
+                    id_lower = identifier.lower()
+                    for key, code in mapping.items():
+                        if id_lower in key.lower():
+                            return code
+                    return ""
+            except Exception:
+                pass
+
+        # Download the ZIP
+        logger.info("Downloading DART corpCode.xml bulk master (~5MB)...")
+        try:
+            resp = requests.get(
+                f"{_DART_BASE}/corpCode.xml",
+                params={"crtfc_key": self._api_key},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            if resp.content[:2] != b"PK":
+                logger.warning("corpCode.xml response is not a ZIP")
+                return ""
+        except Exception as exc:
+            logger.warning("corpCode.xml download failed: %s", exc)
+            return ""
+
+        # Parse the XML inside the ZIP
+        mapping: dict[str, str] = {}  # stock_code/corp_name -> corp_code
+        try:
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                xml_files = [n for n in zf.namelist() if n.endswith(".xml")]
+                if not xml_files:
+                    return ""
+                with zf.open(xml_files[0]) as xf:
+                    tree = ET.parse(xf)
+                    root = tree.getroot()
+                    for corp in root.findall(".//list"):
+                        corp_code = corp.findtext("corp_code", "").strip()
+                        stock_code = corp.findtext("stock_code", "").strip()
+                        corp_name = corp.findtext("corp_name", "").strip()
+                        if corp_code:
+                            if stock_code:
+                                mapping[stock_code] = corp_code
+                            if corp_name:
+                                mapping[corp_name] = corp_code
+        except Exception as exc:
+            logger.warning("corpCode.xml parse failed: %s", exc)
+            return ""
+
+        # Also populate the corp_list_cache for future list_companies() calls
+        listed = []
+        for key, code in mapping.items():
+            if key.isdigit() and len(key) == 6:  # stock_code entries
+                # Find the corp_name for this stock_code
+                corp_name = ""
+                for k2, c2 in mapping.items():
+                    if c2 == code and not k2.isdigit():
+                        corp_name = k2
+                        break
+                listed.append({
+                    "ticker": key,
+                    "name": corp_name,
+                    "corp_code": code,
+                    "cik": code,
+                    "exchange": "KRX",
+                    "market_id": self.market_id,
+                })
+        if listed:
+            self._corp_list_cache = listed
+            logger.info("DART corpCode.xml: %d listed companies loaded", len(listed))
+
+        # Save to disk cache
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            import json as _json
+            cache_path.write_text(_json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+        # Now resolve
+        result = mapping.get(identifier, "")
+        if result:
+            return result
+        # Substring search
+        id_lower = identifier.lower()
+        for key, code in mapping.items():
+            if id_lower in key.lower():
+                return code
+
         return ""
 
     def _cache_filings(self, identifier: str, df: pd.DataFrame) -> None:
