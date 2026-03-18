@@ -645,6 +645,23 @@ MACRO_APIS: dict[str, MacroAPIInfo] = {
         series_unemployment="TASA_DESOCUPACION",
         series_currency="TCO_DOLAR",
     ),
+
+    # --- Latin America (additional) ---
+    "mx_banxico": MacroAPIInfo(
+        macro_id="mx_banxico",
+        country="Mexico",
+        country_code="MX",
+        region="Latin America",
+        api_name="Banxico (Banco de Mexico)",
+        api_url="https://www.banxico.org.mx/SieAPIRest/",
+        requires_api_key=True,  # free registration at banxico.org.mx
+        description="Banxico central bank: interest rate, inflation, FX; wbgapi fallback for GDP/unemployment",
+        series_gdp="",           # GDP from wbgapi fallback
+        series_inflation="SP74665",
+        series_interest_rate="SF61745",
+        series_unemployment="",  # unemployment from wbgapi fallback
+        series_currency="SF63528",
+    ),
 }
 
 # Map country_code -> macro_id for quick lookup from market selection
