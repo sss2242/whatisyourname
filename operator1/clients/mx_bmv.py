@@ -433,11 +433,28 @@ class MXBmvClient:
         return self._fetch_financials(identifier, "cashflow")
 
     def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
-        """Fetch financials via BMV/EMISNET filing discovery only (PIT-compliant).
+        """Fetch financials from BMV XBRL (primary, fast) or filing discovery (fallback).
+
+        Primary path: Download XBRL JSON ZIPs from BMV's IFRS XBRL page.
+        Each ZIP contains structured financial data with IFRS concept codes
+        and period dates -- no LLM needed, no PDF parsing.
+
+        Fallback: BMV search API filing discovery + LLM/fuzzy PDF extraction.
 
         yfinance is NOT used for financial statements because it does not
         provide true filing dates (sets filing_date = report_date).
         """
+        # Primary: XBRL JSON extraction (fast, structured, no LLM needed)
+        try:
+            df = _fetch_bmv_xbrl_financials(identifier, statement_type)
+            if df is not None and not df.empty:
+                logger.info("BMV %s %s: %d rows from XBRL (fast path)",
+                           identifier, statement_type, len(df))
+                return df
+        except Exception as exc:
+            logger.debug("BMV XBRL extraction failed for %s: %s", identifier, exc)
+
+        # Fallback: filing discovery + LLM/fuzzy extraction
         try:
             from operator1.clients.filing_discoverer import try_filing_extraction
             df = try_filing_extraction(
@@ -465,3 +482,294 @@ class MXBmvClient:
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
+
+
+# ---------------------------------------------------------------------------
+# BMV XBRL Financial Data Extraction (fast path, no LLM needed)
+# ---------------------------------------------------------------------------
+
+_BMV_XBRL_PAGE = f"{_BMV_BASE_URL}/en/issuers/standard-xbrl-files"
+
+# Cache the parsed XBRL page (ticker -> ZIP URLs mapping)
+_xbrl_index_cache: dict[str, list[dict]] | None = None
+_xbrl_index_cache_time: float = 0.0
+_XBRL_INDEX_TTL = 86400  # 24 hours
+
+# IFRS concept -> canonical field name mapping
+_IFRS_INCOME_CONCEPTS: dict[str, str] = {
+    "ifrs-full_Revenue": "revenue",
+    "ifrs-full_CostOfSales": "cost_of_revenue",
+    "ifrs-full_GrossProfit": "gross_profit",
+    "ifrs-full_ProfitLossFromOperatingActivities": "operating_income",
+    "ifrs-full_ProfitLoss": "net_income",
+    "ifrs-full_ProfitLossBeforeTax": "ebit",
+    "ifrs-full_IncomeTaxExpenseContinuingOperations": "taxes",
+    "ifrs-full_FinanceCosts": "interest_expense",
+    "ifrs-full_SellingGeneralAndAdministrativeExpense": "sga_expenses",
+    "ifrs-full_ResearchAndDevelopmentExpense": "rd_expenses",
+    "ifrs-full_BasicEarningsLossPerShare": "eps_basic",
+    "ifrs-full_DilutedEarningsLossPerShare": "eps_diluted",
+}
+
+_IFRS_BALANCE_CONCEPTS: dict[str, str] = {
+    "ifrs-full_Assets": "total_assets",
+    "ifrs-full_Liabilities": "total_liabilities",
+    "ifrs-full_Equity": "total_equity",
+    "ifrs-full_CurrentAssets": "current_assets",
+    "ifrs-full_CurrentLiabilities": "current_liabilities",
+    "ifrs-full_CashAndCashEquivalents": "cash_and_equivalents",
+    "ifrs-full_NoncurrentLiabilities": "long_term_debt",
+    "ifrs-full_RetainedEarnings": "retained_earnings",
+    "ifrs-full_Goodwill": "goodwill",
+    "ifrs-full_IntangibleAssetsOtherThanGoodwill": "intangible_assets",
+    "ifrs-full_TradeAndOtherCurrentReceivables": "receivables",
+    "ifrs-full_Inventories": "inventory",
+    "ifrs-full_TradeAndOtherCurrentPayables": "payables",
+}
+
+_IFRS_CASHFLOW_CONCEPTS: dict[str, str] = {
+    "ifrs-full_CashFlowsFromUsedInOperatingActivities": "operating_cash_flow",
+    "ifrs-full_CashFlowsFromUsedInInvestingActivities": "investing_cf",
+    "ifrs-full_CashFlowsFromUsedInFinancingActivities": "financing_cf",
+    "ifrs-full_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities": "capex",
+    "ifrs-full_DividendsPaidClassifiedAsFinancingActivities": "dividends_paid",
+}
+
+_STATEMENT_CONCEPTS: dict[str, dict[str, str]] = {
+    "income": _IFRS_INCOME_CONCEPTS,
+    "balance": _IFRS_BALANCE_CONCEPTS,
+    "cashflow": _IFRS_CASHFLOW_CONCEPTS,
+}
+
+
+def _get_xbrl_index() -> dict[str, list[dict]]:
+    """Parse the BMV XBRL page to build a ticker -> ZIP URLs index.
+
+    The page contains ~5,800 XBRL ZIP entries for ~244 issuers.
+    Cached for 24 hours to avoid re-parsing the 4MB HTML page.
+    """
+    import re as _re
+
+    global _xbrl_index_cache, _xbrl_index_cache_time
+    now = time.time()
+    if _xbrl_index_cache is not None and (now - _xbrl_index_cache_time) < _XBRL_INDEX_TTL:
+        return _xbrl_index_cache
+
+    try:
+        resp = requests.get(
+            _BMV_XBRL_PAGE,
+            headers=_BMV_HEADERS,
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        logger.warning("BMV XBRL page fetch failed: %s", exc)
+        return _xbrl_index_cache or {}
+
+    rows = _re.findall(r"<tr[^>]*>(.*?)</tr>", resp.text, _re.DOTALL)
+    index: dict[str, list[dict]] = {}
+
+    for row in rows:
+        cells = _re.findall(r"<td[^>]*>(.*?)</td>", row, _re.DOTALL)
+        if len(cells) < 4:
+            continue
+        ticker = _re.sub(r"<[^>]+>", "", cells[0]).strip()
+        if not ticker or ticker.lower() == "ticker":
+            continue
+        company = _re.sub(r"<[^>]+>", "", cells[1]).strip()
+        date_str = _re.sub(r"<[^>]+>", "", cells[2]).strip()
+        zip_match = _re.search(r"docins=([^\"&]+)", row)
+        if not zip_match:
+            continue
+
+        zip_path = zip_match.group(1)
+        if zip_path.startswith(".."):
+            zip_url = f"{_BMV_BASE_URL}/docs-pub/{zip_path.replace('../', '')}"
+        else:
+            zip_url = f"{_BMV_BASE_URL}/docs-pub/ifrsxbrl/{zip_path}"
+
+        # Parse filing date from "DD/MM/YYYY HH:MM" format
+        filing_date = ""
+        fd_match = _re.search(r"(\d{2})/(\d{2})/(\d{4})", date_str)
+        if fd_match:
+            filing_date = f"{fd_match.group(3)}-{fd_match.group(2)}-{fd_match.group(1)}"
+
+        if ticker not in index:
+            index[ticker] = []
+        index[ticker].append({
+            "url": zip_url,
+            "filing_date": filing_date,
+            "company": company,
+        })
+
+    _xbrl_index_cache = index
+    _xbrl_index_cache_time = now
+    logger.info("BMV XBRL index: %d tickers, %d ZIPs",
+               len(index), sum(len(v) for v in index.values()))
+    return index
+
+
+def _extract_xbrl_json(zip_bytes: bytes, concept_map: dict[str, str]) -> list[dict]:
+    """Extract financial values from a BMV XBRL JSON ZIP.
+
+    Parameters
+    ----------
+    zip_bytes:
+        Raw bytes of the XBRL ZIP file.
+    concept_map:
+        Mapping from IFRS concept name to canonical field name.
+
+    Returns
+    -------
+    List of dicts with keys: canonical_name, value, report_date, filing_date.
+    """
+    import zipfile
+    import io
+    import json as _json
+
+    records: list[dict] = []
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        json_files = [n for n in zf.namelist() if n.endswith(".json")]
+        if not json_files:
+            return records
+
+        with zf.open(json_files[0]) as jf:
+            data = _json.loads(jf.read())
+
+    hechos_por_concepto = data.get("HechosPorIdConcepto", {})
+    hechos_por_id = data.get("HechosPorId", {})
+    contextos = data.get("ContextosPorId", {})
+
+    for ifrs_concept, canonical_name in concept_map.items():
+        fact_ids = hechos_por_concepto.get(ifrs_concept, [])
+        if not isinstance(fact_ids, list) or not fact_ids:
+            continue
+
+        for fact_id in fact_ids:
+            fact = hechos_por_id.get(fact_id)
+            if fact is None:
+                continue
+
+            value = fact.get("Valor") or fact.get("ValorNumerico")
+            if value is None:
+                continue
+
+            try:
+                value = float(str(value).replace(",", ""))
+            except (ValueError, TypeError):
+                continue
+
+            # Get period from context
+            ctx_id = fact.get("IdContexto", "")
+            ctx = contextos.get(ctx_id, {})
+            if ctx is None:
+                continue
+            period = ctx.get("Periodo", {})
+            if period is None:
+                continue
+
+            # Balance sheet items use FechaInstante (instant date),
+            # flow items use FechaFin (period end). Both may be present
+            # but set to None, so we need explicit None checks.
+            end_date = period.get("FechaFin") or period.get("FechaInstante") or ""
+            start_date = period.get("FechaInicio") or ""
+
+            # Skip if no date
+            if not end_date:
+                continue
+
+            # Use end_date as report_date (period end = fiscal period end)
+            report_date = str(end_date)[:10]
+
+            records.append({
+                "canonical_name": canonical_name,
+                "value": value,
+                "report_date": report_date,
+                "start_date": str(start_date)[:10] if start_date else "",
+            })
+
+    return records
+
+
+def _fetch_bmv_xbrl_financials(
+    ticker: str,
+    statement_type: str,
+    max_zips: int = 8,
+) -> pd.DataFrame:
+    """Fetch structured financial data from BMV XBRL JSON ZIPs.
+
+    Downloads XBRL ZIP files for the given ticker, extracts IFRS
+    concept values, and returns a canonical long-format DataFrame.
+
+    This is the fast path -- no LLM needed, no PDF parsing.
+    Each ZIP is ~767KB and contains structured JSON.
+
+    Parameters
+    ----------
+    ticker:
+        BMV ticker (e.g. 'WALMEX', 'AMX', 'CEMEX').
+    statement_type:
+        One of 'income', 'balance', 'cashflow'.
+    max_zips:
+        Maximum number of ZIPs to download (8 = 2 years quarterly).
+    """
+    concept_map = _STATEMENT_CONCEPTS.get(statement_type, {})
+    if not concept_map:
+        return pd.DataFrame()
+
+    # Get the XBRL index
+    index = _get_xbrl_index()
+    zip_entries = index.get(ticker.upper(), [])
+    if not zip_entries:
+        logger.debug("No XBRL ZIPs found for %s", ticker)
+        return pd.DataFrame()
+
+    # Download the most recent ZIPs (sorted by filing date, newest first)
+    zip_entries.sort(key=lambda e: e.get("filing_date", ""), reverse=True)
+    entries_to_fetch = zip_entries[:max_zips]
+
+    all_records: list[dict] = []
+    for entry in entries_to_fetch:
+        try:
+            resp = requests.get(
+                entry["url"],
+                headers=_BMV_HEADERS,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            if resp.content[:2] != b"PK":
+                continue
+
+            records = _extract_xbrl_json(resp.content, concept_map)
+            # Add filing_date from the XBRL page metadata
+            for rec in records:
+                rec["filing_date"] = entry.get("filing_date", "")
+            all_records.extend(records)
+
+        except Exception as exc:
+            logger.debug("BMV XBRL ZIP download failed for %s: %s", entry["url"][-40:], exc)
+            continue
+
+    if not all_records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_records)
+
+    # Convert dates
+    for col in ("filing_date", "report_date"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    # Dedup: keep the most recent filing per (canonical_name, report_date)
+    if "filing_date" in df.columns:
+        df = df.sort_values("filing_date", ascending=False)
+        df = df.drop_duplicates(subset=["canonical_name", "report_date"], keep="first")
+
+    df = df.sort_values("report_date")
+
+    logger.info(
+        "BMV XBRL for %s/%s: %d records from %d/%d ZIPs",
+        ticker, statement_type, len(df), len(entries_to_fetch), len(zip_entries),
+    )
+    return df
