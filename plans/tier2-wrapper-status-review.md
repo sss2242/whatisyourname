@@ -14,7 +14,7 @@ Current state of all 15 Tier 2 market wrappers based on code review.
 | 6 | **Singapore** `sg_sgx` | **SGX Securities API + yfinance** | **SGX Securities API (561 stocks)** | **SGX Financial Reports API (discovery) + LLM extraction** | yfinance (.SI) | **SGXFilingDiscoverer (financialreports API, PDF download confirmed)** |
 | 7 | **Saudi Arabia** `sa_tadawul` | yfinance (.SR) | Tadawul API (broken) | Filing discovery + LLM only | yfinance (.SR) | TadawulFilingDiscoverer (registered) |
 | 8 | **Switzerland** `ch_six` | yfinance (.SW) | Broken | None | yfinance (.SW) | None registered |
-| 9 | **South Africa** `za_jse` | yfinance (.JO) | JSE API (broken) | Filing discovery + LLM only | yfinance (.JO) | JSEFilingDiscoverer (registered, untested) |
+| 9 | **South Africa** `za_jse` | **JSE WCF API (ISIN, sector, market cap) + yfinance** | **JSE Issuer Directory (298 equity issuers)** | **JSE SENS per-issuer API (instant) + LLM extraction** | yfinance (.JO) | **JSEFilingDiscoverer (WCF SENS API, per-issuer fast path, PDF download confirmed)** |
 | 10 | **Mexico** `mx_bmv` | **BMV WSO2 Search API + yfinance** | **BMV Search API (150+ issuers, token-based)** | **BMV Search API (filing discovery) + LLM extraction** | yfinance (.MX) | **BMVFilingDiscoverer (token-based search API, PDF download confirmed)** |
 | 11 | **UAE** `ae_dfm` | yfinance (.AE) | DFM API (broken) | Filing discovery + LLM only | yfinance (.AE) | DFMFilingDiscoverer (registered, untested) |
 | 12 | **Netherlands** `nl_esef` | ESEF partial | ESEF API (0 results) | ESEF API (0 results) | yfinance | None registered |
@@ -64,7 +64,15 @@ Current state of all 15 Tier 2 market wrappers based on code review.
 - Financials: need LLM client for PDF extraction
 - First pure-requests SEDAR+ implementation (community projects all use Selenium)
 
-### Profile + Search + Filing discovery working (native API)
+### Profile + Search + Filing discovery working (native API, J-Quants speed)
+
+**South Africa (`za_jse`)** -- newly fixed (WCF API discovery)
+- Profile: JSE Issuer Directory (298 equity issuers, name, ticker, MasterID, registration, contacts) + Instruments API (ISIN, sector, industry, market cap, price, board, listing date). Richer than yfinance.
+- Search: JSE CustomerRoleService.svc/GetAllIssuers (client-side fuzzy match, cached). Confirmed: NPN (Naspers), SOL (Sasol), SBK (Standard Bank).
+- Filing discovery: JSE SENSService.svc/GetSensAnnouncementsByIssuerMasterId (single API call per issuer, instant, like J-Quants). Returns 15 announcements with PDFPath URLs.
+- PDF download: senspdf.jse.co.za/documents/SENS_*.pdf (165KB Naspers PDF confirmed)
+- No authentication required (public SharePoint WCF endpoints)
+- Financials: need LLM client for PDF extraction (discovery + download both work)
 
 **Mexico (`mx_bmv`)** -- newly fixed (HKEX pattern applied)
 - Profile: BMV WSO2 Search API (name, ticker, series, market, status, company IDs) + yfinance supplement for sector/industry
@@ -93,10 +101,11 @@ All 15 markets return daily OHLCV data via yfinance or regional wrappers (baosto
 - CH, NL, ES, IT, SE: no filing discoverer registered, no native financial API
 - yfinance intentionally NOT used for financials (no filing dates = no PIT compliance)
 
-### Company search (5/15 broken)
-- SA (Tadawul returns HTML), ZA (JSE API broken), AE (DFM API broken), CH (SIX API broken): native APIs return HTML or are unreachable
+### Company search (4/15 broken)
+- SA (Tadawul returns HTML), AE (DFM API broken), CH (SIX API broken): native APIs return HTML or are unreachable
 - NL, ES, IT, SE: ESEF API returns 0 results for company name searches
 - MX: **FIXED** -- BMV WSO2 Search API now works (token-based, no key needed)
+- ZA: **FIXED** -- JSE WCF CustomerRoleService returns 298 equity issuers
 
 ### ESEF markets (4/15 barely functional)
 - Netherlands, Spain, Italy, Sweden all use the same `eu_esef_wrapper` which queries `filings.xbrl.org/api`
@@ -109,8 +118,8 @@ All 15 markets return daily OHLCV data via yfinance or regional wrappers (baosto
 
 | Capability | Working | Partial | Broken |
 |-----------|---------|---------|--------|
-| Profile | IN, CN, AU, CA, SG, **MX** + 5 via yfinance | NL, ES, IT, SE (ESEF partial) | -- |
-| Company Search | IN, CN, AU, CA, SG, **MX** | -- | HK (yfinance only), SA, CH, ZA, AE, NL, ES, IT, SE |
-| Financial Statements | IN (native), CN (akshare) | AU, CA, HK, SG, **MX**, SA, ZA, AE (need LLM) | CH, NL, ES, IT, SE (no path) |
+| Profile | IN, CN, AU, CA, SG, **MX**, **ZA** + 4 via yfinance | NL, ES, IT, SE (ESEF partial) | -- |
+| Company Search | IN, CN, AU, CA, SG, **MX**, **ZA** | -- | HK (yfinance only), SA, CH, AE, NL, ES, IT, SE |
+| Financial Statements | IN (native), CN (akshare) | AU, CA, HK, SG, **MX**, SA, **ZA**, AE (need LLM) | CH, NL, ES, IT, SE (no path) |
 | OHLCV | All 15 | -- | -- |
-| Filing Discovery | IN, AU, CA, HK, SG, **MX**, SA, ZA, AE | -- | CH, NL, ES, IT, SE (none registered) |
+| Filing Discovery | IN, AU, CA, HK, SG, **MX**, SA, **ZA**, AE | -- | CH, NL, ES, IT, SE (none registered) |
