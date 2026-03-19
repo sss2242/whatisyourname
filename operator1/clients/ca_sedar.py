@@ -260,11 +260,15 @@ class CASedarClient:
     # -- Company profile -----------------------------------------------------
 
     def get_profile(self, identifier: str) -> dict[str, Any]:
-        """Fetch company profile from TMX GraphQL API.
+        """Fetch company profile from TMX GraphQL API with full enrichment.
 
         Uses the TMX GraphQL endpoint (app-money.tmx.com) which works
-        globally and returns sector, industry, name, and price.
-        Enriches with exchange info from the directory.
+        globally and returns sector, industry, name, price, valuation
+        ratios, dividend data, fundamentals, and company description.
+
+        The TMX quote API provides richer data than yfinance for
+        Canadian stocks (MarketCap, PE, ROA, ROE, debt/equity, beta,
+        dividends, volume averages, 52-week range, description).
 
         No yfinance or SEDAR+ dependency for profiles.
         Profile is cached for 7 days.
@@ -289,19 +293,26 @@ class CASedarClient:
             "lei": "",
         }
 
-        # Try TMX GraphQL for rich profile data
-        gql = _tmx_graphql_profile(identifier.upper())
-        if gql:
-            raw["name"] = gql.get("name", "")
-            raw["sector"] = gql.get("sector", "")
-            raw["industry"] = gql.get("industry", "")
-            raw["ticker"] = gql.get("symbol", identifier.upper())
-            logger.info(
-                "TMX GraphQL enriched %s: %s (%s / %s)",
-                identifier, raw["name"], raw["sector"], raw["industry"],
-            )
-        else:
-            # Fall back to directory for at least the name
+        # Try TMX GraphQL for rich profile data (full quote enrichment)
+        try:
+            from operator1.clients.ohlcv_tmx import tmx_enrich_profile
+            tmx_enrich_profile(identifier.upper(), raw)
+        except Exception as exc:
+            logger.debug("TMX enrichment failed for %s: %s", identifier, exc)
+
+        # If TMX didn't provide a name, fall back to GraphQL basic query
+        if not raw.get("name") or raw["name"] == identifier.upper():
+            gql = _tmx_graphql_profile(identifier.upper())
+            if gql:
+                raw["name"] = gql.get("name", "")
+                if not raw.get("sector"):
+                    raw["sector"] = gql.get("sector", "")
+                if not raw.get("industry"):
+                    raw["industry"] = gql.get("industry", "")
+                raw["ticker"] = gql.get("symbol", identifier.upper())
+
+        # If still no name, fall back to directory
+        if not raw.get("name") or raw["name"] == identifier.upper():
             directory = _get_tmx_directory()
             dir_matches = [
                 d for d in directory

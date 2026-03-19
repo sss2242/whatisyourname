@@ -21,6 +21,7 @@ _PRIMARY_FETCHERS: dict[str, str] = {
     "tw_mops": "twstock",
     "cn_sse": "baostock",  # China: baostock (free, no key, works globally)
     "in_bse": "nselib",  # India: nselib (NSE data, no key, no geo-blocking)
+    "ca_sedar": "tmx",  # Canada: TMX GraphQL (recent ~8 days, merged with yfinance)
 }
 
 
@@ -76,6 +77,44 @@ def fetch_ohlcv(
             df = fetch_ohlcv_nselib(ticker, years=years)
         except Exception as exc:
             logger.debug("nselib primary failed: %s", exc)
+
+    elif primary == "tmx":
+        # Canada: TMX GraphQL provides ~8 days of recent OHLCV data.
+        # We fetch the full yfinance history first, then overlay TMX
+        # recent bars for more accurate recent data from the source
+        # exchange.  TMX data replaces yfinance for overlapping dates.
+        try:
+            from operator1.clients.ohlcv_yfinance import fetch_ohlcv_yfinance
+            from operator1.clients.ohlcv_tmx import fetch_ohlcv_tmx
+
+            # Get 2-year history from yfinance
+            yf_df = fetch_ohlcv_yfinance(ticker, market_id=market_id, years=years)
+
+            # Get recent ~8 days from TMX (minute bars aggregated to daily)
+            tmx_df = fetch_ohlcv_tmx(ticker, interval=1)
+
+            if not tmx_df.empty and not yf_df.empty:
+                # Normalize date columns for comparison
+                yf_df["date"] = pd.to_datetime(yf_df["date"]).dt.normalize()
+                tmx_df["date"] = pd.to_datetime(tmx_df["date"]).dt.normalize()
+
+                # Remove yfinance rows that overlap with TMX data
+                tmx_dates = set(tmx_df["date"])
+                yf_no_overlap = yf_df[~yf_df["date"].isin(tmx_dates)]
+
+                # Combine: yfinance historical + TMX recent
+                df = pd.concat([yf_no_overlap, tmx_df], ignore_index=True)
+                df = df.sort_values("date").reset_index(drop=True)
+                logger.info(
+                    "TMX+yfinance merged for %s: %d yf + %d tmx = %d total rows",
+                    ticker, len(yf_no_overlap), len(tmx_df), len(df),
+                )
+            elif not tmx_df.empty:
+                df = tmx_df
+            elif not yf_df.empty:
+                df = yf_df
+        except Exception as exc:
+            logger.debug("TMX+yfinance merge failed for %s: %s", ticker, exc)
 
     # J-Quants OHLCV is handled inside jp_jquants_wrapper.py get_quotes()
     # So jp_jquants is NOT listed here -- it goes through the PIT client path.

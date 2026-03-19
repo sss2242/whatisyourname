@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,14 @@ class KRDartClient:
     Implements the ``PITClient`` protocol. Uses dart-fss as primary
     library with direct DART API as fallback.
 
+    **Cross-statement caching**: The DART ``fnlttSinglAcntAll.json``
+    endpoint returns ALL financial line items (income + balance + cashflow)
+    in a single response.  On the first call for any statement type, we
+    fetch all periods at once (8 API calls for 2 years x 4 periods) and
+    cache the combined result.  Subsequent calls for the same company
+    but different statement types are served from cache, reducing total
+    API calls from 36 (3 types x 12 periods) to 8.
+
     Parameters
     ----------
     api_key:
@@ -77,6 +86,9 @@ class KRDartClient:
         self._cache_dir = Path(cache_dir)
         self._dart_fss_available = False
         self._corp_list_cache: list[dict[str, Any]] | None = None
+        # Cross-statement cache: identifier -> {all raw rows from fnlttSinglAcntAll}
+        # Populated on first financial fetch, reused for all 3 statement types.
+        self._financial_cache: dict[str, pd.DataFrame] = {}
 
         # Initialize dart-fss if available
         if self._api_key:
@@ -441,31 +453,40 @@ class KRDartClient:
             logger.debug("dart-fss extract_fs failed: %s", exc)
             return None
 
-    def _fetch_via_direct_api_financials(
-        self, identifier: str, statement_type: str,
-    ) -> pd.DataFrame:
-        """Fallback: use DART fnlttSinglAcntAll.json endpoint."""
+    def _fetch_all_financials_bulk(self, identifier: str) -> pd.DataFrame:
+        """Fetch ALL financial line items in one batch (cross-statement cache).
+
+        Makes 8 API calls (2 years x 4 periods) and caches the combined
+        result.  The ``fnlttSinglAcntAll.json`` endpoint returns income,
+        balance sheet, and cash flow items together -- there's no need to
+        call it separately per statement type.
+
+        Returns the full raw DataFrame with ALL statement types combined.
+        Subsequent calls for the same identifier return from cache.
+        """
+        # Return from cache if already fetched
+        if identifier in self._financial_cache:
+            cached = self._financial_cache[identifier]
+            logger.debug("DART cross-statement cache hit for %s (%d rows)", identifier, len(cached))
+            return cached
+
         from operator1.http_utils import cached_get
 
         corp_code = self._resolve_corp_code(identifier)
         if not corp_code:
+            self._financial_cache[identifier] = pd.DataFrame()
             return pd.DataFrame()
-
-        # DART financial statement types
-        fs_div_map = {
-            "income": "IS",   # Income Statement
-            "balance": "BS",  # Balance Sheet
-            "cashflow": "CF", # Cash Flow
-        }
-        fs_div = fs_div_map.get(statement_type, "IS")
 
         rows: list[dict] = []
         current_year = date.today().year
+        api_calls = 0
 
-        for year in range(current_year - 2, current_year + 1):
+        # Fetch 2 years x 4 periods = 8 API calls (was 12 per statement type)
+        for year in range(current_year - 1, current_year + 1):
             for reprt_code in ["11011", "11014", "11012", "11013"]:
                 # 11011=annual, 11014=Q3, 11012=semi, 11013=Q1
                 try:
+                    _dart_throttle()
                     data = cached_get(
                         f"{_DART_BASE}/fnlttSinglAcntAll.json",
                         params={
@@ -476,15 +497,21 @@ class KRDartClient:
                             "fs_div": "CFS",  # Consolidated
                         },
                     )
+                    api_calls += 1
 
                     items = data.get("list", []) if isinstance(data, dict) else []
                     for item in items:
                         account_name = item.get("account_nm", "")
-                        canonical = self._map_dart_concept(account_name, statement_type)
-                        if not canonical:
+                        sj_div = item.get("sj_div", "")  # BS, IS, CF, SCE
+
+                        # Map to ALL statement types at once (not filtered)
+                        for st in ("income", "balance", "cashflow"):
+                            canonical = self._map_dart_concept(account_name, st)
+                            if canonical:
+                                break
+                        else:
                             continue
 
-                        # Get current period amount
                         value_str = item.get("thstrm_amount", "")
                         if not value_str or value_str == "-":
                             continue
@@ -495,8 +522,6 @@ class KRDartClient:
                             continue
 
                         is_annual = reprt_code == "11011"
-                        # rcept_dt is the filing (receipt) date; rcept_no is
-                        # just the document ID and will fail to parse as a date.
                         filing_dt = item.get("rcept_dt", "") or ""
                         rows.append({
                             "concept": canonical,
@@ -505,11 +530,13 @@ class KRDartClient:
                             "report_date": f"{year}-12-31" if is_annual else f"{year}-{['03','06','09','12'][int(reprt_code[-1])-1]}-30",
                             "period_type": "annual" if is_annual else "quarterly",
                             "form": "Annual" if is_annual else "Quarterly",
+                            "sj_div": sj_div,
                         })
                 except Exception:
                     continue
 
         if not rows:
+            self._financial_cache[identifier] = pd.DataFrame()
             return pd.DataFrame()
 
         df = pd.DataFrame(rows)
@@ -517,11 +544,7 @@ class KRDartClient:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
 
-        # Pre-filter duplicates: keep only the latest amendment per
-        # (concept, report_date).  DART returns multiple filings for the
-        # same period (original + amendments), and the downstream
-        # reconciliation layer removes them anyway -- but pre-filtering
-        # here avoids 96% wasted rows (e.g. 186 -> 7).
+        # Dedup: keep latest amendment per (concept, report_date)
         _before = len(df)
         if "concept" in df.columns and "report_date" in df.columns:
             df = (
@@ -532,14 +555,37 @@ class KRDartClient:
             )
             _after = len(df)
             if _before != _after:
-                logger.info("DART dedup: %d -> %d rows (removed %d duplicates)",
+                logger.info("DART bulk dedup: %d -> %d rows (removed %d duplicates)",
                             _before, _after, _before - _after)
 
-        # Cache filings
+        self._financial_cache[identifier] = df
+        logger.info(
+            "DART bulk fetch for %s: %d rows from %d API calls (cached for all statement types)",
+            identifier, len(df), api_calls,
+        )
+
+        # Cache filings to disk
         self._cache_filings(identifier, df)
+        return df
+
+    def _fetch_via_direct_api_financials(
+        self, identifier: str, statement_type: str,
+    ) -> pd.DataFrame:
+        """Fetch financials via DART API with cross-statement caching.
+
+        On first call, fetches ALL financial data in bulk (8 API calls
+        for 2 years x 4 periods).  On subsequent calls for the same
+        company, serves from the in-memory cache -- zero additional
+        API calls.  This reduces total API usage from 36 calls
+        (3 statement types x 12 periods) to 8 calls.
+        """
+        # Get or populate the bulk cache
+        all_df = self._fetch_all_financials_bulk(identifier)
+        if all_df.empty:
+            return pd.DataFrame()
 
         from operator1.clients.canonical_translator import translate_financials
-        return translate_financials(df, self.market_id, statement_type)
+        return translate_financials(all_df, self.market_id, statement_type)
 
     def _map_dart_concept(self, concept: str, statement_type: str) -> str | None:
         """Map DART Korean account name to canonical name.
@@ -568,18 +614,296 @@ class KRDartClient:
         return None
 
     def _resolve_corp_code(self, identifier: str) -> str:
-        """Resolve a stock code or name to a DART corp_code."""
+        """Resolve a stock code or name to a DART corp_code.
+
+        Resolution order:
+        1. Cached corp list (from dart-fss or previous search)
+        2. DART web portal ``searchCorpExt.do`` (fast, no API key needed)
+        3. DART ``list.json`` filing search with date windows
+        4. DART ``corpCode.xml`` bulk ZIP download (slow, last resort)
+        """
+        # Try cached corp list first
         matches = self.list_companies(query=identifier)
         if matches:
             return matches[0].get("corp_code", "")
 
-        # Try direct search
+        # Try direct search by stock_code in cached list
         if identifier.isdigit():
             all_companies = self.list_companies()
             for c in all_companies:
                 if c.get("ticker") == identifier:
                     return c.get("corp_code", "")
+
+        # Fast path: DART web portal company search (no API key needed!)
+        corp_code = self._resolve_via_web_search(identifier)
+        if corp_code:
+            return corp_code
+
+        # Fallback: filing search + corpCode.xml
+        if self._api_key:
+            corp_code = self._resolve_via_corp_code_xml(identifier)
+            if corp_code:
+                return corp_code
+
         return ""
+
+    def _resolve_via_web_search(self, identifier: str) -> str:
+        """Resolve stock_code to corp_code via DART web portal search.
+
+        Uses the undocumented ``searchCorpExt.do`` endpoint from the
+        OpenDART web portal.  This is the same AJAX call the website
+        makes when a user types a company name or stock code in the
+        search box.
+
+        Returns the corp_code in ~1 second, no API key required.
+        Works from any IP (not rate-limited like the REST API).
+
+        The response HTML contains JavaScript function calls like:
+            selectCorp('00126380','삼성전자','P','통신 및 방송장비 제조업')
+        which give us corp_code, company name, market type, and industry.
+        """
+        import re as _re
+
+        try:
+            resp = requests.post(
+                "https://opendart.fss.or.kr/cmm/searchCorpExt.do",
+                data={"textCrpNm": identifier},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64)",
+                    "Referer": "https://opendart.fss.or.kr/disclosureinfo/fnltt/singl/main.do",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return ""
+
+            # Parse selectCorp('corp_code','corp_name','market','industry')
+            matches = _re.findall(
+                r"selectCorp\('(\d{8})','([^']+)','([^']+)','([^']*)'\)",
+                resp.text,
+            )
+            if not matches:
+                return ""
+
+            # If searching by stock code, the first match is usually correct
+            corp_code, corp_name, market_type, industry = matches[0]
+            logger.info(
+                "DART web search resolved %s -> corp_code=%s (%s, %s)",
+                identifier, corp_code, corp_name, industry,
+            )
+
+            # Cache the result for future lookups
+            if self._corp_list_cache is None:
+                self._corp_list_cache = []
+            self._corp_list_cache.append({
+                "ticker": identifier if identifier.isdigit() else "",
+                "name": corp_name,
+                "corp_code": corp_code,
+                "cik": corp_code,
+                "exchange": "KOSPI" if market_type == "P" else "KOSDAQ",
+                "industry": industry,
+                "market_id": self.market_id,
+            })
+
+            return corp_code
+
+        except Exception as exc:
+            logger.debug("DART web search failed for %s: %s", identifier, exc)
+            return ""
+
+    def _resolve_via_corp_code_xml(self, identifier: str) -> str:
+        """Resolve stock_code to corp_code using DART filing search.
+
+        Uses the HKEX date-windowed pattern: scan recent annual filings
+        via ``list.json`` with narrow date windows.  Each filing result
+        includes both ``stock_code`` and ``corp_code``, allowing us to
+        build a mapping without downloading the slow 5MB corpCode.xml ZIP.
+
+        Falls back to corpCode.xml bulk download if the filing search
+        doesn't find the company (e.g. company filed outside the window).
+
+        Resolution order:
+        1. Disk cache (valid for 7 days)
+        2. DART list.json filing search (fast, ~1s per page)
+        3. DART corpCode.xml bulk ZIP download (slow, ~5MB)
+        """
+        import json as _json
+        from datetime import timedelta
+
+        cache_path = self._cache_dir / "_corpcode_map.json"
+
+        # Try disk cache first (valid for 7 days)
+        if cache_path.exists():
+            try:
+                age_days = (date.today() - date.fromtimestamp(cache_path.stat().st_mtime)).days
+                if age_days < 7:
+                    mapping = _json.loads(cache_path.read_text(encoding="utf-8"))
+                    result = mapping.get(identifier, "")
+                    if result:
+                        logger.debug("corpCode cache hit: %s -> %s", identifier, result)
+                        return result
+                    # Search by name substring
+                    id_lower = identifier.lower()
+                    for key, code in mapping.items():
+                        if id_lower in key.lower():
+                            return code
+            except Exception:
+                pass
+
+        # --- Fast path: DART list.json filing search (HKEX pattern) ---
+        # Scan recent annual filings to build stock_code -> corp_code mapping.
+        # Each page returns 100 filings with both stock_code and corp_code.
+        # Most listed companies file annually, so scanning a few months
+        # of filings covers the majority of active companies.
+        mapping: dict[str, str] = {}
+
+        try:
+            today = date.today()
+            for months_back in [1, 3, 6, 12]:
+                start = today - timedelta(days=30 * months_back)
+                end = today if months_back == 1 else today - timedelta(days=30 * (months_back - 1) - 1)
+
+                for page in range(1, 11):  # Max 10 pages per window
+                    _dart_throttle()
+                    resp = requests.get(
+                        f"{_DART_BASE}/list.json",
+                        params={
+                            "crtfc_key": self._api_key,
+                            "bgn_de": start.strftime("%Y%m%d"),
+                            "end_de": end.strftime("%Y%m%d"),
+                            "pblntf_ty": "A",  # Annual reports
+                            "page_count": "100",
+                            "page_no": str(page),
+                        },
+                        timeout=15,
+                    )
+                    data = resp.json()
+                    items = data.get("list", [])
+                    if not items:
+                        break
+
+                    for item in items:
+                        sc = item.get("stock_code", "").strip()
+                        cc = item.get("corp_code", "").strip()
+                        cn = item.get("corp_name", "").strip()
+                        if sc and cc:
+                            mapping[sc] = cc
+                        if cn and cc:
+                            mapping[cn] = cc
+
+                    total_page = int(data.get("total_page", "1"))
+                    if page >= total_page:
+                        break
+
+                # Check if we found the target
+                if identifier in mapping:
+                    logger.info(
+                        "DART filing search resolved %s -> %s (%d mappings built)",
+                        identifier, mapping[identifier], len(mapping),
+                    )
+                    break
+
+        except Exception as exc:
+            logger.debug("DART filing search for corp_code failed: %s", exc)
+
+        # Populate corp_list_cache from the mappings we built
+        if mapping:
+            listed = []
+            for key, code in mapping.items():
+                if key.isdigit() and len(key) == 6:
+                    corp_name = ""
+                    for k2, c2 in mapping.items():
+                        if c2 == code and not k2.isdigit():
+                            corp_name = k2
+                            break
+                    listed.append({
+                        "ticker": key,
+                        "name": corp_name,
+                        "corp_code": code,
+                        "cik": code,
+                        "exchange": "KRX",
+                        "market_id": self.market_id,
+                    })
+            if listed:
+                self._corp_list_cache = listed
+                logger.info("DART filing search: %d listed companies mapped", len(listed))
+
+            # Save to disk cache
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(
+                    _json.dumps(mapping, ensure_ascii=False), encoding="utf-8",
+                )
+            except Exception:
+                pass
+
+        result = mapping.get(identifier, "")
+        if result:
+            return result
+
+        # Substring search
+        id_lower = identifier.lower()
+        for key, code in mapping.items():
+            if id_lower in key.lower():
+                return code
+
+        # --- Slow fallback: corpCode.xml bulk ZIP ---
+        # Only used if filing search didn't find the company.
+        logger.info("DART filing search didn't find %s; trying corpCode.xml bulk download...", identifier)
+        return self._resolve_via_corp_code_xml_zip(identifier)
+
+    def _resolve_via_corp_code_xml_zip(self, identifier: str) -> str:
+        """Last-resort: download corpCode.xml bulk ZIP (~5MB) from DART."""
+        import zipfile
+        import io
+        import json as _json
+        import xml.etree.ElementTree as ET
+
+        try:
+            resp = requests.get(
+                f"{_DART_BASE}/corpCode.xml",
+                params={"crtfc_key": self._api_key},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            if resp.content[:2] != b"PK":
+                return ""
+        except Exception as exc:
+            logger.warning("corpCode.xml download failed: %s", exc)
+            return ""
+
+        mapping: dict[str, str] = {}
+        try:
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                xml_files = [n for n in zf.namelist() if n.endswith(".xml")]
+                if not xml_files:
+                    return ""
+                with zf.open(xml_files[0]) as xf:
+                    tree = ET.parse(xf)
+                    root = tree.getroot()
+                    for corp in root.findall(".//list"):
+                        cc = corp.findtext("corp_code", "").strip()
+                        sc = corp.findtext("stock_code", "").strip()
+                        cn = corp.findtext("corp_name", "").strip()
+                        if cc:
+                            if sc:
+                                mapping[sc] = cc
+                            if cn:
+                                mapping[cn] = cc
+        except Exception as exc:
+            logger.warning("corpCode.xml parse failed: %s", exc)
+            return ""
+
+        # Cache
+        try:
+            cache_path = self._cache_dir / "_corpcode_map.json"
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(_json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+        return mapping.get(identifier, "")
 
     def _cache_filings(self, identifier: str, df: pd.DataFrame) -> None:
         """Cache financial data as per-period JSON files."""
