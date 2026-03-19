@@ -1088,6 +1088,94 @@ def compute_six_proxies(
                 equity_from_dupont / 1e9, market_implied_equity / 1e9,
             )
 
+        # === v5: OHLSON RESIDUAL INCOME EQUITY ===
+        # Uses the Ohlson (1995) model to get a company-specific book value
+        # from observed price and estimated earnings, replacing sector-average P/B.
+        if best_earnings and best_earnings > 0 and latest_close and shares:
+            best_eps = best_earnings / float(shares)
+            ebo_cost = 0.065  # default
+            if "six_proxy_ebo_pe" in cache.columns:
+                # Use EBO cost of equity if available
+                ebo_data = _ebo_reverse_earnings(
+                    latest_close, float(latest_div or 0),
+                    result.dividend_cagr_5y or 0.03,
+                )
+                ebo_cost = ebo_data.get("implied_cost_of_equity", 0.065) if ebo_data else 0.065
+
+            ohlson = _ohlson_residual_income_equity(
+                price=latest_close,
+                earnings_per_share=best_eps,
+                dividend_per_share=float(latest_div or 0),
+                cost_of_equity=ebo_cost,
+            )
+            if ohlson and ohlson.get("book_value_per_share"):
+                ohlson_bv = ohlson["book_value_per_share"]
+                ohlson_equity = ohlson_bv * float(shares)
+                ohlson_conf = ohlson.get("confidence", 0.65)
+
+                _set_with_confidence(cache, "six_proxy_ohlson_equity", ohlson_equity, ohlson_conf)
+                _set_with_confidence(cache, "six_proxy_ohlson_pb", ohlson.get("implied_pb", 0), ohlson_conf)
+                _set_with_confidence(cache, "six_proxy_ohlson_roe", ohlson.get("implied_roe", 0), ohlson_conf)
+                n_proxies += 3
+
+                # Use Ohlson equity if it agrees with market-implied (within 40%)
+                if equity_floor > 0:
+                    ohlson_div = abs(ohlson_equity - equity_floor) / equity_floor
+                    if ohlson_div < 0.40:
+                        # Ohlson confirms market-implied -- take average
+                        blended_equity = (equity_floor + ohlson_equity) / 2.0
+                        equity_floor = blended_equity
+                        result.book_equity_floor = blended_equity
+                        _set_with_confidence(
+                            cache, "six_proxy_book_equity_floor",
+                            blended_equity, min(0.82, ohlson_conf + 0.10),
+                        )
+                        logger.debug(
+                            "Ohlson equity confirms (div=%.1f%%): avg=%.1fB",
+                            ohlson_div * 100, blended_equity / 1e9,
+                        )
+
+        # === v5: MERTON STRUCTURAL DEBT MODEL ===
+        # Uses Merton (1974) to estimate total assets and implied debt from
+        # equity value and volatility. Fixes the total assets underestimation.
+        if shares and latest_close:
+            equity_val = float(shares) * latest_close
+            # Get equity volatility from cache if available
+            eq_vol = 0.20  # default 20% annualized
+            if has_close:
+                close_data = cache.get("close")
+                if close_data is not None and close_data.notna().sum() >= 20:
+                    daily_ret = close_data.pct_change().dropna()
+                    eq_vol = float(daily_ret.std() * np.sqrt(252))
+
+            merton = _merton_structural_debt(
+                equity_value=equity_val,
+                equity_volatility=eq_vol,
+            )
+            if merton and merton.get("asset_value"):
+                merton_assets = merton["asset_value"]
+                merton_debt = merton.get("implied_debt", 0)
+                merton_conf = merton.get("confidence", 0.55)
+
+                _set_with_confidence(cache, "six_proxy_merton_assets", merton_assets, merton_conf)
+                _set_with_confidence(cache, "six_proxy_merton_debt", merton_debt, merton_conf)
+                _set_with_confidence(
+                    cache, "six_proxy_merton_dd",
+                    merton.get("distance_to_default", 0), merton_conf,
+                )
+                _set_with_confidence(
+                    cache, "six_proxy_merton_pd",
+                    merton.get("default_probability", 0), merton_conf,
+                )
+                n_proxies += 4
+
+                logger.debug(
+                    "Merton: assets=%.1fB, debt=%.1fB, DD=%.2f, PD=%.4f",
+                    merton_assets / 1e9, merton_debt / 1e9,
+                    merton.get("distance_to_default", 0),
+                    merton.get("default_probability", 0),
+                )
+
         if best_earnings and best_earnings > 0 and equity_floor > 0:
             l1_bs = _reconstruct_balance_sheet(
                 net_income=best_earnings,
@@ -2195,6 +2283,230 @@ def _cross_sectional_pe_regression(
 
     except Exception as exc:
         logger.debug("Cross-sectional PE regression failed: %s", exc)
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# v5 Method 4: Ohlson (1995) Residual Income Model for Equity
+# ---------------------------------------------------------------------------
+
+def _ohlson_residual_income_equity(
+    price: float,
+    earnings_per_share: float,
+    dividend_per_share: float,
+    cost_of_equity: float = 0.065,
+    omega: float = 0.62,
+    gamma: float = 0.32,
+) -> dict[str, float]:
+    """Estimate book value per share using the Ohlson (1995) residual income model.
+
+    The Ohlson model relates price to book value through residual income:
+      P = BV + alpha_1 * RI + alpha_2 * v
+
+    where:
+      RI = NI - r * BV  (residual income)
+      alpha_1 = omega / (R - omega)
+      alpha_2 = R / ((R - omega)(R - gamma))
+
+    By observing P, NI, and D, we can solve for BV:
+      BV = (P - alpha_2 * v_est) / (1 + alpha_1 * (NI/BV - r))
+
+    This is solved iteratively via fixed-point iteration.
+
+    Parameters
+    ----------
+    price:
+        Current stock price.
+    earnings_per_share:
+        Estimated EPS (from Kalman or implied).
+    dividend_per_share:
+        Latest annual dividend.
+    cost_of_equity:
+        Required return on equity (from CAPM or EBO).
+    omega:
+        Residual income persistence (0.62 = Ohlson's empirical estimate).
+    gamma:
+        Other-information persistence (0.32 = Ohlson's estimate).
+
+    Returns
+    -------
+    Dict with book_value_per_share, implied_pb, implied_roe, confidence.
+    """
+    if price <= 0 or earnings_per_share <= 0:
+        return {}
+
+    try:
+        R = 1.0 + cost_of_equity
+        alpha_1 = omega / (R - omega)
+        alpha_2 = R / ((R - omega) * (R - gamma))
+
+        # Estimate v (other information) as the portion of price not explained
+        # by current earnings. Start with v = 0 and iterate.
+        bv = price / 3.0  # initial guess: P/B ~ 3
+
+        for iteration in range(50):
+            bv_prev = bv
+            ri = earnings_per_share - cost_of_equity * bv
+            # v captures information beyond current RI (growth expectations)
+            v_est = (price - bv - alpha_1 * ri) / max(alpha_2, 0.01)
+            # Update BV using the Ohlson formula inverted
+            bv_new = price - alpha_1 * ri - alpha_2 * v_est
+            # Damped update for stability
+            bv = 0.7 * bv_new + 0.3 * bv_prev
+            # Bound: BV must be positive and less than price
+            bv = max(bv, price * 0.05)
+            bv = min(bv, price * 0.80)
+
+            if abs(bv - bv_prev) < 0.01:
+                break
+
+        implied_pb = price / bv if bv > 0 else 0
+        implied_roe = earnings_per_share / bv if bv > 0 else 0
+
+        # Confidence: higher when the model converges quickly and BV is reasonable
+        confidence = 0.75 if iteration < 20 else 0.55
+
+        result = {
+            "book_value_per_share": bv,
+            "implied_pb": implied_pb,
+            "implied_roe": implied_roe,
+            "iterations": iteration + 1,
+            "confidence": confidence,
+        }
+
+        logger.debug(
+            "Ohlson equity: BV/share=%.2f, P/B=%.1f, ROE=%.1f%%, iters=%d",
+            bv, implied_pb, implied_roe * 100, iteration + 1,
+        )
+        return result
+
+    except Exception as exc:
+        logger.debug("Ohlson residual income failed: %s", exc)
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# v5 Method 5: Merton (1974) Structural Debt Model for Total Assets
+# ---------------------------------------------------------------------------
+
+def _merton_structural_debt(
+    equity_value: float,
+    equity_volatility: float,
+    risk_free_rate: float = 0.015,
+    debt_maturity: float = 5.0,
+    n_iterations: int = 100,
+) -> dict[str, float]:
+    """Estimate total assets and debt using Merton's structural credit model.
+
+    In the Merton (1974) framework, equity is a call option on the firm's
+    assets with strike equal to the face value of debt. Given observable
+    equity value and equity volatility, we can back out:
+      - Asset value (V)
+      - Asset volatility (sigma_V)
+      - Implied face value of debt (K)
+      - Distance to default (DD)
+
+    The two Merton equations:
+      E = V * N(d1) - K * exp(-rT) * N(d2)
+      sigma_E * E = N(d1) * sigma_V * V
+
+    are solved simultaneously for V and sigma_V.
+
+    Parameters
+    ----------
+    equity_value:
+        Total market cap (equity_value = shares * price).
+    equity_volatility:
+        Annualized equity volatility (from close prices).
+    risk_free_rate:
+        Risk-free rate (~1.5% Swiss govt bond).
+    debt_maturity:
+        Average debt maturity in years.
+    n_iterations:
+        Max iterations for Newton-Raphson solver.
+
+    Returns
+    -------
+    Dict with asset_value, asset_volatility, implied_debt,
+    distance_to_default, default_probability, confidence.
+    """
+    if equity_value <= 0 or equity_volatility <= 0:
+        return {}
+
+    try:
+        from scipy.stats import norm
+
+        E = equity_value
+        sigma_E = equity_volatility
+        r = risk_free_rate
+        T = debt_maturity
+
+        # Initial guess: V = E * 1.5 (typical leverage ~33%)
+        V = E * 1.5
+        sigma_V = sigma_E * E / V  # leverage adjustment
+
+        for _ in range(n_iterations):
+            V_prev = V
+            sigma_V_prev = sigma_V
+
+            # Guess K (debt face value) from V - E
+            K = max(V - E, E * 0.1)
+
+            if K <= 0 or V <= 0 or sigma_V <= 0:
+                break
+
+            # Merton d1, d2
+            d1 = (np.log(V / K) + (r + 0.5 * sigma_V ** 2) * T) / (sigma_V * np.sqrt(T))
+            d2 = d1 - sigma_V * np.sqrt(T)
+
+            # Update V from Black-Scholes call equation
+            V_new = (E + K * np.exp(-r * T) * norm.cdf(d2)) / max(norm.cdf(d1), 1e-10)
+
+            # Update sigma_V from the volatility relationship
+            if norm.cdf(d1) > 1e-10 and V_new > 0:
+                sigma_V_new = sigma_E * E / (norm.cdf(d1) * V_new)
+            else:
+                sigma_V_new = sigma_V
+
+            # Damped update
+            V = 0.5 * V_new + 0.5 * V_prev
+            sigma_V = 0.5 * sigma_V_new + 0.5 * sigma_V_prev
+
+            # Check convergence
+            if abs(V - V_prev) / max(V_prev, 1) < 1e-6:
+                break
+
+        # Final calculations
+        K_final = max(V - E, 0)
+        if K_final > 0 and sigma_V > 0:
+            d1_final = (np.log(V / K_final) + (r + 0.5 * sigma_V ** 2) * T) / (sigma_V * np.sqrt(T))
+            d2_final = d1_final - sigma_V * np.sqrt(T)
+            dd = d2_final  # distance to default
+            pd = norm.cdf(-d2_final)  # default probability
+        else:
+            dd = 5.0  # very far from default
+            pd = 0.0
+
+        confidence = 0.65 if equity_volatility > 0.10 else 0.50
+
+        result = {
+            "asset_value": V,
+            "asset_volatility": sigma_V,
+            "implied_debt": K_final,
+            "implied_total_assets": V,
+            "distance_to_default": dd,
+            "default_probability": pd,
+            "confidence": confidence,
+        }
+
+        logger.debug(
+            "Merton structural: V=%.0f, K=%.0f, sigma_V=%.3f, DD=%.2f, PD=%.4f",
+            V, K_final, sigma_V, dd, pd,
+        )
+        return result
+
+    except Exception as exc:
+        logger.debug("Merton structural debt failed: %s", exc)
         return {}
 
 
