@@ -496,18 +496,20 @@ class CHSixClient:
         """Fetch financials via EU ESEF crossover or SIX filing discovery + LLM.
 
         SIX APIs do not provide financial statement line items (only metadata
-        like auditor and accounting standard). For actual financials:
+        like auditor and accounting standard). Switzerland is not an EU member,
+        so Swiss companies are not in the ESEF database either.
 
-        Path 1: EU ESEF wrapper (Swiss blue chips like Nestle, Novartis, Roche
-        file ESEF XBRL reports). PIT-compliant with filing dates.
+        Path 1: EU ESEF wrapper (attempt -- Swiss companies are not subject
+        to the EU ESEF regulation, so this rarely returns data).
 
-        Path 2: SIX filing discovery (via SIXFilingDiscoverer) provides
-        corporate action text that can be extracted by LLM.
+        Path 2: SIX filing discovery + LLM extraction. The SIXFilingDiscoverer
+        provides corporate action notice text. When an LLM client is available,
+        it can extract structured financial data from company annual report
+        PDFs linked in these notices.
 
-        yfinance is NOT used for financial statements (no filing dates = no
-        PIT compliance).
+        Returns empty DataFrame when no PIT-compliant data source is available.
         """
-        # Path 1: EU ESEF wrapper (Swiss blue chips file ESEF)
+        # Path 1: EU ESEF wrapper (Swiss companies rarely file ESEF)
         try:
             from operator1.clients.eu_esef_wrapper import EUEsefClient
             esef = EUEsefClient()
@@ -540,7 +542,6 @@ class CHSixClient:
         except Exception as exc:
             logger.debug("SIX filing discovery failed for %s: %s", identifier, exc)
 
-        # No yfinance fallback -- return empty for PIT compliance
         return pd.DataFrame()
 
     # -- Price data ----------------------------------------------------------
