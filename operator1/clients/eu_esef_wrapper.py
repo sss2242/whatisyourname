@@ -117,7 +117,7 @@ class EUEsefError(Exception):
 # ---------------------------------------------------------------------------
 
 def _api_get(path: str, params: dict | None = None) -> dict:
-    """GET from filings.xbrl.org JSON:API."""
+    """GET from filings.xbrl.org JSON:API (fallback for when xbrl-filings-api unavailable)."""
     try:
         resp = requests.get(
             f"{_XBRL_API_BASE}{path}",
@@ -144,6 +144,72 @@ def _fetch_entity_name(entity_link: str) -> str:
         return data.get("data", {}).get("attributes", {}).get("name", "")
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# xbrl-filings-api library integration
+# ---------------------------------------------------------------------------
+
+_XF_AVAILABLE = False
+try:
+    import xbrl_filings_api as _xf
+    _XF_AVAILABLE = True
+except ImportError:
+    _xf = None  # type: ignore
+
+
+def _xf_get_filings(
+    country: str = "",
+    entity_name: str = "",
+    limit: int = 100,
+) -> tuple[list, list]:
+    """Fetch filings using xbrl-filings-api library.
+
+    Returns (filings_list, entities_list) where each filing is a dict
+    with keys: json_url, reporting_date, country, entity_name, entity_id.
+    """
+    if not _XF_AVAILABLE:
+        return [], []
+
+    import warnings
+    filters: dict = {}
+    if country:
+        filters["country"] = country
+    if entity_name:
+        filters["entity.name"] = entity_name
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fs = _xf.get_filings(
+                filters=filters,
+                sort="-last_end_date",
+                limit=limit,
+                flags=_xf.GET_ENTITY,
+            )
+
+        filings = []
+        for f in fs:
+            filings.append({
+                "json_url": f.json_url,
+                "reporting_date": str(f.reporting_date) if f.reporting_date else "",
+                "country": f.country or "",
+                "entity_name": f.entity.name if f.entity else "",
+                "entity_id": f.entity.identifier if f.entity else "",
+                "added_time": str(f.added_time)[:10] if f.added_time else "",
+            })
+
+        entities = []
+        for e in fs.entities:
+            entities.append({
+                "name": e.name or "",
+                "identifier": e.identifier or "",
+            })
+
+        return filings, entities
+    except Exception as exc:
+        logger.debug("xbrl-filings-api query failed: %s", exc)
+        return [], []
 
 
 def _download_xbrl_json(json_url: str) -> dict:
@@ -333,10 +399,46 @@ class EUEsefClient:
     def search_company(self, name: str) -> list[dict[str, Any]]:
         """Search for companies by name in ESEF filings.
 
-        First tries exact match via the entities API, then falls
-        back to the cached entity directory with substring matching.
+        Strategy:
+        1. Try exact match via xbrl-filings-api entity.name filter
+        2. Try exact match via raw /api/entities endpoint
+        3. Fall back to substring search in cached entity directory
         """
-        # Path 1: Exact name match via /api/entities
+        # Path 1: Exact match via xbrl-filings-api (fast, handles JSON:API)
+        if _XF_AVAILABLE:
+            filings, entities = _xf_get_filings(
+                country=self._country_code,
+                entity_name=name,
+                limit=5,
+            )
+            if entities:
+                results = []
+                for e in entities:
+                    results.append({
+                        "ticker": e["identifier"][:20],
+                        "name": e["name"],
+                        "lei": e["identifier"],
+                        "cik": e["identifier"],
+                        "country": filings[0]["country"] if filings else "EU",
+                        "exchange": "ESEF",
+                        "market_id": self.market_id,
+                    })
+                return results
+            # Also try without country filter for exact name match
+            if self._country_code:
+                filings2, entities2 = _xf_get_filings(entity_name=name, limit=5)
+                if entities2:
+                    return [{
+                        "ticker": e["identifier"][:20],
+                        "name": e["name"],
+                        "lei": e["identifier"],
+                        "cik": e["identifier"],
+                        "country": "EU",
+                        "exchange": "ESEF",
+                        "market_id": self.market_id,
+                    } for e in entities2]
+
+        # Path 2: Raw API exact match
         try:
             data = _api_get("/entities", params={"filter[name]": name, "page[size]": "5"})
             entities = data.get("data", [])
@@ -360,7 +462,7 @@ class EUEsefClient:
         except Exception:
             pass
 
-        # Path 2: Substring search in cached directory
+        # Path 3: Substring search in cached directory
         return self.list_companies(query=name)
 
     def _get_entity_directory(self) -> dict[str, dict]:
@@ -507,13 +609,58 @@ class EUEsefClient:
     def _get_entity_filings(self, entity_id: str) -> list[dict]:
         """Fetch all filings for a specific entity.
 
-        Uses the entity's related filings link for efficient lookup.
-        Falls back to country-filtered search with client-side matching.
+        Uses xbrl-filings-api entity.identifier filter (fastest),
+        then falls back to raw API entity filings link.
         """
         if not entity_id:
             return []
 
-        # Path 1: Direct entity filings via relationship link
+        # Path 1: xbrl-filings-api with entity.identifier filter
+        if _XF_AVAILABLE:
+            filings, _ = _xf_get_filings(
+                entity_name=_entity_name_cache.get(entity_id, ""),
+                limit=20,
+            )
+            if not filings:
+                # Try identifier-based filter
+                import warnings
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        fs = _xf.get_filings(
+                            filters={"entity.identifier": entity_id},
+                            sort="-last_end_date",
+                            limit=20,
+                        )
+                    filings = [{
+                        "json_url": f.json_url,
+                        "reporting_date": str(f.reporting_date) if f.reporting_date else "",
+                        "country": f.country or "",
+                        "entity_name": f.entity.name if f.entity else "",
+                        "entity_id": f.entity.identifier if f.entity else "",
+                        "added_time": str(f.added_time)[:10] if f.added_time else "",
+                    } for f in fs]
+                except Exception:
+                    pass
+
+            if filings:
+                # Convert to the format expected by _fetch_financials
+                api_filings = []
+                for fl in filings:
+                    api_filings.append({
+                        "attributes": {
+                            "json_url": fl["json_url"],
+                            "period_end": fl["reporting_date"],
+                            "date_added": fl["added_time"],
+                            "country": fl["country"],
+                        },
+                        "relationships": {
+                            "entity": {"links": {"related": f"/api/entities/{entity_id}"}}
+                        },
+                    })
+                return api_filings
+
+        # Path 2: Direct entity filings via raw API
         try:
             data = _api_get(f"/entities/{entity_id}/filings", params={
                 "page[size]": "20",
@@ -521,34 +668,11 @@ class EUEsefClient:
             })
             filings = data.get("data", [])
             if filings:
-                logger.debug("ESEF: %d filings via entity link for %s", len(filings), entity_id)
                 return filings
         except Exception:
             pass
 
-        # Path 2: Country-filtered search with client-side entity matching
-        params: dict[str, str] = {
-            "page[size]": "250",
-            "sort": "-period_end",
-        }
-        if self._country_code:
-            params["filter[country]"] = self._country_code
-
-        data = _api_get("/filings", params=params)
-        filings = data.get("data", [])
-
-        entity_filings = []
-        for f in filings:
-            entity_link = (
-                f.get("relationships", {})
-                .get("entity", {})
-                .get("links", {})
-                .get("related", "")
-            )
-            if entity_id in entity_link:
-                entity_filings.append(f)
-
-        return entity_filings
+        return []
 
     def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
         """Fetch financial data by downloading XBRL JSON from filings.

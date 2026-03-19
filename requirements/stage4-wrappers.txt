@@ -42,6 +42,9 @@ banxicoapi==1.0.2
 pdfplumber==0.11.9
 camelot-py[base]==1.0.9    # High-accuracy PDF table extraction (MIT)
 
+# EU ESEF XBRL filings
+xbrl-filings-api==1.0          # filings.xbrl.org Python client (entity search, filing download)
+
 # News sentiment
 gnews==0.4.3
 feedparser==6.0.12
