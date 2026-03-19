@@ -304,22 +304,38 @@ def _fetch_historic_csv(valor_id: str) -> pd.DataFrame:
         }, timeout=30)
         resp.raise_for_status()
 
-        df = pd.read_csv(io.StringIO(resp.text), sep=";")
+        # SIX CSV format: 2 metadata lines, then "Date;Price;Volume" header.
+        # Example:
+        #   NESTLE N (Nestlé/CH0038863350/CHF)
+        #           19.03.2026
+        #           Date;Price;Volume
+        #   19.03.2026;77.24;1514740
+        lines = resp.text.strip().split("\n")
 
-        # SIX CSV columns vary but typically include Date, Close, Volume
-        # Normalize column names
+        # Find the header line (contains "Date" and ";")
+        header_idx = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if ";" in stripped and ("date" in stripped.lower() or "datum" in stripped.lower()):
+                header_idx = i
+                break
+
+        csv_text = "\n".join(lines[header_idx:])
+        df = pd.read_csv(io.StringIO(csv_text), sep=";")
+
+        # Normalize column names: map Price->close, Date->date, Volume->volume
         col_map: dict[str, str] = {}
         for col in df.columns:
             cl = col.strip().lower()
             if cl in ("date", "datum"):
                 col_map[col] = "date"
-            elif cl in ("close", "schluss", "last", "closing price"):
+            elif cl in ("price", "close", "schluss", "last", "closing price"):
                 col_map[col] = "close"
             elif cl in ("volume", "volumen", "umsatz stk"):
                 col_map[col] = "volume"
 
         if "date" not in col_map.values() or "close" not in col_map.values():
-            # Try positional: first col = date, second = close
+            # Positional fallback: first col = date, second = close
             cols = df.columns.tolist()
             if len(cols) >= 2:
                 col_map = {cols[0]: "date", cols[1]: "close"}
@@ -332,7 +348,8 @@ def _fetch_historic_csv(valor_id: str) -> pd.DataFrame:
             logger.debug("SIX CSV missing date/close columns: %s", list(df.columns))
             return pd.DataFrame()
 
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        # SIX dates are DD.MM.YYYY format (e.g. "19.03.2026")
+        df["date"] = pd.to_datetime(df["date"], format="%d.%m.%Y", errors="coerce")
         df = df.dropna(subset=["date"])
         df = df.set_index("date").sort_index()
 

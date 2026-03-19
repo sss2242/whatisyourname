@@ -327,18 +327,27 @@ def _exponential_stability(dividends: pd.Series, halflife_years: float = 5.0) ->
         return 0.5
 
     n = len(growth_rates)
-    weights = np.exp(np.arange(n) * np.log(2) / halflife_years)
+    # Weights: index 0 = oldest (lowest weight), index n-1 = newest (highest)
+    # Exponential decay from newest: weight_i = 2^(i/halflife) where i=0..n-1
+    weights = np.exp(np.arange(n) * np.log(2) / max(halflife_years, 1.0))
     weights = weights / weights.sum()
 
     weighted_mean = np.average(growth_rates.values, weights=weights)
     weighted_var = np.average((growth_rates.values - weighted_mean) ** 2, weights=weights)
     weighted_std = np.sqrt(weighted_var)
 
-    if abs(weighted_mean) < _EPS:
-        return 1.0 if weighted_std < 0.01 else 0.5
+    # Count positive growth rates (dividends that grew or stayed flat)
+    positive_growth = (growth_rates.values >= -0.001).astype(float)
+    positive_fraction = np.average(positive_growth, weights=weights)
 
-    cv = weighted_std / abs(weighted_mean)
-    return max(0.0, min(1.0, 1.0 - cv))
+    # Measure consistency: low std of growth rates = high stability
+    # Use absolute scale (not CV) since mean can be near zero
+    # A std of 0.05 (5% variation) is very stable for dividends
+    consistency = max(0.0, 1.0 - weighted_std / 0.10)
+
+    # Combine: 60% positive growth fraction + 40% consistency
+    score = positive_fraction * 0.6 + consistency * 0.4
+    return max(0.0, min(1.0, score))
 
 
 # ---------------------------------------------------------------------------
