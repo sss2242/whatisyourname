@@ -16,11 +16,11 @@ Current state of all 15 Tier 2 market wrappers based on code review.
 | 8 | **Switzerland** `ch_six` | **SIX FQS + Share Details APIs (no auth)** | **SIX FQS ref.json (110K+ securities)** | **Synthetic from SIX dividends/capital/notices + Kalman/PELT/Merton/L1 (22 fields, no LLM)** | **SIX historic CSV (close+volume, ~5mo)** | ESEF crossover + LLM fallback |
 | 9 | **South Africa** `za_jse` | **JSE WCF API (ISIN, sector, market cap) + yfinance** | **JSE Issuer Directory (298 equity issuers)** | **JSE SENS per-issuer API (instant) + LLM extraction** | yfinance (.JO) | **JSEFilingDiscoverer (WCF SENS API, per-issuer fast path, PDF download confirmed)** |
 | 10 | **Mexico** `mx_bmv` | **BMV WSO2 Search API + yfinance** | **BMV Search API (244 issuers, token-based)** | **BMV XBRL JSON (native, no LLM needed, 5,817 ZIPs)** | yfinance (.MX) | **BMVFilingDiscoverer (token-based search API) + XBRL fast path** |
-| 11 | **UAE** `ae_dfm` | yfinance (.AE) | DFM API (broken) | Filing discovery + LLM only | yfinance (.AE) | DFMFilingDiscoverer (registered, untested) |
-| 12 | **Netherlands** `nl_esef` | ESEF partial | ESEF API (0 results) | ESEF API (0 results) | yfinance | None registered |
-| 13 | **Spain** `es_esef` | ESEF partial | ESEF API (0 results) | ESEF API (0 results) | yfinance | None registered |
-| 14 | **Italy** `it_esef` | ESEF partial | ESEF API (0 results) | ESEF API (0 results) | yfinance | None registered |
-| 15 | **Sweden** `se_esef` | ESEF partial | ESEF API (0 results) | ESEF API (0 results) | yfinance | None registered |
+| 11 | **UAE** `ae_dfm` | **DFM api2 stocks + yfinance** | **DFM api2 (461 securities) + Nuxt SSR (510 companies)** | **eFsah API discovery + PDF (no LLM for discovery)** | yfinance (.AE) | **DFMFilingDiscoverer (eFsah API, PDF download confirmed)** |
+| 12 | **Netherlands** `nl_esef` | **ESEF entity (filings.xbrl.org)** | **ESEF directory (157 entities, fuzzy match)** | **XBRL JSON native (no LLM, 32 IFRS fields)** | yfinance | ESEF XBRL JSON (inline) |
+| 13 | **Spain** `es_esef` | **ESEF entity** | **ESEF directory (133 entities, fuzzy match)** | **XBRL JSON native (no LLM, 32 IFRS fields)** | yfinance | ESEF XBRL JSON (inline) |
+| 14 | **Italy** `it_esef` | **ESEF entity** | **ESEF directory (202 entities, fuzzy match)** | **XBRL JSON native (no LLM, 32 IFRS fields)** | yfinance | ESEF XBRL JSON (inline) |
+| 15 | **Sweden** `se_esef` | **ESEF entity** | **ESEF directory (343 entities, fuzzy match)** | **XBRL JSON native (no LLM, 32 IFRS fields)** | yfinance | ESEF XBRL JSON (inline) |
 
 ---
 
@@ -106,23 +106,29 @@ All 15 markets return daily OHLCV data via yfinance or regional wrappers (baosto
 
 ## What Doesn't Work
 
-### Financial statements (9/15 need LLM)
-- AU, CA, HK, SG, SA, ZA, AE: have filing discoverers (discovery + PDF download work) but need an LLM client (Gemini/Claude/OpenRouter API key) to extract structured data from PDFs
-- NL, ES, IT, SE: no filing discoverer registered, no native financial API
+### Financial statements (5/15 need LLM)
+- AU, CA, HK, SG, SA: have filing discoverers (discovery + PDF download work) but need an LLM client (Gemini/Claude/OpenRouter API key) to extract structured data from PDFs
 - CH: **FIXED** -- synthetic financials from SIX dividend/capital/notices data (22 fields, no LLM needed)
+- AE: **FIXED** -- eFsah API discovery + PDF download (needs LLM for extraction)
+- NL, ES, IT, SE: **FIXED** -- XBRL JSON extraction from filings.xbrl.org (32 IFRS fields, no LLM needed)
+- ZA: filing discovery works (SENS API), needs LLM for PDF extraction
 - yfinance intentionally NOT used for financials (no filing dates = no PIT compliance)
 
-### Company search (3/15 broken)
-- SA (Tadawul returns HTML), AE (DFM API broken): native APIs return HTML or are unreachable
-- NL, ES, IT, SE: ESEF API returns 0 results for company name searches
+### Company search (1/15 broken)
+- SA (Tadawul returns HTML): native API returns HTML, not JSON
+- AE: **FIXED** -- DFM api2 stocks (461 securities) + Nuxt SSR (510 companies)
+- NL, ES, IT, SE: **FIXED** -- ESEF entity directory (133-343 entities per country, fuzzy match with rapidfuzz WRatio)
 - CH: **FIXED** -- SIX FQS ref.json (110K+ securities, ticker/ISIN/name search, no auth)
 - MX: **FIXED** -- BMV WSO2 Search API now works (token-based, no key needed)
 - ZA: **FIXED** -- JSE WCF CustomerRoleService returns 298 equity issuers
 
-### ESEF markets (4/15 barely functional)
-- Netherlands, Spain, Italy, Sweden all use the same `eu_esef_wrapper` which queries `filings.xbrl.org/api`
-- The API returns partial profiles but 0 results for company search and financial statements
-- No filing discoverer registered for any of these markets
+### ESEF markets (4/15 now functional with XBRL JSON)
+- Netherlands (599 filings), Spain (542), Italy (754), Sweden (1,415) now have **structured IFRS financial data** via XBRL JSON extraction from filings.xbrl.org
+- Entity search uses `include=entity` sideload + rapidfuzz WRatio fuzzy matching
+- 32 IFRS concepts mapped to canonical fields (revenue, net_income, total_assets, equity, cash, etc.)
+- Uses `xbrl-filings-api==1.0` library for entity.name exact match + raw API fallback
+- Tested: Heineken NL (42 income + 64 balance facts), BNP PARIBAS FR (47+82), Unilever NL (32+41)
+- **Germany (DE): 0 filings** on filings.xbrl.org -- not available via ESEF
 
 ---
 
@@ -130,8 +136,8 @@ All 15 markets return daily OHLCV data via yfinance or regional wrappers (baosto
 
 | Capability | Working | Partial | Broken |
 |-----------|---------|---------|--------|
-| Profile | IN, CN, AU, CA, SG, **MX**, **ZA**, **CH** + 3 via yfinance | NL, ES, IT, SE (ESEF partial) | -- |
-| Company Search | IN, CN, AU, CA, SG, **MX**, **ZA**, **CH** | -- | HK (yfinance only), SA, AE, NL, ES, IT, SE |
-| Financial Statements | IN (native), CN (akshare), **MX (XBRL JSON)**, **CH (synthetic from SIX APIs)** | AU, CA, HK, SG, SA, **ZA**, AE (need LLM) | NL, ES, IT, SE (no path) |
-| OHLCV | All 15 (**CH**: SIX historic CSV, ~5mo close+volume) | -- | -- |
-| Filing Discovery | IN, AU, CA, HK, SG, **MX**, SA, **ZA**, AE | **CH** (ESEF crossover + LLM fallback) | NL, ES, IT, SE (none registered) |
+| Profile | IN, CN, AU, CA, SG, **MX**, **ZA**, **CH**, **AE**, **NL**, **ES**, **IT**, **SE** + 1 via yfinance | -- | -- |
+| Company Search | IN, CN, AU, CA, SG, **MX**, **ZA**, **CH**, **AE**, **NL**, **ES**, **IT**, **SE** | HK (yfinance only) | SA (Tadawul HTML) |
+| Financial Statements | IN (native), CN (akshare), **MX (XBRL JSON)**, **CH (synthetic)**, **NL/ES/IT/SE (ESEF XBRL JSON)** | AU, CA, HK, SG, SA, **ZA**, **AE** (need LLM) | -- |
+| OHLCV | All 15 (**CH**: SIX CSV, **AE**: api2 snapshot + yfinance) | -- | -- |
+| Filing Discovery | IN, AU, CA, HK, SG, **MX**, SA, **ZA**, **AE**, **NL/ES/IT/SE** (ESEF XBRL) | **CH** (ESEF + LLM) | -- |
