@@ -1656,24 +1656,32 @@ class BMVFilingDiscoverer:
 
 
 # ---------------------------------------------------------------------------
-# DFM/ADX UAE Filing Discoverer
+# DFM/ADX UAE Filing Discoverer (eFsah API on api2.dfm.ae)
 # ---------------------------------------------------------------------------
 
-_DFM_DISC_URL = "https://www.dfm.ae/api/DisclosureFilesApi/GetCompanyDisclosures"
-_ADX_DISC_URL = "https://www.adx.ae/api/disclosures"
+# Old endpoints (404 since ~2025): www.dfm.ae/api/DisclosureFilesApi, www.adx.ae/api/disclosures
+# New endpoint: api2.dfm.ae/efsah/v1/prototype_efsah (discovered via Nuxt SSR config)
+# PDF download: feeds.dfm.ae/documents/{r_path} (from cms_resources=true)
+_DFM_EFSAH_API = "https://api2.dfm.ae/efsah/v1/prototype_efsah"
+_DFM_FEEDS_BASE = "https://feeds.dfm.ae/documents"
 _DFM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
     "Accept": "application/json",
+    "Origin": "https://www.dfm.ae",
     "Referer": "https://www.dfm.ae/",
 }
 
 
 class DFMFilingDiscoverer:
-    """Discovers financial filings from DFM and ADX (UAE).
+    """Discovers financial filings from DFM via the eFsah API.
 
-    Tries both Dubai Financial Market (DFM) and Abu Dhabi Securities
-    Exchange (ADX) disclosure APIs. Both exchanges publish company
-    financial statements through their disclosure portals.
+    Uses the eFsah disclosure API on api2.dfm.ae (discovered by
+    reverse-engineering the DFM Nuxt.js SPA). This replaces the old
+    www.dfm.ae/api/DisclosureFilesApi endpoint which was decommissioned.
+
+    The eFsah API returns disclosure metadata with PIT publication dates.
+    PDF resources are available via cms_resources=true parameter, with
+    PDFs hosted on feeds.dfm.ae/documents/{r_path}.
 
     UAE adopted IFRS for all listed companies, so standard IFRS
     canonical mapping applies.
@@ -1684,115 +1692,114 @@ class DFMFilingDiscoverer:
         ticker: str,
         years: int = 2,
     ) -> FilingDiscovery:
-        """Discover financial filings from DFM/ADX.
+        """Discover financial filings from DFM eFsah API.
 
         Parameters
         ----------
         ticker:
-            DFM or ADX ticker symbol (e.g. 'EMAAR', 'ETISALAT').
+            DFM ticker symbol (e.g. 'EMAAR', 'DIB', 'DEWA').
         years:
             Number of years to search back.
         """
         result = FilingDiscovery(ticker=ticker, market_id="ae_dfm")
 
-        today = date.today()
-        from_date = today - timedelta(days=365 * years)
+        try:
+            import json as _json
 
-        # Try DFM disclosure API
-        for endpoint, exchange_name, headers in [
-            (_DFM_DISC_URL, "DFM", _DFM_HEADERS),
-            (_ADX_DISC_URL, "ADX", {**_DFM_HEADERS, "Referer": "https://www.adx.ae/"}),
-        ]:
-            try:
-                resp = requests.get(
-                    endpoint,
-                    params={
-                        "symbol": ticker,
-                        "companySymbol": ticker,
-                        "fromDate": from_date.strftime("%Y-%m-%d"),
-                        "toDate": today.strftime("%Y-%m-%d"),
-                        "category": "Financial",
-                        "pageSize": "20",
-                    },
-                    headers=headers,
-                    timeout=15,
+            # Fetch disclosures with PDF resources
+            resp = requests.get(
+                _DFM_EFSAH_API,
+                params={
+                    "announcement_type": "Disclosure",
+                    "symbol": ticker.upper(),
+                    "take": "50",
+                    "skip": "0",
+                    "lang": "en",
+                    "h7_datetime_format": "MMM dd, yyyy HH:mm:ss",
+                    "cms_resources": "true",
+                },
+                headers=_DFM_HEADERS,
+                timeout=15,
+            )
+            resp.raise_for_status()
+
+            # eFsah returns UTF-8 BOM -- decode with utf-8-sig
+            data = _json.loads(resp.content.decode("utf-8-sig"))
+            records = data.get("root", [])
+
+            for item in records:
+                headline = item.get("headline", "")
+                if not headline:
+                    continue
+
+                # Filter to financial disclosures
+                lower = headline.lower()
+                report_type = (item.get("integrated_report_type") or "").lower()
+                is_financial = any(kw in lower for kw in [
+                    "financial", "annual", "interim", "quarter",
+                    "result", "statement", "report",
+                ]) or "financial" in report_type
+
+                if not is_financial:
+                    continue
+
+                # Parse publication date (PIT filing date)
+                pub_date = item.get("publication_date", "")
+                filing_date = ""
+                if pub_date:
+                    # Format: "Mar 12, 2026 03:53:30 PM"
+                    try:
+                        from datetime import datetime
+                        dt = datetime.strptime(
+                            pub_date.split(" AM")[0].split(" PM")[0].rsplit(" ", 1)[0],
+                            "%b %d, %Y",
+                        )
+                        filing_date = dt.strftime("%Y-%m-%d")
+                    except (ValueError, IndexError):
+                        filing_date = pub_date[:10]
+
+                # Classify filing type
+                if "annual" in lower or "year" in lower or "annual" in report_type:
+                    filing_type = "annual"
+                elif "interim" in lower or "half" in lower or "six" in lower:
+                    filing_type = "interim"
+                elif "quarter" in lower or "qtr" in lower:
+                    filing_type = "quarterly"
+                else:
+                    filing_type = "annual"
+
+                # Extract PDF URL from resources
+                doc_url = ""
+                resources = item.get("resources", [])
+                if resources:
+                    for res in resources:
+                        r_path = res.get("r_path", "")
+                        if r_path:
+                            doc_url = f"{_DFM_FEEDS_BASE}{r_path}"
+                            break
+
+                # Determine report date from integrated_period
+                report_date = ""
+                period = item.get("integrated_period")
+                if period:
+                    report_date = f"{period}-12-31"
+
+                filing = FilingMetadata(
+                    title=headline,
+                    filing_date=filing_date,
+                    report_date=report_date,
+                    document_url=doc_url,
+                    document_format="pdf",
+                    filing_type=filing_type,
+                    market_id="ae_dfm",
                 )
-                resp.raise_for_status()
-            except Exception as exc:
-                result.errors.append(f"{exchange_name} disclosure API failed: {exc}")
-                continue
+                result.filings.append(filing)
 
-            try:
-                data = resp.json()
-                records = []
-                if isinstance(data, dict):
-                    records = data.get("data", data.get("items", data.get("disclosures", [])))
-                elif isinstance(data, list):
-                    records = data
+        except Exception as exc:
+            result.errors.append(f"DFM eFsah API failed: {exc}")
+            logger.debug("DFM eFsah discovery failed for %s: %s", ticker, exc)
 
-                for item in records:
-                    # Try both English and Arabic field names
-                    title_text = item.get("titleEn", item.get("title", item.get("subject", "")))
-                    ann_date = item.get("publishDate", item.get("date", item.get("disclosureDate", "")))
-                    doc_url = item.get("pdfUrl", item.get("fileUrl", item.get("documentUrl", "")))
-
-                    if not title_text:
-                        title_text = item.get("titleAr", "")
-                    if not title_text:
-                        continue
-
-                    # Filter financial disclosures
-                    lower = title_text.lower()
-                    if not any(kw in lower for kw in [
-                        "financial", "annual", "interim", "quarter",
-                        "result", "statement", "report",
-                        # Arabic keywords
-                        "مالي", "سنوي", "نتائج", "بيانات",
-                    ]):
-                        continue
-
-                    filing_date = str(ann_date)[:10] if ann_date else ""
-
-                    if "annual" in lower or "سنوي" in lower or "year" in lower:
-                        filing_type = "annual"
-                    elif "interim" in lower or "half" in lower or "six" in lower:
-                        filing_type = "interim"
-                    elif "quarter" in lower:
-                        filing_type = "quarterly"
-                    else:
-                        filing_type = "annual"
-
-                    if doc_url and not doc_url.startswith("http"):
-                        base = "https://www.dfm.ae" if exchange_name == "DFM" else "https://www.adx.ae"
-                        doc_url = f"{base}{doc_url}"
-
-                    filing = FilingMetadata(
-                        title=title_text,
-                        filing_date=filing_date,
-                        document_url=doc_url,
-                        document_format="pdf",
-                        filing_type=filing_type,
-                        market_id="ae_dfm",
-                    )
-                    result.filings.append(filing)
-
-            except (ValueError, AttributeError):
-                # HTML response -- try to find PDF links
-                html = resp.text
-                link_pattern = re.compile(r'href="([^"]*\.pdf)"', re.IGNORECASE)
-                for link in link_pattern.findall(html)[:10]:
-                    base = "https://www.dfm.ae" if exchange_name == "DFM" else "https://www.adx.ae"
-                    doc_url = link if link.startswith("http") else f"{base}{link}"
-                    filing = FilingMetadata(
-                        title=f"{ticker} financial disclosure ({exchange_name})",
-                        document_url=doc_url,
-                        document_format="pdf",
-                        filing_type="annual",
-                        market_id="ae_dfm",
-                    )
-                    result.filings.append(filing)
-
-        # Dedup
+        # Dedup by document URL or title
         seen: set[str] = set()
         unique: list[FilingMetadata] = []
         for f in result.filings:
@@ -1802,14 +1809,23 @@ class DFMFilingDiscoverer:
                 unique.append(f)
         result.filings = unique
 
-        logger.info("DFM/ADX discovery for %s: found %d filings", ticker, len(result.filings))
+        logger.info("DFM eFsah discovery for %s: found %d filings", ticker, len(result.filings))
         return result
 
     def download_filing(self, filing: FilingMetadata) -> bytes:
-        """Download a DFM/ADX filing document."""
+        """Download a DFM filing PDF from feeds.dfm.ae.
+
+        The feeds.dfm.ae server returns 406 if Accept header includes
+        application/json. Must use Accept: application/pdf or */*.
+        """
         if not filing.document_url:
             raise ValueError("No document URL in filing metadata")
-        resp = requests.get(filing.document_url, headers=_DFM_HEADERS, timeout=30)
+        download_headers = {
+            "User-Agent": _DFM_HEADERS["User-Agent"],
+            "Accept": "application/pdf, */*",
+            "Referer": "https://www.dfm.ae/",
+        }
+        resp = requests.get(filing.document_url, headers=download_headers, timeout=60)
         resp.raise_for_status()
         if resp.content[:4] != b"%PDF":
             raise ValueError(f"Not a PDF: {resp.headers.get('Content-Type', 'unknown')}")
