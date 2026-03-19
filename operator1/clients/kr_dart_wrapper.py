@@ -617,31 +617,100 @@ class KRDartClient:
         """Resolve a stock code or name to a DART corp_code.
 
         Resolution order:
-        1. Search the cached corp list (from dart-fss or previous bulk download)
-        2. Download and parse ``corpCode.xml`` bulk ZIP (same approach as dart-fss)
-        3. Return empty string if all paths fail
+        1. Cached corp list (from dart-fss or previous search)
+        2. DART web portal ``searchCorpExt.do`` (fast, no API key needed)
+        3. DART ``list.json`` filing search with date windows
+        4. DART ``corpCode.xml`` bulk ZIP download (slow, last resort)
         """
         # Try cached corp list first
         matches = self.list_companies(query=identifier)
         if matches:
             return matches[0].get("corp_code", "")
 
-        # Try direct search by stock_code
+        # Try direct search by stock_code in cached list
         if identifier.isdigit():
             all_companies = self.list_companies()
             for c in all_companies:
                 if c.get("ticker") == identifier:
                     return c.get("corp_code", "")
 
-        # Fallback: download corpCode.xml bulk ZIP from DART API
-        # This is the same approach dart-fss uses internally.
-        # The ZIP contains ~100K companies with stock_code -> corp_code mapping.
+        # Fast path: DART web portal company search (no API key needed!)
+        corp_code = self._resolve_via_web_search(identifier)
+        if corp_code:
+            return corp_code
+
+        # Fallback: filing search + corpCode.xml
         if self._api_key:
             corp_code = self._resolve_via_corp_code_xml(identifier)
             if corp_code:
                 return corp_code
 
         return ""
+
+    def _resolve_via_web_search(self, identifier: str) -> str:
+        """Resolve stock_code to corp_code via DART web portal search.
+
+        Uses the undocumented ``searchCorpExt.do`` endpoint from the
+        OpenDART web portal.  This is the same AJAX call the website
+        makes when a user types a company name or stock code in the
+        search box.
+
+        Returns the corp_code in ~1 second, no API key required.
+        Works from any IP (not rate-limited like the REST API).
+
+        The response HTML contains JavaScript function calls like:
+            selectCorp('00126380','삼성전자','P','통신 및 방송장비 제조업')
+        which give us corp_code, company name, market type, and industry.
+        """
+        import re as _re
+
+        try:
+            resp = requests.post(
+                "https://opendart.fss.or.kr/cmm/searchCorpExt.do",
+                data={"textCrpNm": identifier},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64)",
+                    "Referer": "https://opendart.fss.or.kr/disclosureinfo/fnltt/singl/main.do",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return ""
+
+            # Parse selectCorp('corp_code','corp_name','market','industry')
+            matches = _re.findall(
+                r"selectCorp\('(\d{8})','([^']+)','([^']+)','([^']*)'\)",
+                resp.text,
+            )
+            if not matches:
+                return ""
+
+            # If searching by stock code, the first match is usually correct
+            corp_code, corp_name, market_type, industry = matches[0]
+            logger.info(
+                "DART web search resolved %s -> corp_code=%s (%s, %s)",
+                identifier, corp_code, corp_name, industry,
+            )
+
+            # Cache the result for future lookups
+            if self._corp_list_cache is None:
+                self._corp_list_cache = []
+            self._corp_list_cache.append({
+                "ticker": identifier if identifier.isdigit() else "",
+                "name": corp_name,
+                "corp_code": corp_code,
+                "cik": corp_code,
+                "exchange": "KOSPI" if market_type == "P" else "KOSDAQ",
+                "industry": industry,
+                "market_id": self.market_id,
+            })
+
+            return corp_code
+
+        except Exception as exc:
+            logger.debug("DART web search failed for %s: %s", identifier, exc)
+            return ""
 
     def _resolve_via_corp_code_xml(self, identifier: str) -> str:
         """Resolve stock_code to corp_code using DART filing search.
