@@ -2988,47 +2988,53 @@ def _tda_dividend_topology(dividends: pd.Series) -> dict[str, Any]:
     Computes persistent homology of the time-delay embedded dividend
     series to extract topological features (monotonicity, cyclicality).
 
-    Falls back to numpy-based sliding window if giotto-tda unavailable.
+    Uses the ``ripser`` library (Ripser algorithm for Vietoris-Rips
+    persistent homology) which is compatible with scikit-learn >= 1.4.
+    Falls back gracefully if ripser is not installed.
     """
     if len(dividends) < 5:
         return {}
 
     try:
-        from gtda.homology import VietorisRipsPersistence
-        from gtda.time_series import SingleTakensEmbedding
+        from ripser import ripser
 
-        # Time-delay embedding (Takens' theorem)
-        d = dividends.sort_index().values.reshape(-1, 1).astype(float)
+        # --- Time-delay embedding (Takens' theorem) ---
+        # Embed 1D dividend series into 3D point cloud with delay=1, dim=3.
+        vals = dividends.sort_index().values.astype(float)
+        dim = 3
+        delay = 1
+        n_pts = len(vals) - (dim - 1) * delay
+        if n_pts < 4:
+            return {"available": False}
+        embedded = np.array([
+            vals[i * delay: i * delay + n_pts] for i in range(dim)
+        ]).T  # shape (n_pts, dim)
 
-        embedder = SingleTakensEmbedding(
-            parameters_type="fixed",
-            time_delay=1,
-            dimension=3,
-            stride=1,
-        )
-        embedded = embedder.fit_transform(d)
+        data_range = float(np.ptp(vals))
+        max_edge = data_range * 2 if data_range > 0 else 1.0
 
-        # Persistent homology
-        persistence = VietorisRipsPersistence(
-            homology_dimensions=[0, 1],
-            max_edge_length=float(np.ptp(d)) * 2,
-        )
-        diagrams = persistence.fit_transform(embedded.reshape(1, -1, 3))
+        # --- Persistent homology via Ripser ---
+        result_rips = ripser(embedded, maxdim=1, thresh=max_edge)
+        diagrams = result_rips["dgms"]
 
-        # Extract topological features
-        diagram = diagrams[0]
-        h0 = diagram[diagram[:, 2] == 0]  # connected components
-        h1 = diagram[diagram[:, 2] == 1]  # loops
+        h0 = diagrams[0]  # H0: connected components (birth, death)
+        h1 = diagrams[1]  # H1: loops (birth, death)
 
-        # Persistence = death - birth (longer = more significant)
-        h0_persistence = h0[:, 1] - h0[:, 0] if len(h0) > 0 else np.array([0])
-        h1_persistence = h1[:, 1] - h1[:, 0] if len(h1) > 0 else np.array([0])
+        # Filter out infinite-death entries (the single surviving component)
+        h0_finite = h0[np.isfinite(h0[:, 1])] if len(h0) > 0 else np.empty((0, 2))
+
+        # Persistence = death - birth
+        h0_persistence = (h0_finite[:, 1] - h0_finite[:, 0]) if len(h0_finite) > 0 else np.array([0.0])
+        h1_persistence = (h1[:, 1] - h1[:, 0]) if len(h1) > 0 else np.array([0.0])
 
         # Monotonicity indicator: no significant loops = monotonic trajectory
-        has_loops = len(h1) > 0 and h1_persistence.max() > np.ptp(d) * 0.1
-        # Betti numbers
-        betti_0 = len(h0)  # connected components (should be 1 for connected)
-        betti_1 = len(h1)  # loops (0 for monotonic, >0 for cyclic)
+        significance_threshold = data_range * 0.1 if data_range > 0 else 0.01
+        significant_h1 = h1_persistence[h1_persistence > significance_threshold] if len(h1) > 0 else np.array([])
+        has_loops = len(significant_h1) > 0
+
+        # Betti numbers (count of significant features)
+        betti_0 = 1  # always 1 connected component for a connected point cloud
+        betti_1 = len(significant_h1)
 
         result = {
             "betti_0": betti_0,
@@ -3047,7 +3053,7 @@ def _tda_dividend_topology(dividends: pd.Series) -> dict[str, Any]:
         return result
 
     except ImportError:
-        logger.debug("giotto-tda not available, skipping TDA")
+        logger.debug("ripser not available, skipping TDA")
         return {"available": False}
     except Exception as exc:
         logger.debug("TDA failed: %s", exc)
