@@ -1,4 +1,4 @@
-# Tier 2 Wrapper Status Review (2026-03-18)
+# Tier 2 Wrapper Status Review (2026-03-19)
 
 Current state of all 15 Tier 2 market wrappers based on code review.
 
@@ -13,7 +13,7 @@ Current state of all 15 Tier 2 market wrappers based on code review.
 | 5 | **China** `cn_sse` | baostock + yfinance | baostock (8,600+ securities, ticker only) | akshare/Sina Finance (primary, PIT dates) + baostock fallback | baostock | N/A (uses akshare directly) |
 | 6 | **Singapore** `sg_sgx` | **SGX Securities API + yfinance** | **SGX Securities API (561 stocks)** | **SGX Financial Reports API (discovery) + LLM extraction** | yfinance (.SI) | **SGXFilingDiscoverer (financialreports API, PDF download confirmed)** |
 | 7 | **Saudi Arabia** `sa_tadawul` | yfinance (.SR) | Tadawul API (broken) | Filing discovery + LLM only | yfinance (.SR) | TadawulFilingDiscoverer (registered) |
-| 8 | **Switzerland** `ch_six` | yfinance (.SW) | Broken | None | yfinance (.SW) | None registered |
+| 8 | **Switzerland** `ch_six` | **SIX FQS + Share Details APIs (no auth)** | **SIX FQS ref.json (110K+ securities)** | **Synthetic from SIX dividends/capital/notices + Kalman/PELT/Merton/L1 (22 fields, no LLM)** | **SIX historic CSV (close+volume, ~5mo)** | ESEF crossover + LLM fallback |
 | 9 | **South Africa** `za_jse` | **JSE WCF API (ISIN, sector, market cap) + yfinance** | **JSE Issuer Directory (298 equity issuers)** | **JSE SENS per-issuer API (instant) + LLM extraction** | yfinance (.JO) | **JSEFilingDiscoverer (WCF SENS API, per-issuer fast path, PDF download confirmed)** |
 | 10 | **Mexico** `mx_bmv` | **BMV WSO2 Search API + yfinance** | **BMV Search API (244 issuers, token-based)** | **BMV XBRL JSON (native, no LLM needed, 5,817 ZIPs)** | yfinance (.MX) | **BMVFilingDiscoverer (token-based search API) + XBRL fast path** |
 | 11 | **UAE** `ae_dfm` | yfinance (.AE) | DFM API (broken) | Filing discovery + LLM only | yfinance (.AE) | DFMFilingDiscoverer (registered, untested) |
@@ -81,6 +81,16 @@ Current state of all 15 Tier 2 market wrappers based on code review.
 - Filing discovery (fallback): BMVFilingDiscoverer uses `busquedaPanel` search type for PDF documents.
 - Token-based auth: `GET /rest/tokenservice/token` returns Bearer token (no API key needed).
 
+### Profile + Search + Synthetic Financials (native APIs, no LLM needed)
+
+**Switzerland (`ch_six`)** -- fully native SIX APIs, no yfinance dependency
+- Profile: SIX FQS ref.json (ValorId, ISIN, ticker, name for 110K+ securities) + Share Details API (shares outstanding, indices, regulatory standard, nominal value, capital structure, dividends, auditor, accounting standard) + historic CSV (latest close for market cap). Sector inferred from SMI/SLI index membership + regulatory standard + name heuristics.
+- Search: SIX FQS ref.json (ticker exact match, ISIN lookup, name substring search). Covers 110K+ securities on SIX. No auth required.
+- OHLCV: SIX historic CSV (`/sheldon/market_data/v1/{ValorId}/historic.csv`) provides ~5 months of close+volume. PIT-compliant exchange data. No open/high/low (set to close for compatibility).
+- Financials: Synthetic generation via `six_derived_proxies.py` -- derives 22 canonical fields mathematically from 18 years of dividend history, capital structure, buyback notices, and sector-calibrated ratios. Uses Kalman filter (Harvey 1989), PELT regime detection (Killick 2012), UKF two-factor earnings, Merton structural debt model (1974), L1 balance sheet reconstruction (Candes & Tao 2005), EBO reverse earnings, Ohlson residual income equity. Fallbacks: EU ESEF crossover, then LLM filing extraction.
+- TDA: Persistent homology on dividend trajectories via ripser (Bauer 2021) for monotonicity/cyclicality detection.
+- No authentication required for any SIX endpoint.
+
 ### Filing discovery working (scraper fixed)
 
 **Hong Kong (`hk_hkex`)**
@@ -96,14 +106,16 @@ All 15 markets return daily OHLCV data via yfinance or regional wrappers (baosto
 
 ## What Doesn't Work
 
-### Financial statements (10/15 need LLM)
-- AU, CA, HK, SG, SA, ZA, MX, AE: have filing discoverers (discovery + PDF download work) but need an LLM client (Gemini/Claude/OpenRouter API key) to extract structured data from PDFs
-- CH, NL, ES, IT, SE: no filing discoverer registered, no native financial API
+### Financial statements (9/15 need LLM)
+- AU, CA, HK, SG, SA, ZA, AE: have filing discoverers (discovery + PDF download work) but need an LLM client (Gemini/Claude/OpenRouter API key) to extract structured data from PDFs
+- NL, ES, IT, SE: no filing discoverer registered, no native financial API
+- CH: **FIXED** -- synthetic financials from SIX dividend/capital/notices data (22 fields, no LLM needed)
 - yfinance intentionally NOT used for financials (no filing dates = no PIT compliance)
 
-### Company search (4/15 broken)
-- SA (Tadawul returns HTML), AE (DFM API broken), CH (SIX API broken): native APIs return HTML or are unreachable
+### Company search (3/15 broken)
+- SA (Tadawul returns HTML), AE (DFM API broken): native APIs return HTML or are unreachable
 - NL, ES, IT, SE: ESEF API returns 0 results for company name searches
+- CH: **FIXED** -- SIX FQS ref.json (110K+ securities, ticker/ISIN/name search, no auth)
 - MX: **FIXED** -- BMV WSO2 Search API now works (token-based, no key needed)
 - ZA: **FIXED** -- JSE WCF CustomerRoleService returns 298 equity issuers
 
@@ -118,8 +130,8 @@ All 15 markets return daily OHLCV data via yfinance or regional wrappers (baosto
 
 | Capability | Working | Partial | Broken |
 |-----------|---------|---------|--------|
-| Profile | IN, CN, AU, CA, SG, **MX**, **ZA** + 4 via yfinance | NL, ES, IT, SE (ESEF partial) | -- |
-| Company Search | IN, CN, AU, CA, SG, **MX**, **ZA** | -- | HK (yfinance only), SA, CH, AE, NL, ES, IT, SE |
-| Financial Statements | IN (native), CN (akshare), **MX (XBRL JSON)** | AU, CA, HK, SG, SA, **ZA**, AE (need LLM) | CH, NL, ES, IT, SE (no path) |
-| OHLCV | All 15 | -- | -- |
-| Filing Discovery | IN, AU, CA, HK, SG, **MX**, SA, **ZA**, AE | -- | CH, NL, ES, IT, SE (none registered) |
+| Profile | IN, CN, AU, CA, SG, **MX**, **ZA**, **CH** + 3 via yfinance | NL, ES, IT, SE (ESEF partial) | -- |
+| Company Search | IN, CN, AU, CA, SG, **MX**, **ZA**, **CH** | -- | HK (yfinance only), SA, AE, NL, ES, IT, SE |
+| Financial Statements | IN (native), CN (akshare), **MX (XBRL JSON)**, **CH (synthetic from SIX APIs)** | AU, CA, HK, SG, SA, **ZA**, AE (need LLM) | NL, ES, IT, SE (no path) |
+| OHLCV | All 15 (**CH**: SIX historic CSV, ~5mo close+volume) | -- | -- |
+| Filing Discovery | IN, AU, CA, HK, SG, **MX**, SA, **ZA**, AE | **CH** (ESEF crossover + LLM fallback) | NL, ES, IT, SE (none registered) |
