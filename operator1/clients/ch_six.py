@@ -1,30 +1,45 @@
-"""Switzerland SIX PIT client -- official notices API + yfinance + ESEF crossover.
+"""Switzerland SIX PIT client -- FQS + share details + official notices APIs.
 
-Primary data source: SIX official notices JSON API (undocumented, no auth).
-  - Discovers corporate actions (capital changes, dividends, share counts)
-    with PIT-compliant announcement dates.
-  - Search by ISIN (valorIds) or issuer name for company discovery.
-  - Detail endpoint provides full structured text of each notice.
+Three undocumented SIX APIs discovered by reverse-engineering the React SPAs
+on six-group.com. All free, no authentication required.
 
-Profile: yfinance (.SW suffix) + SIX notices enrichment (shares outstanding
-from capital action notices, ex-dividend dates).
+1. **FQS (Financial Query Service)** -- /fqs/ref.json
+   - 110K+ securities with ValorId, ISIN, ticker (ValorSymbol), name
+   - Searchable by ticker, ISIN, or name
+   - Powers the share explorer on six-group.com
 
-Financial statements: EU ESEF crossover (Swiss blue chips file IFRS reports
-via ESEF) + SIX filing discovery for LLM-based extraction of notice text.
+2. **Share Details API** -- /sheldon/share_details/v3/{ValorId}/...
+   - overview/info.json: issuer code, website, next GM date
+   - share/info.json: numberInIssue, nominalValue, indices, regulatory standard
+   - share/dividend.json: 18+ years of ex-dividend dates and amounts
+   - issuer/financial_reports.json: auditor, accounting standard, closing date
+   - issuer/capital_structure.json: share capital, conditional capital
+   - issuer/contact.json: issuer contact info
 
-OHLCV: handled separately via ohlcv_provider.py (yfinance .SW suffix).
+3. **Official Notices API** -- /sheldon/official_notices/v2/...
+   - Corporate actions (capital destruction, buybacks) with PIT dates
+   - Ex-dividend notices
+   - 349K+ notices
+
+ValorId format: {ISIN}{currency}4 (e.g. CH0038863350CHF4 for Nestle)
+
+Financial statements: EU ESEF crossover (Swiss blue chips file IFRS via ESEF).
+SIX does not provide financial statement line items through these APIs --
+only metadata (auditor, standard, closing date).
+
+OHLCV: yfinance (.SW suffix) via ohlcv_provider.py. SIX provides ~5 months
+of close+volume via /sheldon/market_data/v1/{ValorId}/historic.csv but lacks
+OHLC and the 2-year window the pipeline requires.
 
 Coverage: ~250+ listed companies on SIX, ~$1.8T market cap.
-
-API reference (undocumented, reverse-engineered from six-group.com React SPA):
-  Search:  GET /sheldon/official_notices/v2/find.json?{params}
-  Detail:  GET /sheldon/official_notices/v2/details/{noticeId}.json
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
 import re
+import unicodedata
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -36,12 +51,23 @@ logger = logging.getLogger(__name__)
 _CACHE_DIR = Path("cache/ch_six")
 
 # ---------------------------------------------------------------------------
-# SIX official notices API constants
+# SIX API constants
 # ---------------------------------------------------------------------------
 
-_SIX_API_BASE = "https://www.six-group.com/sheldon/official_notices/v2"
-_SIX_FIND_URL = f"{_SIX_API_BASE}/find.json"
-_SIX_DETAIL_URL = f"{_SIX_API_BASE}/details"
+_SIX_BASE = "https://www.six-group.com"
+
+# FQS (Financial Query Service) -- reference data for all SIX securities
+_FQS_REF_URL = f"{_SIX_BASE}/fqs/ref.json"
+
+# Share details -- per-security structured data
+_SHARE_DETAILS_BASE = f"{_SIX_BASE}/sheldon/share_details/v3"
+
+# Official notices -- corporate actions, dividends
+_NOTICES_FIND_URL = f"{_SIX_BASE}/sheldon/official_notices/v2/find.json"
+_NOTICES_DETAIL_URL = f"{_SIX_BASE}/sheldon/official_notices/v2/details"
+
+# Market data -- historic price CSV
+_MARKET_DATA_BASE = f"{_SIX_BASE}/sheldon/market_data/v1"
 
 _SIX_HEADERS = {
     "User-Agent": "Operator1/1.0 (financial-research)",
@@ -50,7 +76,128 @@ _SIX_HEADERS = {
 
 
 # ---------------------------------------------------------------------------
-# SIX notices API helpers
+# FQS reference data helpers
+# ---------------------------------------------------------------------------
+
+def _fqs_search(
+    ticker: str = "",
+    isin: str = "",
+    name: str = "",
+    page_size: int = 20,
+) -> list[dict[str, Any]]:
+    """Search the SIX FQS reference data for securities.
+
+    The FQS ref endpoint covers 110K+ securities listed on SIX.
+    Returns ValorId (needed for all other SIX APIs), ISIN, ticker
+    (ValorSymbol), name (ShortName), and ValorNumber.
+
+    Parameters
+    ----------
+    ticker:
+        SIX ticker symbol (ValorSymbol), e.g. 'NESN', 'NOVN'.
+    isin:
+        ISIN code, e.g. 'CH0038863350'.
+    name:
+        Company name substring search.
+    page_size:
+        Max results to return.
+
+    Returns
+    -------
+    List of dicts with keys: name, ticker, isin, valor_number, valor_id.
+    """
+    params: dict[str, str] = {
+        "select": "ShortName,ValorSymbol,ISIN,ValorNumber,ValorId",
+        "pagesize": str(page_size),
+    }
+
+    # Build the where clause
+    if ticker:
+        params["where"] = f"ValorSymbol={ticker.upper()}"
+    elif isin:
+        params["where"] = f"ISIN={isin}"
+    elif name:
+        params["where"] = f"ShortName~{name.upper()}"
+    else:
+        params["orderby"] = "ShortName"
+
+    try:
+        resp = requests.get(_FQS_REF_URL, params=params, headers=_SIX_HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        col_names = data.get("colNames", [])
+        rows = data.get("rowData", [])
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            record = dict(zip(col_names, row))
+            results.append({
+                "name": record.get("ShortName", ""),
+                "ticker": record.get("ValorSymbol", ""),
+                "isin": record.get("ISIN", ""),
+                "valor_number": record.get("ValorNumber"),
+                "valor_id": record.get("ValorId", ""),
+                "country": "CH",
+                "exchange": "SIX",
+                "market_id": "ch_six",
+            })
+        return results
+
+    except Exception as exc:
+        logger.debug("FQS search failed: %s", exc)
+        return []
+
+
+def _get_valor_id(ticker: str = "", isin: str = "") -> str:
+    """Resolve a ticker or ISIN to a SIX ValorId.
+
+    ValorId format: {ISIN}{currency}4 (e.g. CH0038863350CHF4).
+    This is needed by all share_details and market_data endpoints.
+    """
+    results = _fqs_search(ticker=ticker, isin=isin, page_size=1)
+    if results:
+        return results[0].get("valor_id", "")
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Share details helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_share_detail(valor_id: str, path: str) -> dict[str, Any]:
+    """Fetch a share details endpoint for a given ValorId."""
+    if not valor_id:
+        return {}
+    url = f"{_SHARE_DETAILS_BASE}/{valor_id}/{path}"
+    try:
+        resp = requests.get(url, headers=_SIX_HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("itemList", [])
+        return items[0] if items else {}
+    except Exception as exc:
+        logger.debug("SIX share_details %s failed for %s: %s", path, valor_id, exc)
+        return {}
+
+
+def _fetch_share_detail_list(valor_id: str, path: str) -> list[dict[str, Any]]:
+    """Fetch a share details endpoint that returns a list."""
+    if not valor_id:
+        return []
+    url = f"{_SHARE_DETAILS_BASE}/{valor_id}/{path}"
+    try:
+        resp = requests.get(url, headers=_SIX_HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("itemList", [])
+    except Exception as exc:
+        logger.debug("SIX share_details %s failed for %s: %s", path, valor_id, exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Official notices helpers
 # ---------------------------------------------------------------------------
 
 def _six_search_notices(
@@ -60,26 +207,7 @@ def _six_search_notices(
     notice_types: str = "M,EX",
     page_size: int = 50,
 ) -> list[dict[str, Any]]:
-    """Search SIX official notices by ISIN or issuer name.
-
-    Parameters
-    ----------
-    isin:
-        ISIN code for precise search (e.g. 'CH0038863350').
-    issuer:
-        Issuer name for text search (e.g. 'Nestle AG').
-    years:
-        How many years back to search.
-    notice_types:
-        Comma-separated notice types to include: M (manual/issuer),
-        EX (ex-dividend), FL (first listing), DE (delisting), A (automatic).
-    page_size:
-        Max results per page.
-
-    Returns
-    -------
-    List of notice dicts from the API.
-    """
+    """Search SIX official notices by ISIN or issuer name."""
     end_date = date.today()
     start_date = end_date - timedelta(days=365 * years)
     types = set(notice_types.upper().split(","))
@@ -107,20 +235,19 @@ def _six_search_notices(
         params["issuerWords"] = issuer
 
     try:
-        resp = requests.get(_SIX_FIND_URL, params=params, headers=_SIX_HEADERS, timeout=30)
+        resp = requests.get(_NOTICES_FIND_URL, params=params, headers=_SIX_HEADERS, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         if data.get("status") == "Ok":
             return data.get("itemList", [])
     except Exception as exc:
         logger.debug("SIX notices search failed: %s", exc)
-
     return []
 
 
 def _six_get_notice_text(notice_id: int | str) -> str:
     """Fetch the full text of a SIX official notice."""
-    url = f"{_SIX_DETAIL_URL}/{notice_id}.json"
+    url = f"{_NOTICES_DETAIL_URL}/{notice_id}.json"
     try:
         resp = requests.get(url, headers=_SIX_HEADERS, timeout=30)
         resp.raise_for_status()
@@ -134,11 +261,7 @@ def _six_get_notice_text(notice_id: int | str) -> str:
 
 
 def _parse_shares_outstanding(text: str) -> int | None:
-    """Extract shares outstanding from a SIX capital action notice.
-
-    SIX capital destruction notices contain lines like:
-        'New number of oustanding shares: 2576520000'
-    """
+    """Extract shares outstanding from a SIX capital action notice."""
     patterns = [
         r"(?:ou?tstanding|ausstehende)\s+(?:shares|Aktien):\s*(\d[\d,. ]*)",
         r"shares:\s*(\d[\d,. ]*\d)",
@@ -156,33 +279,6 @@ def _parse_shares_outstanding(text: str) -> int | None:
     return None
 
 
-def _parse_dividend_info(text: str) -> dict[str, Any]:
-    """Extract dividend details from a SIX ex-dividend notice."""
-    result: dict[str, Any] = {}
-
-    # Ex-date pattern
-    ex_match = re.search(
-        r"[Ee]x[\s-]*[Dd](?:ividend|ate|atum).*?(\d{1,2}[./]\d{1,2}[./]\d{4})",
-        text,
-    )
-    if ex_match:
-        result["ex_date"] = ex_match.group(1)
-
-    # Amount pattern
-    amt_match = re.search(
-        r"(?:CHF|EUR|USD)\s*([\d.,]+)",
-        text,
-    )
-    if amt_match:
-        raw = amt_match.group(1).replace(",", ".")
-        try:
-            result["amount"] = float(raw)
-        except ValueError:
-            pass
-
-    return result
-
-
 # ---------------------------------------------------------------------------
 # CHSixClient -- PIT client for Swiss SIX equities
 # ---------------------------------------------------------------------------
@@ -191,11 +287,13 @@ def _parse_dividend_info(text: str) -> dict[str, Any]:
 class CHSixClient:
     """PIT client for Swiss SIX equities.
 
-    Uses the SIX official notices API (undocumented JSON endpoint) for:
-      - Company search by ISIN or issuer name
-      - Corporate action data (shares outstanding, dividends)
+    Uses three undocumented SIX APIs (no auth required):
+    1. FQS ref endpoint -- company search, ValorId resolution
+    2. Share details -- profile, dividends, capital structure
+    3. Official notices -- corporate actions with PIT dates
 
-    Falls back to yfinance for profile and EU ESEF for financial statements.
+    Falls back to EU ESEF for financial statements and yfinance for
+    profile fields not available from SIX (sector, industry).
     """
 
     def __init__(self, cache_dir: Path | str = _CACHE_DIR) -> None:
@@ -231,42 +329,33 @@ class CHSixClient:
     # -- Company discovery ---------------------------------------------------
 
     def list_companies(self, query: str = "") -> list[dict[str, Any]]:
-        """Search for SIX-listed companies.
+        """Search for SIX-listed companies via FQS reference data.
 
-        First tries the SIX official notices API to find issuers matching
-        the query, then falls back to yfinance search.
+        Uses the native SIX FQS API (110K+ securities, no auth).
+        Falls back to yfinance only if FQS is unreachable.
         """
         if not query:
             from operator1.clients.yfinance_backed import yf_search
             return yf_search("", self.market_id, "CH", "SIX", yf_suffix=".SW")
 
-        # Try SIX notices API -- search by issuer name across all notice types
-        results: list[dict[str, Any]] = []
-        try:
-            notices = _six_search_notices(
-                issuer=query, years=5, notice_types="M,EX,FL", page_size=50,
-            )
-            # Extract unique issuers from notice contacts
-            seen_contacts: set[str] = set()
-            for notice in notices:
-                contact = notice.get("contact", "")
-                isin = notice.get("isin") or ""
-                if contact and contact not in seen_contacts and contact != "SIX Swiss Exchange":
-                    seen_contacts.add(contact)
-                    results.append({
-                        "name": contact,
-                        "ticker": "",
-                        "isin": isin,
-                        "country": "CH",
-                        "exchange": "SIX",
-                        "market_id": "ch_six",
-                    })
+        # Try FQS by ticker first (exact match)
+        results = _fqs_search(ticker=query, page_size=10)
+        if results:
+            logger.info("SIX FQS search for '%s' (ticker): %d results", query, len(results))
+            return results
 
+        # Try FQS by ISIN
+        if query.startswith("CH") and len(query) >= 12:
+            results = _fqs_search(isin=query, page_size=10)
             if results:
-                logger.info("SIX notices search for '%s': %d unique issuers", query, len(results))
+                logger.info("SIX FQS search for '%s' (ISIN): %d results", query, len(results))
                 return results
-        except Exception as exc:
-            logger.debug("SIX notices search failed for '%s': %s", query, exc)
+
+        # Try FQS by name (substring match)
+        results = _fqs_search(name=query, page_size=20)
+        if results:
+            logger.info("SIX FQS search for '%s' (name): %d results", query, len(results))
+            return results
 
         # Fallback to yfinance
         from operator1.clients.yfinance_backed import yf_search
@@ -278,130 +367,116 @@ class CHSixClient:
     # -- Company profile -----------------------------------------------------
 
     def get_profile(self, identifier: str) -> dict[str, Any]:
-        """Fetch company profile from yfinance + SIX notices enrichment.
+        """Fetch company profile from SIX APIs + yfinance enrichment.
 
-        The SIX notices API provides:
-          - Latest shares outstanding (from capital action notices)
-          - Ex-dividend history
-          - Corporate action timeline
+        Data sources (in priority order):
+        1. FQS ref -- ValorId, ISIN, ticker, name
+        2. Share details -- shares outstanding, dividends, indices, regulatory standard
+        3. Capital structure -- share capital breakdown
+        4. Official notices -- PIT-dated corporate actions
+        5. yfinance -- sector, industry, market_cap (SIX doesn't provide these)
         """
         cached = self._read_cache(identifier, "profile.json")
         if cached:
             return cached
 
-        # Base profile from yfinance
-        from operator1.clients.yfinance_backed import yf_get_profile
-        profile = yf_get_profile(
-            identifier, self.market_id,
-            "Switzerland", "CH", "SIX", "CHF",
-            yf_suffix=".SW",
-        )
+        profile: dict[str, Any] = {
+            "ticker": identifier,
+            "name": identifier,
+            "country": "CH",
+            "exchange": "SIX",
+            "currency": "CHF",
+            "market_id": "ch_six",
+        }
 
-        # Enrich with SIX notices data
-        isin = profile.get("isin", "")
-        issuer_name = profile.get("name", identifier)
+        # Step 1: Resolve ValorId via FQS
+        valor_id = ""
+        fqs_results = _fqs_search(ticker=identifier, page_size=1)
+        if not fqs_results and identifier.startswith("CH"):
+            fqs_results = _fqs_search(isin=identifier, page_size=1)
 
-        try:
-            # Search for corporate actions to get shares outstanding.
-            # Strategy: try ISIN first (most precise), then issuer name,
-            # then simplified name (first word without accents).
-            notices = []
+        if fqs_results:
+            fqs = fqs_results[0]
+            valor_id = fqs.get("valor_id", "")
+            profile.update({
+                "name": fqs.get("name", identifier),
+                "ticker": fqs.get("ticker", identifier),
+                "isin": fqs.get("isin", ""),
+                "valor_number": fqs.get("valor_number"),
+                "valor_id": valor_id,
+            })
+            logger.info("SIX FQS resolved %s -> ValorId=%s", identifier, valor_id)
 
-            if isin:
-                notices = _six_search_notices(
-                    isin=isin, years=2, notice_types="M,EX",
-                )
-
-            if not notices and issuer_name:
-                # Try full issuer name
-                notices = _six_search_notices(
-                    issuer=issuer_name, years=2, notice_types="M,EX",
-                )
-
-            if not notices and issuer_name:
-                # Try simplified name (first word, strip accents)
-                import unicodedata
-                simple_name = unicodedata.normalize("NFD", issuer_name)
-                simple_name = "".join(c for c in simple_name if unicodedata.category(c) != "Mn")
-                first_word = simple_name.split()[0] if simple_name.split() else ""
-                if first_word and first_word.lower() != identifier.lower():
-                    raw_notices = _six_search_notices(
-                        issuer=first_word, years=2, notice_types="M,EX",
-                    )
-                    # Filter to only notices from the actual company (not
-                    # structured product issuers like Bank Vontobel)
-                    if raw_notices:
-                        notices = [
-                            n for n in raw_notices
-                            if first_word.lower() in (n.get("contact", "")).lower()
-                        ]
-                        # If filtering removed everything, try extracting
-                        # ISIN from the detail text of matching notices
-                        if not notices:
-                            for n in raw_notices:
-                                if first_word.lower() in (n.get("contact", "")).lower():
-                                    notices.append(n)
-                                    break
-
-            # If we found notices but still no ISIN, extract it from:
-            # 1. The search result's isin field
-            # 2. The notice detail text (ISIN Code: CHxxxxx)
-            # Then re-search with ISIN for more precise results.
-            if notices and not isin:
-                for notice in notices:
-                    # Check search result's isin field
-                    notice_isin = notice.get("isin")
-                    if notice_isin and notice_isin.startswith("CH"):
-                        isin = notice_isin
-                        break
-
-                # If still no ISIN, try extracting from notice detail text
-                if not isin:
-                    for notice in notices[:3]:  # Check up to 3 notices
-                        nid = notice.get("noticeId")
-                        if nid:
-                            text = _six_get_notice_text(nid)
-                            isin_match = re.search(r"ISIN[^:]*:\s*(CH\d{10,})", text)
-                            if isin_match:
-                                isin = isin_match.group(1)
-                                break
-
-                if isin:
-                    profile["isin"] = isin
-                    # Re-search with ISIN for more complete results
-                    isin_notices = _six_search_notices(
-                        isin=isin, years=2, notice_types="M,EX",
-                    )
-                    if isin_notices:
-                        notices = isin_notices
-
-            if notices:
-                profile["six_notices_found"] = len(notices)
-
-                # Extract shares outstanding from capital action notices
-                for notice in notices:
-                    if notice.get("noticeType") == "M":
-                        notice_id = notice.get("noticeId")
-                        if notice_id:
-                            text = _six_get_notice_text(notice_id)
-                            if text:
-                                shares = _parse_shares_outstanding(text)
-                                if shares:
-                                    profile["shares_outstanding"] = shares
-                                    profile["shares_outstanding_source"] = "SIX official notice"
-                                    profile["shares_outstanding_date"] = str(notice.get("date", ""))
-                                    logger.info(
-                                        "SIX shares outstanding for %s: %d (from notice %s)",
-                                        identifier, shares, notice_id,
-                                    )
-                                    break  # Use the most recent
-
+        # Step 2: Share info (shares outstanding, indices, regulatory standard)
+        if valor_id:
+            share_info = _fetch_share_detail(valor_id, "share/info.json")
+            if share_info:
+                profile["shares_outstanding"] = share_info.get("numberInIssue")
+                profile["nominal_value"] = share_info.get("nominalValue")
+                profile["trading_currency"] = share_info.get("tradingCurrency")
+                profile["security_type"] = share_info.get("securityType")
+                profile["regulatory_standard"] = share_info.get("regulatoryStandard")
+                profile["primary_listed"] = share_info.get("primaryListed")
+                profile["first_trading_date"] = share_info.get("firstTradingDate")
+                profile["index_memberships"] = share_info.get("indexSymbols", [])
+                profile["issued_by"] = share_info.get("issuedBy", "")
+                if share_info.get("issuedBy"):
+                    profile["name"] = share_info["issuedBy"]
                 logger.info(
-                    "SIX profile enrichment for %s: %d notices found",
-                    identifier, len(notices),
+                    "SIX share info for %s: %s shares, indices=%s",
+                    identifier,
+                    share_info.get("numberInIssue"),
+                    share_info.get("indexSymbols"),
                 )
+
+            # Step 3: Overview (issuer code, website, next GM)
+            overview = _fetch_share_detail(valor_id, "overview/info.json")
+            if overview:
+                profile["website"] = overview.get("website", "")
+                profile["issuer_code"] = overview.get("issuerCode", "")
+                profile["next_gm_date"] = overview.get("nextGeneralMeeting")
+
+            # Step 4: Capital structure
+            cap_items = _fetch_share_detail_list(valor_id, "issuer/capital_structure.json")
+            if cap_items:
+                for item in cap_items:
+                    if item.get("category") == "REPORTED_CAPITAL":
+                        for cap in item.get("capitals", []):
+                            if cap.get("capitalType") == "SHARE":
+                                profile["reported_share_capital"] = cap.get("capital")
+                                profile["reported_unit_capital"] = cap.get("unitCapital")
+
+            # Step 5: Financial reports metadata
+            fin_meta = _fetch_share_detail(valor_id, "issuer/financial_reports.json")
+            if fin_meta:
+                profile["accounting_standard"] = fin_meta.get("accountingStandardCode")
+                profile["auditor"] = fin_meta.get("auditor")
+                profile["annual_closing_date"] = fin_meta.get("annualClosingDate")
+
+            # Step 6: Dividend history (latest)
+            dividends = _fetch_share_detail_list(valor_id, "share/dividend.json")
+            if dividends:
+                latest = dividends[0]
+                profile["latest_dividend_amount"] = latest.get("value")
+                profile["latest_dividend_currency"] = latest.get("currency")
+                profile["latest_ex_dividend_date"] = latest.get("exDividendDate")
+                profile["dividend_history_years"] = len(dividends)
+
+        # Step 7: Enrich with yfinance for sector/industry (SIX doesn't provide these)
+        try:
+            from operator1.clients.yfinance_backed import yf_get_profile
+            yf_profile = yf_get_profile(
+                identifier, self.market_id,
+                "Switzerland", "CH", "SIX", "CHF",
+                yf_suffix=".SW",
+            )
+            for key in ("sector", "industry", "market_cap", "description"):
+                if key not in profile or not profile[key]:
+                    val = yf_profile.get(key)
+                    if val:
+                        profile[key] = val
         except Exception as exc:
-            logger.debug("SIX profile enrichment failed for %s: %s", identifier, exc)
+            logger.debug("yfinance enrichment failed for %s: %s", identifier, exc)
 
         self._write_cache(identifier, "profile.json", profile)
         return profile
@@ -419,6 +494,9 @@ class CHSixClient:
 
     def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
         """Fetch financials via EU ESEF crossover or SIX filing discovery + LLM.
+
+        SIX APIs do not provide financial statement line items (only metadata
+        like auditor and accounting standard). For actual financials:
 
         Path 1: EU ESEF wrapper (Swiss blue chips like Nestle, Novartis, Roche
         file ESEF XBRL reports). PIT-compliant with filing dates.
@@ -468,7 +546,13 @@ class CHSixClient:
     # -- Price data ----------------------------------------------------------
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:
-        """SIX does not provide OHLCV data. Handled by ohlcv_provider."""
+        """SIX does not provide sufficient OHLCV data for the 2-year window.
+
+        The SIX historic CSV (/sheldon/market_data/v1/{ValorId}/historic.csv)
+        only provides ~5 months of close+volume data (no open/high/low).
+        The pipeline requires 2 years of full OHLCV, so this is handled
+        by ohlcv_provider.py via yfinance (.SW suffix).
+        """
         return pd.DataFrame()
 
     def get_peers(self, identifier: str) -> list[str]:
