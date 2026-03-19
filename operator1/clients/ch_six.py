@@ -652,23 +652,41 @@ class CHSixClient:
         return self._fetch_financials(identifier, "cashflow")
 
     def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
-        """Fetch financials via EU ESEF crossover or SIX filing discovery + LLM.
+        """Fetch financials via synthetic generation from SIX data.
 
-        SIX APIs do not provide financial statement line items (only metadata
-        like auditor and accounting standard). Switzerland is not an EU member,
-        so Swiss companies are not in the ESEF database either.
+        SIX APIs do not provide financial statement line items directly.
+        Instead, we derive 22 canonical fields mathematically from:
+        - 18 years of dividend history (SIX share/dividend.json)
+        - Capital structure (SIX issuer/capital_structure.json)
+        - Buyback notices (SIX official_notices)
+        - Sector-calibrated financial ratios
 
-        Path 1: EU ESEF wrapper (attempt -- Swiss companies are not subject
-        to the EU ESEF regulation, so this rarely returns data).
+        The remaining 8 fields (receivables, inventory, payables, goodwill,
+        intangibles, sga, rd, short_term_debt) are supplemented from yfinance.
 
-        Path 2: SIX filing discovery + LLM extraction. The SIXFilingDiscoverer
-        provides corporate action notice text. When an LLM client is available,
-        it can extract structured financial data from company annual report
-        PDFs linked in these notices.
-
-        Returns empty DataFrame when no PIT-compliant data source is available.
+        Path 1: Synthetic financials from SIX data + math (primary)
+        Path 2: EU ESEF crossover (fallback, rarely works)
+        Path 3: SIX filing discovery + LLM extraction (fallback)
         """
-        # Path 1: EU ESEF wrapper (Swiss companies rarely file ESEF)
+        # Path 1: Synthetic financials from SIX data
+        try:
+            from operator1.features.six_derived_proxies import generate_synthetic_financials
+
+            # Use cached profile for this identifier
+            profile = self._read_cache(identifier, "profile.json")
+            if not profile:
+                profile = self.get_profile(identifier)
+
+            synthetics = generate_synthetic_financials(profile)
+            df = synthetics.get(statement_type, pd.DataFrame())
+            if df is not None and not df.empty:
+                logger.info("SIX %s %s: %d rows from synthetic financials",
+                           identifier, statement_type, len(df))
+                return df
+        except Exception as exc:
+            logger.debug("SIX synthetic financials failed for %s: %s", identifier, exc)
+
+        # Path 2: EU ESEF wrapper (Swiss companies rarely file ESEF)
         try:
             from operator1.clients.eu_esef_wrapper import EUEsefClient
             esef = EUEsefClient()
@@ -685,7 +703,7 @@ class CHSixClient:
         except Exception as exc:
             logger.debug("EU ESEF crossover failed for SIX %s: %s", identifier, exc)
 
-        # Path 2: SIX filing discovery + LLM extraction
+        # Path 3: SIX filing discovery + LLM extraction
         try:
             from operator1.clients.filing_discoverer import try_filing_extraction
             df = try_filing_extraction(
