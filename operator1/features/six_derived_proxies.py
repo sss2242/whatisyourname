@@ -95,7 +95,8 @@ class SixProxyResult:
     implied_earnings: float | None = None
     implied_pe: float | None = None
     book_equity_floor: float | None = None
-    price_to_book_floor: float | None = None
+    price_to_par: float | None = None  # price / par_value -- only useful as extreme distress signal (<1.0)
+    par_value_distress: bool = False    # True if stock trades below par value
     dilution_risk: float | None = None
 
 
@@ -425,54 +426,70 @@ def _compute_book_equity_floor(profile: dict[str, Any]) -> dict[str, float]:
 # Improvement 8: Dilution risk from conditional capital
 # ---------------------------------------------------------------------------
 
-def _compute_dilution_risk(profile: dict[str, Any]) -> float:
+def _compute_dilution_risk(profile: dict[str, Any]) -> tuple[float, float]:
     """Compute dilution risk from conditional/reported capital ratio.
 
-    SIX capital_structure.json provides both REPORTED_CAPITAL and
-    CONDITIONAL_CAPITAL. The ratio conditional/reported indicates
-    potential share dilution from warrants, convertibles, employee
-    stock options, etc.
+    SIX capital_structure.json returns items with category=REPORTED_CAPITAL
+    containing capitals with capitalType=SHARE and capitalType=CONDITIONAL.
+    The ratio conditional/reported indicates potential share dilution from
+    warrants, convertibles, employee stock options, etc.
 
-    Returns a ratio in [0, 1+] where:
-      0.0 = no conditional capital (no dilution risk)
-      0.05-0.10 = normal (most Swiss companies)
-      0.15+ = elevated dilution risk
+    Returns (dilution_ratio, confidence) where:
+      dilution_ratio:
+        0.0 = no conditional capital (no dilution risk)
+        0.03-0.05 = normal (most Swiss blue chips)
+        0.15+ = elevated dilution risk
+      confidence:
+        0.90 = API returned data with both capital types
+        0.70 = API returned data but no conditional entry (assumed zero)
+        0.0  = API returned no data (unknown)
     """
     try:
         from operator1.clients.ch_six import _fetch_share_detail_list
 
         valor_id = profile.get("valor_id", "")
         if not valor_id:
-            return 0.0
+            return 0.0, 0.0  # unknown
 
         cap_items = _fetch_share_detail_list(valor_id, "issuer/capital_structure.json")
         if not cap_items:
-            return 0.0
+            return 0.0, 0.0  # unknown -- API returned nothing
 
-        reported = 0.0
+        reported_share = 0.0
         conditional = 0.0
+        has_data = False
 
         for item in cap_items:
-            category = item.get("category", "")
             for cap in item.get("capitals", []):
-                if cap.get("capitalType") == "SHARE":
-                    amount = cap.get("capital", 0) or 0
-                    try:
-                        amount = float(amount)
-                    except (TypeError, ValueError):
-                        continue
-                    if category == "REPORTED_CAPITAL":
-                        reported += amount
-                    elif category == "CONDITIONAL_CAPITAL":
-                        conditional += amount
+                capital_type = cap.get("capitalType", "")
+                amount = cap.get("capital", 0) or 0
+                try:
+                    amount = float(amount)
+                except (TypeError, ValueError):
+                    continue
 
-        if reported > 0:
-            return conditional / reported
-        return 0.0
+                if capital_type == "SHARE":
+                    reported_share += amount
+                    has_data = True
+                elif capital_type == "CONDITIONAL":
+                    conditional += amount
+                    has_data = True
+
+        if not has_data:
+            return 0.0, 0.0  # unknown
+
+        if reported_share > 0:
+            ratio = conditional / reported_share
+            # If we found conditional capital, high confidence
+            # If no conditional entry found, medium confidence (genuinely zero or missing)
+            confidence = 0.90 if conditional > 0 else 0.70
+            return ratio, confidence
+
+        return 0.0, 0.0  # no reported capital (shouldn't happen)
 
     except Exception as exc:
         logger.debug("Dilution risk computation failed: %s", exc)
-        return 0.0
+        return 0.0, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +803,19 @@ def compute_six_proxies(
                     _set_with_confidence(cache, "six_proxy_dividend_coverage", coverage, 0.65)
                     n_proxies += 1
 
+                    # --- Two-pass revealed payout ratio ---
+                    # Now that we have implied earnings, back-calculate the
+                    # actual payout ratio instead of using sector estimate.
+                    # revealed_payout = dividends / implied_earnings
+                    if result.implied_earnings > 0:
+                        revealed_payout = total_div / result.implied_earnings
+                        if 0.10 <= revealed_payout <= 1.0:
+                            result.estimated_payout_ratio = round(revealed_payout, 4)
+                            logger.debug(
+                                "SIX payout ratio refined: sector=%.0f%% -> revealed=%.1f%%",
+                                payout_ratio * 100, revealed_payout * 100,
+                            )
+
         # === PRICE-BASED PROXIES (need close data from SIX CSV) ===
 
         if has_close:
@@ -813,19 +843,28 @@ def compute_six_proxies(
             )
             n_proxies += 1
 
-            # Price-to-book floor (needs market cap)
-            if shares and latest_close:
-                market_cap = float(shares) * latest_close
-                if result.book_equity_floor > 0:
-                    ptb = market_cap / result.book_equity_floor
-                    result.price_to_book_floor = ptb
-                    _set_with_confidence(cache, "six_proxy_price_to_book_floor", ptb, 0.75)
-                    n_proxies += 1
+            # Price-to-par ratio (NOT P/B -- par value is much smaller than book equity)
+            # Only useful as an extreme distress signal: if price < par, stock is
+            # trading below its legal minimum value per share.
+            nominal = profile.get("nominal_value")
+            if nominal and latest_close:
+                try:
+                    par_per_share = float(nominal)
+                    if par_per_share > 0:
+                        price_to_par = latest_close / par_per_share
+                        result.price_to_par = price_to_par
+                        result.par_value_distress = price_to_par < 1.0
+                        _set_with_confidence(cache, "six_proxy_price_to_par", price_to_par, 0.95)
+                        if result.par_value_distress:
+                            _set_with_confidence(cache, "six_proxy_par_distress_flag", 1, 0.95)
+                        n_proxies += 1
+                except (TypeError, ValueError):
+                    pass
 
         # --- Improvement 8: Dilution risk ---
-        dilution = _compute_dilution_risk(profile)
+        dilution, dilution_conf = _compute_dilution_risk(profile)
         result.dilution_risk = dilution
-        _set_with_confidence(cache, "six_proxy_dilution_risk", dilution, 0.90)
+        _set_with_confidence(cache, "six_proxy_dilution_risk", dilution, dilution_conf)
         n_proxies += 1
 
         # --- Insider proxies ---
@@ -844,7 +883,7 @@ def compute_six_proxies(
         logger.info(
             "SIX proxy v3: %d columns, yield=%.2f%%, cagr_5y=%.2f%%, "
             "buyback=%.2f%%, implied_pe=%.1f, payout=%.0f%%, "
-            "book_floor=%.0f, dilution=%.3f, coverage=%.2f, "
+            "book_floor=%.0f, dilution=%.3f, p/par=%.0f, coverage=%.2f, "
             "has_close=%s (%d pts)",
             n_proxies,
             (result.dividend_yield or 0) * 100,
@@ -854,6 +893,7 @@ def compute_six_proxies(
             (result.estimated_payout_ratio or 0) * 100,
             result.book_equity_floor or 0,
             result.dilution_risk or 0,
+            result.price_to_par or 0,
             result.dividend_coverage or 0,
             has_close,
             int(close.notna().sum()) if has_close else 0,
@@ -934,16 +974,10 @@ def _inject_calibrated_tier_scores(
             valuation = 25
     if result.dividend_yield is not None:
         yield_score = _calibrated_score(result.dividend_yield, "dividend_yield")
-        valuation = valuation * 0.4 + yield_score * 0.3
-    if result.price_to_book_floor is not None:
-        # P/B floor < 2 is cheap, > 5 is expensive
-        if result.price_to_book_floor < 2:
-            pb_score = 80
-        elif result.price_to_book_floor < 4:
-            pb_score = 55
-        else:
-            pb_score = 30
-        valuation += pb_score * 0.3
+        valuation = valuation * 0.5 + yield_score * 0.5
+    # Par value distress is an extreme signal, not a valuation metric
+    if result.par_value_distress:
+        valuation = max(0, valuation - 30)  # severe penalty
     _set_with_confidence(
         cache, "six_proxy_tier5_score",
         max(0, min(100, valuation)),
