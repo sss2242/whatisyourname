@@ -1001,6 +1001,201 @@ def _inject_survival_proxies(
 
 
 # ---------------------------------------------------------------------------
+# Lintner Dividend Model (1956) -- earnings reconstruction
+# ---------------------------------------------------------------------------
+
+def _lintner_estimate_earnings(
+    dividends: pd.Series,
+    buyback_values: pd.Series | None = None,
+) -> pd.Series:
+    """Reconstruct earnings from dividend history using Lintner's model.
+
+    The Lintner partial adjustment model (1956) relates dividends to
+    earnings: D_t = c + s*E_t + (1-s)*D_{t-1}
+
+    We observe D_t for 18 years. We estimate c and s via OLS regression
+    of dividend changes on dividend levels:
+
+        dD_t = c + s*(E_t - D_{t-1})    [Lintner's original form]
+
+    Since E_t is unobserved, we use the insight that for stable dividend
+    payers, the dividend change itself contains information about earnings:
+
+        dD_t = alpha + beta * D_{t-1} + epsilon_t
+
+    Then: E_t = D_t + (1/s - 1) * dD_t    [inverted model]
+
+    For companies with buybacks, total cash returned (dividends + buybacks)
+    is used as the observable instead of dividends alone.
+
+    Parameters
+    ----------
+    dividends:
+        Annual dividend per share, indexed by date, newest first.
+    buyback_values:
+        Annual buyback value per share (optional).
+
+    Returns
+    -------
+    Earnings per share series, same index as dividends.
+    """
+    if len(dividends) < 4:
+        # Insufficient data for regression -- fall back to simple ratio
+        return dividends * 1.35  # typical payout ~74% -> earnings = div / 0.74
+
+    # Sort oldest first for time series regression
+    d = dividends.sort_index().copy()
+
+    # Add buyback if available
+    if buyback_values is not None and len(buyback_values) > 0:
+        # Align buyback series to dividend dates
+        bb = buyback_values.reindex(d.index, method="nearest").fillna(0)
+        total_returned = d + bb
+    else:
+        total_returned = d.copy()
+
+    # Compute dividend changes
+    d_change = total_returned.diff().dropna()
+    d_lagged = total_returned.shift(1).dropna()
+
+    # Align series
+    common_idx = d_change.index.intersection(d_lagged.index)
+    if len(common_idx) < 3:
+        return dividends * 1.35
+
+    y = d_change.loc[common_idx].values  # dD_t
+    x = d_lagged.loc[common_idx].values  # D_{t-1}
+
+    # OLS: dD_t = alpha + beta * D_{t-1}
+    # beta < 0 for stable dividend payers (mean-reverting changes)
+    # The speed of adjustment s = -beta
+    n = len(y)
+    x_with_const = np.column_stack([np.ones(n), x])
+
+    try:
+        # Solve via least squares
+        coeffs, residuals, rank, sv = np.linalg.lstsq(x_with_const, y, rcond=None)
+        alpha, beta = coeffs
+
+        # Speed of adjustment: s = -beta (should be in [0.1, 0.9])
+        s = max(0.15, min(0.85, -beta))
+
+        # Target payout ratio: implied from the constant
+        # In steady state: dD = 0, so 0 = alpha + beta * D_ss
+        # D_ss = -alpha / beta = alpha / s
+        # If E_ss = D_ss / payout, then payout = s * D_ss / (alpha + D_ss)
+
+        # Invert the model to get earnings:
+        # D_t = c + s*E_t + (1-s)*D_{t-1}
+        # E_t = (D_t - c - (1-s)*D_{t-1}) / s
+        earnings = pd.Series(index=total_returned.index, dtype=float)
+        for i in range(len(total_returned)):
+            if i == 0:
+                # First year: use simple approximation
+                earnings.iloc[i] = total_returned.iloc[i] / 0.70
+            else:
+                d_t = total_returned.iloc[i]
+                d_prev = total_returned.iloc[i - 1]
+                e_t = (d_t - alpha - (1 - s) * d_prev) / s
+                # Sanity: earnings should be > dividends (positive retention)
+                e_t = max(e_t, d_t * 0.95)
+                earnings.iloc[i] = e_t
+
+        # Convert back to newest-first order (matching input)
+        return earnings.sort_index(ascending=False)
+
+    except Exception as exc:
+        logger.debug("Lintner regression failed: %s", exc)
+        return dividends * 1.35
+
+
+# ---------------------------------------------------------------------------
+# DuPont Decomposition -- derive income statement from earnings
+# ---------------------------------------------------------------------------
+
+def _dupont_decompose(
+    net_income: float,
+    market_cap: float,
+    sector: str,
+    ratios: dict[str, float],
+) -> dict[str, float]:
+    """Use DuPont decomposition to derive full income statement from earnings.
+
+    DuPont: ROE = Net_Margin * Asset_Turnover * Financial_Leverage
+    ROE = (NI/Rev) * (Rev/TA) * (TA/Equity)
+
+    Given: NI (from Lintner), sector net_margin, sector equity_ratio
+    Derive: Revenue, Total_Assets, Equity, and all other items.
+    """
+    net_margin = ratios.get("net_margin", 0.12)
+    gross_margin = ratios.get("gross_margin", 0.45)
+    operating_margin = ratios.get("operating_margin", 0.15)
+    tax_rate = ratios.get("tax_rate", 0.15)
+    equity_ratio = ratios.get("equity_ratio", 0.35)
+    cash_conversion = ratios.get("cash_conversion", 1.15)
+    capex_intensity = ratios.get("capex_intensity", 0.05)
+    current_liab_share = ratios.get("current_liab_share", 0.35)
+    current_ratio_est = ratios.get("current_ratio_est", 1.0)
+    interest_rate = ratios.get("interest_rate", 0.025)
+
+    # Income statement via DuPont
+    revenue = net_income / max(net_margin, 0.02)
+    ebit = net_income / max(1.0 - tax_rate, 0.50)
+    taxes = ebit - net_income
+    gross_profit = revenue * gross_margin
+    cost_of_revenue = revenue - gross_profit
+    operating_income = revenue * operating_margin
+
+    # Balance sheet via DuPont leverage component
+    # Equity = NI / ROE, and ROE = NI / Equity
+    # Use market-implied equity: for public companies, P/B is typically 2-6x
+    # But we need book equity, not market equity
+    # DuPont: TA = Equity / equity_ratio
+    # Start with equity derived from retained earnings accumulation
+    # (handled in the main function), here just compute the other items
+    total_equity_est = revenue * net_margin / 0.15  # assume ROE ~15%
+    total_assets = total_equity_est / max(equity_ratio, 0.10)
+    total_liabilities = total_assets - total_equity_est
+
+    # Balance sheet detail
+    current_liabilities = total_liabilities * current_liab_share
+    current_assets = current_liabilities * current_ratio_est
+    cash = max(revenue * 0.08, current_assets * 0.3)  # ~8% of revenue
+    long_term_debt = total_liabilities * (1 - current_liab_share)
+    interest_expense = long_term_debt * interest_rate
+
+    # Cash flow
+    operating_cf = net_income * cash_conversion
+    capex = revenue * capex_intensity
+    free_cash_flow = operating_cf - capex
+
+    return {
+        # Income
+        "revenue": revenue,
+        "cost_of_revenue": cost_of_revenue,
+        "gross_profit": gross_profit,
+        "operating_income": operating_income,
+        "net_income": net_income,
+        "ebit": ebit,
+        "taxes": taxes,
+        "interest_expense": interest_expense,
+        # Balance
+        "total_assets": total_assets,
+        "total_liabilities": total_liabilities,
+        "total_equity": total_equity_est,
+        "current_assets": current_assets,
+        "current_liabilities": current_liabilities,
+        "cash_and_equivalents": cash,
+        "long_term_debt": long_term_debt,
+        # Cash flow
+        "operating_cash_flow": operating_cf,
+        "capex": -capex,
+        "free_cash_flow": free_cash_flow,
+        "investing_cf": -capex,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Synthetic financial statement generator
 # ---------------------------------------------------------------------------
 
@@ -1117,6 +1312,24 @@ def generate_synthetic_financials(
     except (TypeError, ValueError):
         share_capital = 0
 
+    # Estimate earnings using Lintner's dividend model (1956)
+    # Uses full 18-year dividend history for OLS parameter estimation.
+    # Lintner inverts D_t = c + s*E_t + (1-s)*D_{t-1} to get E_t.
+    # Sanity check: Lintner earnings must be >= dividend (positive retention).
+    # If Lintner underestimates (common for ultra-smooth dividenders like Nestle),
+    # fall back to total_returned * 1.05 floor.
+    lintner_eps = _lintner_estimate_earnings(dividends)
+
+    # Floor: earnings >= (dividend + buyback_per_share) for each year
+    buyback_per_share = buyback_yield * (avg_price or 0)
+    for idx in lintner_eps.index:
+        div_val = float(dividends.get(idx, 0))
+        floor = (div_val + buyback_per_share) * 1.05
+        if lintner_eps[idx] < floor:
+            lintner_eps[idx] = floor
+
+    logger.debug("Lintner EPS (floored): %s", lintner_eps.head().to_dict())
+
     # Build annual records from dividend history (most recent years)
     income_records: list[dict] = []
     balance_records: list[dict] = []
@@ -1141,109 +1354,80 @@ def generate_synthetic_financials(
 
         filing_date = ex_date  # PIT: ex-dividend date is when data became public
 
-        # === INCOME STATEMENT ===
+        # === USE LINTNER-DERIVED EARNINGS ===
+        # eps_earnings is per-share; convert to total
+        net_income = float(lintner_eps.iloc[i]) * shares
         total_dividends = div_per_share * shares
         total_buyback_value = buyback_yield * shares * (avg_price or 0)
-        total_returned = total_dividends + total_buyback_value
 
-        # Net income: the minimum of two approaches:
-        # 1. total_returned / payout_ratio (sector-estimated)
-        # 2. total_returned itself (can't sustainably return more than earned)
-        # Companies like Nestle return >100% of earnings in some years
-        # (funded from reserves), so the lower bound is more accurate.
-        payout = _estimate_payout_ratio(sector, profile.get("index_memberships"))
-        implied_from_payout = total_returned / max(payout, 0.20)
-        # Use the lower estimate -- total_returned is the floor of earnings
-        # for companies that return most of their income
-        net_income = min(implied_from_payout, total_returned * 1.05)
-        ebit = net_income / max(1.0 - ratios["tax_rate"], 0.50)
-        taxes = ebit - net_income
-        revenue = net_income / max(ratios["net_margin"], 0.05)
-        gross_profit = revenue * ratios["gross_margin"]
-        cost_of_revenue = revenue - gross_profit
-        operating_income = revenue * ratios["operating_margin"]
+        # DuPont decomposition: derive full statements from earnings
+        decomp = _dupont_decompose(net_income, 0, sector, ratios)
+
+        # === INCOME STATEMENT ===
         eps_basic = net_income / shares
-        eps_diluted = net_income / (shares * 1.01)  # ~1% dilution from conditionals
+        eps_diluted = net_income / (shares * 1.01)
 
-        for name, value in [
-            ("revenue", revenue),
-            ("cost_of_revenue", cost_of_revenue),
-            ("gross_profit", gross_profit),
-            ("operating_income", operating_income),
-            ("net_income", net_income),
-            ("ebit", ebit),
-            ("taxes", taxes),
-            ("eps_basic", eps_basic),
-            ("eps_diluted", eps_diluted),
-        ]:
+        for name in ["revenue", "cost_of_revenue", "gross_profit",
+                      "operating_income", "net_income", "ebit",
+                      "taxes", "interest_expense"]:
             income_records.append({
                 "canonical_name": name,
-                "value": value,
+                "value": decomp.get(name, 0),
                 "report_date": report_date,
                 "filing_date": filing_date,
-                "source": "six_synthetic",
+                "source": "six_lintner",
+            })
+        for name, value in [("eps_basic", eps_basic), ("eps_diluted", eps_diluted)]:
+            income_records.append({
+                "canonical_name": name, "value": value,
+                "report_date": report_date, "filing_date": filing_date,
+                "source": "six_lintner",
             })
 
         # === BALANCE SHEET ===
-        total_equity = net_income * (1 - payout) + cumulative_retained
-        cumulative_retained = total_equity  # for next year
-        total_assets = total_equity / max(ratios["equity_ratio"], 0.10)
-        total_liabilities = total_assets - total_equity
-        current_liabilities = total_liabilities * ratios["current_liab_share"]
-        current_assets = current_liabilities * ratios["current_ratio_est"]
-        cash = max(total_dividends, current_assets * 0.3)  # at least enough for dividends
-        long_term_debt = total_liabilities * (1 - ratios["current_liab_share"])
-        retained_earnings = total_equity - share_capital
+        # Use DuPont estimates but track retained earnings cumulatively
+        payout = total_dividends / max(net_income, 1) if net_income > 0 else 0.7
+        retained_this_year = net_income * max(0, 1 - payout)
+        cumulative_retained += retained_this_year
+        total_equity = max(share_capital + cumulative_retained, decomp.get("total_equity", 0))
 
-        for name, value in [
-            ("total_assets", total_assets),
-            ("total_liabilities", total_liabilities),
-            ("total_equity", total_equity),
-            ("current_assets", current_assets),
-            ("current_liabilities", current_liabilities),
-            ("cash_and_equivalents", cash),
-            ("long_term_debt", long_term_debt),
-            ("retained_earnings", retained_earnings),
-        ]:
+        for name in ["total_assets", "total_liabilities", "current_assets",
+                      "current_liabilities", "cash_and_equivalents", "long_term_debt"]:
             balance_records.append({
                 "canonical_name": name,
-                "value": value,
-                "report_date": report_date,
-                "filing_date": filing_date,
-                "source": "six_synthetic",
+                "value": decomp.get(name, 0),
+                "report_date": report_date, "filing_date": filing_date,
+                "source": "six_lintner",
             })
+        balance_records.append({
+            "canonical_name": "total_equity", "value": total_equity,
+            "report_date": report_date, "filing_date": filing_date,
+            "source": "six_lintner",
+        })
+        balance_records.append({
+            "canonical_name": "retained_earnings", "value": cumulative_retained,
+            "report_date": report_date, "filing_date": filing_date,
+            "source": "six_lintner",
+        })
 
         # === CASH FLOW ===
-        operating_cf = net_income * ratios["cash_conversion"]
-        capex = revenue * ratios["capex_intensity"]
-        free_cash_flow = operating_cf - capex
         financing_cf = -(total_dividends + total_buyback_value)
-        investing_cf = -capex
-        interest_expense = long_term_debt * ratios["interest_rate"]
-
-        for name, value in [
-            ("operating_cash_flow", operating_cf),
-            ("investing_cf", investing_cf),
-            ("financing_cf", financing_cf),
-            ("capex", -capex),  # capex is negative in cash flow
-            ("dividends_paid", -total_dividends),
-            ("free_cash_flow", free_cash_flow),
-        ]:
+        for name in ["operating_cash_flow", "investing_cf", "capex", "free_cash_flow"]:
             cashflow_records.append({
                 "canonical_name": name,
-                "value": value,
-                "report_date": report_date,
-                "filing_date": filing_date,
-                "source": "six_synthetic",
+                "value": decomp.get(name, 0),
+                "report_date": report_date, "filing_date": filing_date,
+                "source": "six_lintner",
             })
-
-        # Interest expense goes in income statement
-        income_records.append({
-            "canonical_name": "interest_expense",
-            "value": interest_expense,
-            "report_date": report_date,
-            "filing_date": filing_date,
-            "source": "six_synthetic",
+        cashflow_records.append({
+            "canonical_name": "dividends_paid", "value": -total_dividends,
+            "report_date": report_date, "filing_date": filing_date,
+            "source": "six_lintner",
+        })
+        cashflow_records.append({
+            "canonical_name": "financing_cf", "value": financing_cf,
+            "report_date": report_date, "filing_date": filing_date,
+            "source": "six_lintner",
         })
 
     # Build DataFrames
