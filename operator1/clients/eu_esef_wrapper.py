@@ -306,6 +306,84 @@ def _extract_ifrs_facts(
 
 
 # ---------------------------------------------------------------------------
+# Company name cleaning (strips legal suffixes for fuzzy matching)
+# ---------------------------------------------------------------------------
+
+_LEGAL_SUFFIXES = [
+    " s.p.a.", " s.p.a", " spa", " s.a.", " sa", " n.v.", " nv",
+    " ab", " ab (publ)", " (publ)", " plc", " ltd", " limited",
+    " se", " ag", " gmbh", " oyj", " asa", " a/s",
+    " societa per azioni", " societe anonyme",
+    " pjsc", " jsc", " inc", " corp", " co",
+]
+
+
+def _clean_company_name(name: str) -> str:
+    """Strip common legal entity suffixes and quotes for fuzzy matching."""
+    cleaned = name.strip().strip('"').strip("'").lower()
+    for suffix in _LEGAL_SUFFIXES:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].strip()
+    cleaned = cleaned.strip('"').strip("'").strip()
+    return cleaned
+
+
+def _fuzzy_match_entity(
+    query: str,
+    entities: dict[str, dict],
+    threshold: float = 65.0,
+) -> list[tuple[str, dict, float]]:
+    """Fuzzy match a company name against the entity directory.
+
+    Uses rapidfuzz WRatio (best general-purpose scorer, combines ratio,
+    partial_ratio, token_sort_ratio, and token_set_ratio with optimal
+    weights). Falls back to difflib SequenceMatcher if rapidfuzz is
+    unavailable.
+
+    Pattern from: operator1/clients/fuzzy_pdf_parser.py::_fuzzy_match_concept
+
+    Returns list of (entity_id, entity_dict, score) sorted by score desc.
+    """
+    if not entities or not query:
+        return []
+
+    query_clean = _clean_company_name(query.lower())
+
+    # Build choices: entity_id -> cleaned name
+    choices: dict[str, str] = {}
+    for eid, info in entities.items():
+        choices[eid] = _clean_company_name(info.get("name", "").lower())
+
+    try:
+        from rapidfuzz import process, fuzz
+        # WRatio is the best general-purpose scorer -- it automatically
+        # picks the best combination of ratio, partial_ratio,
+        # token_sort_ratio, and token_set_ratio.
+        matches = process.extract(
+            query_clean,
+            choices,
+            scorer=fuzz.WRatio,
+            score_cutoff=threshold,
+            limit=10,
+        )
+        results = []
+        for match_name, score, eid in matches:
+            results.append((eid, entities[eid], score))
+        return results
+
+    except ImportError:
+        # Fallback: difflib SequenceMatcher
+        from difflib import SequenceMatcher
+        results = []
+        for eid, cleaned in choices.items():
+            ratio = SequenceMatcher(None, query_clean, cleaned).ratio() * 100
+            if ratio >= threshold:
+                results.append((eid, entities[eid], ratio))
+        results.sort(key=lambda x: x[2], reverse=True)
+        return results[:10]
+
+
+# ---------------------------------------------------------------------------
 # Entity cache (resolves LEI -> entity name)
 # ---------------------------------------------------------------------------
 
@@ -392,7 +470,31 @@ class EUEsefClient:
         results = list(directory.values())
         if query:
             q = query.lower()
-            results = [c for c in results if q in c["name"].lower() or q in c.get("lei", "").lower()]
+            # Exact substring match first (fast)
+            exact = [
+                c for c in results
+                if q in c["name"].lower() or q in c.get("lei", "").lower()
+            ]
+            if exact:
+                return exact
+
+            # Cleaned substring match (strips legal suffixes)
+            q_clean = _clean_company_name(q)
+            if len(q_clean) >= 3:
+                cleaned = [
+                    c for c in results
+                    if q_clean in _clean_company_name(c["name"].lower())
+                ]
+                if cleaned:
+                    return cleaned
+
+            # Fuzzy match with rapidfuzz WRatio (handles legal suffixes,
+            # acronyms, partial names). Higher threshold for short queries
+            # to avoid false positives (e.g., "BNP" matching "CNP").
+            min_score = 80.0 if len(q_clean) < 6 else 70.0
+            fuzzy_matches = _fuzzy_match_entity(query, directory, threshold=min_score)
+            if fuzzy_matches:
+                return [info for _, info, _ in fuzzy_matches]
 
         return results
 
@@ -482,7 +584,7 @@ class EUEsefClient:
             return cached
 
         params: dict[str, str] = {
-            "page[size]": "250",
+            "page[size]": "500",
             "sort": "-period_end",
             "include": "entity",
         }
