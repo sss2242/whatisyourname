@@ -1816,6 +1816,284 @@ class DFMFilingDiscoverer:
         return resp.content
 
 
+# ---------------------------------------------------------------------------
+# SIX Swiss Exchange Filing Discoverer
+# ---------------------------------------------------------------------------
+
+# SIX official notices JSON API (undocumented, discovered from React SPA).
+# Base endpoint: /sheldon/official_notices/v2/find.json
+# Detail endpoint: /sheldon/official_notices/v2/details/{noticeId}.json
+#
+# Supported query parameters:
+#   firstDate, lastDate     -- YYYYMMDD date range
+#   pageNumber, pageSize    -- pagination (0-indexed)
+#   sortAttribute, sortDirection -- sorting (date, desc/asc)
+#   showManual              -- M-type notices (issuer corporate actions)
+#   showAutomatic           -- A-type notices (automated adjustments)
+#   showExDividend          -- EX-type notices (ex-dividend)
+#   showFirstListing        -- FL-type notices (first listings)
+#   showDelisting           -- DE-type notices (delistings)
+#   showProvisional         -- PZ-type notices (provisional)
+#   issuerWords             -- search by issuer name (space-separated words)
+#   valorIds                -- search by ISIN or valor number
+#   linkDirectly            -- filter to notices directly linked to the security
+#   linkUnderlying          -- filter to notices referencing the underlying
+#
+# No authentication required. No rate limit documented. Free and public.
+
+_SIX_API_BASE = "https://www.six-group.com/sheldon/official_notices/v2"
+_SIX_FIND_URL = f"{_SIX_API_BASE}/find.json"
+_SIX_DETAIL_URL = f"{_SIX_API_BASE}/details"
+
+_SIX_HEADERS = {
+    "User-Agent": "Operator1/1.0 (financial-research)",
+    "Accept": "application/json",
+}
+
+# Delay between SIX API requests (be polite -- no documented rate limit).
+_SIX_REQUEST_DELAY_S = 0.3
+
+
+class SIXFilingDiscoverer:
+    """Filing discoverer for SIX Swiss Exchange using the official notices API.
+
+    Discovers corporate action notices (capital changes, dividends, share
+    count updates) for SIX-listed companies via the undocumented sheldon
+    JSON API that powers the official notices React SPA on six-group.com.
+
+    Discovery approach (HKEX-inspired):
+      1. Search by ISIN using ``valorIds`` with ``linkDirectly=true``
+         to get notices directly related to the security.
+      2. Filter by notice types: M (manual/issuer), EX (ex-dividend),
+         FL (first listing), DE (delisting).
+      3. Fetch detail text for each notice via the detail endpoint.
+      4. Parse structured text for shares outstanding, dividend amounts,
+         and other corporate action data.
+
+    Note: SIX official notices contain corporate actions, NOT financial
+    statement filings. Financial results for Swiss companies are published
+    via ad-hoc disclosures (requires auth) or company IR websites.
+    The notices are still valuable for:
+      - Shares outstanding changes (PIT-compliant dates)
+      - Ex-dividend dates and amounts
+      - Capital destruction (buyback) events
+      - First listing / delisting events
+    """
+
+    def discover_filings(
+        self,
+        ticker: str,
+        years: int = 2,
+        isin: str = "",
+    ) -> FilingDiscovery:
+        """Discover SIX official notices for a company.
+
+        Parameters
+        ----------
+        ticker:
+            SIX ticker symbol (e.g. 'NESN', 'NOVN', 'ROG', 'UBSG').
+        years:
+            How many years of notices to search for.
+        isin:
+            ISIN code (e.g. 'CH0038863350' for Nestle). If provided,
+            used for precise ISIN-based search. Otherwise falls back
+            to issuer name search.
+
+        Returns
+        -------
+        FilingDiscovery with list of discovered notices.
+        """
+        result = FilingDiscovery(ticker=ticker, market_id="ch_six")
+
+        end_date = date.today()
+        start_date = end_date - timedelta(days=365 * years)
+
+        try:
+            # Build query params
+            params: dict[str, str] = {
+                "firstDate": start_date.strftime("%Y%m%d"),
+                "lastDate": end_date.strftime("%Y%m%d"),
+                "pageNumber": "0",
+                "pageSize": "50",
+                "sortAttribute": "date",
+                "sortDirection": "desc",
+                "showManual": "true",
+                "showAutomatic": "false",
+                "showExDividend": "true",
+                "showFirstListing": "false",
+                "showDelisting": "false",
+                "showProvisional": "false",
+            }
+
+            if isin:
+                # ISIN-based search (most precise)
+                params["valorIds"] = isin
+                params["linkDirectly"] = "true"
+                params["linkUnderlying"] = "false"
+            else:
+                # Issuer name search (fallback)
+                params["issuerWords"] = ticker
+
+            resp = requests.get(
+                _SIX_FIND_URL,
+                params=params,
+                headers=_SIX_HEADERS,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data.get("status") != "Ok":
+                result.errors.append(f"SIX API error: {data.get('status', 'unknown')}")
+                return result
+
+            items = data.get("itemList", [])
+            total = data.get("totalCount", 0)
+
+            for item in items:
+                notice_id = item.get("noticeId", "")
+                notice_type = item.get("noticeType", "")
+                raw_date = str(item.get("date", ""))
+                contact = item.get("contact", "")
+                title = item.get("title", "")
+                item_isin = item.get("isin") or isin
+
+                # Parse date from YYYYMMDD integer
+                filing_date = ""
+                if raw_date and len(raw_date) == 8:
+                    filing_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+
+                # Classify filing type from notice type
+                filing_type = _six_classify_notice_type(notice_type, title)
+
+                result.filings.append(FilingMetadata(
+                    title=f"{contact}: {title}".strip(": "),
+                    filing_date=filing_date,
+                    report_date="",  # Parsed from detail text if needed
+                    document_url=f"{_SIX_DETAIL_URL}/{notice_id}.json",
+                    document_format="json",  # SIX notices are structured text, not PDFs
+                    filing_type=filing_type,
+                    market_id="ch_six",
+                    attachment_id=str(notice_id),
+                    extra={
+                        "notice_type": notice_type,
+                        "isin": item_isin,
+                        "contact": contact,
+                    },
+                ))
+
+            # Dedup by notice ID
+            seen: set[str] = set()
+            unique: list[FilingMetadata] = []
+            for f in result.filings:
+                if f.attachment_id not in seen:
+                    seen.add(f.attachment_id)
+                    unique.append(f)
+            result.filings = unique
+
+            logger.info(
+                "SIX discovery for %s (ISIN=%s): %d notices (%d total in range)",
+                ticker, isin or "N/A", len(result.filings), total,
+            )
+
+        except Exception as exc:
+            result.errors.append(f"SIX discovery failed: {exc}")
+            logger.warning("SIX discovery failed for %s: %s", ticker, exc)
+
+        return result
+
+    def download_filing(self, filing: FilingMetadata) -> bytes:
+        """Download a SIX notice detail as UTF-8 text bytes.
+
+        SIX notices are structured text (not PDFs). The detail endpoint
+        returns JSON with a ``text`` field containing the full notice.
+        We extract the text and return it as UTF-8 bytes.
+        """
+        if not filing.document_url:
+            raise ValueError("No document URL in filing metadata")
+
+        time.sleep(_SIX_REQUEST_DELAY_S)
+
+        resp = requests.get(
+            filing.document_url,
+            headers=_SIX_HEADERS,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        items = data.get("itemList", [])
+        if not items:
+            raise ValueError(f"SIX detail returned no items for {filing.attachment_id}")
+
+        text = items[0].get("text", "")
+        if not text:
+            raise ValueError(f"SIX notice {filing.attachment_id} has no text content")
+
+        return text.encode("utf-8")
+
+    def get_notice_text(self, notice_id: int | str) -> str:
+        """Fetch the full text of a SIX official notice.
+
+        Convenience method for extracting structured data from notices
+        (shares outstanding, dividend amounts, etc.).
+
+        Parameters
+        ----------
+        notice_id:
+            The numeric notice ID from the find results.
+
+        Returns
+        -------
+        Full notice text as a string.
+        """
+        url = f"{_SIX_DETAIL_URL}/{notice_id}.json"
+        resp = requests.get(url, headers=_SIX_HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        items = data.get("itemList", [])
+        if not items:
+            return ""
+        return items[0].get("text", "")
+
+
+def _six_classify_notice_type(notice_type: str, title: str) -> str:
+    """Classify a SIX notice into a filing type category."""
+    nt = notice_type.upper()
+    title_lower = title.lower()
+
+    if nt == "EX":
+        return "dividend"
+    if nt == "FL":
+        return "first_listing"
+    if nt == "DE":
+        return "delisting"
+    if nt == "PZ":
+        return "provisional"
+
+    # M-type (manual/issuer notices) -- classify by title content
+    if nt == "M":
+        if any(kw in title_lower for kw in ("kapitalvernichtung", "capital destruction",
+                                              "kapitalherabsetzung", "capital reduction")):
+            return "capital_action"
+        if any(kw in title_lower for kw in ("ruckkauf", "rueckkauf", "buyback", "repurchase")):
+            return "buyback"
+        if any(kw in title_lower for kw in ("dividende", "dividend")):
+            return "dividend"
+        if any(kw in title_lower for kw in ("annual", "jahres")):
+            return "annual"
+        if any(kw in title_lower for kw in ("interim", "halbjahr", "half")):
+            return "interim"
+        return "corporate_action"
+
+    # A-type (automatic) -- typically structured product adjustments
+    if nt == "A":
+        return "automatic"
+
+    return "other"
+
+
 DISCOVERER_REGISTRY: dict[str, type] = {
     "in_bse": BSEFilingDiscoverer,
     "au_asx": ASXFilingDiscoverer,
@@ -1826,6 +2104,7 @@ DISCOVERER_REGISTRY: dict[str, type] = {
     "za_jse": JSEFilingDiscoverer,
     "mx_bmv": BMVFilingDiscoverer,
     "ae_dfm": DFMFilingDiscoverer,
+    "ch_six": SIXFilingDiscoverer,
 }
 
 
