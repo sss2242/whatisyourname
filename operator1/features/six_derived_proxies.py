@@ -21,8 +21,7 @@ The proxies map to the pipeline's 5-tier survival hierarchy:
                           book equity floor, capital action frequency
   Tier 3 (Stability):    Volatility from SIX CSV close data, drawdown
   Tier 4 (Profitability): Dividend growth consistency, implied earnings
-  Tier 5 (Valuation):    Dividend yield, PDG ratio, implied PE,
-                          price-to-book floor
+  Tier 5 (Valuation):    Dividend yield, PDG ratio, implied PE
 
 Accuracy improvements (v3 -- no yfinance):
   1. Adaptive payout ratio from sector + index membership
@@ -95,8 +94,6 @@ class SixProxyResult:
     implied_earnings: float | None = None
     implied_pe: float | None = None
     book_equity_floor: float | None = None
-    price_to_par: float | None = None  # price / par_value -- only useful as extreme distress signal (<1.0)
-    par_value_distress: bool = False    # True if stock trades below par value
     dilution_risk: float | None = None
 
 
@@ -843,23 +840,7 @@ def compute_six_proxies(
             )
             n_proxies += 1
 
-            # Price-to-par ratio (NOT P/B -- par value is much smaller than book equity)
-            # Only useful as an extreme distress signal: if price < par, stock is
-            # trading below its legal minimum value per share.
-            nominal = profile.get("nominal_value")
-            if nominal and latest_close:
-                try:
-                    par_per_share = float(nominal)
-                    if par_per_share > 0:
-                        price_to_par = latest_close / par_per_share
-                        result.price_to_par = price_to_par
-                        result.par_value_distress = price_to_par < 1.0
-                        _set_with_confidence(cache, "six_proxy_price_to_par", price_to_par, 0.95)
-                        if result.par_value_distress:
-                            _set_with_confidence(cache, "six_proxy_par_distress_flag", 1, 0.95)
-                        n_proxies += 1
-                except (TypeError, ValueError):
-                    pass
+
 
         # --- Improvement 8: Dilution risk ---
         dilution, dilution_conf = _compute_dilution_risk(profile)
@@ -883,7 +864,7 @@ def compute_six_proxies(
         logger.info(
             "SIX proxy v3: %d columns, yield=%.2f%%, cagr_5y=%.2f%%, "
             "buyback=%.2f%%, implied_pe=%.1f, payout=%.0f%%, "
-            "book_floor=%.0f, dilution=%.3f, p/par=%.0f, coverage=%.2f, "
+            "book_floor=%.0f, dilution=%.3f, coverage=%.2f, "
             "has_close=%s (%d pts)",
             n_proxies,
             (result.dividend_yield or 0) * 100,
@@ -893,7 +874,6 @@ def compute_six_proxies(
             (result.estimated_payout_ratio or 0) * 100,
             result.book_equity_floor or 0,
             result.dilution_risk or 0,
-            result.price_to_par or 0,
             result.dividend_coverage or 0,
             has_close,
             int(close.notna().sum()) if has_close else 0,
@@ -975,9 +955,6 @@ def _inject_calibrated_tier_scores(
     if result.dividend_yield is not None:
         yield_score = _calibrated_score(result.dividend_yield, "dividend_yield")
         valuation = valuation * 0.5 + yield_score * 0.5
-    # Par value distress is an extreme signal, not a valuation metric
-    if result.par_value_distress:
-        valuation = max(0, valuation - 30)  # severe penalty
     _set_with_confidence(
         cache, "six_proxy_tier5_score",
         max(0, min(100, valuation)),
