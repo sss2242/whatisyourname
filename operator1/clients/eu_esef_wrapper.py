@@ -1,34 +1,108 @@
-"""EU ESEF PIT client -- powered by pyesef + filings.xbrl.org.
+"""EU ESEF PIT client -- filings.xbrl.org XBRL JSON extraction.
 
 Covers pan-EU filings: France (Euronext), Germany (Frankfurt/XETRA),
-and all other EU member states under the ESEF regulation.
+Netherlands, Spain, Italy, Sweden, and all other EU/EEA/UK member
+states under the ESEF regulation.
 
-Primary library: pyesef (https://github.com/ggravlingen/pyesef)
-  - ESEF XBRL file extraction and parsing using Arelle
+Data source: filings.xbrl.org JSON:API (free, no key required)
+  - /api/filings: 23,900+ filings with XBRL JSON download URLs
+  - /api/entities: 7,200+ registered filers with LEI identifiers
+  - XBRL JSON (OIM format): Full IFRS financial statements (revenue,
+    profit, assets, equity, cash, liabilities, EPS, etc.)
 
-Fallback: Direct filings.xbrl.org API (same as original esef.py)
+Coverage by country (filing counts):
+  NL: 599, ES: 542, IT: 754, SE: 1,415, FR: 1,042, GB: 2,565
+  DE: 0 (Germany does not file via ESEF/filings.xbrl.org)
 
-Coverage: ~5,000+ EU-listed companies, $8-9T combined market cap.
-API: https://filings.xbrl.org/api (free, no key required)
+Key API quirks:
+  - JSON:API format: use filter[country], page[size], not country=
+  - Entity names are NOT in filing records -- must follow
+    relationships.entity.links.related to get entity name
+  - XBRL JSON download needs Accept: application/json (not vnd.api+json)
+  - Facts use XBRL OIM format: {"f-1": {value, dimensions: {concept, period, unit}}}
+  - IFRS concepts are prefixed: "ifrs-full:Revenue", "ifrs-full:Assets"
+
+Total coverage: ~4,350+ EU-listed companies, $8-9T combined market cap.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-
-from operator1.http_utils import cached_get, HTTPError
+import requests
 
 logger = logging.getLogger(__name__)
 
 _XBRL_API_BASE = "https://filings.xbrl.org/api"
+_XBRL_FILES_BASE = "https://filings.xbrl.org"
 _CACHE_DIR = Path("cache/eu_esef")
+
+_HEADERS_API = {
+    "User-Agent": "Operator1/1.0 (financial-research)",
+    "Accept": "application/vnd.api+json",
+}
+_HEADERS_JSON = {
+    "User-Agent": "Operator1/1.0 (financial-research)",
+    "Accept": "application/json",
+}
+
+# IFRS concept -> canonical field name mapping
+_IFRS_CONCEPT_MAP: dict[str, str] = {
+    "ifrs-full:Revenue": "revenue",
+    "ifrs-full:CostOfSales": "cost_of_revenue",
+    "ifrs-full:GrossProfit": "gross_profit",
+    "ifrs-full:ProfitLossFromOperatingActivities": "operating_income",
+    "ifrs-full:ProfitLoss": "net_income",
+    "ifrs-full:ProfitLossAttributableToOwnersOfParent": "net_income_attributable",
+    "ifrs-full:IncomeTaxExpenseContinuingOperations": "taxes",
+    "ifrs-full:FinanceCosts": "interest_expense",
+    "ifrs-full:BasicEarningsLossPerShare": "eps",
+    "ifrs-full:DilutedEarningsLossPerShare": "eps_diluted",
+    "ifrs-full:Assets": "total_assets",
+    "ifrs-full:CurrentAssets": "current_assets",
+    "ifrs-full:NoncurrentAssets": "noncurrent_assets",
+    "ifrs-full:Liabilities": "total_liabilities",
+    "ifrs-full:CurrentLiabilities": "current_liabilities",
+    "ifrs-full:NoncurrentLiabilities": "noncurrent_liabilities",
+    "ifrs-full:Equity": "total_equity",
+    "ifrs-full:CashAndCashEquivalents": "cash_and_equivalents",
+    "ifrs-full:IssuedCapital": "share_capital",
+    "ifrs-full:RetainedEarnings": "retained_earnings",
+    "ifrs-full:Inventories": "inventory",
+    "ifrs-full:TradeAndOtherCurrentReceivables": "receivables",
+    "ifrs-full:TradeAndOtherCurrentPayables": "payables",
+    "ifrs-full:PropertyPlantAndEquipment": "property_plant_equipment",
+    "ifrs-full:Goodwill": "goodwill",
+    "ifrs-full:IntangibleAssetsOtherThanGoodwill": "intangible_assets",
+    "ifrs-full:CashFlowsFromUsedInOperatingActivities": "operating_cash_flow",
+    "ifrs-full:CashFlowsFromUsedInInvestingActivities": "investing_cf",
+    "ifrs-full:CashFlowsFromUsedInFinancingActivities": "financing_cf",
+    "ifrs-full:DividendsPaid": "dividends_paid",
+    "ifrs-full:DepreciationAndAmortisationExpense": "depreciation_amortization",
+}
+
+# Statement type -> set of canonical field names that belong to it
+_INCOME_FIELDS = {
+    "revenue", "cost_of_revenue", "gross_profit", "operating_income",
+    "net_income", "net_income_attributable", "taxes", "interest_expense",
+    "eps", "eps_diluted", "depreciation_amortization",
+}
+_BALANCE_FIELDS = {
+    "total_assets", "current_assets", "noncurrent_assets",
+    "total_liabilities", "current_liabilities", "noncurrent_liabilities",
+    "total_equity", "cash_and_equivalents", "share_capital",
+    "retained_earnings", "inventory", "receivables", "payables",
+    "property_plant_equipment", "goodwill", "intangible_assets",
+}
+_CASHFLOW_FIELDS = {
+    "operating_cash_flow", "investing_cf", "financing_cf", "dividends_paid",
+}
 
 
 class EUEsefError(Exception):
@@ -38,20 +112,153 @@ class EUEsefError(Exception):
         super().__init__(f"EU ESEF error on {endpoint}: {detail}")
 
 
+# ---------------------------------------------------------------------------
+# API helpers
+# ---------------------------------------------------------------------------
+
+def _api_get(path: str, params: dict | None = None) -> dict:
+    """GET from filings.xbrl.org JSON:API."""
+    try:
+        resp = requests.get(
+            f"{_XBRL_API_BASE}{path}",
+            params=params,
+            headers=_HEADERS_API,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        logger.debug("ESEF API %s failed: %s", path, exc)
+        return {}
+
+
+def _fetch_entity_name(entity_link: str) -> str:
+    """Resolve an entity relationship link to the entity name."""
+    if not entity_link:
+        return ""
+    try:
+        url = entity_link if entity_link.startswith("http") else f"{_XBRL_FILES_BASE}{entity_link}"
+        resp = requests.get(url, headers=_HEADERS_API, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("data", {}).get("attributes", {}).get("name", "")
+    except Exception:
+        return ""
+
+
+def _download_xbrl_json(json_url: str) -> dict:
+    """Download and parse an XBRL JSON (OIM) file from filings.xbrl.org.
+
+    The JSON files need Accept: application/json (not vnd.api+json).
+    Files can be large (6+ MB for Unilever).
+    """
+    if not json_url:
+        return {}
+    url = json_url if json_url.startswith("http") else f"{_XBRL_FILES_BASE}{json_url}"
+    try:
+        resp = requests.get(url, headers=_HEADERS_JSON, timeout=60)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        logger.debug("XBRL JSON download failed for %s: %s", json_url, exc)
+        return {}
+
+
+def _extract_ifrs_facts(
+    xbrl_data: dict,
+    statement_type: str,
+) -> list[dict]:
+    """Extract IFRS financial facts from XBRL JSON (OIM format).
+
+    Each fact in the OIM format:
+    {
+      "f-1": {
+        "value": "50503000000.0",
+        "dimensions": {
+          "concept": "ifrs-full:Revenue",
+          "entity": "scheme:549300MKFYEKVRWML317",
+          "period": "2025-01-01T00:00:00/2026-01-01T00:00:00",
+          "unit": "iso4217:EUR"
+        }
+      }
+    }
+    """
+    # Select fields for requested statement type
+    if statement_type == "income":
+        target_fields = _INCOME_FIELDS
+    elif statement_type == "balance":
+        target_fields = _BALANCE_FIELDS
+    elif statement_type == "cashflow":
+        target_fields = _CASHFLOW_FIELDS
+    else:
+        target_fields = _INCOME_FIELDS | _BALANCE_FIELDS | _CASHFLOW_FIELDS
+
+    facts = xbrl_data.get("facts", {})
+    rows: list[dict] = []
+
+    for fact_id, fact in facts.items():
+        dims = fact.get("dimensions", {})
+        concept = dims.get("concept", "")
+        canonical = _IFRS_CONCEPT_MAP.get(concept)
+        if not canonical or canonical not in target_fields:
+            continue
+
+        value_str = fact.get("value", "")
+        if not value_str:
+            continue
+
+        try:
+            value = float(value_str)
+        except (ValueError, TypeError):
+            continue
+
+        # Parse period: instant ("2025-01-01T00:00:00") or
+        # duration ("2025-01-01T00:00:00/2026-01-01T00:00:00")
+        period = dims.get("period", "")
+        if "/" in period:
+            # Duration: use end date as report_date
+            report_date = period.split("/")[1][:10]
+        else:
+            # Instant: use the date directly
+            report_date = period[:10]
+
+        # Skip facts with extra dimensional breakdowns (segments, etc.)
+        # to avoid double-counting. Keep only facts with exactly the
+        # standard 4 dimensions: concept, entity, period, unit.
+        n_dims = len(dims)
+        if n_dims > 4:
+            continue
+
+        rows.append({
+            "canonical_name": canonical,
+            "value": value,
+            "report_date": report_date,
+            "filing_date": "",  # Set by caller from filing metadata
+        })
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Entity cache (resolves LEI -> entity name)
+# ---------------------------------------------------------------------------
+
+_entity_name_cache: dict[str, str] = {}
+
+
+# ---------------------------------------------------------------------------
+# EUEsefClient
+# ---------------------------------------------------------------------------
+
+
 class EUEsefClient:
-    """Point-in-time client for ESEF filings (EU equities) using pyesef.
+    """Point-in-time client for ESEF filings (EU equities).
+
+    Uses the filings.xbrl.org JSON:API with proper filter syntax
+    and XBRL JSON extraction for structured IFRS financial data.
 
     Implements the ``PITClient`` protocol. Filters by country code to
-    support per-country market entries (EU, FR, DE).
-
-    Parameters
-    ----------
-    country_code:
-        ISO-2 country code to filter filings. "" for all EU.
-    market_id:
-        Registry market ID (e.g. "eu_esef", "fr_esef", "de_esef").
-    cache_dir:
-        Local cache directory.
+    support per-country market entries (EU, FR, DE, NL, ES, IT, SE).
     """
 
     def __init__(
@@ -63,15 +270,6 @@ class EUEsefClient:
         self._country_code = country_code.upper()
         self._market_id = market_id
         self._cache_dir = Path(cache_dir)
-        self._pyesef_available = False
-        self._filing_cache: dict[str, list[dict]] = {}
-
-        try:
-            import pyesef
-            self._pyesef_available = True
-            logger.info("pyesef available for ESEF XBRL parsing")
-        except ImportError:
-            logger.info("pyesef not available; using filings.xbrl.org API only")
 
     def _cache_path(self, identifier: str, filename: str) -> Path:
         safe_id = identifier.replace("/", "_").replace("\\", "_").upper()
@@ -85,22 +283,16 @@ class EUEsefClient:
             age_days = (date.today() - date.fromtimestamp(path.stat().st_mtime)).days
             if filename == "profile.json" and age_days > 7:
                 return None
+            if filename.endswith("_financials.json") and age_days > 30:
+                return None
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return None
 
-    def _write_cache(self, identifier: str, filename: str, data: dict) -> None:
+    def _write_cache(self, identifier: str, filename: str, data: Any) -> None:
         path = self._cache_path(identifier, filename)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, default=str, indent=2), encoding="utf-8")
-
-    def _get_xbrl(self, path: str, params: dict | None = None) -> Any:
-        url = f"{_XBRL_API_BASE}{path}"
-        headers = {"Accept": "application/json", "User-Agent": "Operator1/1.0"}
-        try:
-            return cached_get(url, params=params, headers=headers)
-        except HTTPError as exc:
-            raise EUEsefError(path, str(exc)) from exc
 
     @property
     def market_id(self) -> str:
@@ -112,216 +304,151 @@ class EUEsefClient:
             "eu_esef": "European Union (ESEF -- all EU)",
             "fr_esef": "France (Paris / Euronext -- ESEF)",
             "de_esef": "Germany (Frankfurt / XETRA -- ESEF)",
+            "nl_esef": "Netherlands (Euronext Amsterdam -- ESEF)",
+            "es_esef": "Spain (Madrid / BME -- ESEF)",
+            "it_esef": "Italy (Borsa Italiana -- ESEF)",
+            "se_esef": "Sweden (Stockholm / Nasdaq Nordic -- ESEF)",
         }
         return labels.get(self._market_id, f"ESEF ({self._country_code})")
 
+    # -- Company discovery ---------------------------------------------------
+
     def list_companies(self, query: str = "") -> list[dict[str, Any]]:
-        """List EU companies from ESEF filings."""
-        filings = self._get_recent_filings()
-        seen: dict[str, dict] = {}
+        """List companies from ESEF filings for this country.
+
+        Fetches filings via JSON:API filter[country], resolves entity
+        names via relationship links, and caches the full directory
+        to avoid repeated API calls.
+        """
+        # Build entity directory (cached per country)
+        directory = self._get_entity_directory()
+
+        results = list(directory.values())
+        if query:
+            q = query.lower()
+            results = [c for c in results if q in c["name"].lower() or q in c.get("lei", "").lower()]
+
+        return results
+
+    def search_company(self, name: str) -> list[dict[str, Any]]:
+        """Search for companies by name in ESEF filings.
+
+        First tries exact match via the entities API, then falls
+        back to the cached entity directory with substring matching.
+        """
+        # Path 1: Exact name match via /api/entities
+        try:
+            data = _api_get("/entities", params={"filter[name]": name, "page[size]": "5"})
+            entities = data.get("data", [])
+            results = []
+            for ent in entities:
+                attrs = ent.get("attributes", {})
+                ent_name = attrs.get("name", "")
+                ent_id = str(ent.get("id", ""))
+                if ent_name:
+                    results.append({
+                        "ticker": ent_id[:20],
+                        "name": ent_name,
+                        "lei": ent_id,
+                        "cik": ent_id,
+                        "country": "EU",
+                        "exchange": "ESEF",
+                        "market_id": self.market_id,
+                    })
+            if results:
+                return results
+        except Exception:
+            pass
+
+        # Path 2: Substring search in cached directory
+        return self.list_companies(query=name)
+
+    def _get_entity_directory(self) -> dict[str, dict]:
+        """Build and cache a directory of entities from ESEF filings.
+
+        Uses ``include=entity`` sideload to get entity names in a
+        single API call (no N+1 entity resolution). Fetches up to
+        250 filings per page to cover most listed companies.
+        """
+        cache_key = f"entity_directory_{self._country_code or 'ALL'}"
+
+        # Check disk cache (24h TTL)
+        cached = self._read_cache(cache_key, "directory.json")
+        if cached and isinstance(cached, dict):
+            for eid, info in cached.items():
+                _entity_name_cache[eid] = info.get("name", "")
+            return cached
+
+        params: dict[str, str] = {
+            "page[size]": "250",
+            "sort": "-period_end",
+            "include": "entity",
+        }
+        if self._country_code:
+            params["filter[country]"] = self._country_code
+
+        data = _api_get("/filings", params=params)
+        filings = data.get("data", [])
+        included = data.get("included", [])
+
+        # Build entity ID -> name map from sideloaded entities
+        entity_map: dict[str, str] = {}
+        for inc in included:
+            if inc.get("type") == "entity":
+                eid = str(inc.get("id", ""))
+                name = inc.get("attributes", {}).get("name", "")
+                if eid and name:
+                    entity_map[eid] = name
+                    _entity_name_cache[eid] = name
+
+        # Build directory from filings + sideloaded entity names
+        directory: dict[str, dict] = {}
         for f in filings:
-            # filings.xbrl.org returns JSON:API format:
-            # { "type": "filing", "id": "...", "attributes": {...}, "relationships": {...} }
-            # Research Log: .roo/research/eu-esef-2026-02-24.md (Section B1-B3)
-            attrs = f.get("attributes", f)  # fallback to f itself if flat format
-            entity = f.get("entity", {})    # may be embedded or empty
+            attrs = f.get("attributes", {})
+            country = attrs.get("country", "")
+            entity_link = (
+                f.get("relationships", {})
+                .get("entity", {})
+                .get("links", {})
+                .get("related", "")
+            )
+            entity_id = entity_link.split("/")[-1] if entity_link else ""
 
-            # Entity info: try embedded entity first, then attributes
-            lei = entity.get("lei", "") or attrs.get("lei", "")
-            name = entity.get("name", "") or attrs.get("entity_name", "") or attrs.get("filer_name", "")
-            country = entity.get("country", "") or attrs.get("country", "")
-
-            if self._country_code and country != self._country_code:
+            if not entity_id or entity_id in directory:
                 continue
-            key = lei or name
-            if key and key not in seen:
-                seen[key] = {
-                    "ticker": lei[:12] if lei else "",
+
+            name = entity_map.get(entity_id, _entity_name_cache.get(entity_id, ""))
+            if name:
+                directory[entity_id] = {
+                    "ticker": entity_id[:20],
                     "name": name,
-                    "lei": lei,
-                    "cik": lei,
+                    "lei": entity_id,
+                    "cik": entity_id,
                     "country": country,
                     "exchange": "ESEF",
                     "market_id": self.market_id,
                 }
 
-        results = list(seen.values())
-        if query:
-            q = query.lower()
-            results = [c for c in results if q in c["name"].lower() or q in c.get("lei", "").lower()]
-        return results
+        if directory:
+            self._write_cache(cache_key, "directory.json", directory)
+            logger.info("ESEF entity directory built: %d entities for %s",
+                        len(directory), self._country_code or "ALL")
 
-    def _search_entities_api(self, query: str) -> list[dict[str, Any]]:
-        """Search the /api/entities endpoint and direct entity lookup.
+        return directory
 
-        Strategy:
-        1. If query looks like an LEI (20-char alphanumeric), do a direct
-           entity lookup at /api/entities/{lei}.
-        2. Otherwise, fetch a page of entities and do substring matching.
-        3. Also fetch recent filings with include=entity and match against
-           the included entity names.
-        """
-        results: list[dict[str, Any]] = []
-        q = query.strip()
-
-        # Path 1: Direct LEI lookup (LEIs are exactly 20 alphanumeric chars).
-        if len(q) == 20 and q.isalnum():
-            try:
-                data = self._get_xbrl(f"/entities/{q}")
-                ent = data.get("data", {}) if isinstance(data, dict) else {}
-                attrs = ent.get("attributes", {})
-                name = attrs.get("name", "")
-                if name:
-                    results.append({
-                        "ticker": q[:12],
-                        "name": name,
-                        "lei": q,
-                        "cik": q,
-                        "country": attrs.get("country", "EU"),
-                        "exchange": "ESEF",
-                        "market_id": self.market_id,
-                    })
-                    return results
-            except Exception:
-                pass
-
-        # Path 2: Paginated entities search (fetch up to 500 for better coverage).
-        try:
-            data = self._get_xbrl("/entities", params={"page[size]": 500})
-            entities = data.get("data", []) if isinstance(data, dict) else []
-            q_lower = q.lower()
-            for ent in entities:
-                attrs = ent.get("attributes", {})
-                ent_name = attrs.get("name", "")
-                lei = attrs.get("lei", "")
-                country = attrs.get("country", "")
-
-                if self._country_code and country and country != self._country_code:
-                    continue
-
-                if q_lower in ent_name.lower() or q_lower in lei.lower():
-                    results.append({
-                        "ticker": lei[:12] if lei else "",
-                        "name": ent_name,
-                        "lei": lei,
-                        "cik": lei or str(ent.get("id", "")),
-                        "country": country or "EU",
-                        "exchange": "ESEF",
-                        "market_id": self.market_id,
-                    })
-        except Exception as exc:
-            logger.debug("Entities API search failed: %s", exc)
-
-        if results:
-            return results
-
-        # Path 3: Fetch filings with include=entity to get entity names
-        # from the relationship sideload.
-        try:
-            params = {"page[size]": 100, "include": "entity"}
-            data = self._get_xbrl("/filings", params=params)
-            if isinstance(data, dict):
-                included = data.get("included", [])
-                q_lower = q.lower()
-                seen_ids: set[str] = set()
-                for inc in included:
-                    if inc.get("type") != "entity":
-                        continue
-                    attrs = inc.get("attributes", {})
-                    ent_name = attrs.get("name", "")
-                    lei = attrs.get("lei", "")
-                    ent_id = str(inc.get("id", ""))
-                    country = attrs.get("country", "")
-
-                    if self._country_code and country and country != self._country_code:
-                        continue
-
-                    key = lei or ent_id
-                    if key in seen_ids:
-                        continue
-                    seen_ids.add(key)
-
-                    if q_lower in ent_name.lower() or q_lower in (lei or "").lower():
-                        results.append({
-                            "ticker": lei[:12] if lei else "",
-                            "name": ent_name,
-                            "lei": lei,
-                            "cik": lei or ent_id,
-                            "country": country or "EU",
-                            "exchange": "ESEF",
-                            "market_id": self.market_id,
-                        })
-        except Exception as exc:
-            logger.debug("Filings include=entity search failed: %s", exc)
-
-        return results
-
-    def search_company(self, name: str) -> list[dict[str, Any]]:
-        """Search for EU companies -- tries entities API first, then filings."""
-        logger.debug("ESEF search_company('%s') starting (country_filter=%s)", name, self._country_code)
-        # Primary: /api/entities endpoint (comprehensive, all registered filers)
-        results = self._search_entities_api(name)
-        if results:
-            return results
-
-        # Fallback: extract from recent filings
-        results = self.list_companies(query=name)
-        if results:
-            return results
-
-        # Fallback: search the /entities endpoint directly
-        try:
-            data = self._get_xbrl("/entities", params={"filter[name]": name, "page[size]": 10})
-            entities = data.get("data", []) if isinstance(data, dict) else []
-            for ent in entities:
-                attrs = ent.get("attributes", {})
-                ent_name = attrs.get("name", "")
-                if name.lower() in ent_name.lower():
-                    results.append({
-                        "ticker": attrs.get("lei", ent.get("id", "")),
-                        "name": ent_name,
-                        "lei": attrs.get("lei", ""),
-                        "cik": attrs.get("lei", str(ent.get("id", ""))),
-                        "country": attrs.get("country", "EU"),
-                        "exchange": "ESEF",
-                        "market_id": self.market_id,
-                    })
-        except Exception as exc:
-            logger.debug("Entity search fallback failed: %s", exc)
-
-        return results
-
-    def _get_recent_filings(self) -> list[dict]:
-        """Fetch recent ESEF filings from filings.xbrl.org."""
-        cache_key = self._country_code or "ALL"
-        if cache_key in self._filing_cache:
-            return self._filing_cache[cache_key]
-
-        # filings.xbrl.org uses JSON:API pagination: page[size], not page_size
-        params: dict[str, Any] = {"page[size]": 100}
-        if self._country_code:
-            params["filter[country]"] = self._country_code
-
-        try:
-            data = self._get_xbrl("/filings", params=params)
-            filings = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            self._filing_cache[cache_key] = filings
-            return filings
-        except Exception:
-            return []
+    # -- Company profile -----------------------------------------------------
 
     def get_profile(self, identifier: str) -> dict[str, Any]:
         cached = self._read_cache(identifier, "profile.json")
         if cached:
             return cached
 
-        # Search filings for this entity
         matches = self.search_company(identifier)
         if not matches:
             raise EUEsefError("get_profile", f"Entity not found: {identifier}")
 
         m = matches[0]
-        raw_profile = {
+        profile = {
             "name": m.get("name", ""),
             "ticker": m.get("lei", identifier),
             "isin": "",
@@ -332,12 +459,13 @@ class EUEsefClient:
             "currency": "EUR",
             "lei": m.get("lei", ""),
             "cik": m.get("lei", ""),
+            "market_id": self.market_id,
         }
 
-        from operator1.clients.canonical_translator import translate_profile
-        profile = translate_profile(raw_profile, self.market_id)
         self._write_cache(identifier, "profile.json", profile)
         return profile
+
+    # -- Financial statements ------------------------------------------------
 
     def get_income_statement(self, identifier: str) -> pd.DataFrame:
         return self._fetch_financials(identifier, "income")
@@ -348,95 +476,181 @@ class EUEsefClient:
     def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
         return self._fetch_financials(identifier, "cashflow")
 
-    def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
-        """Fetch financial data from ESEF XBRL filings.
+    def _find_entity_id(self, identifier: str) -> str:
+        """Resolve a company name or LEI to the ESEF entity ID.
 
-        Searches filings.xbrl.org for this entity's filings, then
-        extracts IFRS concepts from the XBRL data.
+        Checks the cached entity directory first (fast), then falls
+        back to exact-match entities API.
         """
-        filings = self._get_recent_filings()
-        # Match entity filings -- handle both JSON:API and flat formats
+        # If it looks like an LEI, use directly
+        if len(identifier) >= 18 and identifier.isalnum():
+            return identifier
+
+        # Check cached directory (substring match)
+        directory = self._get_entity_directory()
+        q = identifier.lower()
+        for eid, info in directory.items():
+            if q in info.get("name", "").lower() or q == eid.lower():
+                return eid
+
+        # Fallback: exact match via entities API
+        try:
+            data = _api_get("/entities", params={"filter[name]": identifier, "page[size]": "1"})
+            entities = data.get("data", [])
+            if entities:
+                return str(entities[0].get("id", ""))
+        except Exception:
+            pass
+
+        return ""
+
+    def _get_entity_filings(self, entity_id: str) -> list[dict]:
+        """Fetch all filings for a specific entity.
+
+        Uses the entity's related filings link for efficient lookup.
+        Falls back to country-filtered search with client-side matching.
+        """
+        if not entity_id:
+            return []
+
+        # Path 1: Direct entity filings via relationship link
+        try:
+            data = _api_get(f"/entities/{entity_id}/filings", params={
+                "page[size]": "20",
+                "sort": "-period_end",
+            })
+            filings = data.get("data", [])
+            if filings:
+                logger.debug("ESEF: %d filings via entity link for %s", len(filings), entity_id)
+                return filings
+        except Exception:
+            pass
+
+        # Path 2: Country-filtered search with client-side entity matching
+        params: dict[str, str] = {
+            "page[size]": "250",
+            "sort": "-period_end",
+        }
+        if self._country_code:
+            params["filter[country]"] = self._country_code
+
+        data = _api_get("/filings", params=params)
+        filings = data.get("data", [])
+
         entity_filings = []
         for f in filings:
-            attrs = f.get("attributes", f)
-            entity = f.get("entity", {})
-            f_name = (entity.get("name", "") or attrs.get("entity_name", "") or attrs.get("filer_name", "")).lower()
-            f_lei = (entity.get("lei", "") or attrs.get("lei", "")).lower()
-            if identifier.lower() in f_name or identifier.lower() in f_lei:
+            entity_link = (
+                f.get("relationships", {})
+                .get("entity", {})
+                .get("links", {})
+                .get("related", "")
+            )
+            if entity_id in entity_link:
                 entity_filings.append(f)
 
+        return entity_filings
+
+    def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
+        """Fetch financial data by downloading XBRL JSON from filings.
+
+        This is the key fix: instead of looking for inline facts or
+        a non-existent /facts endpoint, we download the actual XBRL
+        JSON file from each filing's json_url attribute and extract
+        IFRS concepts directly.
+        """
+        # Check cache
+        cache_key = f"{statement_type}_financials.json"
+        cached = self._read_cache(identifier, cache_key)
+        if cached:
+            try:
+                df = pd.DataFrame(cached)
+                if not df.empty:
+                    for col in ("filing_date", "report_date"):
+                        if col in df.columns:
+                            df[col] = pd.to_datetime(df[col], errors="coerce")
+                    return df
+            except Exception:
+                pass
+
+        entity_id = self._find_entity_id(identifier)
+        if not entity_id:
+            logger.info("ESEF: entity not found for '%s'", identifier)
+            return pd.DataFrame()
+
+        entity_filings = self._get_entity_filings(entity_id)
         if not entity_filings:
+            logger.info("ESEF: no filings found for entity %s", entity_id)
             return pd.DataFrame()
 
-        rows: list[dict] = []
-        for filing in entity_filings[:8]:
-            # JSON:API format: fields are inside "attributes"
-            # Research: .roo/research/eu-esef-2026-02-24.md (Section B1)
-            attrs = filing.get("attributes", filing)
-            filing_date = attrs.get("date_added", attrs.get("processed", ""))
+        all_rows: list[dict] = []
+
+        for filing in entity_filings[:5]:  # Limit to 5 most recent
+            attrs = filing.get("attributes", {})
+            json_url = attrs.get("json_url", "")
+            filing_date = attrs.get("date_added", attrs.get("processed", ""))[:10]
             period_end = attrs.get("period_end", "")
-            if not period_end:
-                period_end = attrs.get("period", {}).get("end_date", "") if isinstance(attrs.get("period"), dict) else ""
-            period_start = attrs.get("period_start", "")
-            if not period_start:
-                period_start = attrs.get("period", {}).get("start_date", "") if isinstance(attrs.get("period"), dict) else ""
 
-            # Extract XBRL facts from the filing
-            facts = filing.get("facts", {})
-            if not facts and filing.get("id"):
-                # Try to fetch detailed facts
-                try:
-                    detail = self._get_xbrl(f"/filings/{filing['id']}/facts")
-                    facts = detail if isinstance(detail, dict) else {}
-                except Exception:
-                    pass
+            if not json_url:
+                continue
 
-            for concept_uri, values in facts.items() if isinstance(facts, dict) else []:
-                from operator1.clients.canonical_translator import _IFRS_MAP
-                canonical = _IFRS_MAP.get(concept_uri)
-                if not canonical:
-                    continue
+            logger.info(
+                "ESEF: downloading XBRL JSON for %s (period_end=%s)",
+                identifier, period_end,
+            )
 
-                value = values if isinstance(values, (int, float)) else None
-                if isinstance(values, dict):
-                    value = values.get("value", values.get("amount"))
-                if isinstance(values, list) and values:
-                    value = values[0].get("value") if isinstance(values[0], dict) else values[0]
+            xbrl_data = _download_xbrl_json(json_url)
+            if not xbrl_data:
+                continue
 
-                if value is not None:
-                    try:
-                        rows.append({
-                            "concept": canonical,
-                            "value": float(value),
-                            "filing_date": filing_date,
-                            "report_date": period_end,
-                            "period_start": period_start,
-                            "period_type": "annual",
-                        })
-                    except (ValueError, TypeError):
-                        continue
+            rows = _extract_ifrs_facts(xbrl_data, statement_type)
 
-        if not rows:
+            # Set filing_date from metadata
+            for row in rows:
+                if not row["filing_date"]:
+                    row["filing_date"] = filing_date
+
+            all_rows.extend(rows)
+
+            # Rate limiting
+            time.sleep(0.5)
+
+        if not all_rows:
             return pd.DataFrame()
 
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(all_rows)
+
+        # Deduplicate: keep one value per (canonical_name, report_date)
+        # preferring the most recent filing
+        df = df.sort_values("filing_date", ascending=False)
+        df = df.drop_duplicates(subset=["canonical_name", "report_date"], keep="first")
+
         for col in ("filing_date", "report_date"):
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
 
-        cutoff = pd.Timestamp.now() - pd.Timedelta(days=730)
-        if "report_date" in df.columns:
-            df = df[df["report_date"] >= cutoff]
+        # Cache results
+        self._write_cache(identifier, cache_key, df.to_dict(orient="records"))
 
-        from operator1.clients.canonical_translator import translate_financials
-        return translate_financials(df, self.market_id, statement_type)
+        logger.info(
+            "ESEF %s %s: %d facts across %d periods",
+            identifier, statement_type, len(df),
+            df["report_date"].nunique() if "report_date" in df.columns else 0,
+        )
+        return df
+
+    # -- Price data ----------------------------------------------------------
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:
+        """ESEF does not provide OHLCV data. Handled by ohlcv_provider."""
         return pd.DataFrame()
 
     def get_peers(self, identifier: str) -> list[str]:
         all_companies = self.list_companies()
-        return [c.get("lei", c.get("name", "")) for c in all_companies if c.get("name", "") != identifier][:10]
+        return [
+            c.get("lei", c.get("name", ""))
+            for c in all_companies
+            if c.get("name", "") != identifier
+        ][:10]
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
