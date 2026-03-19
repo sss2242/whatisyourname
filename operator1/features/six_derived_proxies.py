@@ -4,33 +4,44 @@ When financial statement data (income, balance, cashflow) is unavailable
 -- as is the case for SIX, which provides no free financial filing API --
 this module computes proxy ratios from the data that IS available:
 
-  - OHLCV price data (close, volume)
+  - Close+volume price data (~5 months from SIX historic CSV)
   - Dividend history (18 years from SIX share/dividend.json)
   - Shares outstanding (from SIX share/info.json)
   - Capital actions (from SIX official notices)
+  - Capital structure (from SIX issuer/capital_structure.json)
   - Insider transactions (from SIX management_transactions)
+
+No yfinance dependency. All data comes from SIX PIT-compliant APIs.
 
 The proxies map to the pipeline's 5-tier survival hierarchy:
 
-  Tier 1 (Liquidity):    Amihud illiquidity, dividend payout capacity
-  Tier 2 (Solvency):     Capital return yield, capital action frequency
-  Tier 3 (Stability):    Already from OHLCV (volatility, drawdown)
+  Tier 1 (Liquidity):    Amihud illiquidity, dividend payout capacity,
+                          dividend coverage ratio
+  Tier 2 (Solvency):     Capital return yield, dilution risk,
+                          book equity floor, capital action frequency
+  Tier 3 (Stability):    Volatility from SIX CSV close data, drawdown
   Tier 4 (Profitability): Dividend growth consistency, implied earnings
-  Tier 5 (Valuation):    Dividend yield, PDG ratio, implied PE
+  Tier 5 (Valuation):    Dividend yield, PDG ratio, implied PE,
+                          price-to-book floor
 
-Accuracy improvements (v2):
+Accuracy improvements (v3 -- no yfinance):
   1. Adaptive payout ratio from sector + index membership
   2. Date-based CAGR (actual years elapsed, not count-1)
   3. Buyback yield from actual shares outstanding delta
   4. Swiss-market-calibrated tier percentile scores
   5. Exponentially weighted dividend stability
   6. Implied earnings from dividend + buyback cash returns
+  7. Book equity floor from nominal_value + capital_structure
+  8. Dilution risk from conditional/reported capital ratio
+  9. Dividend coverage ratio
+  10. Confidence tagging on all proxy columns
+  11. Graceful handling of short/missing close data
 
 Survival mode triggers are adapted:
-  - current_ratio < 1.0    -> dividend_cut_flag
-  - debt_to_equity > 3.0   -> no_buyback_and_dividend_cut
+  - current_ratio < 1.0    -> dividend_cut_flag OR dividend_coverage < 1.0
+  - debt_to_equity > 3.0   -> high dilution_risk AND dividend_cut
   - fcf_yield < 0           -> total_shareholder_return < 0
-  - drawdown_252d < -0.40  -> same (from OHLCV, already works)
+  - drawdown_252d < -0.40  -> same (from SIX CSV close, if available)
 
 Top-level entry point:
     ``compute_six_proxies(cache, profile) -> SixProxyResult``
@@ -72,6 +83,7 @@ class SixProxyResult:
     dividend_cagr_5y: float | None = None
     dividend_cut_flag: bool = False
     dividend_stability: float | None = None
+    dividend_coverage: float | None = None
     total_shareholder_return: float | None = None
     amihud_illiquidity_mean: float | None = None
     insider_confidence: float | None = None
@@ -82,6 +94,9 @@ class SixProxyResult:
     buyback_yield: float | None = None
     implied_earnings: float | None = None
     implied_pe: float | None = None
+    book_equity_floor: float | None = None
+    price_to_book_floor: float | None = None
+    dilution_risk: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +233,6 @@ def _compute_buyback_yield_from_notices(
             if shares_timeline:
                 _, notice_shares = shares_timeline[0]
                 if notice_shares > shares_current:
-                    # Shares were destroyed between the notice and now
                     destroyed = notice_shares - shares_current
                     buyback_value = destroyed * avg_price
                     market_cap = shares_current * avg_price
@@ -226,7 +240,6 @@ def _compute_buyback_yield_from_notices(
             return 0.0
 
         # Multiple data points: compute total shares destroyed
-        # Timeline is newest first
         shares_timeline.sort(key=lambda x: x[0], reverse=True)
         newest_shares = shares_timeline[0][1]
         oldest_shares = shares_timeline[-1][1]
@@ -245,7 +258,7 @@ def _compute_buyback_yield_from_notices(
             d2 = dt_date(int(newest_date[:4]), int(newest_date[4:6]), int(newest_date[6:8]))
             years = max((d2 - d1).days / 365.25, 0.5)
         else:
-            years = len(shares_timeline) - 1  # rough estimate
+            years = len(shares_timeline) - 1
 
         annual_destroyed = total_destroyed / years
         annual_buyback_value = annual_destroyed * avg_price
@@ -262,25 +275,18 @@ def _compute_buyback_yield_from_notices(
 # Improvement 4: Swiss-market-calibrated percentile scores
 # ---------------------------------------------------------------------------
 
-# Reference distributions for Swiss market metrics
-# Based on SMI/SLI constituent analysis
 _SWISS_BENCHMARKS: dict[str, dict[str, float]] = {
     "dividend_yield": {"p25": 0.015, "p50": 0.028, "p75": 0.042},
     "dividend_cagr": {"p25": 0.01, "p50": 0.03, "p75": 0.06},
     "amihud_illiquidity": {"p25": 0.00001, "p50": 0.0001, "p75": 0.001},
     "buyback_yield": {"p25": 0.0, "p50": 0.005, "p75": 0.02},
+    "dilution_risk": {"p25": 0.0, "p50": 0.05, "p75": 0.15},
+    "dividend_coverage": {"p25": 1.0, "p50": 1.5, "p75": 2.5},
 }
 
 
 def _calibrated_score(value: float, metric: str, invert: bool = False) -> float:
-    """Map a metric value to a 0-100 score using Swiss market percentiles.
-
-    Parameters
-    ----------
-    value: The metric value to score.
-    metric: Key into _SWISS_BENCHMARKS.
-    invert: If True, lower values get higher scores (e.g., illiquidity).
-    """
+    """Map a metric value to a 0-100 score using Swiss market percentiles."""
     bench = _SWISS_BENCHMARKS.get(metric)
     if not bench:
         return 50.0
@@ -321,7 +327,6 @@ def _exponential_stability(dividends: pd.Series, halflife_years: float = 5.0) ->
         return 0.5
 
     n = len(growth_rates)
-    # Exponential weights: index 0 = oldest, -1 = newest
     weights = np.exp(np.arange(n) * np.log(2) / halflife_years)
     weights = weights / weights.sum()
 
@@ -351,15 +356,11 @@ def _compute_implied_earnings(
     Key insight: total cash returned (dividends + buybacks) cannot exceed
     after-tax earnings sustainably. For mature companies that distribute
     most of their earnings, this gives a tight lower bound.
-
-    Returns dict with implied_after_tax_earnings, implied_pretax_earnings,
-    implied_pe, and implied_earnings_yield.
     """
     total_returned = total_dividends + total_buyback_value
     if total_returned <= 0:
         return {}
 
-    # Minimum after-tax earnings = cash returned
     implied_after_tax = total_returned
     implied_pretax = implied_after_tax / max(1.0 - tax_rate, 0.5)
 
@@ -373,6 +374,96 @@ def _compute_implied_earnings(
         results["implied_earnings_yield"] = implied_after_tax / market_cap
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Improvement 7: Book equity floor from capital structure
+# ---------------------------------------------------------------------------
+
+def _compute_book_equity_floor(profile: dict[str, Any]) -> dict[str, float]:
+    """Compute book equity floor from SIX capital structure data.
+
+    SIX provides nominal_value * shares_outstanding = share capital.
+    The issuer/capital_structure.json gives reported_share_capital.
+    This is a PIT-compliant lower bound on book equity (actual book
+    equity >= share capital since retained earnings are positive for
+    profitable companies).
+    """
+    results: dict[str, float] = {}
+
+    shares = profile.get("shares_outstanding")
+    nominal = profile.get("nominal_value")
+    reported_capital = profile.get("reported_share_capital")
+
+    # Method 1: From capital_structure API
+    if reported_capital:
+        try:
+            results["book_equity_floor"] = float(reported_capital)
+        except (TypeError, ValueError):
+            pass
+
+    # Method 2: From nominal_value * shares (fallback)
+    if "book_equity_floor" not in results and shares and nominal:
+        try:
+            results["book_equity_floor"] = float(shares) * float(nominal)
+        except (TypeError, ValueError):
+            pass
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Improvement 8: Dilution risk from conditional capital
+# ---------------------------------------------------------------------------
+
+def _compute_dilution_risk(profile: dict[str, Any]) -> float:
+    """Compute dilution risk from conditional/reported capital ratio.
+
+    SIX capital_structure.json provides both REPORTED_CAPITAL and
+    CONDITIONAL_CAPITAL. The ratio conditional/reported indicates
+    potential share dilution from warrants, convertibles, employee
+    stock options, etc.
+
+    Returns a ratio in [0, 1+] where:
+      0.0 = no conditional capital (no dilution risk)
+      0.05-0.10 = normal (most Swiss companies)
+      0.15+ = elevated dilution risk
+    """
+    try:
+        from operator1.clients.ch_six import _fetch_share_detail_list
+
+        valor_id = profile.get("valor_id", "")
+        if not valor_id:
+            return 0.0
+
+        cap_items = _fetch_share_detail_list(valor_id, "issuer/capital_structure.json")
+        if not cap_items:
+            return 0.0
+
+        reported = 0.0
+        conditional = 0.0
+
+        for item in cap_items:
+            category = item.get("category", "")
+            for cap in item.get("capitals", []):
+                if cap.get("capitalType") == "SHARE":
+                    amount = cap.get("capital", 0) or 0
+                    try:
+                        amount = float(amount)
+                    except (TypeError, ValueError):
+                        continue
+                    if category == "REPORTED_CAPITAL":
+                        reported += amount
+                    elif category == "CONDITIONAL_CAPITAL":
+                        conditional += amount
+
+        if reported > 0:
+            return conditional / reported
+        return 0.0
+
+    except Exception as exc:
+        logger.debug("Dilution risk computation failed: %s", exc)
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -415,16 +506,25 @@ def _get_dividend_series_from_profile(profile: dict) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
-# Liquidity proxies
+# Liquidity proxies (works with short close data)
 # ---------------------------------------------------------------------------
 
 def _compute_liquidity_proxies(cache: pd.DataFrame) -> dict[str, pd.Series]:
-    """Compute Amihud illiquidity ratio from OHLCV data."""
+    """Compute Amihud illiquidity ratio from close+volume data.
+
+    Works with the ~5 months of SIX historic CSV data. For days
+    without close data, the Amihud values will be NaN (not fabricated).
+    """
     results: dict[str, pd.Series] = {}
 
     close = cache.get("close")
     volume = cache.get("volume")
     if close is None or volume is None:
+        return results
+
+    # Only compute where we have actual data
+    valid = close.notna() & volume.notna() & (volume > 0)
+    if valid.sum() < 5:
         return results
 
     returns = close.pct_change().abs()
@@ -435,6 +535,10 @@ def _compute_liquidity_proxies(cache: pd.DataFrame) -> dict[str, pd.Series]:
 
     results["six_proxy_amihud_illiquidity"] = amihud_scaled
     results["six_proxy_amihud_21d"] = amihud_scaled.rolling(21, min_periods=5).mean()
+
+    # Confidence: high where we have actual data, zero where interpolated
+    conf = valid.astype(float)
+    results["six_proxy_amihud_confidence"] = conf
 
     # Liquidity score: calibrated against Swiss market benchmarks
     latest_amihud = float(amihud_scaled.dropna().iloc[-1]) if not amihud_scaled.dropna().empty else 0.0
@@ -501,6 +605,24 @@ def _compute_insider_proxies(profile: dict[str, Any]) -> dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
+# Confidence tagging helper
+# ---------------------------------------------------------------------------
+
+def _set_with_confidence(
+    cache: pd.DataFrame,
+    col_name: str,
+    value: pd.Series | float,
+    confidence: float,
+) -> None:
+    """Set a proxy column and its companion confidence column."""
+    if isinstance(value, (int, float)):
+        cache[col_name] = pd.Series(value, index=cache.index, dtype=float)
+    else:
+        cache[col_name] = value
+    cache[f"{col_name}_confidence"] = pd.Series(confidence, index=cache.index, dtype=float)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -508,8 +630,10 @@ def compute_six_proxies(
     cache: pd.DataFrame,
     profile: dict[str, Any],
 ) -> SixProxyResult:
-    """Compute all SIX market-data-only proxy ratios (v2 with accuracy improvements).
+    """Compute all SIX market-data-only proxy ratios.
 
+    v3: No yfinance. All data from SIX PIT APIs + historic CSV.
+    Decoupled: dividend-based proxies work even without price data.
     Injects proxy columns into the cache DataFrame in-place.
     """
     result = SixProxyResult()
@@ -520,9 +644,7 @@ def compute_six_proxies(
     try:
         n_proxies = 0
         close = cache.get("close")
-        if close is None or close.dropna().empty:
-            result.error = "No close price data"
-            return result
+        has_close = close is not None and close.notna().sum() >= 5
 
         shares = profile.get("shares_outstanding")
         latest_div = profile.get("latest_dividend_amount")
@@ -533,64 +655,81 @@ def compute_six_proxies(
         payout_ratio = _estimate_payout_ratio(sector, index_memberships)
         result.estimated_payout_ratio = payout_ratio
 
-        # --- Dividend yield (daily) ---
-        if latest_div and shares:
-            annual_dividend = float(latest_div)
-            div_yield = annual_dividend / close.replace(0, np.nan)
-            cache["six_proxy_dividend_yield"] = div_yield
-            n_proxies += 1
-            result.dividend_yield = float(div_yield.dropna().iloc[-1]) if not div_yield.dropna().empty else None
-
-            # Total annual outflow
-            total_div_outflow = annual_dividend * float(shares)
-
-            # Estimated OCF using adaptive payout ratio
-            estimated_ocf = total_div_outflow / payout_ratio
-            cache["six_proxy_est_operating_cf"] = pd.Series(estimated_ocf, index=cache.index, dtype=float)
-            n_proxies += 1
+        # === DIVIDEND-BASED PROXIES (work without close data) ===
 
         # --- Improvement 2: Date-based CAGR ---
         dividends = _get_dividend_series_from_profile(profile)
         if len(dividends) >= 2:
-            # Full-history CAGR
             cagr_full = _precise_cagr(dividends)
             result.dividend_cagr = cagr_full
 
-            # 5-year CAGR (more recent trajectory)
             cagr_5y = _precise_cagr(dividends, max_years=5)
             result.dividend_cagr_5y = cagr_5y
 
-            # Dividend cut flag
+            # Dividend cut flag: latest < previous
             result.dividend_cut_flag = bool(dividends.iloc[0] < dividends.iloc[1])
 
             # --- Improvement 5: Exponential stability ---
             stability = _exponential_stability(dividends)
             result.dividend_stability = stability
-            cache["six_proxy_dividend_stability"] = pd.Series(stability, index=cache.index, dtype=float)
+            _set_with_confidence(cache, "six_proxy_dividend_stability", stability, 0.85)
             n_proxies += 1
 
-            # Gordon model (use 5y CAGR as more forward-looking)
-            if result.dividend_yield is not None:
-                result.gordon_implied_return = result.dividend_yield + cagr_5y
+            result.dividend_data_years = profile.get("dividend_history_years", len(dividends))
+
+        # --- Dividend yield (needs close OR latest_close from profile) ---
+        latest_close = None
+        if has_close:
+            latest_close = float(close.dropna().iloc[-1])
+        elif profile.get("latest_close"):
+            latest_close = float(profile["latest_close"])
+
+        if latest_div and latest_close and latest_close > 0:
+            annual_dividend = float(latest_div)
+
+            if has_close:
+                # Daily dividend yield series from actual close prices
+                div_yield = annual_dividend / close.replace(0, np.nan)
+                _set_with_confidence(cache, "six_proxy_dividend_yield", div_yield, 0.95)
+            else:
+                # Single-point dividend yield from profile's latest_close
+                div_yield_scalar = annual_dividend / latest_close
+                _set_with_confidence(cache, "six_proxy_dividend_yield", div_yield_scalar, 0.80)
+
+            result.dividend_yield = annual_dividend / latest_close
+            n_proxies += 1
+
+            # Estimated OCF using adaptive payout ratio
+            if shares:
+                total_div_outflow = annual_dividend * float(shares)
+                estimated_ocf = total_div_outflow / payout_ratio
+                _set_with_confidence(cache, "six_proxy_est_operating_cf", estimated_ocf, 0.50)
+                n_proxies += 1
+
+            # Gordon model
+            if result.dividend_cagr_5y is not None:
+                result.gordon_implied_return = result.dividend_yield + result.dividend_cagr_5y
 
             # PDG ratio
-            if latest_div and cagr_5y > 0.001:
-                price_to_div = close / float(latest_div)
-                pdg = price_to_div / (cagr_5y * 100)
-                cache["six_proxy_pdg_ratio"] = pdg
+            if result.dividend_cagr_5y and result.dividend_cagr_5y > 0.001:
+                pdg_scalar = (latest_close / annual_dividend) / (result.dividend_cagr_5y * 100)
+                _set_with_confidence(cache, "six_proxy_pdg_ratio", pdg_scalar, 0.70)
+                result.pdg_ratio = pdg_scalar
                 n_proxies += 1
-                result.pdg_ratio = float(pdg.dropna().iloc[-1]) if not pdg.dropna().empty else None
 
         # --- Improvement 3: Buyback yield from shares delta ---
-        avg_price = float(close.mean()) if not close.empty else 0.0
+        avg_price = latest_close or 0.0
+        if has_close:
+            avg_price = float(close.dropna().mean())
         buyback_yield = _compute_buyback_yield_from_notices(profile, avg_price)
         result.buyback_yield = buyback_yield
 
         # Total shareholder return
         if result.dividend_yield is not None:
             result.total_shareholder_return = result.dividend_yield + buyback_yield
-            cache["six_proxy_total_shareholder_return"] = (
-                cache.get("six_proxy_dividend_yield", pd.Series(0, index=cache.index)) + buyback_yield
+            _set_with_confidence(
+                cache, "six_proxy_total_shareholder_return",
+                result.total_shareholder_return, 0.85,
             )
             n_proxies += 1
 
@@ -611,10 +750,10 @@ def compute_six_proxies(
             pass
 
         # --- Improvement 6: Implied earnings ---
-        if latest_div and shares:
+        if latest_div and shares and latest_close:
             total_div = float(latest_div) * float(shares)
             annual_buyback = buyback_yield * (float(shares) * avg_price) if avg_price > 0 else 0.0
-            market_cap = float(shares) * float(close.dropna().iloc[-1]) if not close.dropna().empty else 0.0
+            market_cap = float(shares) * latest_close
 
             implied = _compute_implied_earnings(total_div, annual_buyback, market_cap)
             if implied:
@@ -622,28 +761,69 @@ def compute_six_proxies(
                 result.implied_pe = implied.get("implied_pe")
 
                 if result.implied_pe:
-                    cache["six_proxy_implied_pe"] = pd.Series(result.implied_pe, index=cache.index, dtype=float)
+                    _set_with_confidence(cache, "six_proxy_implied_pe", result.implied_pe, 0.70)
                     n_proxies += 1
                 if implied.get("implied_earnings_yield"):
-                    cache["six_proxy_implied_earnings_yield"] = pd.Series(
-                        implied["implied_earnings_yield"], index=cache.index, dtype=float,
+                    _set_with_confidence(
+                        cache, "six_proxy_implied_earnings_yield",
+                        implied["implied_earnings_yield"], 0.70,
                     )
                     n_proxies += 1
 
-        # --- Liquidity proxies ---
-        liq_proxies = _compute_liquidity_proxies(cache)
-        for key, val in liq_proxies.items():
-            if isinstance(val, pd.Series):
-                cache[key] = val
-                n_proxies += 1
+                # --- Improvement 9: Dividend coverage ---
+                if total_div > 0 and result.implied_earnings:
+                    coverage = result.implied_earnings / total_div
+                    result.dividend_coverage = coverage
+                    _set_with_confidence(cache, "six_proxy_dividend_coverage", coverage, 0.65)
+                    n_proxies += 1
 
-        result.amihud_illiquidity_mean = float(cache["six_proxy_amihud_21d"].mean()) if "six_proxy_amihud_21d" in cache.columns else None
+        # === PRICE-BASED PROXIES (need close data from SIX CSV) ===
+
+        if has_close:
+            # Liquidity proxies (Amihud)
+            liq_proxies = _compute_liquidity_proxies(cache)
+            for key, val in liq_proxies.items():
+                if isinstance(val, pd.Series):
+                    cache[key] = val
+                    n_proxies += 1
+
+            result.amihud_illiquidity_mean = (
+                float(cache["six_proxy_amihud_21d"].mean())
+                if "six_proxy_amihud_21d" in cache.columns else None
+            )
+
+        # === CAPITAL STRUCTURE PROXIES (from SIX API, no price needed) ===
+
+        # --- Improvement 7: Book equity floor ---
+        book_equity = _compute_book_equity_floor(profile)
+        if book_equity.get("book_equity_floor"):
+            result.book_equity_floor = book_equity["book_equity_floor"]
+            _set_with_confidence(
+                cache, "six_proxy_book_equity_floor",
+                result.book_equity_floor, 0.90,
+            )
+            n_proxies += 1
+
+            # Price-to-book floor (needs market cap)
+            if shares and latest_close:
+                market_cap = float(shares) * latest_close
+                if result.book_equity_floor > 0:
+                    ptb = market_cap / result.book_equity_floor
+                    result.price_to_book_floor = ptb
+                    _set_with_confidence(cache, "six_proxy_price_to_book_floor", ptb, 0.75)
+                    n_proxies += 1
+
+        # --- Improvement 8: Dilution risk ---
+        dilution = _compute_dilution_risk(profile)
+        result.dilution_risk = dilution
+        _set_with_confidence(cache, "six_proxy_dilution_risk", dilution, 0.90)
+        n_proxies += 1
 
         # --- Insider proxies ---
         insider_proxies = _compute_insider_proxies(profile)
         result.insider_confidence = insider_proxies.get("_insider_conviction")
 
-        # --- Improvement 4: Calibrated tier scores ---
+        # --- Calibrated tier scores ---
         _inject_calibrated_tier_scores(cache, result)
 
         # --- Survival proxy triggers ---
@@ -651,17 +831,23 @@ def compute_six_proxies(
 
         result.computed = True
         result.n_proxies = n_proxies
-        result.dividend_data_years = profile.get("dividend_history_years", 0)
 
         logger.info(
-            "SIX proxy v2: %d columns, yield=%.2f%%, cagr_5y=%.2f%%, "
-            "buyback=%.2f%%, implied_pe=%.1f, payout=%.0f%%",
+            "SIX proxy v3: %d columns, yield=%.2f%%, cagr_5y=%.2f%%, "
+            "buyback=%.2f%%, implied_pe=%.1f, payout=%.0f%%, "
+            "book_floor=%.0f, dilution=%.3f, coverage=%.2f, "
+            "has_close=%s (%d pts)",
             n_proxies,
             (result.dividend_yield or 0) * 100,
             (result.dividend_cagr_5y or 0) * 100,
             (result.buyback_yield or 0) * 100,
             result.implied_pe or 0,
             (result.estimated_payout_ratio or 0) * 100,
+            result.book_equity_floor or 0,
+            result.dilution_risk or 0,
+            result.dividend_coverage or 0,
+            has_close,
+            int(close.notna().sum()) if has_close else 0,
         )
 
     except Exception as exc:
@@ -677,29 +863,40 @@ def _inject_calibrated_tier_scores(
 ) -> None:
     """Inject Swiss-market-calibrated tier proxy scores."""
 
-    # Tier 1: Liquidity (Amihud + dividend payout capacity)
+    # Tier 1: Liquidity (Amihud + dividend payout capacity + coverage)
     liq_score = 50.0
     if "six_proxy_liquidity_score" in cache.columns:
         liq_score = float(cache["six_proxy_liquidity_score"].iloc[-1])
     div_capacity_bonus = 0.0
     if result.estimated_payout_ratio and result.dividend_yield:
-        # Companies paying dividends have demonstrated cash generation
-        div_capacity_bonus = min(result.dividend_yield * 500, 25)  # up to 25 pts
-    cache["six_proxy_tier1_score"] = pd.Series(
-        max(0, min(100, liq_score * 0.6 + (50 + div_capacity_bonus) * 0.4)),
-        index=cache.index, dtype=float,
+        div_capacity_bonus = min(result.dividend_yield * 500, 25)
+    coverage_bonus = 0.0
+    if result.dividend_coverage is not None and result.dividend_coverage >= 1.5:
+        coverage_bonus = min((result.dividend_coverage - 1.0) * 20, 15)
+    _set_with_confidence(
+        cache, "six_proxy_tier1_score",
+        max(0, min(100, liq_score * 0.5 + (50 + div_capacity_bonus) * 0.3 + (50 + coverage_bonus) * 0.2)),
+        0.60,
     )
 
-    # Tier 2: Solvency (capital actions + dividend continuity)
+    # Tier 2: Solvency (capital actions + dividend continuity + dilution risk)
     solvency = 50.0
     if result.capital_action_count > 0:
-        solvency += _calibrated_score(result.buyback_yield or 0, "buyback_yield") * 0.3
+        solvency += _calibrated_score(result.buyback_yield or 0, "buyback_yield") * 0.2
     if result.dividend_cut_flag:
         solvency -= 30
     if not result.dividend_cut_flag and result.dividend_data_years >= 5:
-        solvency += 10  # long dividend streak = solvency confidence
-    cache["six_proxy_tier2_score"] = pd.Series(
-        max(0, min(100, solvency)), index=cache.index, dtype=float,
+        solvency += 10
+    # Dilution risk penalty
+    if result.dilution_risk is not None and result.dilution_risk > 0.10:
+        solvency -= min((result.dilution_risk - 0.10) * 100, 25)
+    # Book equity floor bonus (having substantial share capital is a solvency signal)
+    if result.book_equity_floor and result.book_equity_floor > 0:
+        solvency += 5
+    _set_with_confidence(
+        cache, "six_proxy_tier2_score",
+        max(0, min(100, solvency)),
+        0.60,
     )
 
     # Tier 4: Profitability (dividend growth + stability)
@@ -707,17 +904,17 @@ def _inject_calibrated_tier_scores(
     if result.dividend_cagr_5y is not None:
         profit_score = _calibrated_score(result.dividend_cagr_5y, "dividend_cagr")
     if result.dividend_stability is not None:
-        # Blend growth score with stability
         stability_score = result.dividend_stability * 100
         profit_score = profit_score * 0.6 + stability_score * 0.4
-    cache["six_proxy_tier4_score"] = pd.Series(
-        max(0, min(100, profit_score)), index=cache.index, dtype=float,
+    _set_with_confidence(
+        cache, "six_proxy_tier4_score",
+        max(0, min(100, profit_score)),
+        0.55,
     )
 
-    # Tier 5: Valuation (implied PE + dividend yield percentile)
+    # Tier 5: Valuation (implied PE + dividend yield + P/B floor)
     valuation = 50.0
     if result.implied_pe is not None:
-        # Lower PE = cheaper = higher score
         if result.implied_pe < 12:
             valuation = 80
         elif result.implied_pe < 18:
@@ -728,9 +925,20 @@ def _inject_calibrated_tier_scores(
             valuation = 25
     if result.dividend_yield is not None:
         yield_score = _calibrated_score(result.dividend_yield, "dividend_yield")
-        valuation = valuation * 0.5 + yield_score * 0.5
-    cache["six_proxy_tier5_score"] = pd.Series(
-        max(0, min(100, valuation)), index=cache.index, dtype=float,
+        valuation = valuation * 0.4 + yield_score * 0.3
+    if result.price_to_book_floor is not None:
+        # P/B floor < 2 is cheap, > 5 is expensive
+        if result.price_to_book_floor < 2:
+            pb_score = 80
+        elif result.price_to_book_floor < 4:
+            pb_score = 55
+        else:
+            pb_score = 30
+        valuation += pb_score * 0.3
+    _set_with_confidence(
+        cache, "six_proxy_tier5_score",
+        max(0, min(100, valuation)),
+        0.55,
     )
 
 
@@ -740,14 +948,33 @@ def _inject_survival_proxies(
 ) -> None:
     """Inject proxy survival triggers when standard triggers are NaN."""
 
-    # Proxy for current_ratio < 1.0: dividend was cut
+    # Proxy for current_ratio < 1.0: dividend was cut OR dividend coverage < 1.0
     if "current_ratio" not in cache.columns or cache["current_ratio"].isna().all():
-        cache["six_proxy_dividend_cut_flag"] = pd.Series(
-            int(result.dividend_cut_flag), index=cache.index, dtype=int,
+        liquidity_distress = result.dividend_cut_flag
+        if result.dividend_coverage is not None and result.dividend_coverage < 1.0:
+            liquidity_distress = True
+        _set_with_confidence(
+            cache, "six_proxy_liquidity_distress_flag",
+            int(liquidity_distress), 0.60,
+        )
+
+    # Proxy for debt_to_equity > 3.0: high dilution + dividend cut
+    if "debt_to_equity" not in cache.columns or cache["debt_to_equity"].isna().all():
+        solvency_distress = (
+            result.dividend_cut_flag
+            and result.dilution_risk is not None
+            and result.dilution_risk > 0.15
+        )
+        _set_with_confidence(
+            cache, "six_proxy_solvency_distress_flag",
+            int(solvency_distress), 0.50,
         )
 
     # Proxy for fcf_yield < 0: total shareholder return < 0
     if "six_proxy_total_shareholder_return" in cache.columns:
         tsr = cache["six_proxy_total_shareholder_return"]
         if "fcf_yield" not in cache.columns or cache["fcf_yield"].isna().all():
-            cache["six_proxy_negative_tsr_flag"] = (tsr < 0).astype(int)
+            _set_with_confidence(
+                cache, "six_proxy_negative_tsr_flag",
+                (tsr < 0).astype(int), 0.70,
+            )
