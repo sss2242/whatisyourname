@@ -1137,6 +1137,26 @@ Non-interactive examples:
     except Exception as exc:
         logger.debug("Vanity scoring skipped: %s", exc)
 
+    # Step 5d.1: SIX-specific proxy computations (Switzerland only).
+    # When financial statements are unavailable, compute proxy ratios
+    # from SIX dividend history, capital structure, and official notices.
+    six_proxy_result = None
+    if market_id == "ch_six":
+        try:
+            from operator1.features.six_derived_proxies import compute_six_proxies
+            six_proxy_result = compute_six_proxies(cache, target_profile)
+            if six_proxy_result.computed:
+                logger.info(
+                    "SIX proxies: %d columns, yield=%.2f%%, implied_pe=%.1f",
+                    six_proxy_result.n_proxies,
+                    (six_proxy_result.dividend_yield or 0) * 100,
+                    six_proxy_result.implied_pe or 0,
+                )
+            elif six_proxy_result.error:
+                logger.warning("SIX proxy computation failed: %s", six_proxy_result.error)
+        except Exception as exc:
+            logger.warning("SIX proxy module failed: %s", exc)
+
     # Step 5e: Linked entity discovery via Gemini (optional)
     relationships = {}
     graph_risk_result = None

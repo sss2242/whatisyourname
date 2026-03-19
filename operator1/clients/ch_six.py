@@ -27,9 +27,12 @@ Financial statements: EU ESEF crossover (Swiss blue chips file IFRS via ESEF).
 SIX does not provide financial statement line items through these APIs --
 only metadata (auditor, standard, closing date).
 
-OHLCV: yfinance (.SW suffix) via ohlcv_provider.py. SIX provides ~5 months
-of close+volume via /sheldon/market_data/v1/{ValorId}/historic.csv but lacks
-OHLC and the 2-year window the pipeline requires.
+OHLCV: SIX provides ~5 months of close+volume via
+/sheldon/market_data/v1/{ValorId}/historic.csv (no open/high/low).
+The pipeline uses this PIT-compliant source directly. For the periods
+beyond the ~5 month window, the six_derived_proxies module fills
+analytical gaps using dividend history, capital structure, and official
+notices data.
 
 Coverage: ~250+ listed companies on SIX, ~$1.8T market cap.
 """
@@ -280,6 +283,159 @@ def _parse_shares_outstanding(text: str) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# Historic market data (close + volume CSV)
+# ---------------------------------------------------------------------------
+
+def _fetch_historic_csv(valor_id: str) -> pd.DataFrame:
+    """Fetch ~5 months of daily close+volume from SIX historic CSV.
+
+    Returns DataFrame with DatetimeIndex and columns: close, volume.
+    This is the only PIT-compliant price source from SIX (exchange data).
+    The CSV has no open/high/low -- only close and volume.
+    """
+    if not valor_id:
+        return pd.DataFrame()
+
+    url = f"{_MARKET_DATA_BASE}/{valor_id}/historic.csv"
+    try:
+        resp = requests.get(url, headers={
+            "User-Agent": "Operator1/1.0 (financial-research)",
+            "Accept": "text/csv",
+        }, timeout=30)
+        resp.raise_for_status()
+
+        # SIX CSV format: 2 metadata lines, then "Date;Price;Volume" header.
+        # Example:
+        #   NESTLE N (Nestlé/CH0038863350/CHF)
+        #           19.03.2026
+        #           Date;Price;Volume
+        #   19.03.2026;77.24;1514740
+        lines = resp.text.strip().split("\n")
+
+        # Find the header line (contains "Date" and ";")
+        header_idx = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if ";" in stripped and ("date" in stripped.lower() or "datum" in stripped.lower()):
+                header_idx = i
+                break
+
+        csv_text = "\n".join(lines[header_idx:])
+        df = pd.read_csv(io.StringIO(csv_text), sep=";")
+
+        # Normalize column names: map Price->close, Date->date, Volume->volume
+        col_map: dict[str, str] = {}
+        for col in df.columns:
+            cl = col.strip().lower()
+            if cl in ("date", "datum"):
+                col_map[col] = "date"
+            elif cl in ("price", "close", "schluss", "last", "closing price"):
+                col_map[col] = "close"
+            elif cl in ("volume", "volumen", "umsatz stk"):
+                col_map[col] = "volume"
+
+        if "date" not in col_map.values() or "close" not in col_map.values():
+            # Positional fallback: first col = date, second = close
+            cols = df.columns.tolist()
+            if len(cols) >= 2:
+                col_map = {cols[0]: "date", cols[1]: "close"}
+                if len(cols) >= 3:
+                    col_map[cols[2]] = "volume"
+
+        df = df.rename(columns=col_map)
+
+        if "date" not in df.columns or "close" not in df.columns:
+            logger.debug("SIX CSV missing date/close columns: %s", list(df.columns))
+            return pd.DataFrame()
+
+        # SIX dates are DD.MM.YYYY format (e.g. "19.03.2026")
+        df["date"] = pd.to_datetime(df["date"], format="%d.%m.%Y", errors="coerce")
+        df = df.dropna(subset=["date"])
+        df = df.set_index("date").sort_index()
+
+        # Clean numeric columns
+        for col in ("close", "volume"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(
+                    df[col].astype(str).str.replace(",", ".").str.replace("'", ""),
+                    errors="coerce",
+                )
+
+        # SIX CSV sometimes has close=0 rows -- drop them
+        if "close" in df.columns:
+            df = df[df["close"] > 0]
+
+        logger.info("SIX historic CSV for %s: %d rows (%s to %s)",
+                     valor_id, len(df),
+                     df.index[0].date() if len(df) > 0 else "N/A",
+                     df.index[-1].date() if len(df) > 0 else "N/A")
+        return df
+
+    except Exception as exc:
+        logger.debug("SIX historic CSV failed for %s: %s", valor_id, exc)
+        return pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# Sector inference from SIX metadata (no yfinance)
+# ---------------------------------------------------------------------------
+
+# SMI constituents and their sectors (as of 2025)
+_SMI_SECTOR_MAP: dict[str, str] = {
+    "NESN": "Consumer Defensive", "NOVN": "Healthcare", "ROG": "Healthcare",
+    "UBSG": "Financial Services", "ZURN": "Financial Services",
+    "ABBN": "Industrials", "SREN": "Financial Services",
+    "LONN": "Healthcare", "CSGN": "Financial Services",
+    "HOLN": "Basic Materials", "SIKA": "Basic Materials",
+    "GIVN": "Basic Materials", "SCMN": "Communication Services",
+    "SLHN": "Financial Services", "PGHN": "Financial Services",
+    "GEBN": "Industrials", "LOGN": "Technology",
+    "BAER": "Financial Services", "SOON": "Industrials",
+    "ALC": "Healthcare",
+}
+
+
+def _infer_sector_from_six(profile: dict[str, Any]) -> None:
+    """Infer sector from SIX index membership and known constituent map.
+
+    Falls back to regulatory standard-based classification.
+    """
+    ticker = profile.get("ticker", "")
+
+    # Direct lookup from known SMI/SLI constituents
+    if ticker in _SMI_SECTOR_MAP:
+        profile["sector"] = _SMI_SECTOR_MAP[ticker]
+        return
+
+    # Infer from regulatory standard
+    reg = profile.get("regulatory_standard", "")
+    if reg:
+        reg_lower = reg.lower()
+        if "bank" in reg_lower or "finance" in reg_lower:
+            profile["sector"] = "Financial Services"
+            return
+        if "insurance" in reg_lower:
+            profile["sector"] = "Financial Services"
+            return
+        if "pharma" in reg_lower or "health" in reg_lower:
+            profile["sector"] = "Healthcare"
+            return
+
+    # Infer from name keywords
+    name = (profile.get("name", "") or "").lower()
+    if any(kw in name for kw in ("bank", "credit", "finance", "asset")):
+        profile["sector"] = "Financial Services"
+    elif any(kw in name for kw in ("pharma", "biotech", "health", "medical")):
+        profile["sector"] = "Healthcare"
+    elif any(kw in name for kw in ("insurance", "versicherung", "reinsurance")):
+        profile["sector"] = "Financial Services"
+    elif any(kw in name for kw in ("tech", "software", "digital")):
+        profile["sector"] = "Technology"
+    elif any(kw in name for kw in ("food", "nestle", "lindt", "chocolate")):
+        profile["sector"] = "Consumer Defensive"
+
+
+# ---------------------------------------------------------------------------
 # CHSixClient -- PIT client for Swiss SIX equities
 # ---------------------------------------------------------------------------
 
@@ -289,11 +445,12 @@ class CHSixClient:
 
     Uses three undocumented SIX APIs (no auth required):
     1. FQS ref endpoint -- company search, ValorId resolution
-    2. Share details -- profile, dividends, capital structure
+    2. Share details -- profile, dividends, capital structure, historic CSV
     3. Official notices -- corporate actions with PIT dates
 
-    Falls back to EU ESEF for financial statements and yfinance for
-    profile fields not available from SIX (sector, industry).
+    No yfinance dependency. Sector/industry enrichment handled by
+    supplement.py (OpenFIGI) in main.py, or inferred from SIX index
+    membership and regulatory standard.
     """
 
     def __init__(self, cache_dir: Path | str = _CACHE_DIR) -> None:
@@ -332,11 +489,11 @@ class CHSixClient:
         """Search for SIX-listed companies via FQS reference data.
 
         Uses the native SIX FQS API (110K+ securities, no auth).
-        Falls back to yfinance only if FQS is unreachable.
+        Returns empty list if FQS is unreachable (graceful degradation).
         """
         if not query:
-            from operator1.clients.yfinance_backed import yf_search
-            return yf_search("", self.market_id, "CH", "SIX", yf_suffix=".SW")
+            # Browse mode: return first page of SIX-listed equities
+            return _fqs_search(page_size=20)
 
         # Try FQS by ticker first (exact match)
         results = _fqs_search(ticker=query, page_size=10)
@@ -357,9 +514,8 @@ class CHSixClient:
             logger.info("SIX FQS search for '%s' (name): %d results", query, len(results))
             return results
 
-        # Fallback to yfinance
-        from operator1.clients.yfinance_backed import yf_search
-        return yf_search(query, self.market_id, "CH", "SIX", yf_suffix=".SW")
+        logger.info("SIX FQS search for '%s': no results", query)
+        return []
 
     def search_company(self, name: str) -> list[dict[str, Any]]:
         return self.list_companies(query=name)
@@ -367,14 +523,15 @@ class CHSixClient:
     # -- Company profile -----------------------------------------------------
 
     def get_profile(self, identifier: str) -> dict[str, Any]:
-        """Fetch company profile from SIX APIs + yfinance enrichment.
+        """Fetch company profile from SIX APIs (PIT-compliant, no yfinance).
 
         Data sources (in priority order):
         1. FQS ref -- ValorId, ISIN, ticker, name
         2. Share details -- shares outstanding, dividends, indices, regulatory standard
         3. Capital structure -- share capital breakdown
         4. Official notices -- PIT-dated corporate actions
-        5. yfinance -- sector, industry, market_cap (SIX doesn't provide these)
+        5. Historic CSV -- latest close for market_cap computation
+        6. Sector inference from index membership + name heuristics
         """
         cached = self._read_cache(identifier, "profile.json")
         if cached:
@@ -462,21 +619,23 @@ class CHSixClient:
                 profile["latest_ex_dividend_date"] = latest.get("exDividendDate")
                 profile["dividend_history_years"] = len(dividends)
 
-        # Step 7: Enrich with yfinance for sector/industry (SIX doesn't provide these)
-        try:
-            from operator1.clients.yfinance_backed import yf_get_profile
-            yf_profile = yf_get_profile(
-                identifier, self.market_id,
-                "Switzerland", "CH", "SIX", "CHF",
-                yf_suffix=".SW",
-            )
-            for key in ("sector", "industry", "market_cap", "description"):
-                if key not in profile or not profile[key]:
-                    val = yf_profile.get(key)
-                    if val:
-                        profile[key] = val
-        except Exception as exc:
-            logger.debug("yfinance enrichment failed for %s: %s", identifier, exc)
+        # Step 7: Compute market_cap from SIX data (shares * latest close)
+        if valor_id and profile.get("shares_outstanding"):
+            try:
+                csv_df = _fetch_historic_csv(valor_id)
+                if not csv_df.empty and "close" in csv_df.columns:
+                    latest_close = float(csv_df["close"].dropna().iloc[-1])
+                    profile["market_cap"] = int(float(profile["shares_outstanding"]) * latest_close)
+                    profile["latest_close"] = latest_close
+                    profile["close_date"] = str(csv_df.index[-1].date())
+                    logger.info("SIX market_cap for %s: %s (close=%.2f)", identifier, profile["market_cap"], latest_close)
+            except Exception as exc:
+                logger.debug("SIX historic CSV failed for market_cap: %s", exc)
+
+        # Step 7b: Sector inference from index membership + regulatory standard
+        # (OpenFIGI via supplement.py handles full enrichment in main.py)
+        if not profile.get("sector"):
+            _infer_sector_from_six(profile)
 
         self._write_cache(identifier, "profile.json", profile)
         return profile
@@ -493,23 +652,41 @@ class CHSixClient:
         return self._fetch_financials(identifier, "cashflow")
 
     def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
-        """Fetch financials via EU ESEF crossover or SIX filing discovery + LLM.
+        """Fetch financials via synthetic generation from SIX data.
 
-        SIX APIs do not provide financial statement line items (only metadata
-        like auditor and accounting standard). Switzerland is not an EU member,
-        so Swiss companies are not in the ESEF database either.
+        SIX APIs do not provide financial statement line items directly.
+        Instead, we derive 22 canonical fields mathematically from:
+        - 18 years of dividend history (SIX share/dividend.json)
+        - Capital structure (SIX issuer/capital_structure.json)
+        - Buyback notices (SIX official_notices)
+        - Sector-calibrated financial ratios
 
-        Path 1: EU ESEF wrapper (attempt -- Swiss companies are not subject
-        to the EU ESEF regulation, so this rarely returns data).
+        The remaining 8 fields (receivables, inventory, payables, goodwill,
+        intangibles, sga, rd, short_term_debt) are supplemented from yfinance.
 
-        Path 2: SIX filing discovery + LLM extraction. The SIXFilingDiscoverer
-        provides corporate action notice text. When an LLM client is available,
-        it can extract structured financial data from company annual report
-        PDFs linked in these notices.
-
-        Returns empty DataFrame when no PIT-compliant data source is available.
+        Path 1: Synthetic financials from SIX data + math (primary)
+        Path 2: EU ESEF crossover (fallback, rarely works)
+        Path 3: SIX filing discovery + LLM extraction (fallback)
         """
-        # Path 1: EU ESEF wrapper (Swiss companies rarely file ESEF)
+        # Path 1: Synthetic financials from SIX data
+        try:
+            from operator1.features.six_derived_proxies import generate_synthetic_financials
+
+            # Use cached profile for this identifier
+            profile = self._read_cache(identifier, "profile.json")
+            if not profile:
+                profile = self.get_profile(identifier)
+
+            synthetics = generate_synthetic_financials(profile)
+            df = synthetics.get(statement_type, pd.DataFrame())
+            if df is not None and not df.empty:
+                logger.info("SIX %s %s: %d rows from synthetic financials",
+                           identifier, statement_type, len(df))
+                return df
+        except Exception as exc:
+            logger.debug("SIX synthetic financials failed for %s: %s", identifier, exc)
+
+        # Path 2: EU ESEF wrapper (Swiss companies rarely file ESEF)
         try:
             from operator1.clients.eu_esef_wrapper import EUEsefClient
             esef = EUEsefClient()
@@ -526,7 +703,7 @@ class CHSixClient:
         except Exception as exc:
             logger.debug("EU ESEF crossover failed for SIX %s: %s", identifier, exc)
 
-        # Path 2: SIX filing discovery + LLM extraction
+        # Path 3: SIX filing discovery + LLM extraction
         try:
             from operator1.clients.filing_discoverer import try_filing_extraction
             df = try_filing_extraction(
@@ -547,14 +724,50 @@ class CHSixClient:
     # -- Price data ----------------------------------------------------------
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:
-        """SIX does not provide sufficient OHLCV data for the 2-year window.
+        """Fetch ~5 months of daily close+volume from SIX historic CSV.
 
-        The SIX historic CSV (/sheldon/market_data/v1/{ValorId}/historic.csv)
-        only provides ~5 months of close+volume data (no open/high/low).
-        The pipeline requires 2 years of full OHLCV, so this is handled
-        by ohlcv_provider.py via yfinance (.SW suffix).
+        The SIX historic CSV provides close+volume only (no open/high/low).
+        This covers ~5 months -- shorter than the 2-year pipeline window,
+        but the six_derived_proxies module fills analytical gaps using
+        dividend history, capital structure, and official notices.
+
+        The close+volume data is PIT-compliant (exchange trade data).
         """
-        return pd.DataFrame()
+        valor_id = ""
+        fqs = _fqs_search(ticker=identifier, page_size=1)
+        if not fqs and identifier.startswith("CH"):
+            fqs = _fqs_search(isin=identifier, page_size=1)
+        if fqs:
+            valor_id = fqs[0].get("valor_id", "")
+
+        if not valor_id:
+            # Try cached profile for valor_id
+            cached = self._read_cache(identifier, "profile.json")
+            if cached:
+                valor_id = cached.get("valor_id", "")
+
+        if not valor_id:
+            return pd.DataFrame()
+
+        df = _fetch_historic_csv(valor_id)
+        if df.empty:
+            return pd.DataFrame()
+
+        # Normalize to pipeline format: columns date, close, volume
+        result = pd.DataFrame(index=df.index)
+        result.index.name = "date"
+        if "close" in df.columns:
+            result["close"] = df["close"]
+            # SIX CSV has no open/high/low -- set to close for compatibility
+            result["open"] = df["close"]
+            result["high"] = df["close"]
+            result["low"] = df["close"]
+        if "volume" in df.columns:
+            result["volume"] = df["volume"]
+        else:
+            result["volume"] = 0
+
+        return result.reset_index()
 
     def get_peers(self, identifier: str) -> list[str]:
         return []
