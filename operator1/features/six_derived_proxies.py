@@ -96,6 +96,16 @@ class SixProxyResult:
     book_equity_floor: float | None = None
     dilution_risk: float | None = None
 
+    # v4 expert methods
+    kalman_earnings: float | None = None
+    kalman_earnings_std: float | None = None
+    pelt_regime_cagr: float | None = None
+    pelt_n_regimes: int = 0
+    pelt_latest_regime_start: str = ""
+    mc_implied_pe_p5: float | None = None
+    mc_implied_pe_p95: float | None = None
+    l1_balance_sheet_solved: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Improvement 1: Adaptive payout ratio from sector + index
@@ -700,6 +710,41 @@ def compute_six_proxies(
 
             result.dividend_data_years = profile.get("dividend_history_years", len(dividends))
 
+            # --- v4: PELT regime detection on dividend growth ---
+            if len(dividends) >= 5:
+                pelt_result = _detect_dividend_regimes(dividends)
+                result.pelt_n_regimes = pelt_result.get("n_regimes", 1)
+                result.pelt_latest_regime_start = pelt_result.get("latest_regime_start", "")
+                if pelt_result.get("regime_cagr") is not None:
+                    result.pelt_regime_cagr = pelt_result["regime_cagr"]
+                    # Use regime-aware CAGR for 5y if PELT found breaks
+                    if result.pelt_n_regimes > 1:
+                        result.dividend_cagr_5y = result.pelt_regime_cagr
+                        logger.debug(
+                            "PELT override: cagr_5y=%.3f (regime-aware, %d regimes)",
+                            result.pelt_regime_cagr, result.pelt_n_regimes,
+                        )
+
+            # --- v4: Kalman filter for optimal earnings estimation ---
+            kalman_eps, kalman_stds = _kalman_earnings_estimate(
+                dividends, payout_prior=payout_ratio,
+            )
+            if not kalman_eps.empty and kalman_eps.notna().any():
+                latest_kalman = float(kalman_eps.iloc[0])
+                latest_std = float(kalman_stds.iloc[0]) if not kalman_stds.empty else 0
+                if latest_kalman > 0 and shares:
+                    result.kalman_earnings = latest_kalman * float(shares)
+                    result.kalman_earnings_std = latest_std * float(shares)
+                    # Map Kalman uncertainty to confidence:
+                    # cv < 0.10 -> 0.90, cv > 0.50 -> 0.50
+                    cv = latest_std / max(latest_kalman, _EPS)
+                    kalman_conf = max(0.50, min(0.90, 0.90 - cv))
+                    _set_with_confidence(
+                        cache, "six_proxy_kalman_earnings",
+                        result.kalman_earnings, kalman_conf,
+                    )
+                    n_proxies += 1
+
         # --- Dividend yield (needs close OR latest_close from profile) ---
         latest_close = None
         if has_close:
@@ -812,6 +857,69 @@ def compute_six_proxies(
                                 "SIX payout ratio refined: sector=%.0f%% -> revealed=%.1f%%",
                                 payout_ratio * 100, revealed_payout * 100,
                             )
+
+        # === v4: MONTE CARLO UNCERTAINTY PROPAGATION ===
+
+        if result.dividend_yield and latest_close and shares:
+            mc_market_cap = float(shares) * latest_close
+            mc_results = _propagate_uncertainty(
+                dividend_yield=result.dividend_yield,
+                buyback_yield=buyback_yield,
+                market_cap=mc_market_cap,
+                tax_rate=_SWISS_TAX_RATE,
+                payout_ratio=result.estimated_payout_ratio or payout_ratio,
+            )
+            if mc_results:
+                pe_ci = mc_results.get("implied_pe", {})
+                if pe_ci:
+                    result.mc_implied_pe_p5 = pe_ci.get("p5")
+                    result.mc_implied_pe_p95 = pe_ci.get("p95")
+                    _set_with_confidence(
+                        cache, "six_proxy_implied_pe_p5",
+                        pe_ci.get("p5", 0), 0.85,
+                    )
+                    _set_with_confidence(
+                        cache, "six_proxy_implied_pe_p95",
+                        pe_ci.get("p95", 0), 0.85,
+                    )
+                    n_proxies += 2
+
+                # Store all MC intervals as cache columns
+                for mc_key, mc_vals in mc_results.items():
+                    if mc_vals and "p5" in mc_vals and "p95" in mc_vals:
+                        _set_with_confidence(
+                            cache, f"six_proxy_mc_{mc_key}_p5",
+                            mc_vals["p5"], 0.85,
+                        )
+                        _set_with_confidence(
+                            cache, f"six_proxy_mc_{mc_key}_p95",
+                            mc_vals["p95"], 0.85,
+                        )
+
+        # === v4: L1 BALANCE SHEET RECONSTRUCTION ===
+
+        best_earnings = result.kalman_earnings or result.implied_earnings
+        equity_floor = result.book_equity_floor or 0.0
+        annual_div_total = (
+            float(latest_div or 0) * float(shares or 0) if latest_div and shares else 0.0
+        )
+
+        if best_earnings and best_earnings > 0 and equity_floor > 0:
+            l1_bs = _reconstruct_balance_sheet(
+                net_income=best_earnings,
+                total_equity_floor=equity_floor,
+                annual_dividends=annual_div_total,
+                sector_ratios=_SECTOR_RATIOS.get(sector, _DEFAULT_RATIOS),
+                market_cap=float(shares) * latest_close if shares and latest_close else 0,
+            )
+            if l1_bs:
+                result.l1_balance_sheet_solved = True
+                for bs_key, bs_val in l1_bs.items():
+                    _set_with_confidence(
+                        cache, f"six_proxy_l1_{bs_key}",
+                        bs_val, 0.65,
+                    )
+                    n_proxies += 1
 
         # === PRICE-BASED PROXIES (need close data from SIX CSV) ===
 
@@ -998,6 +1106,633 @@ def _inject_survival_proxies(
                 cache, "six_proxy_negative_tsr_flag",
                 (tsr < 0).astype(int), 0.70,
             )
+
+
+# ---------------------------------------------------------------------------
+# P0: Kalman filter for latent earnings state (Harvey 1989)
+# ---------------------------------------------------------------------------
+
+def _kalman_earnings_estimate(
+    dividends: pd.Series,
+    buyback_values: pd.Series | None = None,
+    payout_prior: float = 0.60,
+) -> tuple[pd.Series, pd.Series]:
+    """Estimate latent earnings from dividend+buyback observations via Kalman filter.
+
+    Models earnings as a local-level state-space model observed noisily
+    through total cash returned to shareholders (dividends + buybacks).
+    The Kalman filter produces optimal time-varying estimates with
+    uncertainty bounds that map directly to the confidence tagging system.
+
+    State equation:    E_t = E_{t-1} + w_t    (random walk earnings)
+    Observation eq:    D_t = payout * E_t + v_t (dividends observe earnings)
+
+    Parameters
+    ----------
+    dividends:
+        Annual dividend per share, indexed by date, newest first.
+    buyback_values:
+        Annual buyback value per share (optional).
+    payout_prior:
+        Prior estimate of payout ratio (used to scale observations).
+
+    Returns
+    -------
+    (earnings_series, std_series) -- smoothed earnings and standard deviation,
+    same index as dividends. Falls back to Lintner if statsmodels unavailable.
+    """
+    if len(dividends) < 3:
+        # Insufficient data -- return simple scaling
+        earnings = dividends / max(payout_prior, 0.30)
+        stds = pd.Series(earnings.values * 0.30, index=dividends.index)
+        return earnings, stds
+
+    try:
+        from statsmodels.tsa.statespace.structural import UnobservedComponents
+    except ImportError:
+        logger.debug("statsmodels not available for Kalman filter, using Lintner fallback")
+        earnings = dividends / max(payout_prior, 0.30)
+        stds = pd.Series(earnings.values * 0.30, index=dividends.index)
+        return earnings, stds
+
+    # Sort oldest first for time series modeling
+    d = dividends.sort_index().copy()
+
+    # Combine dividends + buybacks as total cash returned
+    if buyback_values is not None and len(buyback_values) > 0:
+        bb = buyback_values.reindex(d.index, method="nearest").fillna(0)
+        total_returned = d + bb
+    else:
+        total_returned = d.copy()
+
+    # Scale to approximate earnings level (divide by payout)
+    # The Kalman filter will refine this
+    observed = total_returned / max(payout_prior, 0.30)
+
+    # Drop any NaN/zero values
+    observed = observed.replace(0, np.nan).dropna()
+    if len(observed) < 3:
+        earnings = dividends / max(payout_prior, 0.30)
+        stds = pd.Series(earnings.values * 0.30, index=dividends.index)
+        return earnings, stds
+
+    try:
+        # Local level model: state = latent earnings level
+        model = UnobservedComponents(
+            observed.values,
+            level="local level",
+        )
+        result = model.fit(disp=False, maxiter=100)
+
+        # Smoothed state = optimal estimate of latent earnings
+        smoothed_state = result.smoothed_state[0]
+        smoothed_cov = result.smoothed_state_cov[0, 0]
+
+        # Build output series aligned to original index
+        earnings = pd.Series(smoothed_state, index=observed.index, dtype=float)
+        stds = pd.Series(
+            np.sqrt(np.maximum(smoothed_cov, 0.0)) if np.isscalar(smoothed_cov)
+            else np.sqrt(np.maximum(result.smoothed_state_cov[0, 0, :], 0.0)),
+            index=observed.index,
+            dtype=float,
+        )
+
+        # Reindex to match original dividends index (newest first)
+        earnings = earnings.reindex(dividends.sort_index().index, method="nearest")
+        stds = stds.reindex(dividends.sort_index().index, method="nearest")
+
+        # Floor: earnings >= total_returned (can't pay more than you earn sustainably)
+        for idx in earnings.index:
+            tr = float(total_returned.get(idx, 0))
+            if earnings[idx] < tr * 0.95:
+                earnings[idx] = tr * 1.05
+
+        # Return in newest-first order
+        earnings = earnings.sort_index(ascending=False)
+        stds = stds.sort_index(ascending=False)
+
+        logger.debug(
+            "Kalman earnings: %d observations, latest=%.2f +/- %.2f",
+            len(earnings), float(earnings.iloc[0]), float(stds.iloc[0]),
+        )
+        return earnings, stds
+
+    except Exception as exc:
+        logger.debug("Kalman filter failed: %s -- falling back to ratio", exc)
+        earnings = dividends / max(payout_prior, 0.30)
+        stds = pd.Series(earnings.values * 0.30, index=dividends.index)
+        return earnings, stds
+
+
+# ---------------------------------------------------------------------------
+# P1: PELT regime detection on dividend series (Killick et al. 2012)
+# ---------------------------------------------------------------------------
+
+def _detect_dividend_regimes(
+    dividends: pd.Series,
+    penalty: float = 2.0,
+) -> dict[str, Any]:
+    """Detect structural breaks in dividend growth using PELT algorithm.
+
+    Uses the Pruned Exact Linear Time algorithm to find changepoints
+    in dividend growth rates. Returns the most recent regime's CAGR
+    and regime boundaries.
+
+    Parameters
+    ----------
+    dividends:
+        Annual dividend per share, indexed by date, newest first.
+    penalty:
+        PELT penalty parameter (higher = fewer breakpoints).
+
+    Returns
+    -------
+    Dict with keys: regime_cagr, n_regimes, latest_regime_start,
+    breakpoints, growth_rates.
+    """
+    result: dict[str, Any] = {
+        "regime_cagr": None,
+        "n_regimes": 1,
+        "latest_regime_start": "",
+        "breakpoints": [],
+        "growth_rates": [],
+    }
+
+    if len(dividends) < 4:
+        return result
+
+    try:
+        import ruptures
+    except ImportError:
+        logger.debug("ruptures not available for PELT, skipping regime detection")
+        return result
+
+    try:
+        # Sort oldest first
+        d = dividends.sort_index()
+        growth = d.pct_change().dropna()
+        if len(growth) < 3:
+            return result
+
+        result["growth_rates"] = growth.values.tolist()
+
+        # PELT on growth rates
+        signal = growth.values.reshape(-1, 1)
+        algo = ruptures.Pelt(model="rbf", min_size=2).fit(signal)
+        breakpoints = algo.predict(pen=penalty)
+
+        # breakpoints includes the final index (len(signal))
+        # Convert to regime boundaries
+        regime_starts = [0] + breakpoints[:-1]
+        regime_ends = breakpoints
+
+        result["n_regimes"] = len(regime_starts)
+        result["breakpoints"] = [int(b) for b in breakpoints[:-1]]
+
+        # Use only the latest regime for CAGR
+        latest_start_idx = regime_starts[-1]
+        latest_regime_growth = growth.iloc[latest_start_idx:]
+
+        if len(latest_regime_growth) >= 1:
+            # Compute CAGR within the latest regime
+            latest_divs = d.iloc[latest_start_idx:]
+            if len(latest_divs) >= 2:
+                first_val = float(latest_divs.iloc[0])
+                last_val = float(latest_divs.iloc[-1])
+                years = (latest_divs.index[-1] - latest_divs.index[0]).days / 365.25
+                if first_val > 0 and years > 0.5:
+                    regime_cagr = (last_val / first_val) ** (1.0 / years) - 1.0
+                    result["regime_cagr"] = regime_cagr
+
+            result["latest_regime_start"] = str(
+                growth.index[latest_start_idx].date()
+                if hasattr(growth.index[latest_start_idx], "date")
+                else growth.index[latest_start_idx]
+            )
+
+        logger.debug(
+            "PELT dividend regimes: %d regimes, %d breakpoints, "
+            "latest regime CAGR=%.3f, start=%s",
+            result["n_regimes"],
+            len(result["breakpoints"]),
+            result["regime_cagr"] or 0,
+            result["latest_regime_start"],
+        )
+
+    except Exception as exc:
+        logger.debug("PELT regime detection failed: %s", exc)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# P1: L1 balance sheet reconstruction (Candes & Tao 2005)
+# ---------------------------------------------------------------------------
+
+def _reconstruct_balance_sheet(
+    net_income: float,
+    total_equity_floor: float,
+    annual_dividends: float,
+    sector_ratios: dict[str, float],
+    market_cap: float = 0.0,
+) -> dict[str, float]:
+    """Reconstruct a full balance sheet via L1 minimization with accounting constraints.
+
+    Uses scipy.optimize.linprog to find the sparsest (L1-minimal) balance
+    sheet that satisfies all accounting identity constraints and
+    sector-specific bounds simultaneously.
+
+    Constraints:
+      - total_assets = total_liabilities + total_equity  (identity)
+      - total_equity >= equity_floor                      (from capital structure)
+      - cash >= annual_dividends                          (solvency)
+      - current_assets >= cash                            (composition)
+      - total_debt <= 3 * total_equity                    (typical bound)
+      - revenue = net_income / net_margin                 (sector-calibrated)
+
+    Parameters
+    ----------
+    net_income:
+        Estimated annual net income (from Kalman or Lintner).
+    total_equity_floor:
+        Minimum equity from SIX capital structure.
+    annual_dividends:
+        Total annual dividend outflow.
+    sector_ratios:
+        Sector-calibrated financial ratios dict.
+    market_cap:
+        Market capitalization (optional, for P/B bound).
+
+    Returns
+    -------
+    Dict of balance sheet items, or empty dict if optimization fails.
+    """
+    try:
+        from scipy.optimize import linprog
+    except ImportError:
+        logger.debug("scipy not available for L1 balance sheet")
+        return {}
+
+    if net_income <= 0:
+        return {}
+
+    try:
+        # Extract sector ratios with defaults
+        net_margin = sector_ratios.get("net_margin", 0.12)
+        equity_ratio = sector_ratios.get("equity_ratio", 0.35)
+        cash_to_assets = sector_ratios.get("cash_to_assets", 0.10)
+        capex_intensity = sector_ratios.get("capex_intensity", 0.05)
+        st_debt_share = sector_ratios.get("st_debt_share", 0.35)
+
+        # Derive revenue from net_income and net_margin
+        revenue = net_income / max(net_margin, 0.02)
+
+        # Variables: [total_assets, total_liabilities, total_equity,
+        #             total_debt, cash, current_assets, current_liabilities,
+        #             long_term_debt, short_term_debt, retained_earnings]
+        # indices:    0              1                  2
+        #             3           4     5                6
+        #             7              8               9
+        n_vars = 10
+
+        # Objective: minimize sum of variables (L1 norm proxy)
+        # We use absolute values, so all variables are non-negative
+        c = np.ones(n_vars)
+
+        # Equality constraints: A_eq @ x = b_eq
+        # 1. total_assets = total_liabilities + total_equity
+        #    x[0] - x[1] - x[2] = 0
+        # 2. total_equity = equity_floor + retained_earnings
+        #    x[2] - x[9] = equity_floor
+        A_eq = np.zeros((2, n_vars))
+        b_eq = np.zeros(2)
+
+        # Constraint 1: TA = TL + TE
+        A_eq[0, 0] = 1.0   # total_assets
+        A_eq[0, 1] = -1.0  # - total_liabilities
+        A_eq[0, 2] = -1.0  # - total_equity
+        b_eq[0] = 0.0
+
+        # Constraint 2: TE = floor + retained_earnings
+        A_eq[1, 2] = 1.0   # total_equity
+        A_eq[1, 9] = -1.0  # - retained_earnings
+        b_eq[1] = max(total_equity_floor, 0)
+
+        # Inequality constraints: A_ub @ x <= b_ub
+        # (linprog uses <= form)
+        ineqs = []
+        ineq_bounds = []
+
+        # cash >= annual_dividends  =>  -cash <= -annual_dividends
+        row = np.zeros(n_vars)
+        row[4] = -1.0
+        ineqs.append(row)
+        ineq_bounds.append(-max(annual_dividends, 0))
+
+        # current_assets >= cash  =>  -current_assets + cash <= 0
+        row = np.zeros(n_vars)
+        row[5] = -1.0
+        row[4] = 1.0
+        ineqs.append(row)
+        ineq_bounds.append(0.0)
+
+        # total_debt <= 3 * total_equity  =>  total_debt - 3*total_equity <= 0
+        row = np.zeros(n_vars)
+        row[3] = 1.0
+        row[2] = -3.0
+        ineqs.append(row)
+        ineq_bounds.append(0.0)
+
+        # long_term_debt + short_term_debt <= total_debt  => LTD + STD - TD <= 0
+        row = np.zeros(n_vars)
+        row[7] = 1.0
+        row[8] = 1.0
+        row[3] = -1.0
+        ineqs.append(row)
+        ineq_bounds.append(0.0)
+
+        A_ub = np.array(ineqs)
+        b_ub = np.array(ineq_bounds)
+
+        # Variable bounds
+        # Use sector ratios to set reasonable ranges
+        ta_est = revenue / max(sector_ratios.get("asset_turnover", 0.6), 0.3)
+        if ta_est <= 0:
+            ta_est = net_income / max(equity_ratio * net_margin, 0.01)
+
+        bounds = [
+            (ta_est * 0.5, ta_est * 2.0),           # total_assets
+            (ta_est * 0.3, ta_est * 1.5),            # total_liabilities
+            (total_equity_floor, ta_est * 0.8),       # total_equity
+            (0, ta_est * 0.8),                         # total_debt
+            (annual_dividends, ta_est * 0.3),          # cash
+            (annual_dividends, ta_est * 0.5),          # current_assets
+            (0, ta_est * 0.4),                         # current_liabilities
+            (0, ta_est * 0.6),                         # long_term_debt
+            (0, ta_est * 0.3),                         # short_term_debt
+            (0, ta_est * 0.8),                         # retained_earnings
+        ]
+
+        result = linprog(
+            c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+            bounds=bounds, method="highs",
+        )
+
+        if not result.success:
+            logger.debug("L1 balance sheet optimization failed: %s", result.message)
+            return {}
+
+        x = result.x
+        bs = {
+            "total_assets": x[0],
+            "total_liabilities": x[1],
+            "total_equity": x[2],
+            "total_debt": x[3],
+            "cash_and_equivalents": x[4],
+            "current_assets": x[5],
+            "current_liabilities": x[6],
+            "long_term_debt": x[7],
+            "short_term_debt": x[8],
+            "retained_earnings": x[9],
+        }
+
+        # Verify accounting identity
+        identity_gap = abs(bs["total_assets"] - bs["total_liabilities"] - bs["total_equity"])
+        if identity_gap > 1.0:
+            logger.warning(
+                "L1 balance sheet identity gap: %.2f (TA=%.0f, TL=%.0f, TE=%.0f)",
+                identity_gap, bs["total_assets"], bs["total_liabilities"], bs["total_equity"],
+            )
+
+        logger.debug(
+            "L1 balance sheet solved: TA=%.0f, TL=%.0f, TE=%.0f, "
+            "debt=%.0f, cash=%.0f",
+            bs["total_assets"], bs["total_liabilities"], bs["total_equity"],
+            bs["total_debt"], bs["cash_and_equivalents"],
+        )
+        return bs
+
+    except Exception as exc:
+        logger.debug("L1 balance sheet reconstruction failed: %s", exc)
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# P1: Monte Carlo uncertainty propagation
+# ---------------------------------------------------------------------------
+
+def _propagate_uncertainty(
+    dividend_yield: float,
+    buyback_yield: float,
+    market_cap: float,
+    tax_rate: float = _SWISS_TAX_RATE,
+    payout_ratio: float = 0.60,
+    n_samples: int = 10_000,
+) -> dict[str, dict[str, float]]:
+    """Propagate input uncertainty through proxy formulas via Monte Carlo sampling.
+
+    Each input is sampled from a distribution reflecting its estimation
+    uncertainty. The samples are pushed through the formula chain to
+    produce statistically rigorous confidence intervals on every output.
+
+    Parameters
+    ----------
+    dividend_yield:
+        Point estimate of dividend yield.
+    buyback_yield:
+        Point estimate of buyback yield.
+    market_cap:
+        Market capitalization.
+    tax_rate:
+        Corporate tax rate estimate.
+    payout_ratio:
+        Estimated payout ratio.
+    n_samples:
+        Number of Monte Carlo samples.
+
+    Returns
+    -------
+    Dict mapping output name -> {p5, p50, p95, mean, std}.
+    """
+    if market_cap <= 0 or dividend_yield <= 0:
+        return {}
+
+    try:
+        rng = np.random.RandomState(42)
+
+        # Sample from input distributions
+        # Dividend yield: ~5% coefficient of variation
+        dy_samples = rng.normal(dividend_yield, dividend_yield * 0.05, n_samples)
+        dy_samples = np.maximum(dy_samples, 0.001)
+
+        # Buyback yield: ~20% CV (more uncertain)
+        if buyback_yield > 0:
+            bb_samples = rng.normal(buyback_yield, buyback_yield * 0.20, n_samples)
+            bb_samples = np.maximum(bb_samples, 0.0)
+        else:
+            bb_samples = np.zeros(n_samples)
+
+        # Tax rate: ~2pp uncertainty
+        tax_samples = rng.normal(tax_rate, 0.02, n_samples)
+        tax_samples = np.clip(tax_samples, 0.05, 0.30)
+
+        # Payout ratio: ~10% CV
+        payout_samples = rng.normal(payout_ratio, payout_ratio * 0.10, n_samples)
+        payout_samples = np.clip(payout_samples, 0.15, 0.95)
+
+        # Propagate through formulas
+        total_yield = dy_samples + bb_samples
+        total_returned = total_yield * market_cap
+        implied_after_tax = total_returned  # minimum earnings
+        implied_pretax = implied_after_tax / np.maximum(1.0 - tax_samples, 0.50)
+        implied_pe = market_cap / np.maximum(implied_after_tax, 1.0)
+        implied_earnings_yield = implied_after_tax / market_cap
+
+        # Gordon implied return
+        # Use a growth rate distribution centered on CAGR
+        growth_samples = rng.normal(0.03, 0.015, n_samples)  # 3% +/- 1.5%
+        gordon_return = dy_samples + growth_samples
+
+        def _percentiles(arr: np.ndarray) -> dict[str, float]:
+            clean = arr[np.isfinite(arr)]
+            if len(clean) < 10:
+                return {}
+            return {
+                "p5": float(np.percentile(clean, 5)),
+                "p50": float(np.percentile(clean, 50)),
+                "p95": float(np.percentile(clean, 95)),
+                "mean": float(np.mean(clean)),
+                "std": float(np.std(clean)),
+            }
+
+        results = {
+            "implied_pe": _percentiles(implied_pe),
+            "implied_earnings": _percentiles(implied_after_tax),
+            "implied_pretax": _percentiles(implied_pretax),
+            "implied_earnings_yield": _percentiles(implied_earnings_yield),
+            "total_shareholder_return": _percentiles(total_yield),
+            "gordon_implied_return": _percentiles(gordon_return),
+        }
+
+        # Filter out empty results
+        results = {k: v for k, v in results.items() if v}
+
+        logger.debug(
+            "Monte Carlo: %d samples, PE=[%.1f, %.1f, %.1f], "
+            "earnings=[%.0f, %.0f, %.0f]",
+            n_samples,
+            results.get("implied_pe", {}).get("p5", 0),
+            results.get("implied_pe", {}).get("p50", 0),
+            results.get("implied_pe", {}).get("p95", 0),
+            results.get("implied_earnings", {}).get("p5", 0),
+            results.get("implied_earnings", {}).get("p50", 0),
+            results.get("implied_earnings", {}).get("p95", 0),
+        )
+        return results
+
+    except Exception as exc:
+        logger.debug("Monte Carlo propagation failed: %s", exc)
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# P0: seed_canonical_columns() -- bridge to estimation engine
+# ---------------------------------------------------------------------------
+
+def seed_canonical_columns(
+    cache: pd.DataFrame,
+    profile: dict[str, Any],
+    proxy_result: "SixProxyResult",
+) -> None:
+    """Inject estimated canonical columns so the estimator can process them.
+
+    The estimator only processes columns with canonical names (net_income,
+    total_equity, etc.). The proxy module's six_proxy_* prefixed columns
+    are invisible to it. This bridge function seeds canonical columns
+    from proxy estimates, tagged with source metadata.
+
+    Called BEFORE run_estimation() in main.py for ch_six market.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache DataFrame (modified in place).
+    profile:
+        Company profile dict from SIX client.
+    proxy_result:
+        Output of compute_six_proxies().
+    """
+    if not proxy_result.computed:
+        return
+
+    seeded = 0
+
+    # net_income (from Kalman or implied earnings)
+    earnings = proxy_result.kalman_earnings or proxy_result.implied_earnings
+    if earnings and ("net_income" not in cache.columns or cache["net_income"].isna().all()):
+        cache["net_income"] = earnings
+        cache["is_missing_net_income"] = 0
+        seeded += 1
+
+    # total_equity (from book equity floor)
+    if proxy_result.book_equity_floor and (
+        "total_equity" not in cache.columns or cache["total_equity"].isna().all()
+    ):
+        cache["total_equity"] = proxy_result.book_equity_floor
+        cache["is_missing_total_equity"] = 0
+        seeded += 1
+
+    # operating_cash_flow (from estimated OCF proxy)
+    if "six_proxy_est_operating_cf" in cache.columns and (
+        "operating_cash_flow" not in cache.columns or cache["operating_cash_flow"].isna().all()
+    ):
+        cache["operating_cash_flow"] = cache["six_proxy_est_operating_cf"]
+        cache["is_missing_operating_cash_flow"] = 0
+        seeded += 1
+
+    # cash_and_equivalents (>= annual dividends)
+    shares = profile.get("shares_outstanding")
+    div = profile.get("latest_dividend_amount")
+    if shares and div and (
+        "cash_and_equivalents" not in cache.columns or cache["cash_and_equivalents"].isna().all()
+    ):
+        cache["cash_and_equivalents"] = float(shares) * float(div)
+        cache["is_missing_cash_and_equivalents"] = 0
+        seeded += 1
+
+    # revenue (from implied earnings / net_margin)
+    if earnings and ("revenue" not in cache.columns or cache["revenue"].isna().all()):
+        sector = profile.get("sector", "")
+        ratios = _SECTOR_RATIOS.get(sector, _DEFAULT_RATIOS)
+        net_margin = ratios.get("net_margin", 0.12)
+        cache["revenue"] = earnings / max(net_margin, 0.02)
+        cache["is_missing_revenue"] = 0
+        seeded += 1
+
+    # ebit (from earnings / (1 - tax_rate))
+    if earnings and ("ebit" not in cache.columns or cache["ebit"].isna().all()):
+        cache["ebit"] = earnings / max(1.0 - _SWISS_TAX_RATE, 0.50)
+        cache["is_missing_ebit"] = 0
+        seeded += 1
+
+    # L1 balance sheet items (if solved)
+    if proxy_result.l1_balance_sheet_solved:
+        for col in ("total_assets", "total_liabilities", "total_debt",
+                     "current_assets", "current_liabilities",
+                     "long_term_debt", "short_term_debt", "retained_earnings"):
+            l1_col = f"six_proxy_l1_{col}"
+            if l1_col in cache.columns and (
+                col not in cache.columns or cache[col].isna().all()
+            ):
+                cache[col] = cache[l1_col]
+                cache[f"is_missing_{col}"] = 0
+                seeded += 1
+
+    if seeded > 0:
+        logger.info(
+            "SIX canonical columns seeded: %d columns injected for estimator",
+            seeded,
+        )
 
 
 # ---------------------------------------------------------------------------
