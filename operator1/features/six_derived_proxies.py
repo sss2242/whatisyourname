@@ -3837,54 +3837,6 @@ def generate_synthetic_financials(
     return result
 
 
-def _supplement_with_yfinance(
-    profile: dict[str, Any],
-    result: dict[str, pd.DataFrame],
-) -> None:
-    """Supplement synthetic financials with yfinance for non-derivable fields.
-
-    The 8 fields that SIX data cannot produce:
-    receivables, inventory, payables, goodwill, intangible_assets,
-    sga_expenses, rd_expenses, short_term_debt.
-    """
-    ticker = profile.get("ticker", "")
-    if not ticker:
-        return
-
-    try:
-        from operator1.clients.yfinance_backed import yf_get_financials
-
-        yf_fields = {
-            "balance": {"receivables", "inventory", "payables", "goodwill",
-                        "intangible_assets", "short_term_debt"},
-            "income": {"sga_expenses", "rd_expenses"},
-        }
-
-        for stmt_type, fields in yf_fields.items():
-            try:
-                yf_df = yf_get_financials(ticker, "ch_six", stmt_type, yf_suffix=".SW")
-                if yf_df is None or yf_df.empty:
-                    continue
-
-                # Filter to only the fields we need
-                if "canonical_name" in yf_df.columns:
-                    yf_filtered = yf_df[yf_df["canonical_name"].isin(fields)].copy()
-                    if not yf_filtered.empty:
-                        yf_filtered["source"] = "yfinance_supplement"
-                        if not result[stmt_type].empty:
-                            result[stmt_type] = pd.concat(
-                                [result[stmt_type], yf_filtered],
-                                ignore_index=True,
-                            )
-                        else:
-                            result[stmt_type] = yf_filtered
-                        logger.debug(
-                            "SIX yfinance supplement for %s: %d rows (%s)",
-                            stmt_type, len(yf_filtered),
-                            list(yf_filtered["canonical_name"].unique()),
-                        )
-            except Exception as exc:
-                logger.debug("SIX yfinance supplement failed for %s: %s", stmt_type, exc)
-
-    except ImportError:
-        logger.debug("yfinance not available for SIX supplementation")
+# _supplement_with_yfinance() removed in v4 -- all 30 canonical fields
+# are now derived from SIX data + DuPont decomposition without yfinance.
+# See generate_synthetic_financials() above.

@@ -953,6 +953,31 @@ Non-interactive examples:
     )
 
     # ------------------------------------------------------------------
+    # Step 4a.5: SIX proxy computation + canonical column seeding
+    # Must run BEFORE estimation so proxy values flow into the estimator.
+    # ------------------------------------------------------------------
+    six_proxy_result = None
+    if market_id == "ch_six":
+        try:
+            from operator1.features.six_derived_proxies import (
+                compute_six_proxies, seed_canonical_columns,
+            )
+            six_proxy_result = compute_six_proxies(cache, target_profile)
+            if six_proxy_result.computed:
+                logger.info(
+                    "SIX proxies: %d columns, yield=%.2f%%, implied_pe=%.1f",
+                    six_proxy_result.n_proxies,
+                    (six_proxy_result.dividend_yield or 0) * 100,
+                    six_proxy_result.implied_pe or 0,
+                )
+                # Seed canonical columns so the estimator can cascade-fill
+                seed_canonical_columns(cache, target_profile, six_proxy_result)
+            elif six_proxy_result.error:
+                logger.warning("SIX proxy computation failed: %s", six_proxy_result.error)
+        except Exception as exc:
+            logger.warning("SIX proxy module failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 4b: Estimation -- fill missing financials
     # ------------------------------------------------------------------
     estimation_coverage = None
@@ -1137,25 +1162,8 @@ Non-interactive examples:
     except Exception as exc:
         logger.debug("Vanity scoring skipped: %s", exc)
 
-    # Step 5d.1: SIX-specific proxy computations (Switzerland only).
-    # When financial statements are unavailable, compute proxy ratios
-    # from SIX dividend history, capital structure, and official notices.
-    six_proxy_result = None
-    if market_id == "ch_six":
-        try:
-            from operator1.features.six_derived_proxies import compute_six_proxies
-            six_proxy_result = compute_six_proxies(cache, target_profile)
-            if six_proxy_result.computed:
-                logger.info(
-                    "SIX proxies: %d columns, yield=%.2f%%, implied_pe=%.1f",
-                    six_proxy_result.n_proxies,
-                    (six_proxy_result.dividend_yield or 0) * 100,
-                    six_proxy_result.implied_pe or 0,
-                )
-            elif six_proxy_result.error:
-                logger.warning("SIX proxy computation failed: %s", six_proxy_result.error)
-        except Exception as exc:
-            logger.warning("SIX proxy module failed: %s", exc)
+    # Step 5d.1: SIX proxy result is available from Step 4a.5 (computed
+    # before estimation). No need to re-compute here.
 
     # Step 5e: Linked entity discovery via Gemini (optional)
     relationships = {}
