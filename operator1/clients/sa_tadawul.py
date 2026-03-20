@@ -94,6 +94,7 @@ _XBRL_BALANCE_MAP: dict[str, str] = {
     "non-controlling interests": "minority_interest_equity",
     "total liabilities and equity": "total_liabilities_and_equity",
     "cash and cash equivalents": "cash_and_equivalents",
+    "bank balances and cash": "cash_and_equivalents",  # Tadawul wording
     "inventories": "inventory",
     "trade receivables": "receivables",
     "trade payables": "payables",
@@ -112,9 +113,17 @@ _XBRL_CASHFLOW_MAP: dict[str, str] = {
     "net cash from (used in) operating activities": "operating_cash_flow",
     "net cash from (used in) investing activities": "investing_cf",
     "net cash from (used in) financing activities": "financing_cf",
+    # Tadawul XBRL uses "flows" in the line item names
+    "net cash flows from (used in) operating activities": "operating_cash_flow",
+    "net cash flows from (used in) investing activities": "investing_cf",
+    "net cash flows from (used in) financing activities": "financing_cf",
+    "net cash flows from operating activities": "operating_cash_flow",
+    "net cash flows from (used in) operations": "operating_cash_flow",
     "capital expenditure": "capex",
-    "dividends paid": "dividends_paid",
+    "capital expenditures": "capex",  # Tadawul uses plural
     "purchase of property, plant and equipment": "capex",
+    "dividends paid": "dividends_paid",
+    "dividends paid to shareholders": "dividends_paid",
 }
 
 # Statement type code -> (table section keyword, field map)
