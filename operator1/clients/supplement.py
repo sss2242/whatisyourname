@@ -473,6 +473,13 @@ _MARKET_ENRICHERS = {
     "eu_esef": lambda t, **kw: euronext_enrich(ticker=t, name=kw.get("name", "")),
     "fr_esef": lambda t, **kw: euronext_enrich(ticker=t, name=kw.get("name", "")),
     "de_esef": lambda t, **kw: euronext_enrich(ticker=t, name=kw.get("name", "")),
+    # Tier 2 ESEF markets: NL is on Euronext Amsterdam so euronext_enrich
+    # is the right enricher.  ES/IT/SE are not on Euronext but the enricher
+    # still attempts OpenFIGI + name-based lookup which can return sector data.
+    "nl_esef": lambda t, **kw: euronext_enrich(ticker=t, name=kw.get("name", "")),
+    "es_esef": lambda t, **kw: euronext_enrich(ticker=t, name=kw.get("name", "")),
+    "it_esef": lambda t, **kw: euronext_enrich(ticker=t, name=kw.get("name", "")),
+    "se_esef": lambda t, **kw: euronext_enrich(ticker=t, name=kw.get("name", "")),
     "jp_jquants": lambda t, **kw: jpx_enrich(ticker=t),
     "tw_mops": lambda t, **kw: twse_enrich(ticker=t),
     "br_cvm": lambda t, **kw: b3_enrich(

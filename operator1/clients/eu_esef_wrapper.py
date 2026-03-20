@@ -405,6 +405,22 @@ class EUEsefClient:
     support per-country market entries (EU, FR, DE, NL, ES, IT, SE).
     """
 
+    # Country code -> primary currency.  Most EU ESEF filers use EUR,
+    # but non-eurozone countries (SE, DK, NO, PL, CZ, HU, RO, BG)
+    # report in their local currency.
+    _COUNTRY_CURRENCY: dict[str, str] = {
+        "SE": "SEK",
+        "DK": "DKK",
+        "NO": "NOK",
+        "PL": "PLN",
+        "CZ": "CZK",
+        "HU": "HUF",
+        "RO": "RON",
+        "BG": "BGN",
+        "GB": "GBP",
+        "CH": "CHF",
+    }
+
     def __init__(
         self,
         country_code: str = "",
@@ -652,15 +668,19 @@ class EUEsefClient:
             raise EUEsefError("get_profile", f"Entity not found: {identifier}")
 
         m = matches[0]
+        # Resolve currency from country code: non-eurozone ESEF filers
+        # report in their local currency (SEK, DKK, NOK, PLN, etc.).
+        _country = m.get("country", self._country_code or "EU").upper()
+        _currency = self._COUNTRY_CURRENCY.get(_country, "EUR")
         profile = {
             "name": m.get("name", ""),
             "ticker": m.get("lei", identifier),
             "isin": "",
-            "country": m.get("country", "EU"),
+            "country": _country if _country != "EU" else m.get("country", "EU"),
             "sector": "",
             "industry": "",
             "exchange": "ESEF",
-            "currency": "EUR",
+            "currency": _currency,
             "lei": m.get("lei", ""),
             "cik": m.get("lei", ""),
             "market_id": self.market_id,

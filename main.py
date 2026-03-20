@@ -953,6 +953,34 @@ Non-interactive examples:
     )
 
     # ------------------------------------------------------------------
+    # Step 4a.3: Conflict risk assessment
+    # Must run BEFORE survival mode (Step 5) because country_conflict_flag
+    # and sanctions_flag are survival triggers.
+    # ------------------------------------------------------------------
+    conflict_result = None
+    linked_conflict = None
+    try:
+        from operator1.features.conflict_risk import (
+            assess_conflict_risk,
+            inject_conflict_risk_into_cache,
+        )
+
+        conflict_result = assess_conflict_risk(
+            country_iso2=market_info.country_code,
+            company_name=company_name,
+        )
+        cache = inject_conflict_risk_into_cache(cache, conflict_result)
+        logger.info(
+            "Conflict risk: flag=%s, intensity=%.3f, type=%s, sources=%s",
+            conflict_result.country_conflict_flag,
+            conflict_result.conflict_intensity_score,
+            conflict_result.conflict_type,
+            conflict_result.data_sources_used,
+        )
+    except Exception as exc:
+        logger.warning("Conflict risk assessment failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 4a.5: SIX proxy computation + canonical column seeding
     # Must run BEFORE estimation so proxy values flow into the estimator.
     # ------------------------------------------------------------------
@@ -1381,6 +1409,32 @@ Non-interactive examples:
             logger.info("Step 5e: Skipped (no LLM API key for entity discovery)")
         else:
             logger.info("Step 5e: Skipped (--skip-linked)")
+
+    # Step 5g.5: Linked entity conflict propagation
+    # Checks if any linked entities (suppliers, customers, etc.) are in
+    # conflict zones, which creates supply chain / revenue exposure risk.
+    if conflict_result is not None and relationships:
+        try:
+            from operator1.features.conflict_risk import (
+                assess_linked_entity_conflict,
+                inject_conflict_risk_into_cache,
+            )
+            linked_conflict = assess_linked_entity_conflict(
+                linked_entities=relationships,
+                target_conflict=conflict_result,
+            )
+            if linked_conflict:
+                cache = inject_conflict_risk_into_cache(
+                    cache, conflict_result, linked_conflict=linked_conflict,
+                )
+                logger.info(
+                    "Linked conflict: supply_chain=%.2f, revenue=%.2f, competitive=%.2f",
+                    linked_conflict.get("supply_chain_risk_score", 0),
+                    linked_conflict.get("revenue_exposure_score", 0),
+                    linked_conflict.get("competitive_advantage_score", 0),
+                )
+        except Exception as exc:
+            logger.warning("Linked entity conflict propagation failed: %s", exc)
 
     # Step 5h: Peer percentile ranking (requires linked caches)
     peer_ranking_result = None

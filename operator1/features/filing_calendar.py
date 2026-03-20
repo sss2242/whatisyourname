@@ -39,6 +39,10 @@ _MARKET_FILING_FREQUENCY: dict[str, dict[str, Any]] = {
     "eu_esef": {"frequency": "annual", "days": 365, "deadline_days": 120, "expected_per_year": 1},
     "fr_esef": {"frequency": "annual", "days": 365, "deadline_days": 120, "expected_per_year": 1},
     "de_esef": {"frequency": "annual", "days": 365, "deadline_days": 120, "expected_per_year": 1},
+    "nl_esef": {"frequency": "annual", "days": 365, "deadline_days": 120, "expected_per_year": 1},
+    "es_esef": {"frequency": "annual", "days": 365, "deadline_days": 120, "expected_per_year": 1},
+    "it_esef": {"frequency": "annual", "days": 365, "deadline_days": 120, "expected_per_year": 1},
+    "se_esef": {"frequency": "annual", "days": 365, "deadline_days": 120, "expected_per_year": 1},
     "ch_six": {"frequency": "annual", "days": 365, "deadline_days": 120, "expected_per_year": 1},
     # Mixed (quarterly interim + annual)
     "jp_jquants": {"frequency": "quarterly", "days": 90, "deadline_days": 45, "expected_per_year": 4},
