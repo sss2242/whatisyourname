@@ -389,10 +389,12 @@ def _parse_xbrl_html(
         logger.debug("XBRL HTML parse failed: %s", exc)
         return []
 
-    # Find the target table by scanning for the section keyword
+    # Find the target data table by scanning for the section keyword.
+    # Skip small tables (TOC, section headers) -- look for the table
+    # that both matches the keyword AND has substantial data (>5 rows).
     target_idx = None
     for i, df in enumerate(dfs):
-        if len(df) == 0:
+        if len(df) < 5:
             continue
         first_row_text = " ".join(str(v) for v in df.iloc[0].values).lower()
         if section_keyword in first_row_text:
@@ -402,10 +404,10 @@ def _parse_xbrl_html(
     if target_idx is None:
         return []
 
-    # The actual data table follows the header table
-    for data_idx in range(target_idx + 1, min(target_idx + 3, len(dfs))):
+    # The data may be in the matched table itself or the next one.
+    for data_idx in range(target_idx, min(target_idx + 3, len(dfs))):
         df = dfs[data_idx]
-        if len(df) < 3:
+        if len(df) < 5:
             continue
 
         rows: list[dict] = []
