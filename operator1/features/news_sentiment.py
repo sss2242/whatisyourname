@@ -119,9 +119,13 @@ def _sentiment_label(score: float) -> str:
 _MARKET_TO_GNEWS_COUNTRY: dict[str, str] = {
     "us_sec_edgar":       "US",
     "uk_companies_house": "GB",
-    "eu_esef_xbrl":       "GB",   # pan-EU defaults to UK English news
-    "eu_esef_france":     "FR",
-    "eu_esef_germany":    "DE",
+    "eu_esef":            "GB",   # pan-EU defaults to UK English news
+    "fr_esef":            "FR",
+    "de_esef":            "DE",
+    "nl_esef":            "NL",
+    "es_esef":            "ES",
+    "it_esef":            "IT",
+    "se_esef":            "SE",
     "jp_jquants":         "JP",
     "kr_dart":            "KR",
     "tw_mops":            "TW",
@@ -245,13 +249,29 @@ def _fetch_news_rss(symbol: str, market_id: str = "", company_name: str = "") ->
             "https://news.google.com/rss/search?q={symbol}+acciones&hl=es&gl=CL&ceid=CL:es-419",
         ],
         # Europe
-        "eu_esef_france": [
+        "fr_esef": [
             "https://news.google.com/rss/search?q={symbol}+bourse&hl=fr&gl=FR&ceid=FR:fr",
             "https://news.google.com/rss/search?q={name}+actions&hl=fr&gl=FR&ceid=FR:fr",
         ],
-        "eu_esef_germany": [
+        "de_esef": [
             "https://news.google.com/rss/search?q={symbol}+Aktie&hl=de&gl=DE&ceid=DE:de",
             "https://news.google.com/rss/search?q={name}+Boerse&hl=de&gl=DE&ceid=DE:de",
+        ],
+        "nl_esef": [
+            "https://news.google.com/rss/search?q={symbol}+aandeel&hl=nl&gl=NL&ceid=NL:nl",
+            "https://news.google.com/rss/search?q={name}+beurs&hl=nl&gl=NL&ceid=NL:nl",
+        ],
+        "es_esef": [
+            "https://news.google.com/rss/search?q={symbol}+acciones&hl=es&gl=ES&ceid=ES:es",
+            "https://news.google.com/rss/search?q={name}+bolsa&hl=es&gl=ES&ceid=ES:es",
+        ],
+        "it_esef": [
+            "https://news.google.com/rss/search?q={symbol}+azioni&hl=it&gl=IT&ceid=IT:it",
+            "https://news.google.com/rss/search?q={name}+borsa&hl=it&gl=IT&ceid=IT:it",
+        ],
+        "se_esef": [
+            "https://news.google.com/rss/search?q={symbol}+aktie&hl=sv&gl=SE&ceid=SE:sv",
+            "https://news.google.com/rss/search?q={name}+börs&hl=sv&gl=SE&ceid=SE:sv",
         ],
         "ch_six": [
             "https://news.google.com/rss/search?q={symbol}+Aktie&hl=de&gl=CH&ceid=CH:de",
