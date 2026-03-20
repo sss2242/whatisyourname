@@ -221,10 +221,51 @@ _ISO2_TO_NAME: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# UCDP GED API client (free, no key required)
+# UCDP GED client (bulk CSV download + API fallback)
 # ---------------------------------------------------------------------------
 
-_UCDP_BASE = "https://ucdpapi.pcr.uu.se/api/gedevents/24.0.10"
+_UCDP_API_BASE = "https://ucdpapi.pcr.uu.se/api/gedevents/24.0.10"
+
+# Candidate GED CSV: freely downloadable without authentication.
+# Updated regularly with the most recent conflict events (~1-2 months lag).
+# ~1.2 MB covering ~1,700 events globally per release.
+_UCDP_CANDIDATE_CSV_URL = (
+    "https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_0_1.csv"
+)
+
+# Module-level cache for the bulk CSV (avoid re-downloading per country)
+_ucdp_csv_cache: "pd.DataFrame | None" = None
+_ucdp_csv_cache_time: float = 0.0
+_UCDP_CSV_TTL = 86400  # 24 hours
+
+
+def _fetch_ucdp_csv() -> "pd.DataFrame":
+    """Download and cache the UCDP candidate GED CSV (no auth needed).
+
+    Returns a DataFrame with columns: country_id, country, date_start,
+    type_of_violence, best (fatalities), etc.
+    """
+    import time
+    import pandas as pd
+
+    global _ucdp_csv_cache, _ucdp_csv_cache_time
+
+    now = time.time()
+    if _ucdp_csv_cache is not None and (now - _ucdp_csv_cache_time) < _UCDP_CSV_TTL:
+        return _ucdp_csv_cache
+
+    try:
+        resp = requests.get(_UCDP_CANDIDATE_CSV_URL, timeout=30)
+        resp.raise_for_status()
+        from io import StringIO
+        df = pd.read_csv(StringIO(resp.text), low_memory=False)
+        _ucdp_csv_cache = df
+        _ucdp_csv_cache_time = now
+        logger.info("UCDP candidate CSV: %d events loaded", len(df))
+        return df
+    except Exception as exc:
+        logger.debug("UCDP CSV download failed: %s", exc)
+        return _ucdp_csv_cache if _ucdp_csv_cache is not None else pd.DataFrame()
 
 
 def _fetch_ucdp_events(
@@ -232,13 +273,13 @@ def _fetch_ucdp_events(
     days: int = 365,
     api_key: str = "",
 ) -> list[dict[str, Any]]:
-    """Fetch recent conflict events from UCDP GED API.
+    """Fetch recent conflict events from UCDP.
 
-    Since 2025, the UCDP API requires authentication. If a
-    ``UCDP_API_KEY`` is provided (via .env or environment variable),
-    it is sent as a Bearer token. Otherwise, the API returns 401
-    and we fall back to static lists, which still provide reliable
-    baseline conflict classification for all countries.
+    Strategy:
+    1. Try the bulk CSV download (free, no auth, ~1.2 MB cached 24h)
+    2. Fall back to the UCDP GED API (needs UCDP_API_KEY since 2025)
+    3. Return empty list if both fail (static lists still provide
+       baseline classification)
 
     Parameters
     ----------
@@ -247,54 +288,80 @@ def _fetch_ucdp_events(
     days:
         How many days back to search.
     api_key:
-        Optional UCDP API key for authenticated access.
+        Optional UCDP API key for authenticated API access.
 
     Returns
     -------
     List of UCDP event dicts with fields like type_of_violence,
-    best_est (fatalities), date_start, etc.
+    best (fatalities), date_start, etc.
     """
+    import pandas as pd
+
     ucdp_id = _ISO2_TO_UCDP_ID.get(country_iso2)
     if ucdp_id is None:
         logger.debug("No UCDP ID for country %s", country_iso2)
         return []
 
-    start_date = (date.today() - timedelta(days=days)).isoformat()
+    start_date = date.today() - timedelta(days=days)
 
+    # Path 1: Bulk CSV (free, no auth needed)
+    csv_df = _fetch_ucdp_csv()
+    if not csv_df.empty and "country_id" in csv_df.columns:
+        country_events = csv_df[csv_df["country_id"] == ucdp_id].copy()
+        if not country_events.empty:
+            # Filter by date
+            country_events["_date"] = pd.to_datetime(
+                country_events["date_start"], errors="coerce"
+            )
+            country_events = country_events[
+                country_events["_date"] >= pd.Timestamp(start_date)
+            ]
+            if not country_events.empty:
+                # Convert to the same dict format as the API
+                events = []
+                for _, row in country_events.iterrows():
+                    events.append({
+                        "date_start": str(row.get("date_start", ""))[:10],
+                        "best": int(row.get("best", 0) or 0),
+                        "best_est": int(row.get("best", 0) or 0),
+                        "type_of_violence": int(row.get("type_of_violence", 0) or 0),
+                        "country": row.get("country", ""),
+                        "country_id": int(row.get("country_id", 0)),
+                    })
+                logger.info(
+                    "UCDP CSV: %d events for %s (country_id=%d)",
+                    len(events), country_iso2, ucdp_id,
+                )
+                return events
+
+    # Path 2: API fallback (needs UCDP_API_KEY)
     headers: dict[str, str] = {"Accept": "application/json"}
     if api_key:
-        # UCDP uses a custom header, not Bearer auth
         headers["x-ucdp-access-token"] = api_key
 
     try:
         resp = requests.get(
-            _UCDP_BASE,
+            _UCDP_API_BASE,
             params={
                 "Country": str(ucdp_id),
-                "StartDate": start_date,
+                "StartDate": start_date.isoformat(),
                 "pagesize": 500,
             },
             headers=headers,
             timeout=15,
         )
         if resp.status_code == 401:
-            if api_key:
-                logger.warning(
-                    "UCDP API rejected API key (401). Check UCDP_API_KEY. "
-                    "Using static conflict lists as fallback."
-                )
-            else:
-                logger.info(
-                    "UCDP API requires authentication (401). "
-                    "Set UCDP_API_KEY in .env for real-time conflict data. "
-                    "Using static conflict lists as fallback."
-                )
+            logger.debug(
+                "UCDP API requires auth (401). CSV fallback returned no data for %s. "
+                "Using static conflict lists.",
+                country_iso2,
+            )
             return []
         resp.raise_for_status()
         data = resp.json()
         return data.get("Result", [])
     except Exception as exc:
-        logger.warning("UCDP API failed for %s: %s", country_iso2, exc)
+        logger.debug("UCDP API failed for %s: %s", country_iso2, exc)
         return []
 
 
