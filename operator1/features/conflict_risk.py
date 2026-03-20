@@ -263,7 +263,8 @@ def _fetch_ucdp_events(
 
     headers: dict[str, str] = {"Accept": "application/json"}
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        # UCDP uses a custom header, not Bearer auth
+        headers["x-ucdp-access-token"] = api_key
 
     try:
         resp = requests.get(
