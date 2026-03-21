@@ -18,7 +18,7 @@ Current state of all Tier 1 and Tier 2 market wrappers based on code review.
 | 6 | **Japan** | `jp_jquants` | J-Quants company info API (name, sector, industry, market cap) | J-Quants listed info (3,800+ TSE companies) | J-Quants financial summary (structured, quarterly/annual) via _JPJquantsAdapter | yfinance (.T) via ohlcv_provider | Yes (free registration) |
 | 7 | **South Korea** | `kr_dart` | dart-fss corporate code lookup + profile | dart-fss corp code search (2,600+ listed) | dart-fss XBRL financial statements (income, balance, cashflow with filing_date) | pykrx (primary) / yfinance (.KS) | Yes (free DART API key) |
 | 8 | **Taiwan** | `tw_mops` | MOPS form POST (company basic info, ROC date conversion) | MOPS company list scraping (1,700+ TWSE/TPEX) | MOPS form POST scraping (quarterly financials, ROC date -> Gregorian conversion) | twstock (primary) / yfinance (.TW) | No |
-| 9 | **Brazil** | `br_cvm` | pycvm CVM open data portal | pycvm company search (~400+ B3 listed) | pycvm financial statements from CVM filings | yfinance (.SA) | No |
+| 9 | **Brazil** | `br_cvm` | CVM CSV registry (2,600+ companies) + FCA ZIP (sector, industry, ownership, website, founding date) | CVM registry search (name, ticker, CNPJ, CD_CVM) + B3 ticker resolution | **CVM ZIP archives (native, no LLM, DFP annual + ITR quarterly, 32+ canonical fields, DT_RECEB PIT dates)** -- live tested: Petrobras 12 periods income, 9 periods balance, 12 periods cashflow | yfinance (.SA) | No |
 | 10 | **Chile** | `cl_cmf` | CMF API + website scraping | CMF company directory (~200+ listed) | CMF FECU financial data + API | yfinance (.SN) | No |
 
 ## Not Working Tier 1 Wrappers
