@@ -198,6 +198,8 @@ class BRCvmClient:
             raise BRCvmError("get_profile", f"Company not found: {identifier}")
 
         m = matches[0]
+        cd_cvm = m.get("cik", "")
+
         raw_profile = {
             "name": m.get("name", ""),
             "ticker": m.get("ticker", identifier),
@@ -207,13 +209,74 @@ class BRCvmClient:
             "industry": "",
             "exchange": "B3",
             "currency": "BRL",
-            "cik": m.get("cik", ""),
+            "cik": cd_cvm,
+            "cnpj": m.get("cnpj", ""),
         }
+
+        # Enrich with FCA (Formulário Cadastral) data -- sector, industry,
+        # founding date, ownership type, website, fiscal year.
+        # FCA ZIP contains fca_cia_aberta_geral_YYYY.csv with rich profile data.
+        fca = self._fetch_fca_profile(cd_cvm)
+        if fca:
+            raw_profile.update({
+                "sector": fca.get("Setor_Atividade", ""),
+                "industry": fca.get("Descricao_Atividade", ""),
+                "sub_industry": "",
+                "website": fca.get("Pagina_Web", ""),
+                "founded": fca.get("Data_Constituicao", ""),
+                "ownership_type": fca.get("Especie_Controle_Acionario", ""),
+                "cvm_category": fca.get("Categoria_Registro_CVM", ""),
+                "fiscal_year_end_month": fca.get("Mes_Encerramento_Exercicio_Social", ""),
+                "fiscal_year_end_day": fca.get("Dia_Encerramento_Exercicio_Social", ""),
+                "status": fca.get("Situacao_Emissor", ""),
+                "country_origin": fca.get("Pais_Origem", "Brasil"),
+            })
+            logger.info(
+                "CVM profile enriched for %s: sector=%s, ownership=%s",
+                cd_cvm, fca.get("Setor_Atividade", "?"), fca.get("Especie_Controle_Acionario", "?"),
+            )
 
         from operator1.clients.canonical_translator import translate_profile
         profile = translate_profile(raw_profile, self.market_id)
         self._write_cache(identifier, "profile.json", profile)
         return profile
+
+    def _fetch_fca_profile(self, cd_cvm: str) -> dict[str, Any] | None:
+        """Fetch company profile from FCA (Formulário Cadastral) ZIP.
+
+        The FCA contains sector, industry description, ownership type,
+        website, founding date, and fiscal year -- richer than the basic
+        registry CSV.
+        """
+        import requests as req
+
+        current_year = date.today().year
+
+        # Try current year first, then previous (FCA may not be filed yet)
+        for year in (current_year, current_year - 1):
+            url = f"{_CVM_DATASET_BASE}/DOC/FCA/DADOS/fca_cia_aberta_{year}.zip"
+            try:
+                z = self._download_zip(url)
+                csv_name = f"fca_cia_aberta_geral_{year}.csv"
+                if csv_name not in z.namelist():
+                    continue
+
+                with z.open(csv_name) as f:
+                    df = pd.read_csv(f, sep=";", encoding="latin-1", on_bad_lines="skip")
+
+                company = df[df["Codigo_CVM"].astype(str) == str(cd_cvm)]
+                if company.empty:
+                    continue
+
+                # Return the most recent version
+                row = company.sort_values("Versao", ascending=False).iloc[0]
+                return {col: str(row[col]) if pd.notna(row[col]) else "" for col in df.columns}
+
+            except Exception as exc:
+                logger.debug("FCA fetch failed for %s/%d: %s", cd_cvm, year, exc)
+                continue
+
+        return None
 
     def get_income_statement(self, identifier: str) -> pd.DataFrame:
         return self._fetch_financials(identifier, "income")
