@@ -19,15 +19,16 @@ Current state of all Tier 1 and Tier 2 market wrappers based on code review.
 | 7 | **South Korea** | `kr_dart` | dart-fss corporate code lookup + profile | dart-fss corp code search (2,600+ listed) | dart-fss XBRL financial statements (income, balance, cashflow with filing_date) | pykrx (primary) / yfinance (.KS) | Yes (free DART API key) |
 | 8 | **Taiwan** | `tw_mops` | MOPS form POST (company basic info, ROC date conversion) | MOPS company list scraping (1,700+ TWSE/TPEX) | MOPS form POST scraping (quarterly financials, ROC date -> Gregorian conversion) | twstock (primary) / yfinance (.TW) | No |
 | 9 | **Brazil** | `br_cvm` | CVM CSV registry (2,600+ companies) + FCA ZIP (sector, industry, ownership, website, founding date) | CVM registry search (name, ticker, CNPJ, CD_CVM) + B3 ticker resolution | **CVM ZIP archives (native, no LLM, DFP annual + ITR quarterly, 32+ canonical fields, DT_RECEB PIT dates)** -- live tested: Petrobras 12 periods income, 9 periods balance, 12 periods cashflow | yfinance (.SA) | No |
-| 10 | **Chile** | `cl_cmf` | CMF API + website scraping | CMF company directory (~200+ listed) | CMF FECU financial data + API | yfinance (.SN) | No |
+| 10 | **Chile** | `cl_cmf` | **BROKEN** -- CMF restructured website, opendata/FECU/portal all return 404. RGALS company lookup (name/RUT) still works via curl_cffi. yfinance (.SN) fallback. | RGALS PHP form (partial) + yfinance (.SN) fallback | **BROKEN** -- CMF opendata/fecu endpoints all return 404. SEIL requires auth. No XBRL/bulk data available. yfinance fallback only (no PIT dates). | yfinance (.SN) | No |
 
 ## Not Working Tier 1 Wrappers
 
 | # | Market | ID | Issue |
 |---|--------|----|-------|
-| 1 | **Germany** | `de_esef` | Financial statements unavailable -- 0 filings on filings.xbrl.org for German companies. Profile and search work via ESEF entity directory. OHLCV works via yfinance. This is a data source limitation, not a code bug -- German companies may file through BaFin/Bundesanzeiger instead of the ESEF XBRL portal. |
+| 1 | **Germany** | `de_esef` | Financial statements unavailable -- 0 filings on filings.xbrl.org for German companies. Profile and search work via ESEF entity directory. OHLCV works via yfinance. Data source limitation -- German companies file through BaFin/Bundesanzeiger instead of the ESEF XBRL portal. |
+| 2 | **Chile** | `cl_cmf` | CMF restructured their entire website in 2025/2026. All opendata, FECU, portal, and IFRS stats endpoints return 404. SEIL (electronic filing system) requires authentication. RGALS company lookup (PHP form) partially works for name/RUT search via curl_cffi. No XBRL/bulk data downloads available. Financial statements currently only via yfinance fallback (no PIT dates). Bolsa de Santiago is behind Radware captcha WAF. No akshare support for Chile. |
 
-**Note:** All other 9 Tier 1 wrappers are fully functional with native financial statement extraction. No LLM required for any Tier 1 market.
+**Note:** 8 of 10 Tier 1 wrappers are fully functional with native financial statement extraction. Germany lacks filing data on filings.xbrl.org. Chile's CMF API is completely broken (website restructuring).
 
 ---
 
