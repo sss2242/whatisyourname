@@ -1,4 +1,37 @@
-# Tier 2 Wrapper Status Review (2026-03-19)
+# Wrappers Status Review (2026-03-21)
+
+Current state of all Tier 1 and Tier 2 market wrappers based on code review.
+
+---
+
+# Tier 1 Wrappers (10 markets, $91T+ coverage)
+
+## Working Tier 1 Wrappers
+
+| # | Market | ID | Profile | Company Search | Financial Statements | OHLCV | Key Required |
+|---|--------|----|---------|---------------|---------------------|-------|-------------|
+| 1 | **United States** | `us_sec_edgar` | edgartools (XBRL-parsed profile, sector, industry, CIK, SIC) | edgartools full-text search + sec-edgar-api EFTS | edgartools XBRL (income, balance, cashflow with filing_date + report_date, PIT-compliant) | yfinance (fallback via ohlcv_provider) | No (email User-Agent only) |
+| 2 | **United Kingdom** | `uk_companies_house` | Companies House REST API (name, SIC codes, registered office, accounts) | Companies House search API (5M+ companies) | iXBRL document parsing (UK-GAAP/FRS 102/IFRS) + filing history | yfinance (.L) | Yes (free API key) |
+| 3 | **EU (pan-EU)** | `eu_esef` | ESEF entity from filings.xbrl.org | ESEF entity directory (7,200+ filers, fuzzy match) | XBRL JSON native (32 IFRS fields, no LLM needed) | yfinance | No |
+| 4 | **France** | `fr_esef` | ESEF entity (FR country filter) | ESEF directory (FR entities) | XBRL JSON native (32 IFRS fields) | yfinance (.PA) | No |
+| 5 | **Germany** | `de_esef` | ESEF entity (DE country filter) | ESEF directory (DE entities) | **0 filings on filings.xbrl.org** -- XBRL JSON unavailable | yfinance (.DE) | No |
+| 6 | **Japan** | `jp_jquants` | J-Quants company info API (name, sector, industry, market cap) | J-Quants listed info (3,800+ TSE companies) | J-Quants financial summary (structured, quarterly/annual) via _JPJquantsAdapter | yfinance (.T) via ohlcv_provider | Yes (free registration) |
+| 7 | **South Korea** | `kr_dart` | dart-fss corporate code lookup + profile | dart-fss corp code search (2,600+ listed) | dart-fss XBRL financial statements (income, balance, cashflow with filing_date) | pykrx (primary) / yfinance (.KS) | Yes (free DART API key) |
+| 8 | **Taiwan** | `tw_mops` | MOPS form POST (company basic info, ROC date conversion) | MOPS company list scraping (1,700+ TWSE/TPEX) | MOPS form POST scraping (quarterly financials, ROC date -> Gregorian conversion) | twstock (primary) / yfinance (.TW) | No |
+| 9 | **Brazil** | `br_cvm` | pycvm CVM open data portal | pycvm company search (~400+ B3 listed) | pycvm financial statements from CVM filings | yfinance (.SA) | No |
+| 10 | **Chile** | `cl_cmf` | CMF API + website scraping | CMF company directory (~200+ listed) | CMF FECU financial data + API | yfinance (.SN) | No |
+
+## Not Working Tier 1 Wrappers
+
+| # | Market | ID | Issue |
+|---|--------|----|-------|
+| 1 | **Germany** | `de_esef` | Financial statements unavailable -- 0 filings on filings.xbrl.org for German companies. Profile and search work via ESEF entity directory. OHLCV works via yfinance. This is a data source limitation, not a code bug -- German companies may file through BaFin/Bundesanzeiger instead of the ESEF XBRL portal. |
+
+**Note:** All other 9 Tier 1 wrappers are fully functional with native financial statement extraction. No LLM required for any Tier 1 market.
+
+---
+
+# Tier 2 Wrappers (15 markets)
 
 Current state of all 15 Tier 2 market wrappers based on code review.
 
