@@ -118,9 +118,9 @@ _XBRL_INCOME_MAP: dict[str, str] = {
     "7000": "non_operating_income",
     "7900": "ebit",                # pre-tax income
     "7950": "taxes",
-    "8200": "income_tax_expense",
+    "8200": "net_income",          # net income from continuing operations
     "8500": "comprehensive_income",
-    "8610": "net_income",          # attributable to parent
+    "8610": "net_income_attributable",  # attributable to parent
     "8620": "minority_interest",   # attributable to NCI
     "9750": "eps",
     "9850": "eps_diluted",
