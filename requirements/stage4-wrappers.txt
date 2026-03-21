@@ -19,7 +19,10 @@ ixbrl-parse==0.10.1
 # Brazil
 pycvm==0.4.1
 
-# China
+# China + Hong Kong (structured financials from Sina Finance / EastMoney)
+akshare==1.18.43
+
+# China (fallback)
 baostock==0.8.9
 
 # India
