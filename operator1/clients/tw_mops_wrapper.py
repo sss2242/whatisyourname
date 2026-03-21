@@ -87,6 +87,7 @@ _XBRL_BALANCE_MAP: dict[str, str] = {
     "2530": "bonds_payable",
     "2320": "short_term_debt",     # current portion of LT debt
     "2540": "long_term_debt",
+    "2200": "other_payables",
     "21XX": "current_liabilities",
     "25XX": "noncurrent_liabilities",
     "2XXX": "total_liabilities",
@@ -98,6 +99,7 @@ _XBRL_BALANCE_MAP: dict[str, str] = {
     "3X2X": "total_liabilities_and_equity",
     # Goodwill -- some companies have it, code may vary
     "1805": "goodwill",
+    "1821": "goodwill",  # alternative code
 }
 
 # Income statement (Table 1 in XBRL response)
@@ -112,6 +114,7 @@ _XBRL_INCOME_MAP: dict[str, str] = {
     "6000": "sga_expenses",
     "6900": "operating_income",
     "7100": "interest_income",
+    "7510": "interest_expense",
     "7000": "non_operating_income",
     "7900": "ebit",                # pre-tax income
     "7950": "taxes",
@@ -133,6 +136,10 @@ _XBRL_CASHFLOW_MAP: dict[str, str] = {
     "B02700": "capex",
     "BBBB": "investing_cf",
     "C04500": "dividends_paid",
+    "C04900": "stock_buybacks",
+    "C05500": "treasury_share_disposal",
+    "A20900": "interest_expense_cf",
+    "A21200": "interest_income_cf",
     "CCCC": "financing_cf",
     "EEEE": "net_change_in_cash",
     "E00100": "beginning_cash",
