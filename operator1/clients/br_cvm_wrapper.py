@@ -1,18 +1,40 @@
-"""Brazil CVM PIT client -- powered by pycvm library.
+"""Brazil CVM PIT client -- ZIP-based dataset extraction.
 
-Primary library: pycvm (https://github.com/glourencoffee/pycvm)
-  - CVM open data portal access for Brazilian company filings
+Primary data source: CVM Open Data Portal (dados.cvm.gov.br)
+  - Annual financial statements: DFP ZIP archives (10 markets, ~320 filings/year)
+  - Quarterly financial statements: ITR ZIP archives (~2,200 filings/year)
+  - Company registry: CSV (2,600+ active companies with CNPJ, CD_CVM)
+  - Each ZIP contains per-statement CSVs with structured account codes
+  - Filing receipt dates (DT_RECEB) provide true PIT timestamps
+  - No API key required, no rate limiting, no auth
 
-Fallback: Direct CVM API (https://dados.cvm.gov.br/api/v1)
+Architecture inspired by HKEX scraper pattern:
+  - Year-windowed downloads (one ZIP per year, like HKEX 2-week windows)
+  - Structured data extraction from within archives (no LLM needed)
+  - Module-level cache to avoid redundant downloads across statement types
 
 Coverage: ~400+ listed companies on B3, $2.2T market cap.
+
+ZIP structure per year:
+  dfp_cia_aberta_YYYY.zip (annual):
+    - dfp_cia_aberta_YYYY.csv          (filing index with DT_RECEB = PIT date)
+    - dfp_cia_aberta_DRE_con_YYYY.csv  (income statement, consolidated)
+    - dfp_cia_aberta_BPA_con_YYYY.csv  (balance sheet assets, consolidated)
+    - dfp_cia_aberta_BPP_con_YYYY.csv  (balance sheet liabilities, consolidated)
+    - dfp_cia_aberta_DFC_MI_con_YYYY.csv (cash flow indirect, consolidated)
+
+  itr_cia_aberta_YYYY.zip (quarterly):
+    - Same structure as DFP but with quarterly data
 """
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
+import time
+import zipfile
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -26,6 +48,22 @@ logger = logging.getLogger(__name__)
 _CVM_BASE = "https://dados.cvm.gov.br/api/v1"
 _CVM_DATASET_BASE = "https://dados.cvm.gov.br/dados/CIA_ABERTA"
 _CACHE_DIR = Path("cache/br_cvm")
+
+# ---------------------------------------------------------------------------
+# Statement type -> CSV filename pattern within the ZIP
+# Uses consolidated (_con) statements; falls back to individual (_ind)
+# ---------------------------------------------------------------------------
+_STATEMENT_CSV_MAP: dict[str, list[str]] = {
+    "income": ["DRE_con", "DRE_ind"],
+    "balance": ["BPA_con", "BPP_con", "BPA_ind", "BPP_ind"],  # Assets + Liabilities
+    "cashflow": ["DFC_MI_con", "DFC_MD_con", "DFC_MI_ind", "DFC_MD_ind"],
+}
+
+# Module-level ZIP cache: {url: ZipFile bytes}
+# Avoids re-downloading the same ZIP for income/balance/cashflow calls
+_zip_cache: dict[str, bytes] = {}
+_zip_cache_time: dict[str, float] = {}
+_ZIP_CACHE_TTL = 3600  # 1 hour
 
 
 class BRCvmError(Exception):
@@ -187,7 +225,26 @@ class BRCvmClient:
         return self._fetch_financials(identifier, "cashflow")
 
     def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
-        """Fetch financial data from CVM using pycvm or direct API."""
+        """Fetch financial data from CVM ZIP archives (HKEX-inspired pattern).
+
+        Downloads year-based ZIP archives from dados.cvm.gov.br, extracts
+        the per-statement CSVs, and parses structured account codes into
+        canonical long-format DataFrames.
+
+        The filing index CSV inside each ZIP provides DT_RECEB (receipt date)
+        which is used as filing_date for true PIT compliance.
+
+        Falls back to pycvm library if ZIP extraction fails.
+        """
+        # Primary: ZIP-based extraction (fast, structured, no LLM)
+        try:
+            df = self._fetch_via_zip(identifier, statement_type)
+            if df is not None and not df.empty:
+                return df
+        except Exception as exc:
+            logger.warning("CVM ZIP extraction failed for %s/%s: %s", identifier, statement_type, exc)
+
+        # Fallback: pycvm library
         if self._pycvm_available:
             try:
                 df = self._fetch_via_pycvm(identifier, statement_type)
@@ -196,127 +253,243 @@ class BRCvmClient:
             except Exception as exc:
                 logger.warning("pycvm failed for %s: %s", identifier, exc)
 
-        return self._fetch_via_direct_api(identifier, statement_type)
+        return pd.DataFrame()
 
-    def _fetch_via_pycvm(self, identifier: str, statement_type: str) -> pd.DataFrame | None:
-        """Use pycvm to fetch CVM financial data."""
-        import pycvm
+    def _download_zip(self, url: str) -> zipfile.ZipFile:
+        """Download and cache a CVM ZIP archive.
 
-        # Map statement type to CVM document categories
-        doc_type_map = {
-            "income": "DRE",
-            "balance": "BPA",  # Balance sheet - assets
-            "cashflow": "DFC_MI",  # Cash flow - indirect method
-        }
-        doc_type = doc_type_map.get(statement_type, "DRE")
+        Uses a module-level cache (like HKEX session reuse) so that
+        multiple statement type calls for the same company share the
+        same downloaded ZIP.
+        """
+        import requests
+
+        now = time.time()
+        if url in _zip_cache and (now - _zip_cache_time.get(url, 0)) < _ZIP_CACHE_TTL:
+            return zipfile.ZipFile(io.BytesIO(_zip_cache[url]))
+
+        r = requests.get(url, timeout=60, headers=self._headers)
+        r.raise_for_status()
+
+        _zip_cache[url] = r.content
+        _zip_cache_time[url] = now
+
+        return zipfile.ZipFile(io.BytesIO(r.content))
+
+    def _get_filing_dates(self, z: zipfile.ZipFile, doc_prefix: str, year: int, cd_cvm: str) -> dict[str, str]:
+        """Extract filing receipt dates (DT_RECEB) from the index CSV.
+
+        Returns dict mapping DT_REFER -> DT_RECEB for the target company.
+        This provides true PIT filing dates.
+        """
+        index_name = f"{doc_prefix}_cia_aberta_{year}.csv"
+        if index_name not in z.namelist():
+            return {}
 
         try:
-            # pycvm provides access to CVM datasets
-            current_year = date.today().year
-            rows: list[dict] = []
+            with z.open(index_name) as f:
+                idx_df = pd.read_csv(f, sep=";", encoding="latin-1")
+            company_rows = idx_df[idx_df["CD_CVM"].astype(str) == cd_cvm]
+            result = {}
+            for _, row in company_rows.iterrows():
+                dt_refer = str(row.get("DT_REFER", ""))
+                dt_receb = str(row.get("DT_RECEB", ""))
+                if dt_refer and dt_receb:
+                    result[dt_refer] = dt_receb
+            return result
+        except Exception:
+            return {}
 
-            for year in range(current_year - 2, current_year + 1):
-                try:
-                    # Fetch the annual financial statements dataset
-                    url = f"{_CVM_DATASET_BASE}/DOC/DFP/DADOS/dfp_cia_aberta_{year}.csv"
-                    df = pd.read_csv(url, sep=";", encoding="latin-1", on_bad_lines="skip")
+    def _extract_from_zip(
+        self,
+        z: zipfile.ZipFile,
+        doc_prefix: str,
+        year: int,
+        cd_cvm: str,
+        statement_type: str,
+    ) -> list[dict]:
+        """Extract financial rows for a company from a CVM ZIP archive.
 
-                    # Filter for the target company
-                    cd_cvm = identifier
-                    company_df = df[df["CD_CVM"].astype(str) == cd_cvm]
-                    if company_df.empty:
-                        # Try matching by name
-                        company_df = df[df["DENOM_CIA"].str.contains(identifier, case=False, na=False)]
+        Applies the HKEX pattern: structured data extraction from within
+        archives, mapping account codes to canonical field names.
+        """
+        from operator1.clients.canonical_translator import _CVM_ACCOUNT_MAP
 
-                    if company_df.empty:
-                        continue
+        csv_patterns = _STATEMENT_CSV_MAP.get(statement_type, [])
+        filing_dates = self._get_filing_dates(z, doc_prefix, year, cd_cvm)
 
-                    for _, row in company_df.iterrows():
-                        account_code = str(row.get("CD_CONTA", ""))
-                        from operator1.clients.canonical_translator import _CVM_ACCOUNT_MAP
-                        canonical = _CVM_ACCOUNT_MAP.get(account_code)
-                        if not canonical:
-                            continue
+        rows: list[dict] = []
+        for pattern in csv_patterns:
+            csv_name = f"{doc_prefix}_cia_aberta_{pattern}_{year}.csv"
+            if csv_name not in z.namelist():
+                continue
 
-                        value = row.get("VL_CONTA")
-                        if pd.isna(value):
-                            continue
+            try:
+                with z.open(csv_name) as f:
+                    df = pd.read_csv(f, sep=";", encoding="latin-1", on_bad_lines="skip")
+            except Exception as exc:
+                logger.debug("Failed to read %s: %s", csv_name, exc)
+                continue
 
-                        rows.append({
-                            "concept": canonical,
-                            "value": float(value),
-                            "filing_date": str(row.get("DT_REFER", "")),
-                            "report_date": str(row.get("DT_REFER", "")),
-                            "period_type": "annual",
-                        })
-                except Exception:
+            # Filter for the target company
+            company_df = df[df["CD_CVM"].astype(str) == cd_cvm]
+            if company_df.empty:
+                continue
+
+            # Use ORDEM_EXERC == 'ULTIMO' for the most recent exercise period
+            # (avoids double-counting from 'PENULTIMO' comparative periods)
+            if "ORDEM_EXERC" in company_df.columns:
+                ultimo = company_df[company_df["ORDEM_EXERC"] == "ULTIMO"]
+                if not ultimo.empty:
+                    company_df = ultimo
+
+            for _, row in company_df.iterrows():
+                account_code = str(row.get("CD_CONTA", ""))
+                canonical = _CVM_ACCOUNT_MAP.get(account_code)
+                if not canonical:
                     continue
 
-            if not rows:
-                return None
+                value = row.get("VL_CONTA")
+                if pd.isna(value):
+                    continue
 
-            df = pd.DataFrame(rows)
-            for col in ("filing_date", "report_date"):
-                if col in df.columns:
-                    df[col] = pd.to_datetime(df[col], errors="coerce")
+                dt_refer = str(row.get("DT_REFER", ""))
+                dt_fim = str(row.get("DT_FIM_EXERC", dt_refer))
 
-            from operator1.clients.canonical_translator import translate_financials
-            return translate_financials(df, self.market_id, statement_type)
+                # Use DT_RECEB from filing index as true PIT filing date
+                filing_date = filing_dates.get(dt_refer, dt_refer)
 
-        except Exception as exc:
-            logger.debug("pycvm extraction failed: %s", exc)
+                rows.append({
+                    "canonical_name": canonical,
+                    "value": float(value),
+                    "filing_date": filing_date,
+                    "report_date": dt_fim or dt_refer,
+                    "period_type": "annual" if doc_prefix == "dfp" else "quarterly",
+                    "account_code": account_code,
+                    "account_desc": str(row.get("DS_CONTA", "")),
+                })
+
+            logger.debug(
+                "CVM %s/%s %s/%d: %d rows from %s",
+                cd_cvm, statement_type, doc_prefix, year,
+                len([r for r in rows if r.get("period_type") == ("annual" if doc_prefix == "dfp" else "quarterly")]),
+                csv_name,
+            )
+
+        return rows
+
+    def _fetch_via_zip(self, identifier: str, statement_type: str) -> pd.DataFrame | None:
+        """Fetch financials from CVM ZIP archives (primary, fast, no LLM).
+
+        Downloads year-based ZIP files and extracts structured CSV data.
+        Covers both annual (DFP) and quarterly (ITR) filings for 2-3 years.
+        """
+        # Resolve CD_CVM from identifier
+        cd_cvm = self._resolve_cd_cvm(identifier)
+        if not cd_cvm:
             return None
 
-    def _fetch_via_direct_api(self, identifier: str, statement_type: str) -> pd.DataFrame:
-        """Fallback: fetch from CVM CSV datasets directly."""
+        current_year = date.today().year
+        all_rows: list[dict] = []
+
+        for year in range(current_year - 2, current_year + 1):
+            for doc_prefix in ("itr", "dfp"):  # quarterly first (more granular)
+                doc_type = "ITR" if doc_prefix == "itr" else "DFP"
+                url = f"{_CVM_DATASET_BASE}/DOC/{doc_type}/DADOS/{doc_prefix}_cia_aberta_{year}.zip"
+
+                try:
+                    z = self._download_zip(url)
+                    rows = self._extract_from_zip(z, doc_prefix, year, cd_cvm, statement_type)
+                    all_rows.extend(rows)
+                except Exception as exc:
+                    logger.debug("CVM ZIP %s/%d failed: %s", doc_prefix, year, exc)
+                    continue
+
+        if not all_rows:
+            return None
+
+        df = pd.DataFrame(all_rows)
+
+        # Deduplicate: keep latest version per (canonical_name, report_date)
+        df = df.sort_values("filing_date", ascending=False)
+        df = df.drop_duplicates(subset=["canonical_name", "report_date"], keep="first")
+
+        for col in ("filing_date", "report_date"):
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+
+        logger.info(
+            "CVM ZIP for %s/%s: %d records from %d unique periods",
+            identifier, statement_type, len(df),
+            df["report_date"].nunique() if "report_date" in df.columns else 0,
+        )
+        return df
+
+    def _resolve_cd_cvm(self, identifier: str) -> str:
+        """Resolve any identifier (ticker, name, CVM code) to a CD_CVM code."""
+        # If identifier looks like a CVM code (all digits), use directly
+        if identifier.strip().isdigit():
+            return identifier.strip()
+
+        # Otherwise search the registry
+        matches = self.list_companies(query=identifier)
+        if matches:
+            cd_cvm = matches[0].get("cik", "")
+            if cd_cvm:
+                logger.info("Resolved '%s' -> CD_CVM=%s (%s)", identifier, cd_cvm, matches[0].get("name", ""))
+                return cd_cvm
+
+        return ""
+
+    def _fetch_via_pycvm(self, identifier: str, statement_type: str) -> pd.DataFrame | None:
+        """Legacy fallback: use pycvm library if ZIP extraction fails."""
+        import pycvm
+
+        cd_cvm = self._resolve_cd_cvm(identifier)
+        if not cd_cvm:
+            return None
+
+        from operator1.clients.canonical_translator import _CVM_ACCOUNT_MAP
+
         current_year = date.today().year
         rows: list[dict] = []
 
         for year in range(current_year - 2, current_year + 1):
-            for doc_type in ("dfp", "itr"):  # dfp=annual, itr=quarterly
-                try:
-                    url = f"{_CVM_DATASET_BASE}/DOC/{'DFP' if doc_type == 'dfp' else 'ITR'}/DADOS/{doc_type}_cia_aberta_{year}.csv"
-                    df = pd.read_csv(url, sep=";", encoding="latin-1", on_bad_lines="skip")
-
-                    company_df = df[
-                        (df["CD_CVM"].astype(str) == identifier) |
-                        (df["DENOM_CIA"].str.contains(identifier, case=False, na=False))
-                    ]
-
-                    if company_df.empty:
-                        continue
-
-                    from operator1.clients.canonical_translator import _CVM_ACCOUNT_MAP
+            try:
+                url = f"{_CVM_DATASET_BASE}/DOC/DFP/DADOS/dfp_cia_aberta_{year}.zip"
+                z = self._download_zip(url)
+                csv_name = f"dfp_cia_aberta_{year}.csv"
+                if csv_name in z.namelist():
+                    with z.open(csv_name) as f:
+                        df = pd.read_csv(f, sep=";", encoding="latin-1")
+                    company_df = df[df["CD_CVM"].astype(str) == cd_cvm]
                     for _, row in company_df.iterrows():
                         account_code = str(row.get("CD_CONTA", ""))
                         canonical = _CVM_ACCOUNT_MAP.get(account_code)
                         if not canonical:
                             continue
-
                         value = row.get("VL_CONTA")
                         if pd.isna(value):
                             continue
-
                         rows.append({
-                            "concept": canonical,
+                            "canonical_name": canonical,
                             "value": float(value),
                             "filing_date": str(row.get("DT_RECEB", row.get("DT_REFER", ""))),
                             "report_date": str(row.get("DT_REFER", "")),
-                            "period_type": "annual" if doc_type == "dfp" else "quarterly",
+                            "period_type": "annual",
                         })
-                except Exception:
-                    continue
+            except Exception:
+                continue
 
         if not rows:
-            return pd.DataFrame()
+            return None
 
         df = pd.DataFrame(rows)
         for col in ("filing_date", "report_date"):
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
 
-        from operator1.clients.canonical_translator import translate_financials
-        return translate_financials(df, self.market_id, statement_type)
+        return df
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:
         return pd.DataFrame()
