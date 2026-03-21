@@ -82,15 +82,7 @@ class BRCvmClient:
 
     def __init__(self, cache_dir: Path | str = _CACHE_DIR) -> None:
         self._cache_dir = Path(cache_dir)
-        self._pycvm_available = False
         self._headers = {"Accept": "application/json", "User-Agent": "Operator1/1.0"}
-
-        try:
-            import pycvm
-            self._pycvm_available = True
-            logger.info("pycvm available for CVM data")
-        except ImportError:
-            logger.info("pycvm not available; using direct CVM API")
 
     def _cache_path(self, identifier: str, filename: str) -> Path:
         safe_id = identifier.replace("/", "_").replace("\\", "_").upper()
@@ -296,25 +288,13 @@ class BRCvmClient:
 
         The filing index CSV inside each ZIP provides DT_RECEB (receipt date)
         which is used as filing_date for true PIT compliance.
-
-        Falls back to pycvm library if ZIP extraction fails.
         """
-        # Primary: ZIP-based extraction (fast, structured, no LLM)
         try:
             df = self._fetch_via_zip(identifier, statement_type)
             if df is not None and not df.empty:
                 return df
         except Exception as exc:
             logger.warning("CVM ZIP extraction failed for %s/%s: %s", identifier, statement_type, exc)
-
-        # Fallback: pycvm library
-        if self._pycvm_available:
-            try:
-                df = self._fetch_via_pycvm(identifier, statement_type)
-                if df is not None and not df.empty:
-                    return df
-            except Exception as exc:
-                logger.warning("pycvm failed for %s: %s", identifier, exc)
 
         return pd.DataFrame()
 
@@ -504,55 +484,7 @@ class BRCvmClient:
 
         return ""
 
-    def _fetch_via_pycvm(self, identifier: str, statement_type: str) -> pd.DataFrame | None:
-        """Legacy fallback: use pycvm library if ZIP extraction fails."""
-        import pycvm
 
-        cd_cvm = self._resolve_cd_cvm(identifier)
-        if not cd_cvm:
-            return None
-
-        from operator1.clients.canonical_translator import _CVM_ACCOUNT_MAP
-
-        current_year = date.today().year
-        rows: list[dict] = []
-
-        for year in range(current_year - 2, current_year + 1):
-            try:
-                url = f"{_CVM_DATASET_BASE}/DOC/DFP/DADOS/dfp_cia_aberta_{year}.zip"
-                z = self._download_zip(url)
-                csv_name = f"dfp_cia_aberta_{year}.csv"
-                if csv_name in z.namelist():
-                    with z.open(csv_name) as f:
-                        df = pd.read_csv(f, sep=";", encoding="latin-1")
-                    company_df = df[df["CD_CVM"].astype(str) == cd_cvm]
-                    for _, row in company_df.iterrows():
-                        account_code = str(row.get("CD_CONTA", ""))
-                        canonical = _CVM_ACCOUNT_MAP.get(account_code)
-                        if not canonical:
-                            continue
-                        value = row.get("VL_CONTA")
-                        if pd.isna(value):
-                            continue
-                        rows.append({
-                            "canonical_name": canonical,
-                            "value": float(value),
-                            "filing_date": str(row.get("DT_RECEB", row.get("DT_REFER", ""))),
-                            "report_date": str(row.get("DT_REFER", "")),
-                            "period_type": "annual",
-                        })
-            except Exception:
-                continue
-
-        if not rows:
-            return None
-
-        df = pd.DataFrame(rows)
-        for col in ("filing_date", "report_date"):
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors="coerce")
-
-        return df
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:
         return pd.DataFrame()
