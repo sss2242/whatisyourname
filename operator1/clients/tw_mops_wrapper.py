@@ -1,43 +1,27 @@
-"""Taiwan MOPS PIT client -- new JSON API (2026 redesign).
+"""Taiwan MOPS PIT client -- dual-source: quarterly HTML + annual JSON API.
 
 MOPS (Market Observation Post System) was redesigned as a Vue.js SPA in
-early 2026.  The old form POST endpoints (``/mops/web/ajax_t163sb04``)
-are WAF-blocked from outside Taiwan.
+early 2026.  The old form POST endpoints on ``mops.twse.com.tw`` are
+WAF-blocked.  However, the legacy backend at ``mopsov.twse.com.tw`` still
+serves quarterly HTML tables via the old form POST interface.
 
-This wrapper uses the **new JSON API** discovered by reverse-engineering
-the Vue.js bundle (``/mops/assets/index.js``).  The API is at
-``/mops/api/`` and accepts JSON POST requests with ``curl_cffi`` Chrome
-TLS impersonation (plain ``requests`` gets 403 from the WAF).
+**Primary source** (quarterly data, HKEX-style session pattern):
+    ``mopsov.twse.com.tw/mops/web/ajax_t164sb04`` etc.
+    - GET index page first to acquire ``jcsession`` cookie
+    - Form POST with ``co_id``, ``year`` (ROC), ``season`` (1-4)
+    - Returns HTML tables parsed by ``pd.read_html()``
+    - 8 quarters (2 years) of data per company
 
-Endpoints:
-    - ``t164sb04`` -- Consolidated income statement (綜合損益表)
-    - ``t164sb03`` -- Consolidated balance sheet (資產負債表)
-    - ``t164sb05`` -- Consolidated cash flow statement (現金流量表)
-    - ``redirectToOld`` -- Bridge to legacy HTML endpoints on mopsov.twse.com.tw
+**Fallback** (annual data, Vue.js API):
+    ``mops.twse.com.tw/mops/api/t164sb04`` etc.
+    - JSON POST with ``companyId``, ``dataType``, ``season``, ``year``
+    - Returns structured JSON with ``reportList`` arrays
+    - Latest 2 annual years per call
 
-API contract::
-
-    POST /mops/api/t164sb04
-    Content-Type: application/json
-
-    {"companyId": "2330", "dataType": "1", "season": "4",
-     "year": "113", "subsidiaryCompanyId": ""}
-
-Response::
-
-    {"code": 200, "message": "查詢成功",
-     "result": {
-       "reportType": "合併",
-       "companyAbbreviation": "台積電",
-       "titles": [...],
-       "reportList": [
-         ["營業收入合計", "3,809,054,272", "100.00", "2,894,307,699", "100.00"],
-         ...
-       ]
-     }}
+Both sources require ``curl_cffi`` with Chrome TLS impersonation.
+No API key required.  No geo-blocking.
 
 Coverage: ~1,700+ listed companies on TWSE/TPEX, ~$1.2T market cap.
-No API key required.  No geo-blocking on the new API.
 """
 
 from __future__ import annotations
@@ -47,20 +31,23 @@ import logging
 import re
 import time
 from datetime import date
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 _MOPS_BASE = "https://mops.twse.com.tw"
 _MOPS_API = f"{_MOPS_BASE}/mops/api"
+_MOPSOV_BASE = "https://mopsov.twse.com.tw"
 _TWSE_BASE = "https://www.twse.com.tw"
 _CACHE_DIR = Path("cache/tw_mops")
 
 # Rate limit: pause between API requests (seconds).
-_REQUEST_DELAY_S = 1.0
+_REQUEST_DELAY_S = 1.5
 
 
 class TWMopsError(Exception):
@@ -158,52 +145,65 @@ _CASHFLOW_MAP: dict[str, str] = {
     "期初現金及約當現金餘額": "beginning_cash",
 }
 
-# Statement type -> (API endpoint, field map)
-_STATEMENT_CONFIG: dict[str, tuple[str, dict[str, str]]] = {
-    "income": ("t164sb04", _INCOME_MAP),
-    "balance": ("t164sb03", _BALANCE_MAP),
-    "cashflow": ("t164sb05", _CASHFLOW_MAP),
+# Statement type -> (consolidated endpoint, individual endpoint, field map)
+_STATEMENT_CONFIG: dict[str, tuple[str, str, dict[str, str]]] = {
+    "income": ("ajax_t164sb04", "ajax_t163sb04", _INCOME_MAP),
+    "balance": ("ajax_t164sb03", "ajax_t163sb05", _BALANCE_MAP),
+    "cashflow": ("ajax_t164sb20", "ajax_t163sb20", _CASHFLOW_MAP),
+}
+
+# JSON API endpoint mapping (fallback)
+_JSON_API_ENDPOINTS: dict[str, str] = {
+    "income": "t164sb04",
+    "balance": "t164sb03",
+    "cashflow": "t164sb05",
 }
 
 
 # ---------------------------------------------------------------------------
-# curl_cffi session helper
+# curl_cffi session helpers
 # ---------------------------------------------------------------------------
 
-def _get_session():
-    """Create a curl_cffi session with Chrome TLS fingerprint.
+def _get_mopsov_session():
+    """Create a curl_cffi session for mopsov.twse.com.tw (legacy HTML API).
 
-    MOPS requires Chrome TLS impersonation -- plain requests gets 403
-    from the WAF.  The session also loads the root page to acquire
-    a JSESSIONID cookie.
+    HKEX-style pattern: GET the index page first to acquire a session
+    cookie (``jcsession``), then POST to ajax endpoints.
     """
+    from curl_cffi import requests as cf_requests
+    session = cf_requests.Session(impersonate="chrome")
+    try:
+        session.get(f"{_MOPSOV_BASE}/mops/web/index", timeout=15)
+        logger.debug("MOPSOV session initialized, cookies: %s", dict(session.cookies))
+    except Exception as exc:
+        logger.debug("MOPSOV session init failed: %s", exc)
+    return session
+
+
+def _get_json_api_session():
+    """Create a curl_cffi session for the new MOPS JSON API (fallback)."""
     from curl_cffi import requests as cf_requests
     session = cf_requests.Session(impersonate="chrome")
     try:
         session.get(f"{_MOPS_BASE}/", timeout=15)
     except Exception as exc:
-        logger.debug("MOPS: failed to load root page: %s", exc)
+        logger.debug("MOPS JSON API session init failed: %s", exc)
     return session
 
 
 def _parse_number(value_str: str) -> float | None:
     """Parse a Chinese/MOPS number string into a float.
 
-    Handles:
-    - Comma-separated thousands: "3,809,054,272"
-    - Negative in parentheses: "(1,234)"
-    - Empty strings -> None
-    - Percentage strings (ignored if no digit)
+    Handles comma-separated thousands, negative in parentheses,
+    and empty strings.
     """
     if not value_str or not value_str.strip():
         return None
     s = value_str.strip()
-    # Remove parentheses (negative)
     negative = False
     if s.startswith("(") and s.endswith(")"):
         negative = True
         s = s[1:-1]
-    # Remove commas
     s = s.replace(",", "")
     try:
         val = float(s)
@@ -217,26 +217,36 @@ def _parse_number(value_str: str) -> float | None:
 # ---------------------------------------------------------------------------
 
 class TWMopsClient:
-    """Point-in-time client for MOPS (Taiwanese equities) using new JSON API.
+    """Point-in-time client for MOPS (Taiwanese equities).
 
-    Implements the ``PITClient`` protocol.  Uses the redesigned MOPS
-    JSON API (2026) with ``curl_cffi`` Chrome TLS impersonation.
+    Implements the ``PITClient`` protocol.  Uses a dual-source approach:
 
-    The API returns the latest 2 years of annual financial data per call
-    (current year vs prior year comparison).  This aligns with the
-    pipeline's 2-year lookback window.
+    **Primary**: ``mopsov.twse.com.tw`` legacy HTML API (quarterly data).
+    Discovered via HKEX-style session probing -- the old MOPS server is
+    still running behind the new Vue.js SPA and serves quarterly financial
+    statements via form POST with proper session cookies.
 
-    Note: MOPS uses ROC calendar (year 113 = CE 2024).
+    **Fallback**: ``mops.twse.com.tw/mops/api/`` JSON API (annual data).
+    The redesigned MOPS exposes a JSON API that returns the latest 2 fiscal
+    years as a comparison table.
+
+    Both require ``curl_cffi`` with Chrome TLS impersonation.
     """
 
     def __init__(self, cache_dir: Path | str = _CACHE_DIR) -> None:
         self._cache_dir = Path(cache_dir)
-        self._session = None
+        self._mopsov_session = None
+        self._json_session = None
 
-    def _get_or_create_session(self):
-        if self._session is None:
-            self._session = _get_session()
-        return self._session
+    def _get_or_create_mopsov_session(self):
+        if self._mopsov_session is None:
+            self._mopsov_session = _get_mopsov_session()
+        return self._mopsov_session
+
+    def _get_or_create_json_session(self):
+        if self._json_session is None:
+            self._json_session = _get_json_api_session()
+        return self._json_session
 
     def _cache_path(self, identifier: str, filename: str) -> Path:
         safe_id = identifier.replace("/", "_").replace("\\", "_").upper()
@@ -259,7 +269,10 @@ class TWMopsClient:
     def _write_cache(self, identifier: str, filename: str, data: dict) -> None:
         path = self._cache_path(identifier, filename)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, default=str, indent=2, ensure_ascii=False), encoding="utf-8")
+        path.write_text(
+            json.dumps(data, default=str, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     @property
     def market_id(self) -> str:
@@ -275,7 +288,7 @@ class TWMopsClient:
 
     def list_companies(self, query: str = "") -> list[dict[str, Any]]:
         """List Taiwanese companies from TWSE stock day all JSON API."""
-        session = self._get_or_create_session()
+        session = self._get_or_create_json_session()
         try:
             r = session.get(
                 f"{_TWSE_BASE}/exchangeReport/STOCK_DAY_ALL",
@@ -318,7 +331,6 @@ class TWMopsClient:
         if cached:
             return cached
 
-        # Retry with backoff for transient failures
         matches: list[dict[str, Any]] = []
         for attempt in range(1, 4):
             try:
@@ -350,38 +362,230 @@ class TWMopsClient:
         return profile
 
     # ------------------------------------------------------------------
-    # Financial statements (new MOPS JSON API)
+    # Financial statements (dual source: quarterly HTML + annual JSON)
     # ------------------------------------------------------------------
 
     def get_income_statement(self, identifier: str) -> pd.DataFrame:
-        return self._fetch_mops_financials(identifier, "income")
+        return self._fetch_financials(identifier, "income")
 
     def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
-        return self._fetch_mops_financials(identifier, "balance")
+        return self._fetch_financials(identifier, "balance")
 
     def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
-        return self._fetch_mops_financials(identifier, "cashflow")
+        return self._fetch_financials(identifier, "cashflow")
 
-    def _fetch_mops_financials(
+    def _fetch_financials(
         self, identifier: str, statement_type: str,
     ) -> pd.DataFrame:
-        """Fetch financial statements from the new MOPS JSON API.
+        """Fetch financial statements using dual source strategy.
 
-        The API returns the latest 2 fiscal years as a comparison table.
-        Each row in ``reportList`` is:
-            [label, current_year_amount, current_year_pct,
-             prior_year_amount, prior_year_pct]
-
-        We extract both years and produce canonical long-format output.
+        Primary: mopsov.twse.com.tw quarterly HTML (HKEX-style session).
+        Fallback: mops.twse.com.tw/mops/api/ annual JSON.
         """
-        endpoint, field_map = _STATEMENT_CONFIG.get(
-            statement_type, ("t164sb04", _INCOME_MAP),
+        # Try primary: quarterly HTML from mopsov
+        df = self._fetch_quarterly_html(identifier, statement_type)
+        if not df.empty:
+            return df
+
+        # Fallback: annual JSON from new MOPS API
+        logger.info(
+            "MOPS quarterly HTML failed for %s/%s, falling back to JSON API",
+            identifier, statement_type,
+        )
+        return self._fetch_annual_json(identifier, statement_type)
+
+    # ------------------------------------------------------------------
+    # Primary: Quarterly HTML from mopsov.twse.com.tw
+    # ------------------------------------------------------------------
+
+    def _fetch_quarterly_html(
+        self, identifier: str, statement_type: str,
+    ) -> pd.DataFrame:
+        """Fetch quarterly financial data from the legacy mopsov server.
+
+        Uses HKEX-style session pattern: GET index first for ``jcsession``
+        cookie, then form POST to ajax endpoints for each quarter.
+        """
+        consolidated_ep, _individual_ep, field_map = _STATEMENT_CONFIG[statement_type]
+        session = self._get_or_create_mopsov_session()
+
+        current_year = date.today().year
+        current_roc = _ce_to_roc(current_year)
+        current_quarter = max(1, (date.today().month - 1) // 3)
+
+        all_rows: list[dict[str, Any]] = []
+
+        # Fetch 2 years of quarterly data (up to 8 quarters)
+        for roc_year in range(current_roc, current_roc - 3, -1):
+            for season in range(4, 0, -1):
+                ce_year = _roc_to_ce(roc_year)
+                # Skip future quarters
+                if ce_year == current_year and season > current_quarter:
+                    continue
+
+                try:
+                    r = session.post(
+                        f"{_MOPSOV_BASE}/mops/web/{consolidated_ep}",
+                        data={
+                            "encodeURIComponent": "1",
+                            "step": "1",
+                            "firstin": "1",
+                            "off": "1",
+                            "TYPEK": "sii",
+                            "co_id": identifier,
+                            "year": str(roc_year),
+                            "season": str(season),
+                        },
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Referer": f"{_MOPSOV_BASE}/mops/web/{consolidated_ep.replace('ajax_', '')}",
+                        },
+                        timeout=20,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "MOPSOV %s failed for %s Y%sQ%s: %s",
+                        statement_type, identifier, roc_year, season, exc,
+                    )
+                    time.sleep(_REQUEST_DELAY_S)
+                    continue
+
+                if not r.text or "<table" not in r.text[:5000].lower():
+                    time.sleep(_REQUEST_DELAY_S)
+                    continue
+
+                if "PAGE CANNOT" in r.text[:500]:
+                    logger.debug("MOPSOV WAF block for %s", identifier)
+                    time.sleep(_REQUEST_DELAY_S)
+                    continue
+
+                # Extract period from HTML header
+                period_match = re.search(
+                    r"民國(\d{2,3})年第(\d)季", r.text[:2000],
+                )
+                if period_match:
+                    actual_roc = int(period_match.group(1))
+                    actual_q = int(period_match.group(2))
+                    actual_ce = _roc_to_ce(actual_roc)
+                else:
+                    actual_ce = ce_year
+                    actual_q = season
+
+                # Determine report_date from quarter
+                month_end = {1: "03-31", 2: "06-30", 3: "09-30", 4: "12-31"}
+                report_date = f"{actual_ce}-{month_end[actual_q]}"
+
+                # Parse HTML table
+                rows = self._parse_html_table(
+                    r.text, field_map, identifier, report_date,
+                )
+                all_rows.extend(rows)
+
+                time.sleep(_REQUEST_DELAY_S)
+
+                # Stop after 8 quarters
+                if len(all_rows) > 0 and len(set(
+                    r["report_date"] for r in all_rows
+                )) >= 8:
+                    break
+            else:
+                continue
+            break
+
+        if not all_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_rows)
+        for col in ("filing_date", "report_date"):
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+
+        # Deduplicate: keep first per (canonical_name, report_date)
+        df = df.drop_duplicates(
+            subset=["canonical_name", "report_date"], keep="first",
         )
 
-        session = self._get_or_create_session()
+        logger.info(
+            "MOPS quarterly %s for %s: %d rows across %d periods",
+            statement_type, identifier, len(df),
+            df["report_date"].nunique() if not df.empty else 0,
+        )
+        return df
+
+    def _parse_html_table(
+        self,
+        html: str,
+        field_map: dict[str, str],
+        identifier: str,
+        report_date: str,
+    ) -> list[dict[str, Any]]:
+        """Parse a MOPS HTML table response into canonical rows."""
+        rows: list[dict[str, Any]] = []
+        try:
+            dfs = pd.read_html(StringIO(html))
+        except Exception:
+            return rows
+
+        for df in dfs:
+            if df.shape[0] < 5 or df.shape[1] < 2:
+                continue
+
+            for _, row in df.iterrows():
+                label = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+                # Strip indentation characters
+                label = label.lstrip("\u3000 \t")
+
+                canonical = field_map.get(label)
+                if not canonical:
+                    continue
+
+                # Current period value is in column 1
+                val = row.iloc[1] if df.shape[1] > 1 else None
+                if pd.isna(val):
+                    continue
+
+                value = _parse_number(str(val))
+                if value is None:
+                    # pandas may have already parsed it as float
+                    try:
+                        value = float(val)
+                        if np.isnan(value):
+                            continue
+                    except (ValueError, TypeError):
+                        continue
+
+                rows.append({
+                    "canonical_name": canonical,
+                    "value": value,
+                    "report_date": report_date,
+                    "filing_date": report_date,
+                    "source": "mopsov_quarterly",
+                    "market_id": "tw_mops",
+                    "identifier": identifier,
+                })
+
+            # Use only the first large table (financial data)
+            if rows:
+                break
+
+        return rows
+
+    # ------------------------------------------------------------------
+    # Fallback: Annual JSON from new MOPS API
+    # ------------------------------------------------------------------
+
+    def _fetch_annual_json(
+        self, identifier: str, statement_type: str,
+    ) -> pd.DataFrame:
+        """Fetch annual financials from the new MOPS JSON API (fallback).
+
+        Returns the latest 2 fiscal years as a comparison table.
+        """
+        endpoint = _JSON_API_ENDPOINTS.get(statement_type, "t164sb04")
+        field_map = _STATEMENT_CONFIG[statement_type][2]
+        session = self._get_or_create_json_session()
         current_roc = _ce_to_roc(date.today().year)
 
-        # Try current year first, then prior year
         result = None
         for year_offset in range(0, 3):
             roc_year = str(current_roc - year_offset)
@@ -408,65 +612,44 @@ class TWMopsClient:
                     break
             except Exception as exc:
                 logger.debug(
-                    "MOPS %s fetch failed for %s (year=%s): %s",
+                    "MOPS JSON %s failed for %s (year=%s): %s",
                     statement_type, identifier, roc_year, exc,
                 )
             time.sleep(_REQUEST_DELAY_S)
 
         if result is None:
-            logger.warning(
-                "MOPS %s: no data for %s after trying %d years",
-                statement_type, identifier, 3,
-            )
             return pd.DataFrame()
 
-        # Parse the reportList into canonical rows
-        return self._parse_report_list(
+        return self._parse_json_report_list(
             result, statement_type, field_map, identifier,
         )
 
-    def _parse_report_list(
+    def _parse_json_report_list(
         self,
         result: dict[str, Any],
         statement_type: str,
         field_map: dict[str, str],
         identifier: str,
     ) -> pd.DataFrame:
-        """Parse MOPS JSON reportList into canonical long-format DataFrame.
-
-        The ``titles`` structure tells us which fiscal years the columns
-        represent.  Typically::
-
-            titles[1].main = "114年度" (current year, ROC)
-            titles[2].main = "113年度" (prior year, ROC)
-
-        For balance sheets, titles may show dates like "114年12月31日".
-        """
+        """Parse MOPS JSON API reportList into canonical long-format DataFrame."""
         report_list = result.get("reportList", [])
         if not report_list:
             return pd.DataFrame()
 
-        # Extract year information from titles
+        # Extract year info and column stride from titles
         titles = result.get("titles", [])
         years: list[int] = []
-        # Count sub-columns per year to determine stride
-        # Income/balance: each year has [金額, %] -> stride 2
-        # Cashflow: each year has [金額] only -> stride 1
         stride = 1
-        for t in titles[1:]:  # skip first title (header label)
+        for t in titles[1:]:
             main = t.get("main", "")
             subs = t.get("sub", [])
-            # Extract ROC year from patterns like "114年度" or "114年12月31日"
             year_match = re.search(r"(\d{2,3})年", main)
             if year_match:
-                roc = int(year_match.group(1))
-                years.append(_roc_to_ce(roc))
-                # Count sub-columns (金額 and optionally %)
+                years.append(_roc_to_ce(int(year_match.group(1))))
                 if len(subs) > 1:
                     stride = len(subs)
 
         if len(years) < 2:
-            # Fallback: assume current year and prior year
             cy = date.today().year
             years = [cy, cy - 1]
 
@@ -475,37 +658,23 @@ class TWMopsClient:
             if not row or len(row) < 3:
                 continue
 
-            label = row[0].strip()
-            # Remove leading whitespace/indentation characters
-            label = label.lstrip("\u3000 \t")
-
+            label = row[0].strip().lstrip("\u3000 \t")
             canonical = field_map.get(label)
             if not canonical:
                 continue
 
-            # Extract values for each year
-            # Income/balance: [label, y1_amount, y1_pct, y2_amount, y2_pct] (stride=2)
-            # Cashflow:       [label, y1_amount, y2_amount]                 (stride=1)
             for yi, year in enumerate(years):
                 val_idx = 1 + yi * stride
                 if val_idx >= len(row):
                     continue
-
                 value = _parse_number(row[val_idx])
                 if value is None:
                     continue
-
-                # Determine report_date from year
-                if statement_type == "balance":
-                    report_date = f"{year}-12-31"
-                else:
-                    report_date = f"{year}-12-31"
-
                 rows.append({
                     "canonical_name": canonical,
                     "value": value,
-                    "report_date": report_date,
-                    "filing_date": report_date,
+                    "report_date": f"{year}-12-31",
+                    "filing_date": f"{year}-12-31",
                     "source": "mops_json_api",
                     "market_id": "tw_mops",
                     "identifier": identifier,
@@ -518,14 +687,12 @@ class TWMopsClient:
         for col in ("filing_date", "report_date"):
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
-
-        # Deduplicate: keep first occurrence per (canonical_name, report_date)
         df = df.drop_duplicates(
             subset=["canonical_name", "report_date"], keep="first",
         )
 
         logger.info(
-            "MOPS %s for %s: %d canonical rows across %d years",
+            "MOPS JSON %s for %s: %d rows across %d years",
             statement_type, identifier, len(df), len(years),
         )
         return df
