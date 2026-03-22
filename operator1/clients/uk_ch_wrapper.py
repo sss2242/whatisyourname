@@ -748,3 +748,60 @@ class UKCompaniesHouseClient:
             ]
         except Exception:
             return []
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch persons with significant control (>25% shares/voting rights).
+
+        Uses the Companies House PSC endpoint which returns anyone with
+        >25% shares, >25% voting rights, or significant influence.
+
+        Returns list of dicts with: name, shares, percentage, holder_type,
+        date_reported, natures_of_control.
+        """
+        try:
+            data = self._get(f"/company/{identifier}/persons-with-significant-control")
+            items = data.get("items", []) if isinstance(data, dict) else []
+        except Exception as exc:
+            logger.debug("UK PSC fetch failed for %s: %s", identifier, exc)
+            return []
+
+        holders: list[dict[str, Any]] = []
+        for item in items:
+            # Build name from name or name_elements
+            name = item.get("name", "")
+            if not name:
+                elems = item.get("name_elements", {})
+                forename = elems.get("forename", "")
+                surname = elems.get("surname", "")
+                name = f"{forename} {surname}".strip() if surname else ""
+
+            natures = item.get("natures_of_control", [])
+            pct = 0.0
+            holder_type = "individual"
+
+            for nature in natures:
+                nl = nature.lower()
+                if "corporate" in nl:
+                    holder_type = "corporate"
+                if "75-to-100" in nl:
+                    pct = max(pct, 87.5)
+                elif "50-to-75" in nl:
+                    pct = max(pct, 62.5)
+                elif "25-to-50" in nl:
+                    pct = max(pct, 37.5)
+                elif "significant-influence" in nl or "significant-control" in nl:
+                    pct = max(pct, 25.0)
+
+            if name:
+                holders.append({
+                    "name": name,
+                    "shares": 0,  # PSC doesn't provide exact share counts
+                    "percentage": round(pct, 2),
+                    "holder_type": holder_type,
+                    "date_reported": item.get("notified_on", ""),
+                    "natures_of_control": natures,
+                })
+
+        if holders:
+            logger.info("UK holders for %s: %d from Companies House PSC", identifier, len(holders))
+        return holders

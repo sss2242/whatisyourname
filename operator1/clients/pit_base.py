@@ -110,6 +110,22 @@ class PITClient(Protocol):
         """Return key executives / officers."""
         ...
 
+    # -- Institutional / major holders ----------------------------------------
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Return institutional or major shareholders.
+
+        Each dict should contain at minimum:
+            - ``name``: holder name (institution or individual)
+            - ``shares``: number of shares held (0 if unknown)
+            - ``percentage``: percentage of outstanding shares (0.0 if unknown)
+
+        Optional fields: ``value``, ``holder_type``, ``date_reported``.
+
+        Returns empty list if holder data is not available for this market.
+        """
+        ...
+
 
 class PITClientError(Exception):
     """Base exception for PIT client errors."""

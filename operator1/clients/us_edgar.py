@@ -669,6 +669,39 @@ class USEdgarClient:
         """SEC doesn't have a direct executives endpoint; returns empty."""
         return []
 
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch institutional holders via yfinance (backed by Yahoo Finance).
+
+        Yahoo Finance aggregates 13F filing data into a convenient
+        institutional_holders table.  This avoids parsing raw 13F XML
+        which requires cross-referencing thousands of filer CIKs.
+
+        Returns list of dicts with: name, shares, percentage, value,
+        holder_type, date_reported.
+        """
+        holders: list[dict[str, Any]] = []
+        try:
+            import yfinance as yf
+            tick = yf.Ticker(identifier)
+            inst = tick.institutional_holders
+            if inst is not None and not inst.empty:
+                for _, row in inst.iterrows():
+                    pct = row.get("% Out", 0)
+                    if isinstance(pct, (int, float)) and pct < 1:
+                        pct = pct * 100  # Convert fraction to percentage
+                    holders.append({
+                        "name": str(row.get("Holder", "")),
+                        "shares": int(row.get("Shares", 0)),
+                        "value": float(row.get("Value", 0)),
+                        "percentage": round(float(pct), 2),
+                        "holder_type": "institutional",
+                        "date_reported": str(row.get("Date Reported", "")),
+                    })
+                logger.info("US holders for %s: %d from yfinance", identifier, len(holders))
+        except Exception as exc:
+            logger.debug("yfinance institutional holders failed for %s: %s", identifier, exc)
+        return holders
+
     # -- edgartools financial extraction -------------------------------------
 
     # Metadata columns returned by edgartools as_dataframe=True (v5.15+).

@@ -647,6 +647,16 @@ Non-interactive examples:
             "industry": company_info.get("industry", ""),
         }
 
+    # Step 2b: Fetch institutional/major holders (US/UK/KR only)
+    target_holders: list[dict] = []
+    try:
+        if hasattr(pit_client, "get_holders"):
+            target_holders = pit_client.get_holders(identifier)
+            if target_holders:
+                logger.info("Holders loaded: %d for %s", len(target_holders), ticker)
+    except Exception as exc:
+        logger.debug("Holder fetch skipped: %s", exc)
+
     # ------------------------------------------------------------------
     # Step 3: Fetch PIT financial data
     # ------------------------------------------------------------------
@@ -2392,6 +2402,16 @@ Non-interactive examples:
         # Inject reconciliation report
         if reconciliation_report:
             profile["meta"]["reconciliation"] = reconciliation_report
+
+        # Inject institutional/major holders
+        if target_holders:
+            profile["institutional_holders"] = {
+                "available": True,
+                "holders": target_holders[:10],
+                "total_holders": len(target_holders),
+            }
+        else:
+            profile["institutional_holders"] = {"available": False}
 
         # Inject extended model results into profile
         if "extended_models" not in profile:

@@ -997,3 +997,98 @@ class KRDartClient:
             ]
         except Exception:
             return []
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch major shareholders (>5%) from DART.
+
+        Uses dart-fss ``majorstock`` endpoint first, falls back to
+        ``hyslr_sttus`` (major shareholder status report).
+
+        Returns list of dicts with: name, shares, percentage, holder_type,
+        date_reported.
+        """
+        if not self._api_key:
+            return []
+
+        corp_code = self._resolve_corp_code(identifier)
+        if not corp_code:
+            return []
+
+        holders: list[dict[str, Any]] = []
+
+        # Try majorstock endpoint (simplest)
+        try:
+            import dart_fss
+            dart_fss.set_api_key(self._api_key)
+            data = dart_fss.api.shareholder.majorstock(corp_code, api_key=self._api_key)
+            items = data.get("list", []) if isinstance(data, dict) else []
+            for item in items:
+                name = item.get("nm", "") or item.get("stock_nm", "")
+                shares = 0
+                try:
+                    shares = int(str(item.get("bsis_posesn_stock_co", "0")).replace(",", ""))
+                except (ValueError, TypeError):
+                    pass
+                pct = 0.0
+                try:
+                    pct = float(str(item.get("bsis_posesn_stock_qota_rt", "0")).replace(",", ""))
+                except (ValueError, TypeError):
+                    pass
+                if name:
+                    holders.append({
+                        "name": name,
+                        "shares": shares,
+                        "percentage": round(pct, 2),
+                        "holder_type": "major",
+                        "date_reported": item.get("rcept_dt", ""),
+                    })
+            if holders:
+                logger.info("KR holders for %s: %d from DART majorstock", identifier, len(holders))
+                return holders
+        except Exception as exc:
+            logger.debug("DART majorstock failed for %s: %s", corp_code, exc)
+
+        # Fallback: hyslr_sttus (shareholder status by report period)
+        try:
+            import dart_fss
+            for year_offset in range(0, 3):
+                bsns_year = str(date.today().year - year_offset)
+                for reprt_code in ("11011", "11012", "11013", "11014"):
+                    try:
+                        data = dart_fss.api.info.hyslr_sttus(
+                            corp_code, bsns_year=bsns_year, reprt_code=reprt_code,
+                            api_key=self._api_key,
+                        )
+                        items = data.get("list", []) if isinstance(data, dict) else []
+                        seen_names: set[str] = set()
+                        for item in items:
+                            name = item.get("nm", "")
+                            if not name or name in seen_names:
+                                continue
+                            seen_names.add(name)
+                            shares = 0
+                            try:
+                                shares = int(str(item.get("trmend_posesn_stock_co", "0")).replace(",", ""))
+                            except (ValueError, TypeError):
+                                pass
+                            pct = 0.0
+                            try:
+                                pct = float(str(item.get("trmend_posesn_stock_qota_rt", "0")).replace(",", ""))
+                            except (ValueError, TypeError):
+                                pass
+                            holders.append({
+                                "name": name,
+                                "shares": shares,
+                                "percentage": round(pct, 2),
+                                "holder_type": item.get("relate", "major"),
+                                "date_reported": bsns_year,
+                            })
+                        if holders:
+                            logger.info("KR holders for %s: %d from DART hyslr_sttus", identifier, len(holders))
+                            return holders
+                    except Exception:
+                        continue
+        except ImportError:
+            pass
+
+        return holders

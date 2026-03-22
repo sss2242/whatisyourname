@@ -61,6 +61,7 @@ OPTIONAL_PROFILE_KEYS: set[str] = {
     "historical_analogs",
     "patterns",
     "cycle_decomposition",
+    "institutional_holders",
 }
 
 

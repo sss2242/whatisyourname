@@ -88,8 +88,8 @@ class ReportMode(str, Enum):
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20},
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 7, 11, 14, 16, 17, 18, 195, 196, 20},
-    ReportTier.PREMIUM: set(range(1, 23)) | {195, 196},  # all 22 sections + geopolitical + SIX
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 7, 11, 14, 16, 17, 18, 195, 196, 197, 20},
+    ReportTier.PREMIUM: set(range(1, 23)) | {195, 196, 197},  # all 22 sections + geopolitical + SIX + holders
 }
 
 
@@ -2455,6 +2455,40 @@ def _build_key_indicators_table(profile: dict[str, Any], mode: ReportMode = Repo
     return "\n".join(lines)
 
 
+def _build_institutional_holders_section(profile: dict[str, Any]) -> str:
+    """Build Institutional/Major Holders section from holder data."""
+    holders_data = profile.get("institutional_holders", {})
+    if not holders_data.get("available"):
+        return "*Institutional holder data not available for this market.*\n"
+
+    holders = holders_data.get("holders", [])
+    if not holders:
+        return "*No institutional holders found.*\n"
+
+    lines = [
+        "### Top Institutional / Major Holders",
+        "",
+        "| Holder | Shares | % Outstanding | Type |",
+        "|--------|--------|--------------|------|",
+    ]
+    for h in holders[:10]:
+        name = h.get("name", "Unknown")
+        shares = h.get("shares", 0)
+        pct = h.get("percentage", 0)
+        htype = h.get("holder_type", "institutional")
+        shares_str = f"{shares:,.0f}" if shares else "N/A"
+        pct_str = f"{pct:.1f}%" if pct else "N/A"
+        lines.append(f"| {name} | {shares_str} | {pct_str} | {htype} |")
+
+    lines.append("")
+    total = holders_data.get("total_holders", len(holders))
+    if total > 10:
+        lines.append(f"*Showing top 10 of {total} holders.*")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def _build_geopolitical_risk_section(profile: dict[str, Any]) -> str:
     """Build Geopolitical & Conflict Risk section from conflict_risk data."""
     lines: list[str] = []
@@ -2838,6 +2872,7 @@ def _build_fallback_report(
         19: ("19. Advanced Quantitative Insights", _build_advanced_insights(profile)),
         195: ("19.5. Geopolitical & Conflict Risk", _build_geopolitical_risk_section(profile)),
         196: ("19.6. SIX Swiss Exchange Analysis", _build_six_swiss_exchange_section(profile)),
+        197: ("19.7. Institutional / Major Holders", _build_institutional_holders_section(profile)),
         20: ("20. Risk Factors & Limitations", (
             _build_risk_assessment(profile) + "\n\n### 20.1 LIMITATIONS\n\n" + _build_limitations(profile)
         )),
