@@ -631,6 +631,20 @@ class ConformalPIDCalibrator:
         global_key = self._bucket_key(variable, "_global")
         return self._scores.get(global_key, [])
 
+    def update(self, residual: float, variable: str = "_global") -> None:
+        """Backward-compatible residual update (calls add_score internally).
+
+        Used by main.py when feeding ForecastResult.residuals (flat floats)
+        into the calibrator. Routes to the global bucket since flat residuals
+        do not carry variable or mode information.
+        """
+        if math.isnan(residual):
+            return
+        self.add_score(variable, 0.0, residual, mode="_global")
+
+    # Alias for compatibility with older callers
+    add_residual = update
+
     def add_score(
         self,
         variable: str,
@@ -743,6 +757,28 @@ class ConformalPIDCalibrator:
             interval_width=width * 2,
             is_adaptive=True,
         )
+
+    @property
+    def coverage(self) -> float:
+        """Target coverage (for build_conformal_result compatibility)."""
+        return self._target
+
+    @property
+    def _adaptive(self) -> bool:
+        """Always True for PID calibrator (for build_conformal_result compat)."""
+        return True
+
+    def get_quantile(self, variable: str) -> float:
+        """Get conformal quantile for a variable (build_conformal_result compat)."""
+        scores = self._get_scores(variable, "_global")
+        if len(scores) < self._min_samples:
+            return float("nan")
+        alpha = self._alpha_t.get(variable, self._alpha)
+        n = len(scores)
+        q_level = min(1.0, math.ceil((n + 1) * (1 - alpha)) / n)
+        sorted_scores = np.sort(scores)
+        idx = min(int(q_level * n), n - 1)
+        return float(sorted_scores[idx])
 
     def get_diagnostics(self) -> dict[str, Any]:
         """Return diagnostics for logging/profile."""
