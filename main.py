@@ -1295,6 +1295,8 @@ Non-interactive examples:
             graph_risk_result = compute_graph_risk_metrics(
                 target_isin=target_profile.get("isin", ticker),
                 relationships=_rel_dicts,
+                target_cache=cache,
+                linked_caches=linked_caches if linked_caches else None,
             )
             logger.info(
                 "Graph risk: %d nodes, centrality=%.3f",
@@ -1991,7 +1993,10 @@ Non-interactive examples:
                 _dtw_vars = [c for c in ["equity_value", "revenue", "net_income",
                              "total_debt", "operating_cash_flow"]
                              if c in cache.columns and cache[c].notna().sum() > 30]
-            dtw_result = find_historical_analogs(cache, variables=_dtw_vars)
+            dtw_result = find_historical_analogs(
+                cache, variables=_dtw_vars,
+                linked_caches=linked_caches if linked_caches else None,
+            )
             logger.info("DTW analogs complete")
         except Exception as exc:
             logger.warning("DTW historical analogs failed: %s", exc)
@@ -2054,6 +2059,58 @@ Non-interactive examples:
             logger.info("Sobol sensitivity analysis complete")
         except Exception as exc:
             logger.warning("Sobol sensitivity failed: %s", exc)
+
+        # Sobol -> Hierarchy feedback loop (Proposal 1.5)
+        # Adjusts hierarchy weights toward data-driven Sobol importance
+        try:
+            from operator1.models.sensitivity import adjust_hierarchy_from_sobol
+            _adjusted_weights = adjust_hierarchy_from_sobol(sobol_result, weights)
+            if _adjusted_weights != weights:
+                weights = _adjusted_weights
+                logger.info("Hierarchy weights adjusted from Sobol: %s", weights)
+        except Exception as exc:
+            logger.debug("Sobol hierarchy feedback skipped: %s", exc)
+
+        # Time-varying Granger causality (Proposal 3.5)
+        _tv_granger_result = None
+        try:
+            from operator1.models.granger_causality import compute_time_varying_granger
+            _tv_granger_result = compute_time_varying_granger(cache, variables=_gc_vars[:15] if '_gc_vars' in dir() else None)
+            if _tv_granger_result and _tv_granger_result.get("emerging_pairs"):
+                logger.info(
+                    "Time-varying Granger: %d windows, %d emerging, %d disappearing",
+                    _tv_granger_result.get("n_windows", 0),
+                    len(_tv_granger_result.get("emerging_pairs", [])),
+                    len(_tv_granger_result.get("disappearing_pairs", [])),
+                )
+        except Exception as exc:
+            logger.debug("Time-varying Granger failed: %s", exc)
+
+        # Multivariate Monte Carlo (Proposal 3.3)
+        _mv_mc_result = None
+        try:
+            from operator1.models.monte_carlo import run_multivariate_monte_carlo
+            _copula_corr = None
+            if copula_result is not None and hasattr(copula_result, "copula_correlation"):
+                # Extract correlation matrix from dict format
+                _cop_vars = list(copula_result.copula_correlation.keys())
+                if _cop_vars:
+                    import numpy as _np
+                    _copula_corr = _np.array([
+                        [copula_result.copula_correlation[vi].get(vj, 0.0) for vj in _cop_vars]
+                        for vi in _cop_vars
+                    ])
+            _mv_mc_result = run_multivariate_monte_carlo(
+                cache, copula_correlation=_copula_corr,
+            )
+            if _mv_mc_result and _mv_mc_result.get("available"):
+                logger.info(
+                    "Multivariate MC: survival=%.4f, vars=%s",
+                    _mv_mc_result.get("survival_probability", 0),
+                    _mv_mc_result.get("variables_simulated", []),
+                )
+        except Exception as exc:
+            logger.debug("Multivariate Monte Carlo failed: %s", exc)
 
         # Genetic Algorithm
         try:
@@ -2327,6 +2384,19 @@ Non-interactive examples:
                 "n_pruned": len(granger_result.pruned_variables),
                 "top_pairs": granger_result.significant_pairs[:10],
             }
+
+        # Time-varying Granger causality (Proposal 3.5)
+        if _tv_granger_result is not None and _tv_granger_result.get("n_windows", 0) > 0:
+            profile["extended_models"]["time_varying_granger"] = {
+                "available": True,
+                "n_windows": _tv_granger_result["n_windows"],
+                "emerging_pairs": _tv_granger_result.get("emerging_pairs", []),
+                "disappearing_pairs": _tv_granger_result.get("disappearing_pairs", []),
+            }
+
+        # Multivariate Monte Carlo (Proposal 3.3)
+        if _mv_mc_result is not None and _mv_mc_result.get("available"):
+            profile["extended_models"]["multivariate_monte_carlo"] = _mv_mc_result
 
         # Dual regimes
         if dual_regime_result is not None and dual_regime_result.fitted:
