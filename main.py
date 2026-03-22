@@ -1174,6 +1174,19 @@ Non-interactive examples:
     try:
         cache["company_survival_mode_flag"] = compute_company_survival_flag(cache)
         cache["survival_probability"] = compute_survival_probability(cache)
+        # Cox PH data-driven survival risk score (lifelines)
+        try:
+            from operator1.analysis.survival_mode import compute_cox_survival_score
+            _cox_score = compute_cox_survival_score(cache)
+            if _cox_score.notna().any():
+                cache["cox_survival_score"] = _cox_score
+                # Blend sigmoid + Cox for combined probability
+                _sig = cache["survival_probability"]
+                _cox = cache["cox_survival_score"].fillna(_sig)
+                cache["survival_probability"] = 0.4 * _sig + 0.6 * _cox
+                logger.info("Cox PH survival score computed and blended")
+        except Exception as _exc:
+            logger.debug("Cox PH survival score skipped: %s", _exc)
         cache = compute_hierarchy_weights(cache)
         for i in range(1, 6):
             col = f"hierarchy_tier{i}_weight"
@@ -1576,6 +1589,17 @@ Non-interactive examples:
             cache, early_regime_result = run_early_regime_detection(
                 cache, target_variable=_regime_target,
             )
+            # Online change point detection via ChangeFinder
+            try:
+                from operator1.models.regime_detector import compute_online_change_scores
+                _ret_for_cf = cache.get(_regime_target)
+                if _ret_for_cf is not None and _ret_for_cf.notna().sum() > 30:
+                    _cf_scores = compute_online_change_scores(_ret_for_cf.fillna(0).values)
+                    if _cf_scores is not None:
+                        cache["online_change_score"] = _cf_scores
+                        logger.info("ChangeFinder online scores computed")
+            except Exception as _exc:
+                logger.debug("ChangeFinder skipped: %s", _exc)
             if early_regime_result and early_regime_result.fitted:
                 regime_detector = early_regime_result.detector
                 logger.info("Early regime detection complete")
@@ -1996,10 +2020,16 @@ Non-interactive examples:
             logger.warning("Particle filter failed: %s", exc)
 
         # Conformal prediction (before aggregation so results feed in)
+        # Prefer ConformalPIDCalibrator (PID-controlled + Mondrian partitioning)
+        # with fallback to standard ConformalCalibrator.
         try:
-            from operator1.models.conformal import ConformalCalibrator, build_conformal_result
+            from operator1.models.conformal import ConformalPIDCalibrator, ConformalCalibrator, build_conformal_result
             if forecast_result is not None:
-                calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
+                try:
+                    calibrator = ConformalPIDCalibrator(target_coverage=0.9)
+                    logger.info("Using ConformalPIDCalibrator (PID + Mondrian)")
+                except Exception:
+                    calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
                 if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
                     for r in forecast_result.residuals:
                         calibrator.update(r)

@@ -594,7 +594,6 @@ def compute_graph_risk_metrics(
         )
 
         # CoVaR and SRISK systemic risk measures (2.5)
-        import pandas as pd
         if target_cache is not None and linked_caches:
             _ret_col = "return_1d"
             if _ret_col in target_cache.columns:
