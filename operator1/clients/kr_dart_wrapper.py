@@ -953,6 +953,93 @@ class KRDartClient:
 
     # -- Price data ------------------------------------------------------------
 
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return quarterly major shareholder metrics over time from DART.
+
+        Fetches hyslr_sttus for each report period across the requested
+        year range (up to 8 quarters). Aggregates per period into:
+        inst_ownership_pct, inst_top5_concentration, inst_holder_count.
+
+        Returns DataFrame with date_reported + inst_* columns.
+        """
+        if not self._api_key:
+            return pd.DataFrame()
+
+        corp_code = self._resolve_corp_code(identifier)
+        if not corp_code:
+            return pd.DataFrame()
+
+        rows: list[dict] = []
+        # Report codes: 11011=annual, 11012=semi, 11013=Q1, 11014=Q3
+        report_periods = [
+            ("11014", "-09-30"),  # Q3 (Sept)
+            ("11012", "-06-30"),  # Semi (June)
+            ("11013", "-03-31"),  # Q1 (March)
+            ("11011", "-12-31"),  # Annual (Dec)
+        ]
+
+        try:
+            import dart_fss
+            dart_fss.set_api_key(self._api_key)
+
+            for year_offset in range(0, years + 1):
+                bsns_year = str(date.today().year - year_offset)
+                for reprt_code, month_day in report_periods:
+                    try:
+                        _dart_throttle()
+                        data = dart_fss.api.info.hyslr_sttus(
+                            corp_code, bsns_year=bsns_year, reprt_code=reprt_code,
+                            api_key=self._api_key,
+                        )
+                        items = data.get("list", []) if isinstance(data, dict) else []
+                        if not items:
+                            continue
+
+                        # Aggregate holder data for this period
+                        total_pct = 0.0
+                        holder_count = 0
+                        top_pcts: list[float] = []
+                        for item in items:
+                            pct = 0.0
+                            try:
+                                pct = float(str(item.get("trmend_posesn_stock_qota_rt", "0")).replace(",", ""))
+                            except (ValueError, TypeError):
+                                pass
+                            if pct > 0:
+                                total_pct += pct
+                                holder_count += 1
+                                top_pcts.append(pct)
+
+                        # HHI of top 5
+                        top_pcts.sort(reverse=True)
+                        top5 = top_pcts[:5]
+                        hhi = 0.0
+                        if top5:
+                            total_top5 = sum(top5)
+                            if total_top5 > 0:
+                                hhi = sum((p / total_top5) ** 2 for p in top5)
+
+                        report_date = f"{bsns_year}{month_day}"
+                        rows.append({
+                            "date_reported": pd.Timestamp(report_date),
+                            "inst_ownership_pct": round(total_pct, 2),
+                            "inst_top5_concentration": round(hhi, 4),
+                            "inst_holder_count": holder_count,
+                        })
+                    except Exception:
+                        continue
+        except ImportError:
+            return pd.DataFrame()
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows).sort_values("date_reported").drop_duplicates(
+            subset=["date_reported"], keep="last"
+        )
+        logger.info("KR holder history for %s: %d quarterly snapshots", identifier, len(df))
+        return df
+
     def get_quotes(self, identifier: str) -> pd.DataFrame:
         """DART does not provide OHLCV data. Returns empty DataFrame."""
         return pd.DataFrame()
@@ -997,3 +1084,98 @@ class KRDartClient:
             ]
         except Exception:
             return []
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch major shareholders (>5%) from DART.
+
+        Uses dart-fss ``majorstock`` endpoint first, falls back to
+        ``hyslr_sttus`` (major shareholder status report).
+
+        Returns list of dicts with: name, shares, percentage, holder_type,
+        date_reported.
+        """
+        if not self._api_key:
+            return []
+
+        corp_code = self._resolve_corp_code(identifier)
+        if not corp_code:
+            return []
+
+        holders: list[dict[str, Any]] = []
+
+        # Try majorstock endpoint (simplest)
+        try:
+            import dart_fss
+            dart_fss.set_api_key(self._api_key)
+            data = dart_fss.api.shareholder.majorstock(corp_code, api_key=self._api_key)
+            items = data.get("list", []) if isinstance(data, dict) else []
+            for item in items:
+                name = item.get("nm", "") or item.get("stock_nm", "")
+                shares = 0
+                try:
+                    shares = int(str(item.get("bsis_posesn_stock_co", "0")).replace(",", ""))
+                except (ValueError, TypeError):
+                    pass
+                pct = 0.0
+                try:
+                    pct = float(str(item.get("bsis_posesn_stock_qota_rt", "0")).replace(",", ""))
+                except (ValueError, TypeError):
+                    pass
+                if name:
+                    holders.append({
+                        "name": name,
+                        "shares": shares,
+                        "percentage": round(pct, 2),
+                        "holder_type": "major",
+                        "date_reported": item.get("rcept_dt", ""),
+                    })
+            if holders:
+                logger.info("KR holders for %s: %d from DART majorstock", identifier, len(holders))
+                return holders
+        except Exception as exc:
+            logger.debug("DART majorstock failed for %s: %s", corp_code, exc)
+
+        # Fallback: hyslr_sttus (shareholder status by report period)
+        try:
+            import dart_fss
+            for year_offset in range(0, 3):
+                bsns_year = str(date.today().year - year_offset)
+                for reprt_code in ("11011", "11012", "11013", "11014"):
+                    try:
+                        data = dart_fss.api.info.hyslr_sttus(
+                            corp_code, bsns_year=bsns_year, reprt_code=reprt_code,
+                            api_key=self._api_key,
+                        )
+                        items = data.get("list", []) if isinstance(data, dict) else []
+                        seen_names: set[str] = set()
+                        for item in items:
+                            name = item.get("nm", "")
+                            if not name or name in seen_names:
+                                continue
+                            seen_names.add(name)
+                            shares = 0
+                            try:
+                                shares = int(str(item.get("trmend_posesn_stock_co", "0")).replace(",", ""))
+                            except (ValueError, TypeError):
+                                pass
+                            pct = 0.0
+                            try:
+                                pct = float(str(item.get("trmend_posesn_stock_qota_rt", "0")).replace(",", ""))
+                            except (ValueError, TypeError):
+                                pass
+                            holders.append({
+                                "name": name,
+                                "shares": shares,
+                                "percentage": round(pct, 2),
+                                "holder_type": item.get("relate", "major"),
+                                "date_reported": bsns_year,
+                            })
+                        if holders:
+                            logger.info("KR holders for %s: %d from DART hyslr_sttus", identifier, len(holders))
+                            return holders
+                    except Exception:
+                        continue
+        except ImportError:
+            pass
+
+        return holders

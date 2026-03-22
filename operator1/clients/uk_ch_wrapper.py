@@ -748,3 +748,144 @@ class UKCompaniesHouseClient:
             ]
         except Exception:
             return []
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch persons with significant control (>25% shares/voting rights).
+
+        Uses the Companies House PSC endpoint which returns anyone with
+        >25% shares, >25% voting rights, or significant influence.
+
+        Returns list of dicts with: name, shares, percentage, holder_type,
+        date_reported, natures_of_control.
+        """
+        try:
+            data = self._get(f"/company/{identifier}/persons-with-significant-control")
+            items = data.get("items", []) if isinstance(data, dict) else []
+        except Exception as exc:
+            logger.debug("UK PSC fetch failed for %s: %s", identifier, exc)
+            return []
+
+        holders: list[dict[str, Any]] = []
+        for item in items:
+            # Build name from name or name_elements
+            name = item.get("name", "")
+            if not name:
+                elems = item.get("name_elements", {})
+                forename = elems.get("forename", "")
+                surname = elems.get("surname", "")
+                name = f"{forename} {surname}".strip() if surname else ""
+
+            natures = item.get("natures_of_control", [])
+            pct = 0.0
+            holder_type = "individual"
+
+            for nature in natures:
+                nl = nature.lower()
+                if "corporate" in nl:
+                    holder_type = "corporate"
+                if "75-to-100" in nl:
+                    pct = max(pct, 87.5)
+                elif "50-to-75" in nl:
+                    pct = max(pct, 62.5)
+                elif "25-to-50" in nl:
+                    pct = max(pct, 37.5)
+                elif "significant-influence" in nl or "significant-control" in nl:
+                    pct = max(pct, 25.0)
+
+            if name:
+                holders.append({
+                    "name": name,
+                    "shares": 0,  # PSC doesn't provide exact share counts
+                    "percentage": round(pct, 2),
+                    "holder_type": holder_type,
+                    "date_reported": item.get("notified_on", ""),
+                    "natures_of_control": natures,
+                })
+
+        if holders:
+            logger.info("UK holders for %s: %d from Companies House PSC", identifier, len(holders))
+            return holders
+
+        # Fallback: yfinance institutional holders (works for LSE-listed companies)
+        # Companies House PSC only covers >25% holders, which public companies
+        # rarely have. yfinance aggregates institutional ownership data.
+        try:
+            import yfinance as yf
+            # Get company name for yfinance search (CH identifiers are company numbers)
+            profile = self.get_profile(identifier)
+            company_name = profile.get("name", "")
+
+            # Try to find the LSE ticker via yfinance search
+            yf_symbols = []
+            if company_name:
+                try:
+                    search_results = yf.Search(company_name)
+                    quotes = getattr(search_results, "quotes", [])
+                    for q in (quotes or []):
+                        sym = q.get("symbol", "")
+                        exchange = q.get("exchange", "")
+                        # LSE tickers end in .L, AIM in .IL
+                        if sym.endswith(".L") or sym.endswith(".IL") or "LSE" in exchange:
+                            yf_symbols.append(sym)
+                except Exception:
+                    pass
+
+            # Also try appending .L to the company number as last resort
+            if not yf_symbols:
+                yf_symbols = [f"{identifier}.L"]
+
+            for yf_symbol in yf_symbols[:3]:
+                try:
+                    tick = yf.Ticker(yf_symbol)
+                    inst = tick.institutional_holders
+                    if inst is not None and not inst.empty:
+                        for _, row in inst.iterrows():
+                            pct = row.get("pctHeld", 0) or 0
+                            if isinstance(pct, (int, float)) and 0 < pct < 1:
+                                pct = pct * 100
+                            holders.append({
+                                "name": str(row.get("Holder", "")),
+                                "shares": int(row.get("Shares", 0)),
+                                "value": float(row.get("Value", 0)),
+                                "percentage": round(float(pct), 2),
+                                "holder_type": "institutional",
+                                "date_reported": str(row.get("Date Reported", "")),
+                            })
+                        if holders:
+                            logger.info("UK holders for %s: %d from yfinance (%s)", identifier, len(holders), yf_symbol)
+                            return holders
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.debug("yfinance UK holder fallback failed for %s: %s", identifier, exc)
+
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return institutional ownership metrics as a single-row snapshot.
+
+        UK Companies House PSC + yfinance only provide current data.
+        Returns a single-row DataFrame that gets forward-filled across the
+        daily cache. When a historical UK source becomes available, extend
+        this to return multiple rows.
+        """
+        holders = self.get_holders(identifier)
+        if not holders:
+            return pd.DataFrame()
+
+        from datetime import date as _date
+
+        total_pct = sum(h.get("percentage", 0) for h in holders)
+        top5 = holders[:5]
+        hhi = 0.0
+        if top5:
+            total_top5 = sum(h.get("percentage", 0) for h in top5)
+            if total_top5 > 0:
+                hhi = sum((h.get("percentage", 0) / total_top5) ** 2 for h in top5)
+
+        return pd.DataFrame([{
+            "date_reported": pd.Timestamp(_date.today()),
+            "inst_ownership_pct": round(total_pct, 2),
+            "inst_top5_concentration": round(hhi, 4),
+            "inst_holder_count": len(holders),
+        }])

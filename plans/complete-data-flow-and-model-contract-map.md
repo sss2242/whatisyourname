@@ -537,7 +537,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 
 | Module | Location | Lines | Tests | Status | Assessment |
 |--------|----------|-------|-------|--------|------------|
-| `portfolio_analysis.py` | `features/` | 283 | None | Not wired | **Planned feature.** Needs institutional holder data most PIT APIs don't provide. Awaiting data source. |
+| `portfolio_analysis.py` | `features/` | 283 | None | **Removed** | Intentionally deleted. User portfolio context is out of scope (Operator 1 analyzes companies, not portfolios). Institutional overlap (Part 2) blocked on data -- free PIT APIs don't provide 13F/holder data. |
 | `llm_filing_extractor.py` | `clients/` | 571 | Used in `live_helpers.py` + `filing_discoverer.py` | **Wired** | Now integrated via `try_filing_extraction()` in `filing_discoverer.py`. BSE India discoverer downloads PDFs and feeds them to `extract_from_pdf()`. ASX discoverer provides announcement metadata (PDF download TBD). |
 | `data_extraction.py` | `steps/` | 392 | Referenced by `cache_builder.py` for types | Not wired | **Legacy code.** Superseded by `main.py` inline extraction logic. Only used for `EntityData` type import by `cache_builder.py`. |
 | `verify_identifiers.py` | `steps/` | 129 | None direct | Not wired | **Legacy code.** Superseded by `main.py` inline verification. Only imported by `data_extraction.py` for `VerifiedTarget` type. |

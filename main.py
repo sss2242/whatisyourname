@@ -647,6 +647,16 @@ Non-interactive examples:
             "industry": company_info.get("industry", ""),
         }
 
+    # Step 2b: Fetch institutional/major holders (US/UK/KR only)
+    target_holders: list[dict] = []
+    try:
+        if hasattr(pit_client, "get_holders"):
+            target_holders = pit_client.get_holders(identifier)
+            if target_holders:
+                logger.info("Holders loaded: %d for %s", len(target_holders), ticker)
+    except Exception as exc:
+        logger.debug("Holder fetch skipped: %s", exc)
+
     # ------------------------------------------------------------------
     # Step 3: Fetch PIT financial data
     # ------------------------------------------------------------------
@@ -969,6 +979,37 @@ Non-interactive examples:
         macro_data=macro_data,
         macro_dataset=macro_dataset,
     )
+
+    # ------------------------------------------------------------------
+    # Step 4d: Institutional ownership history -> cache merge
+    # ------------------------------------------------------------------
+    try:
+        if hasattr(pit_client, "get_holder_history"):
+            _holder_hist_df = pit_client.get_holder_history(identifier, years=int(getattr(args, "years", 2)))
+            if _holder_hist_df is not None and not _holder_hist_df.empty and "date_reported" in _holder_hist_df.columns:
+                _holder_hist_df["date_reported"] = pd.to_datetime(_holder_hist_df["date_reported"])
+                _holder_hist_df = _holder_hist_df.sort_values("date_reported")
+                _inst_cols = [c for c in _holder_hist_df.columns if c.startswith("inst_")]
+                if _inst_cols:
+                    _inst_indexed = _holder_hist_df.set_index("date_reported")[_inst_cols]
+                    if _use_interpolator and len(_inst_indexed) >= 2:
+                        _inst_aligned, _ = interpolate_statement_to_daily(
+                            _inst_indexed, daily_index=cache.index, market_id=market_id,
+                        )
+                    else:
+                        # Single snapshot or no interpolator: flat forward-fill
+                        _combined = cache.index.union(_inst_indexed.index).sort_values()
+                        _inst_aligned = _inst_indexed.reindex(_combined).ffill()
+                        _inst_aligned = _inst_aligned.reindex(cache.index)
+                    _new_inst = [c for c in _inst_aligned.columns if c not in cache.columns]
+                    if _new_inst:
+                        cache = cache.join(_inst_aligned[_new_inst], how="left")
+                    logger.info(
+                        "Institutional ownership merged: %d columns from %d snapshots",
+                        len(_new_inst), len(_holder_hist_df),
+                    )
+    except Exception as exc:
+        logger.debug("Institutional ownership history skipped: %s", exc)
 
     # ------------------------------------------------------------------
     # Step 4a.3: Conflict risk assessment
@@ -1721,6 +1762,7 @@ Non-interactive examples:
             c for c in cache.columns
             if (c.startswith("fh_") or c.startswith("sentiment_")
                 or c.startswith("peer_") or c.startswith("macro_")
+                or c.startswith("inst_")
                 or c in ("survival_intensity", "regime_confidence",
                          "regime_transition_prob", "stability_score_21d")
                 or any(c.startswith(p) for p in _linked_prefixes))
@@ -2393,6 +2435,16 @@ Non-interactive examples:
         if reconciliation_report:
             profile["meta"]["reconciliation"] = reconciliation_report
 
+        # Inject institutional/major holders
+        if target_holders:
+            profile["institutional_holders"] = {
+                "available": True,
+                "holders": target_holders[:10],
+                "total_holders": len(target_holders),
+            }
+        else:
+            profile["institutional_holders"] = {"available": False}
+
         # Inject extended model results into profile
         if "extended_models" not in profile:
             profile["extended_models"] = {}
@@ -2528,6 +2580,19 @@ Non-interactive examples:
         with open(profile_path, "w", encoding="utf-8") as fh:
             json.dump(profile, fh, indent=2, default=str)
         logger.info("Profile saved: %s", profile_path)
+
+        # Validate profile completeness before report generation
+        try:
+            from operator1.report.profile_schema import validate_profile
+            _profile_issues = validate_profile(profile)
+            if _profile_issues:
+                logger.warning(
+                    "Profile validation: %d issues (report may have missing sections)",
+                    len(_profile_issues),
+                )
+        except Exception as exc:
+            logger.debug("Profile validation skipped: %s", exc)
+
     except Exception as exc:
         logger.error("Profile building failed: %s", exc)
         return 1
