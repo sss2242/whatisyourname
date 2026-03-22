@@ -313,6 +313,48 @@ Key change: instead of `ConformalCalibrator.update(residual)` accumulating all r
 
 ---
 
+## Proposal J: Fuzzy Protection -- Use scikit-fuzzy Rule Engine
+
+**File**: `operator1/analysis/fuzzy_protection.py`
+
+**Current limitation**: Uses fuzzy OR (max) to aggregate 3 dimensions. This misses dimension interactions -- a non-strategic sector with an emergency rate cut should get moderate protection, but fuzzy OR gives it only the rate cut score.
+
+**Library**: `scikit-fuzzy` (skfuzzy) -- the standard fuzzy logic toolkit for Python.
+
+**What it provides over custom code**:
+- Mamdani rule engine: `IF sector IS strategic AND economic IS significant THEN protection IS high`
+- Interaction rules: `IF sector IS non_strategic AND policy IS emergency THEN protection IS moderate`
+- Centroid defuzzification (smoother than threshold-based labels)
+- Built-in membership functions (gaussmf, gbellmf, pimf, sigmf)
+
+**Implementation**: ~50 lines of skfuzzy code replaces ~100 lines of custom math, producing better results with dimension interactions.
+
+**PyPI packages evaluated**: scikit-fuzzy (recommended), simpful (lightweight alternative), fuzzylite (C++ engine, overkill), fuzzylogic (pythonic but less mature), pyfuzzy (legacy).
+
+**Community resources relevant to all analysis models**:
+
+| Resource | URL | Relevance |
+|----------|-----|-----------|
+| `tslearn` | pypi.org/project/tslearn | DTW analogs -- provides DTW barycenter averaging and DTW clustering for finding analog groups, not just individual analogs |
+| `arch` (already installed) | pypi.org/project/arch | GARCH -- already used, but could add DCC-GARCH (Dynamic Conditional Correlation) for multivariate volatility in the copula module |
+| `copulas` (SDV project) | pypi.org/project/copulas | Copula -- provides Student-t, Clayton, Frank, Gumbel copulas with AIC-based selection. Drop-in replacement for our Gaussian-only implementation |
+| `causalml` (Uber) | pypi.org/project/causalml | Granger/TE -- provides causal inference methods (uplift modeling, CATE estimation) designed for treatment effect estimation in economics |
+| `pymc` (already installed) | pypi.org/project/pymc | Bayesian methods -- could replace the Heckman selection model with a fully Bayesian selection model with proper posterior uncertainty |
+| `darts` (Unit8) | pypi.org/project/darts | Forecasting -- provides TFT, N-BEATS, DeepAR with a unified interface. Could replace our custom Transformer/LSTM with production-grade implementations |
+| `mapie` (already installed) | pypi.org/project/mapie | Conformal -- provides adaptive conformal prediction (ACI) out of the box. Our custom ConformalCalibrator could be replaced with MAPIE's `MapieRegressor` |
+| `emd` | pypi.org/project/emd | Cycle decomposition -- Empirical Mode Decomposition for non-stationary signals. Drop-in replacement for FFT |
+| `scikit-fuzzy` | pypi.org/project/scikit-fuzzy | Fuzzy protection -- Mamdani rule engine with proper defuzzification |
+| `dowhy` (Microsoft) | pypi.org/project/dowhy | Causal inference -- provides DAG-based causal reasoning for the granger/TE modules |
+| `networkx` (optional, already in many envs) | pypi.org/project/networkx | Graph risk -- provides betweenness centrality, community detection, and Katz centrality that our numpy-only graph module lacks |
+
+**Priority note**: The most impactful community library integrations would be:
+1. `mapie` for adaptive conformal prediction (already installed, just needs wiring)
+2. `copulas` for Student-t/Clayton copulas (small install, high impact on tail risk)
+3. `scikit-fuzzy` for rule-based protection (small install, better dimension interactions)
+4. `emd` for non-stationary cycle analysis (small install, better than FFT)
+
+---
+
 ## The Core Insight
 
 The pipeline's learn-predict-compare-adjust loop is fundamentally sound. The models are doing their jobs. The improvements above are not "fixes" -- they are optimizations that would move the system from "good financial analysis" to "institutional-grade quant research." The current architecture already handles the hard part (25 markets, PIT compliance, graceful degradation, regime-aware weighting). The improvements are about squeezing more signal from the data that is already flowing through the system correctly.
