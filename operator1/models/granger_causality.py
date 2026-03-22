@@ -250,6 +250,131 @@ def _fallback_granger(
     return result
 
 
+def compute_time_varying_granger(
+    cache: pd.DataFrame,
+    variables: list[str] | None = None,
+    *,
+    window_size: int = 126,
+    step_size: int = 21,
+    max_lag: int = 5,
+    significance_level: float = 0.05,
+    min_observations: int = 50,
+) -> dict[str, Any]:
+    """Run rolling-window Granger causality to detect time-varying causal links.
+
+    Instead of a single static causal graph, this produces a temporal causal
+    graph showing when relationships emerge and disappear. Feature pruning
+    can then use the DAG for the CURRENT regime, not a static aggregate.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache DataFrame.
+    variables:
+        Columns to test (auto-selected if None).
+    window_size:
+        Rolling window size in days (default ~6 months).
+    step_size:
+        How many days to slide between windows (default ~1 month).
+    max_lag:
+        Maximum lag order for Granger F-tests.
+    significance_level:
+        P-value threshold.
+    min_observations:
+        Minimum non-NaN observations per window.
+
+    Returns
+    -------
+    Dict with:
+        - ``windows``: list of {start_date, end_date, significant_pairs, density}
+        - ``emerging_pairs``: pairs that became significant in recent windows
+        - ``disappearing_pairs``: pairs that were significant but are no longer
+        - ``current_window_result``: GrangerResult for the most recent window
+    """
+    if cache is None or cache.empty:
+        return {"error": "No data", "windows": []}
+
+    if variables is None:
+        variables = [
+            c for c in cache.columns
+            if cache[c].dtype in ("float64", "float32")
+            and cache[c].notna().sum() >= min_observations
+        ][:20]
+
+    if len(variables) < 2:
+        return {"error": "Need >= 2 variables", "windows": []}
+
+    n_rows = len(cache)
+    if n_rows < window_size + step_size:
+        return {"error": "Insufficient data for rolling windows", "windows": []}
+
+    windows_results: list[dict[str, Any]] = []
+    prev_pairs: set[tuple[str, str]] = set()
+
+    # Slide windows
+    for start in range(0, n_rows - window_size + 1, step_size):
+        end = start + window_size
+        window_cache = cache.iloc[start:end]
+
+        # Run Granger on this window
+        window_result = compute_granger_causality(
+            window_cache,
+            variables=variables,
+            max_lag=max_lag,
+            significance_level=significance_level,
+            min_observations=min(min_observations, window_size // 2),
+        )
+
+        current_pairs = {
+            (p["source"], p["target"])
+            for p in window_result.significant_pairs
+        }
+
+        start_date = str(cache.index[start])[:10] if hasattr(cache.index, "strftime") else str(start)
+        end_date = str(cache.index[end - 1])[:10] if hasattr(cache.index, "strftime") else str(end)
+
+        windows_results.append({
+            "start_date": start_date,
+            "end_date": end_date,
+            "n_significant": len(window_result.significant_pairs),
+            "density": window_result.network_density,
+            "pairs": list(current_pairs),
+        })
+
+        prev_pairs = current_pairs
+
+    # Identify emerging and disappearing pairs from the last two windows
+    emerging: list[tuple[str, str]] = []
+    disappearing: list[tuple[str, str]] = []
+    if len(windows_results) >= 2:
+        prev_set = set(tuple(p) for p in windows_results[-2].get("pairs", []))
+        curr_set = set(tuple(p) for p in windows_results[-1].get("pairs", []))
+        emerging = [p for p in curr_set - prev_set]
+        disappearing = [p for p in prev_set - curr_set]
+
+    # Current window result (most recent)
+    current_result = compute_granger_causality(
+        cache.iloc[-window_size:],
+        variables=variables,
+        max_lag=max_lag,
+        significance_level=significance_level,
+        min_observations=min(min_observations, window_size // 2),
+    )
+
+    logger.info(
+        "Time-varying Granger: %d windows, %d emerging pairs, %d disappearing",
+        len(windows_results), len(emerging), len(disappearing),
+    )
+
+    return {
+        "windows": windows_results,
+        "emerging_pairs": [{"source": p[0], "target": p[1]} for p in emerging],
+        "disappearing_pairs": [{"source": p[0], "target": p[1]} for p in disappearing],
+        "current_window_result": current_result,
+        "n_windows": len(windows_results),
+    }
+
+
 def prune_features_by_causality(
     variables: list[str],
     granger_result: GrangerResult,

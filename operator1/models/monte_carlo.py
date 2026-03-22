@@ -1025,3 +1025,162 @@ def run_monte_carlo(
     )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Multivariate Monte Carlo (Proposal 3.3)
+# ---------------------------------------------------------------------------
+
+
+def run_multivariate_monte_carlo(
+    cache: pd.DataFrame,
+    copula_correlation: np.ndarray | None = None,
+    *,
+    n_paths: int = 5000,
+    horizon_steps: int = 252,
+    random_state: int = 42,
+    survival_thresholds: dict[str, tuple[str, float]] | None = None,
+) -> dict[str, Any]:
+    """Multivariate Monte Carlo that jointly simulates financial ratios.
+
+    Instead of simulating returns alone and using a proxy mapping to ratios,
+    this jointly simulates (return, delta_current_ratio, delta_fcf_yield,
+    delta_debt_to_equity) using the copula correlation structure.
+
+    Survival triggers are checked on the simulated ratios directly.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache with return_1d and financial ratio columns.
+    copula_correlation:
+        Correlation matrix from copula analysis. If None, uses empirical
+        correlation from the cache.
+    n_paths:
+        Number of simulation paths.
+    horizon_steps:
+        Number of days to simulate.
+    random_state:
+        Seed for reproducibility.
+    survival_thresholds:
+        Survival trigger thresholds.
+
+    Returns
+    -------
+    Dict with multivariate survival probability and per-variable terminal
+    distributions.
+    """
+    if survival_thresholds is None:
+        survival_thresholds = DEFAULT_SURVIVAL_THRESHOLDS
+
+    rng = np.random.default_rng(random_state)
+
+    # Variables to jointly simulate
+    sim_vars = ["return_1d", "current_ratio", "debt_to_equity_abs", "fcf_yield"]
+    available = [v for v in sim_vars if v in cache.columns and cache[v].notna().sum() > 30]
+
+    if len(available) < 2:
+        return {"available": False, "error": "Insufficient variables for multivariate MC"}
+
+    # Compute daily changes for ratio variables
+    change_data = pd.DataFrame(index=cache.index)
+    var_is_change: dict[str, bool] = {}
+    for v in available:
+        if v == "return_1d":
+            change_data[v] = cache[v]
+            var_is_change[v] = False
+        else:
+            change_data[v] = cache[v].diff()
+            var_is_change[v] = True
+
+    clean = change_data[available].dropna()
+    if len(clean) < 50:
+        return {"available": False, "error": "Insufficient clean data for multivariate MC"}
+
+    # Correlation structure
+    if copula_correlation is not None and copula_correlation.shape[0] >= len(available):
+        corr = copula_correlation[:len(available), :len(available)]
+    else:
+        corr = clean[available].corr().values
+        # Ensure positive definite
+        eigvals = np.linalg.eigvalsh(corr)
+        if eigvals.min() <= 0:
+            corr += np.eye(len(available)) * (abs(eigvals.min()) + 0.01)
+
+    # Per-variable mean and std
+    means = clean[available].mean().values
+    stds = clean[available].std().values
+    stds[stds < 1e-10] = 1e-6
+
+    # Initial values for ratios
+    initial: dict[str, float] = {}
+    for v in available:
+        if v == "return_1d":
+            continue
+        col = cache[v].dropna()
+        initial[v] = float(col.iloc[-1]) if len(col) > 0 else 1.0
+
+    # Simulate paths using multivariate normal with copula correlation
+    try:
+        L = np.linalg.cholesky(corr)
+    except np.linalg.LinAlgError:
+        # Fallback: add diagonal noise
+        corr_safe = corr + np.eye(len(available)) * 0.01
+        L = np.linalg.cholesky(corr_safe)
+
+    survival_count = 0
+    terminal_values: dict[str, list[float]] = {v: [] for v in available if v != "return_1d"}
+
+    for _ in range(n_paths):
+        # Simulate correlated changes
+        z = rng.standard_normal((horizon_steps, len(available)))
+        correlated = z @ L.T  # apply correlation structure
+        changes = correlated * stds + means
+
+        # Track ratio levels
+        ratios: dict[str, float] = dict(initial)
+        triggered = False
+
+        for t in range(horizon_steps):
+            for vi, v in enumerate(available):
+                if v == "return_1d":
+                    continue
+                ratios[v] = ratios.get(v, 1.0) + float(changes[t, vi])
+
+            # Check survival triggers on actual ratios
+            if check_survival_triggers(ratios, survival_thresholds):
+                triggered = True
+                break
+
+        if not triggered:
+            survival_count += 1
+
+        for v in terminal_values:
+            terminal_values[v].append(ratios.get(v, 0.0))
+
+    survival_prob = survival_count / n_paths
+
+    # Terminal distribution statistics
+    terminal_stats: dict[str, dict[str, float]] = {}
+    for v, vals in terminal_values.items():
+        arr = np.array(vals)
+        terminal_stats[v] = {
+            "mean": round(float(np.mean(arr)), 4),
+            "std": round(float(np.std(arr)), 4),
+            "p5": round(float(np.percentile(arr, 5)), 4),
+            "p95": round(float(np.percentile(arr, 95)), 4),
+        }
+
+    logger.info(
+        "Multivariate MC: %d paths x %d steps, survival=%.4f, vars=%s",
+        n_paths, horizon_steps, survival_prob, available,
+    )
+
+    return {
+        "available": True,
+        "survival_probability": round(survival_prob, 4),
+        "n_paths": n_paths,
+        "horizon_steps": horizon_steps,
+        "variables_simulated": available,
+        "terminal_distributions": terminal_stats,
+    }

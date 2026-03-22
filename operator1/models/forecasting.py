@@ -314,6 +314,140 @@ def fit_kalman(
 
 
 # ---------------------------------------------------------------------------
+# 1b. Dynamic Factor Model (multi-variable state-space Kalman)
+# ---------------------------------------------------------------------------
+
+
+def fit_dynamic_factor(
+    data: pd.DataFrame,
+    target_col: str,
+    n_forecast: int = 1,
+    n_factors: int = 2,
+) -> tuple[np.ndarray | None, ModelMetrics]:
+    """Fit a Dynamic Factor Model extracting latent factors from multiple variables.
+
+    Instead of the simple local-level model, this extracts a small number of
+    latent factors from 5-15 variables using a Kalman smoother. Captures the
+    common signal while filtering out variable-specific noise.
+
+    Falls back to the simple local-level Kalman if DFM fitting fails.
+
+    Parameters
+    ----------
+    data:
+        DataFrame with multiple numeric columns including target_col.
+    target_col:
+        Variable to extract forecasts for.
+    n_forecast:
+        Steps ahead.
+    n_factors:
+        Number of latent factors to extract (default 2).
+
+    Returns
+    -------
+    (forecasts, metrics)
+    """
+    metrics = ModelMetrics(model_name="kalman_dfm")
+
+    try:
+        from statsmodels.tsa.statespace.dynamic_factor import DynamicFactor
+    except ImportError:
+        metrics.error = "statsmodels DynamicFactor not available"
+        return None, metrics
+
+    # Select numeric columns with sufficient data
+    numeric_cols = [
+        c for c in data.columns
+        if data[c].dtype in ("float64", "float32")
+        and data[c].notna().sum() > _MIN_OBS_KALMAN
+        and c != target_col
+    ]
+    if target_col not in data.columns:
+        metrics.error = f"Target '{target_col}' not in data"
+        return None, metrics
+
+    # Use target + up to 10 most correlated variables
+    if len(numeric_cols) > 10:
+        corrs = data[numeric_cols].corrwith(data[target_col]).abs().dropna()
+        numeric_cols = corrs.nlargest(10).index.tolist()
+
+    cols = [target_col] + [c for c in numeric_cols if c != target_col]
+    if len(cols) < 3:
+        metrics.error = "Need at least 3 variables for DFM"
+        return None, metrics
+
+    clean = data[cols].dropna()
+    if len(clean) < _MIN_OBS_KALMAN * 2:
+        metrics.error = f"Insufficient data for DFM ({len(clean)})"
+        return None, metrics
+
+    n_factors = min(n_factors, len(cols) - 1)
+
+    try:
+        train_n = max(1, int(len(clean) * 0.85))
+        train = clean.iloc[:train_n]
+        test = clean.iloc[train_n:]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model = DynamicFactor(
+                train,
+                k_factors=n_factors,
+                factor_order=1,
+            )
+            result = model.fit(disp=False, maxiter=200)
+
+        # Validation
+        if len(test) > 0:
+            forecast_obj = result.get_forecast(steps=len(test))
+            pred_df = forecast_obj.predicted_mean
+            if target_col in pred_df.columns:
+                preds = pred_df[target_col].values
+            else:
+                preds = pred_df.iloc[:, 0].values
+            actuals = test[target_col].values
+            mae, rmse = _compute_metrics(actuals, preds[:len(actuals)])
+            metrics.test_residuals = _compute_residuals(actuals, preds[:len(actuals)])
+        else:
+            mae, rmse = float("nan"), float("nan")
+
+        # Full refit for final forecast
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            full_model = DynamicFactor(
+                clean,
+                k_factors=n_factors,
+                factor_order=1,
+            )
+            full_result = full_model.fit(disp=False, maxiter=200)
+
+        forecast_obj = full_result.get_forecast(steps=n_forecast)
+        pred_df = forecast_obj.predicted_mean
+        if target_col in pred_df.columns:
+            forecasts = pred_df[target_col].values
+        else:
+            forecasts = pred_df.iloc[:, 0].values
+
+        metrics.mae = mae
+        metrics.rmse = rmse
+        metrics.n_train = len(train)
+        metrics.n_test = len(test)
+        metrics.fitted = True
+        metrics.model_name = "kalman_dfm"
+
+        logger.info(
+            "DFM fit: %d factors, %d vars, %d train, MAE=%.6f, RMSE=%.6f",
+            n_factors, len(cols), len(train), mae, rmse,
+        )
+        return np.array(forecasts), metrics
+
+    except Exception as exc:
+        metrics.error = f"DFM fitting failed: {exc}"
+        logger.debug(metrics.error)
+        return None, metrics
+
+
+# ---------------------------------------------------------------------------
 # 2. GARCH (volatility forecasting)
 # ---------------------------------------------------------------------------
 
