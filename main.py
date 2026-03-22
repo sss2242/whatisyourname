@@ -2528,6 +2528,19 @@ Non-interactive examples:
         with open(profile_path, "w", encoding="utf-8") as fh:
             json.dump(profile, fh, indent=2, default=str)
         logger.info("Profile saved: %s", profile_path)
+
+        # Validate profile completeness before report generation
+        try:
+            from operator1.report.profile_schema import validate_profile
+            _profile_issues = validate_profile(profile)
+            if _profile_issues:
+                logger.warning(
+                    "Profile validation: %d issues (report may have missing sections)",
+                    len(_profile_issues),
+                )
+        except Exception as exc:
+            logger.debug("Profile validation skipped: %s", exc)
+
     except Exception as exc:
         logger.error("Profile building failed: %s", exc)
         return 1
