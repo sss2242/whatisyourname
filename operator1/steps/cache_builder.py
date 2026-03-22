@@ -26,7 +26,7 @@ import pandas as pd
 
 from operator1.constants import CACHE_DIR, DATE_START, DATE_END
 from operator1.config_loader import get_global_config
-from operator1.steps.data_extraction import EntityData, ExtractionResult
+from operator1.types import EntityData, ExtractionResult
 
 logger = logging.getLogger(__name__)
 

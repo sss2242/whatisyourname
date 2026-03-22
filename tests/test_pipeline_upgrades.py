@@ -1,10 +1,12 @@
-"""Tests for the 5 pipeline quality upgrades.
+"""Tests for the pipeline quality upgrades.
 
-1. Parallel executor
-2. Profile schema validation
-3. Historical conflict time-varying
-4. Cache column namespacing
-5. Estimation-conflict integration (placeholder)
+1. Profile schema validation
+2. Historical conflict time-varying
+3. Cache column namespacing
+4. Estimation-conflict integration (placeholder)
+
+Note: Parallel executor tests removed -- parallel_executor module was
+replaced by inline ThreadPoolExecutor usage in the estimator (Fix 5).
 """
 
 from __future__ import annotations
@@ -15,91 +17,6 @@ from datetime import date
 import numpy as np
 import pandas as pd
 import pytest
-
-
-# ---------------------------------------------------------------------------
-# Upgrade 1: Parallel Executor
-# ---------------------------------------------------------------------------
-
-class TestParallelExecutor:
-    """Test the parallel model executor."""
-
-    def test_run_parallel_models_basic(self):
-        """Test parallel execution with simple tasks."""
-        from operator1.steps.parallel_executor import run_parallel_models
-
-        cache = pd.DataFrame({"close": [100, 101, 102]})
-
-        def task_a(cache, **kw):
-            return {"result": "a", "rows": len(cache)}
-
-        def task_b(cache, **kw):
-            return {"result": "b", "sum": cache["close"].sum()}
-
-        tasks = [
-            ("task_a", task_a, {}),
-            ("task_b", task_b, {}),
-        ]
-
-        results = run_parallel_models(cache, tasks, max_workers=2)
-
-        assert "task_a" in results
-        assert "task_b" in results
-        assert results["task_a"]["result"] == "a"
-        assert results["task_b"]["sum"] == 303
-
-    def test_run_parallel_models_failure_handling(self):
-        """Test that one failing task doesn't crash others."""
-        from operator1.steps.parallel_executor import run_parallel_models
-
-        cache = pd.DataFrame({"close": [100]})
-
-        def good_task(cache, **kw):
-            return "success"
-
-        def bad_task(cache, **kw):
-            raise ValueError("intentional failure")
-
-        tasks = [
-            ("good", good_task, {}),
-            ("bad", bad_task, {}),
-        ]
-
-        results = run_parallel_models(cache, tasks, max_workers=2)
-
-        assert results["good"] == "success"
-        assert results["bad"] is None  # failed tasks return None
-
-    def test_run_parallel_models_empty(self):
-        """Test with no tasks."""
-        from operator1.steps.parallel_executor import run_parallel_models
-
-        results = run_parallel_models(pd.DataFrame(), [])
-        assert results == {}
-
-    def test_parallel_faster_than_sequential(self):
-        """Verify parallel is actually faster than sequential for I/O-bound tasks."""
-        from operator1.steps.parallel_executor import run_parallel_models
-
-        cache = pd.DataFrame({"close": [100]})
-
-        def slow_task(cache, delay=0.1, **kw):
-            time.sleep(delay)
-            return "done"
-
-        tasks = [
-            ("t1", slow_task, {"delay": 0.15}),
-            ("t2", slow_task, {"delay": 0.15}),
-            ("t3", slow_task, {"delay": 0.15}),
-        ]
-
-        t0 = time.time()
-        results = run_parallel_models(cache, tasks, max_workers=3)
-        parallel_time = time.time() - t0
-
-        # Sequential would take 0.45s, parallel should take ~0.15s
-        assert parallel_time < 0.4  # generous threshold
-        assert all(v == "done" for v in results.values())
 
 
 # ---------------------------------------------------------------------------

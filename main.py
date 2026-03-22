@@ -420,6 +420,16 @@ Non-interactive examples:
         ),
     )
     parser.add_argument(
+        "--pit-mode", type=str, default="report_date",
+        choices=["report_date", "filing_date"],
+        help=(
+            "PIT alignment mode for financial statement merging. "
+            "'report_date' (default): data appears on the fiscal period end date. "
+            "'filing_date': strict PIT -- data appears only when publicly filed. "
+            "Use 'filing_date' for backtesting to avoid look-ahead bias."
+        ),
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Enable debug logging",
     )
@@ -820,11 +830,19 @@ Non-interactive examples:
         if stmt_df.empty:
             continue
         try:
-            # Use report_date for alignment (filing_date has duplicates from
-            # multi-period filings like 10-Q containing both Q and YTD data).
-            # The PIT constraint is still satisfied: we forward-fill from the
-            # report_date, which is always <= filing_date.
-            date_col = "report_date" if "report_date" in stmt_df.columns else "filing_date"
+            # PIT alignment mode:
+            # - report_date (default): data appears on fiscal period end.
+            # - filing_date (strict PIT): data appears only when publicly filed.
+            #   Use --pit-mode filing_date for backtesting to avoid look-ahead bias.
+            _preferred_date_col = getattr(args, "pit_mode", "report_date")
+            if _preferred_date_col in stmt_df.columns:
+                date_col = _preferred_date_col
+            elif "report_date" in stmt_df.columns:
+                date_col = "report_date"
+            elif "filing_date" in stmt_df.columns:
+                date_col = "filing_date"
+            else:
+                date_col = ""
             if date_col not in stmt_df.columns:
                 logger.warning("No date column in %s data, skipping merge", label)
                 continue
@@ -1044,6 +1062,37 @@ Non-interactive examples:
         logger.warning("Estimation failed (continuing with raw data): %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 4b.1: Unified confidence metric (precision-weighted pooling)
+    # Combines interpolation confidence (distance from filing) with
+    # estimation confidence (model agreement) into a single metric.
+    # ------------------------------------------------------------------
+    try:
+        from operator1.estimation.estimator import ESTIMABLE_VARIABLES as _EST_VARS
+        _n_combined = 0
+        for col in _EST_VARS:
+            interp_col = f"interp_confidence_{col}"
+            est_col = f"{col}_confidence"
+            combined_col = f"{col}_combined_confidence"
+            if interp_col in cache.columns and est_col in cache.columns:
+                ic = cache[interp_col].fillna(0.5)
+                ec = cache[est_col].fillna(0.5)
+                # Precision-weighted pooling: 1 / (1/a + 1/b)
+                # Clamp to avoid division by zero
+                ic_safe = ic.clip(lower=0.01)
+                ec_safe = ec.clip(lower=0.01)
+                combined = 1.0 / ((1.0 / ic_safe) + (1.0 / ec_safe))
+                # Normalize to [0, 1]
+                max_val = combined.max()
+                if max_val > 0:
+                    combined = combined / max_val
+                cache[combined_col] = combined
+                _n_combined += 1
+        if _n_combined > 0:
+            logger.info("Unified confidence: %d variables with combined confidence metric", _n_combined)
+    except Exception as exc:
+        logger.debug("Unified confidence computation skipped: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 4c: Filing calendar analysis
     # ------------------------------------------------------------------
     filing_calendar_result = None
@@ -1089,7 +1138,7 @@ Non-interactive examples:
     logger.info("Step 5: Computing derived features...")
 
     from operator1.features.derived_variables import compute_derived_variables
-    from operator1.analysis.survival_mode import compute_company_survival_flag
+    from operator1.analysis.survival_mode import compute_company_survival_flag, compute_survival_probability
     from operator1.analysis.hierarchy_weights import compute_hierarchy_weights
 
     try:
@@ -1124,6 +1173,7 @@ Non-interactive examples:
     weights: dict = {f"tier{i}": 20.0 for i in range(1, 6)}
     try:
         cache["company_survival_mode_flag"] = compute_company_survival_flag(cache)
+        cache["survival_probability"] = compute_survival_probability(cache)
         cache = compute_hierarchy_weights(cache)
         for i in range(1, 6):
             col = f"hierarchy_tier{i}_weight"
@@ -2027,6 +2077,7 @@ Non-interactive examples:
                 forecast_result=forecast_result,
                 mc_result=mc_result,
                 pattern_drift_multiplier=_pattern_drift,
+                cycle_result=cycle_result,
             )
             if ohlc_result and ohlc_result.fitted:
                 logger.info("OHLC prediction complete")

@@ -257,3 +257,74 @@ def _run_sensitivity_impl(
         tier_importance=tier_importance,
         method=method,
     )
+
+
+def adjust_hierarchy_from_sobol(
+    sobol_result: SobolResult | None,
+    current_weights: dict[str, float],
+    max_adjustment: float = 0.10,
+    threshold: float = 0.20,
+) -> dict[str, float]:
+    """Adjust hierarchy weights based on Sobol sensitivity analysis.
+
+    Creates a data-driven calibration loop: Sobol measures actual
+    variance contribution per tier -> weights adjust toward empirical
+    importance -> next pipeline run uses better-calibrated weights.
+
+    Parameters
+    ----------
+    sobol_result:
+        Output from ``run_sensitivity_analysis()``.
+    current_weights:
+        Current tier weights, e.g. ``{"tier1": 20.0, ...}``.
+    max_adjustment:
+        Maximum weight adjustment per tier per run (prevents oscillation).
+    threshold:
+        Minimum discrepancy (as fraction) to trigger adjustment.
+
+    Returns
+    -------
+    Adjusted weights dict. Returns original weights if Sobol result
+    is unavailable or adjustment is not warranted.
+    """
+    if sobol_result is None or not sobol_result.tier_importance:
+        return dict(current_weights)
+
+    # Normalize Sobol tier importance to sum to 100
+    total_sobol = sum(sobol_result.tier_importance.values())
+    if total_sobol <= 0:
+        return dict(current_weights)
+
+    sobol_pct = {
+        k: (v / total_sobol) * 100.0
+        for k, v in sobol_result.tier_importance.items()
+    }
+
+    adjusted = dict(current_weights)
+    any_adjusted = False
+
+    for tier in sorted(current_weights.keys()):
+        current = current_weights.get(tier, 20.0)
+        target = sobol_pct.get(tier, current)
+
+        discrepancy = abs(target - current) / max(current, 1.0)
+        if discrepancy > threshold:
+            # Move toward target, capped at max_adjustment * 100
+            direction = 1.0 if target > current else -1.0
+            adjustment = min(abs(target - current), max_adjustment * 100)
+            adjusted[tier] = current + direction * adjustment
+            any_adjusted = True
+
+    # Renormalize to sum to 100
+    total = sum(adjusted.values())
+    if total > 0:
+        adjusted = {k: v / total * 100.0 for k, v in adjusted.items()}
+
+    if any_adjusted:
+        logger.info(
+            "Sobol-adjusted hierarchy weights: %s (from %s)",
+            {k: f"{v:.1f}" for k, v in adjusted.items()},
+            {k: f"{v:.1f}" for k, v in current_weights.items()},
+        )
+
+    return adjusted

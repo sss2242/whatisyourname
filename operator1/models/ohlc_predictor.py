@@ -100,6 +100,7 @@ def predict_ohlc_series(
     mc_result: Any | None = None,
     *,
     pattern_drift_multiplier: float = 1.0,
+    cycle_result: Any | None = None,
     random_seed: int = 42,
 ) -> OHLCPredictionResult:
     """Generate predicted OHLC candlestick series for all horizons.
@@ -115,6 +116,10 @@ def predict_ohlc_series(
     mc_result:
         Monte Carlo result (optional, used for survival-adjusted
         uncertainty).
+    cycle_result:
+        Output from ``run_cycle_decomposition()`` (optional). If provided,
+        modulates predicted returns by the dominant cycle phase: at cycle
+        peak, biases return downward; at trough, biases upward.
 
     Returns
     -------
@@ -140,6 +145,31 @@ def predict_ohlc_series(
     mu = float(returns.tail(63).mean())  # ~3-month average daily return
     # Apply pattern-based drift adjustment (Synergy C)
     mu *= pattern_drift_multiplier
+
+    # Apply cycle phase modulation (Phase 1.4 improvement)
+    # If a dominant cycle is detected, modulate predicted return by cycle phase.
+    # At cycle peak, bias return downward; at trough, bias upward.
+    _cycle_adjustment = 0.0
+    if cycle_result is not None:
+        dominant_cycles = getattr(cycle_result, "dominant_cycles", [])
+        if dominant_cycles:
+            # Use the strongest cycle (first in list, sorted by amplitude)
+            top_cycle = dominant_cycles[0]
+            period = getattr(top_cycle, "period_days", 0)
+            phase = getattr(top_cycle, "phase", 0)
+            amplitude = getattr(top_cycle, "amplitude", 0)
+            if period > 0 and amplitude > 0:
+                # Current phase position: how far through the cycle are we?
+                # phase is in radians; advance by 2*pi/period per day
+                import math as _math
+                # Negative cosine: +1 at trough (buy), -1 at peak (sell)
+                _cycle_adjustment = -_math.cos(phase) * amplitude * 0.01
+                mu += _cycle_adjustment
+                logger.debug(
+                    "Cycle phase adjustment: period=%dd, phase=%.2f rad, "
+                    "adjustment=%.6f",
+                    period, phase, _cycle_adjustment,
+                )
     vol_col = "volatility_21d"
     if vol_col in cache.columns and cache[vol_col].notna().any():
         sigma = float(cache[vol_col].dropna().iloc[-1])

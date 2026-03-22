@@ -125,6 +125,74 @@ def compute_company_survival_flag(
     return flag
 
 
+def compute_survival_probability(
+    df: pd.DataFrame,
+    thresholds: dict[str, float] | None = None,
+) -> pd.Series:
+    """Compute continuous company survival distress probability (0-1).
+
+    Unlike the binary ``compute_company_survival_flag()`` which produces
+    sharp 0/1 transitions at threshold crossings, this produces a smooth
+    probability using sigmoid transforms of the distance from each threshold.
+
+    A company with current_ratio = 1.01 gets probability ~0.48 (nearly
+    distressed) while one with 0.99 gets ~0.52. The binary flag would
+    give 0 and 1 respectively -- a cliff edge.
+
+    The probability drives hierarchy weight interpolation: weights shift
+    proportionally rather than snapping between regimes.
+    """
+    import numpy as np
+
+    t = thresholds or _COMPANY_THRESHOLDS
+
+    distress_signals: list[pd.Series] = []
+
+    # Each trigger: compute normalized distance from threshold, then sigmoid
+    trigger_configs = [
+        ("current_ratio", t.get("current_ratio_lt", 1.0), "below"),
+        ("debt_to_equity_abs", t.get("debt_to_equity_abs_gt", 3.0), "above"),
+        ("fcf_yield", t.get("fcf_yield_lt", 0.0), "below"),
+        ("drawdown_252d", t.get("drawdown_252d_lt", -0.40), "below"),
+    ]
+
+    for col, threshold, direction in trigger_configs:
+        if col not in df.columns:
+            continue
+        s = df[col].fillna(threshold)  # neutral if missing
+
+        # Distance from threshold (positive = in distress direction)
+        if direction == "below":
+            dist = (threshold - s) / max(abs(threshold), 0.01)
+        else:
+            dist = (s - threshold) / max(abs(threshold), 0.01)
+
+        # Clip to reasonable range before sigmoid
+        dist = dist.clip(lower=-5, upper=5)
+        distress_signals.append(dist)
+
+    # Conflict/sanctions triggers
+    for col in ("country_conflict_flag", "sanctions_flag"):
+        if col in df.columns:
+            distress_signals.append(df[col].fillna(0).astype(float) * 3.0)
+
+    if not distress_signals:
+        return pd.Series(0.0, index=df.index, name="survival_probability")
+
+    # Max distress signal across all triggers
+    combined = pd.concat(distress_signals, axis=1).max(axis=1)
+    # Sigmoid transform to [0, 1]
+    probability = 1.0 / (1.0 + np.exp(-combined))
+    probability.name = "survival_probability"
+
+    logger.info(
+        "Survival probability: mean=%.3f, max=%.3f, >50%%=%d days",
+        probability.mean(), probability.max(), (probability > 0.5).sum(),
+    )
+
+    return probability
+
+
 # ---------------------------------------------------------------------------
 # Country survival
 # ---------------------------------------------------------------------------

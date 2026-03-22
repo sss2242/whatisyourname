@@ -349,6 +349,7 @@ def compute_graph_risk_metrics(
     contagion_prob: float = DEFAULT_CONTAGION_PROB,
     contagion_sims: int = DEFAULT_CONTAGION_SIMS,
     random_state: int = 42,
+    edge_weights: dict[str, float] | None = None,
 ) -> GraphRiskResult:
     """Compute all graph-theoretic risk metrics.
 
@@ -360,10 +361,18 @@ def compute_graph_risk_metrics(
         Discovery result mapping group -> list of entity dicts.
     contagion_prob:
         Per-edge infection probability for contagion simulation.
+        When ``edge_weights`` are provided, this is scaled per-edge
+        by the weight (higher weight = higher contagion probability).
     contagion_sims:
         Number of Monte Carlo contagion simulations.
     random_state:
         Seed for reproducibility.
+    edge_weights:
+        Optional dict of entity_id -> weight (0-1) representing revenue
+        or supply exposure. A supplier providing 30% of inputs gets
+        weight 0.30. When provided, contagion probability per edge is
+        scaled by this weight (higher exposure = higher risk). If None,
+        all edges get equal weight (backward compatible).
 
     Returns
     -------
