@@ -1888,6 +1888,50 @@ Non-interactive examples:
         except Exception as exc:
             logger.warning("Walk-forward evaluation failed: %s", exc)
 
+        # Forward pass error aggregation + MCS + Fixed Share (Part 2)
+        _mode_confidence_sets = None
+        _fixed_share = None
+        try:
+            if forward_pass_result is not None and hasattr(forward_pass_result, "predictions_log"):
+                from operator1.models.walk_forward import (
+                    aggregate_forward_pass_errors,
+                    compute_mode_confidence_sets,
+                )
+                from operator1.models.prediction_aggregator import FixedShareForecaster
+
+                _fp_log = getattr(forward_pass_result, "predictions_log", [])
+                if _fp_log:
+                    _mode_errors = aggregate_forward_pass_errors(_fp_log, cache)
+                    if _mode_errors:
+                        _mode_confidence_sets = compute_mode_confidence_sets(_mode_errors)
+                        logger.info(
+                            "Mode confidence sets: %s",
+                            {m: len(v) for m, v in _mode_confidence_sets.items()},
+                        )
+
+                    # Initialize Fixed Share with all model names from forward pass
+                    _all_model_names = set()
+                    for mode_models in _mode_errors.values():
+                        _all_model_names.update(mode_models.keys())
+                    if _all_model_names:
+                        _fixed_share = FixedShareForecaster(sorted(_all_model_names))
+                        # Feed historical errors to warm up weights
+                        for mode_models in _mode_errors.values():
+                            _min_len = min(len(v) for v in mode_models.values()) if mode_models else 0
+                            for step in range(min(_min_len, 50)):
+                                step_losses = {
+                                    name: errs[step]
+                                    for name, errs in mode_models.items()
+                                    if step < len(errs)
+                                }
+                                _fixed_share.update(step_losses)
+                        logger.info(
+                            "Fixed Share weights: %s",
+                            {k: f"{v:.3f}" for k, v in _fixed_share.get_weights().items()},
+                        )
+        except Exception as exc:
+            logger.debug("Mode error aggregation / Fixed Share failed: %s", exc)
+
         # Monte Carlo
         # In private mode, use equity_change_rate instead of return_1d.
         try:
