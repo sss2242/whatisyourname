@@ -686,8 +686,9 @@ class USEdgarClient:
             inst = tick.institutional_holders
             if inst is not None and not inst.empty:
                 for _, row in inst.iterrows():
-                    pct = row.get("% Out", 0)
-                    if isinstance(pct, (int, float)) and pct < 1:
+                    # yfinance uses 'pctHeld' (fraction, e.g. 0.097 = 9.7%)
+                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                    if isinstance(pct, (int, float)) and 0 < pct < 1:
                         pct = pct * 100  # Convert fraction to percentage
                     holders.append({
                         "name": str(row.get("Holder", "")),
