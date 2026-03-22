@@ -804,4 +804,59 @@ class UKCompaniesHouseClient:
 
         if holders:
             logger.info("UK holders for %s: %d from Companies House PSC", identifier, len(holders))
+            return holders
+
+        # Fallback: yfinance institutional holders (works for LSE-listed companies)
+        # Companies House PSC only covers >25% holders, which public companies
+        # rarely have. yfinance aggregates institutional ownership data.
+        try:
+            import yfinance as yf
+            # Get company name for yfinance search (CH identifiers are company numbers)
+            profile = self.get_profile(identifier)
+            company_name = profile.get("name", "")
+
+            # Try to find the LSE ticker via yfinance search
+            yf_symbols = []
+            if company_name:
+                try:
+                    search_results = yf.Search(company_name)
+                    quotes = getattr(search_results, "quotes", [])
+                    for q in (quotes or []):
+                        sym = q.get("symbol", "")
+                        exchange = q.get("exchange", "")
+                        # LSE tickers end in .L, AIM in .IL
+                        if sym.endswith(".L") or sym.endswith(".IL") or "LSE" in exchange:
+                            yf_symbols.append(sym)
+                except Exception:
+                    pass
+
+            # Also try appending .L to the company number as last resort
+            if not yf_symbols:
+                yf_symbols = [f"{identifier}.L"]
+
+            for yf_symbol in yf_symbols[:3]:
+                try:
+                    tick = yf.Ticker(yf_symbol)
+                    inst = tick.institutional_holders
+                    if inst is not None and not inst.empty:
+                        for _, row in inst.iterrows():
+                            pct = row.get("pctHeld", 0) or 0
+                            if isinstance(pct, (int, float)) and 0 < pct < 1:
+                                pct = pct * 100
+                            holders.append({
+                                "name": str(row.get("Holder", "")),
+                                "shares": int(row.get("Shares", 0)),
+                                "value": float(row.get("Value", 0)),
+                                "percentage": round(float(pct), 2),
+                                "holder_type": "institutional",
+                                "date_reported": str(row.get("Date Reported", "")),
+                            })
+                        if holders:
+                            logger.info("UK holders for %s: %d from yfinance (%s)", identifier, len(holders), yf_symbol)
+                            return holders
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.debug("yfinance UK holder fallback failed for %s: %s", identifier, exc)
+
         return holders
