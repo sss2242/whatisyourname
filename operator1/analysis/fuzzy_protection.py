@@ -276,10 +276,76 @@ def compute_fuzzy_protection(
     else:
         result["fuzzy_policy_score"] = 0.0
 
-    # Aggregation: fuzzy OR (element-wise maximum across dimensions)
-    result["fuzzy_protection_degree"] = result[
-        ["fuzzy_sector_score", "fuzzy_economic_score", "fuzzy_policy_score"]
-    ].max(axis=1)
+    # Aggregation: prefer scikit-fuzzy Mamdani rule engine (captures
+    # dimension interactions), fall back to fuzzy OR (max) if unavailable.
+    _used_skfuzzy = False
+    try:
+        import skfuzzy as fuzz
+        from skfuzzy import control as ctrl
+
+        # Define fuzzy variables (antecedents + consequent)
+        sector_var = ctrl.Antecedent(np.arange(0, 1.01, 0.01), "sector")
+        economic_var = ctrl.Antecedent(np.arange(0, 1.01, 0.01), "economic")
+        policy_var = ctrl.Antecedent(np.arange(0, 1.01, 0.01), "policy")
+        protection_var = ctrl.Consequent(np.arange(0, 1.01, 0.01), "protection")
+
+        # Membership functions for each antecedent
+        for var in (sector_var, economic_var, policy_var):
+            var["low"] = fuzz.trimf(var.universe, [0, 0, 0.4])
+            var["medium"] = fuzz.trimf(var.universe, [0.2, 0.5, 0.8])
+            var["high"] = fuzz.trimf(var.universe, [0.6, 1.0, 1.0])
+
+        protection_var["unprotected"] = fuzz.trimf(protection_var.universe, [0, 0, 0.3])
+        protection_var["weak"] = fuzz.trimf(protection_var.universe, [0.1, 0.35, 0.55])
+        protection_var["moderate"] = fuzz.trimf(protection_var.universe, [0.35, 0.55, 0.75])
+        protection_var["strong"] = fuzz.trimf(protection_var.universe, [0.6, 0.8, 1.0])
+
+        # Rules capturing dimension interactions
+        rules = [
+            ctrl.Rule(sector_var["high"] & economic_var["high"], protection_var["strong"]),
+            ctrl.Rule(sector_var["high"] & economic_var["medium"], protection_var["strong"]),
+            ctrl.Rule(sector_var["high"] & economic_var["low"], protection_var["moderate"]),
+            ctrl.Rule(sector_var["medium"] & economic_var["high"], protection_var["strong"]),
+            ctrl.Rule(sector_var["medium"] & economic_var["medium"], protection_var["moderate"]),
+            ctrl.Rule(sector_var["medium"] & economic_var["low"], protection_var["weak"]),
+            ctrl.Rule(sector_var["low"] & economic_var["high"], protection_var["moderate"]),
+            ctrl.Rule(sector_var["low"] & economic_var["medium"], protection_var["weak"]),
+            ctrl.Rule(sector_var["low"] & economic_var["low"], protection_var["unprotected"]),
+            ctrl.Rule(policy_var["high"], protection_var["moderate"]),
+            ctrl.Rule(sector_var["low"] & policy_var["high"], protection_var["moderate"]),
+        ]
+
+        protection_ctrl = ctrl.ControlSystem(rules)
+        sim = ctrl.ControlSystemSimulation(protection_ctrl)
+
+        # Evaluate row-by-row
+        degrees = []
+        for idx in range(len(result)):
+            s = float(result["fuzzy_sector_score"].iloc[idx])
+            e = float(result["fuzzy_economic_score"].iloc[idx])
+            p = float(result["fuzzy_policy_score"].iloc[idx])
+            try:
+                sim.input["sector"] = np.clip(s, 0.001, 0.999)
+                sim.input["economic"] = np.clip(e, 0.001, 0.999)
+                sim.input["policy"] = np.clip(p, 0.001, 0.999)
+                sim.compute()
+                degrees.append(float(sim.output["protection"]))
+            except Exception:
+                degrees.append(max(s, e, p))  # fallback per-row
+
+        result["fuzzy_protection_degree"] = degrees
+        _used_skfuzzy = True
+        logger.info("Fuzzy protection: using scikit-fuzzy Mamdani rule engine")
+    except ImportError:
+        logger.debug("scikit-fuzzy not installed, using fuzzy OR fallback")
+    except Exception as exc:
+        logger.debug("scikit-fuzzy rule engine failed, using fallback: %s", exc)
+
+    if not _used_skfuzzy:
+        # Fallback: fuzzy OR (element-wise maximum across dimensions)
+        result["fuzzy_protection_degree"] = result[
+            ["fuzzy_sector_score", "fuzzy_economic_score", "fuzzy_policy_score"]
+        ].max(axis=1)
 
     # Label
     result["fuzzy_protection_label"] = result["fuzzy_protection_degree"].apply(

@@ -40,10 +40,24 @@ class PatternMatch:
 
 
 @dataclass
+class MotifMatch:
+    """A recurring motif discovered by Matrix Profile."""
+    start_idx_1: int = 0
+    start_idx_2: int = 0
+    distance: float = 0.0
+    window_size: int = 0
+    label: str = ""
+
+
+@dataclass
 class PatternDetectorResult:
     """Result from pattern detection."""
     recent_patterns: list[PatternMatch] = field(default_factory=list)
     predicted_patterns_week: list[dict[str, Any]] = field(default_factory=list)
+    # Matrix Profile motifs (recurring patterns)
+    motifs: list[MotifMatch] = field(default_factory=list)
+    # Matrix Profile discords (anomalies)
+    discords: list[dict[str, Any]] = field(default_factory=list)
     available: bool = True
     error: str = ""
 
@@ -57,6 +71,13 @@ class PatternDetectorResult:
                 for p in self.recent_patterns
             ],
             "predicted_patterns_week": self.predicted_patterns_week,
+            "motifs": [
+                {"start_1": m.start_idx_1, "start_2": m.start_idx_2,
+                 "distance": round(m.distance, 4), "window": m.window_size,
+                 "label": m.label}
+                for m in self.motifs
+            ],
+            "discords": self.discords,
         }
 
 
@@ -143,6 +164,95 @@ def detect_three_soldiers_crows(
         if closes[1] < closes[0] and closes[2] < closes[1]:
             return "bearish"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Matrix Profile motif/discord detection via stumpy
+# ---------------------------------------------------------------------------
+
+def _detect_motifs_stumpy(
+    close: np.ndarray,
+    window_size: int = 21,
+    top_k: int = 3,
+) -> tuple[list[MotifMatch], list[dict[str, Any]]]:
+    """Discover recurring motifs and anomalies via Matrix Profile.
+
+    stumpy computes the Matrix Profile in O(n log n), finding ALL
+    recurring subsequences (motifs) and unique outliers (discords).
+    This complements the rule-based candlestick detector by finding
+    any recurring shape, not just named patterns.
+
+    Returns (motifs, discords).
+    Falls back to empty lists if stumpy is not installed.
+    """
+    try:
+        import stumpy
+    except ImportError:
+        logger.debug("stumpy not installed, skipping Matrix Profile")
+        return [], []
+
+    n = len(close)
+    if n < window_size * 3:
+        return [], []
+
+    try:
+        # Compute Matrix Profile
+        mp = stumpy.stump(close.astype(np.float64), m=window_size)
+        # mp[:, 0] = matrix profile distances
+        # mp[:, 1] = nearest neighbor indices
+
+        distances = mp[:, 0].astype(float)
+        nn_indices = mp[:, 1].astype(int)
+
+        # Motifs: pairs with smallest Matrix Profile distance
+        motifs: list[MotifMatch] = []
+        sorted_idx = np.argsort(distances)
+        seen: set[int] = set()
+        for idx in sorted_idx:
+            if len(motifs) >= top_k:
+                break
+            nn = int(nn_indices[idx])
+            # Avoid overlapping motifs
+            if idx in seen or nn in seen:
+                continue
+            if abs(idx - nn) < window_size:
+                continue
+            motifs.append(MotifMatch(
+                start_idx_1=int(idx),
+                start_idx_2=nn,
+                distance=float(distances[idx]),
+                window_size=window_size,
+                label=f"motif_{len(motifs)+1}",
+            ))
+            seen.update(range(idx, idx + window_size))
+            seen.update(range(nn, nn + window_size))
+
+        # Discords: subsequences with largest Matrix Profile distance
+        discords: list[dict[str, Any]] = []
+        discord_idx = np.argsort(-distances)
+        seen_d: set[int] = set()
+        for idx in discord_idx:
+            if len(discords) >= top_k:
+                break
+            if idx in seen_d:
+                continue
+            discords.append({
+                "start_idx": int(idx),
+                "distance": float(distances[idx]),
+                "window_size": window_size,
+                "label": f"discord_{len(discords)+1}",
+            })
+            seen_d.update(range(idx, idx + window_size))
+
+        logger.info(
+            "Matrix Profile: %d motifs, %d discords (window=%d)",
+            len(motifs), len(discords), window_size,
+        )
+        return motifs, discords
+
+    except Exception as exc:
+        logger.debug("Matrix Profile computation failed: %s", exc)
+        return [], []
 
 
 # ---------------------------------------------------------------------------
@@ -257,13 +367,19 @@ def _detect_patterns_impl(
     else:
         predicted.append({"pattern": "Neutral / consolidation", "confidence": 0.5})
 
+    # Matrix Profile motif/discord discovery (stumpy)
+    motifs, discords = _detect_motifs_stumpy(closes)
+
     logger.info(
         "Pattern detection: %d patterns found in %d days "
-        "(%d bullish, %d bearish)",
+        "(%d bullish, %d bearish), %d motifs, %d discords",
         len(patterns), len(df), bullish_count, bearish_count,
+        len(motifs), len(discords),
     )
 
     return PatternDetectorResult(
         recent_patterns=recent,
         predicted_patterns_week=predicted,
+        motifs=motifs,
+        discords=discords,
     )

@@ -184,6 +184,82 @@ def _wavelet_decomposition(
     return energy
 
 
+def _emd_decomposition(
+    series: np.ndarray,
+    min_period: int = 5,
+    max_period: int = 300,
+    top_n: int = 5,
+) -> list[DominantCycle]:
+    """Extract dominant cycles using Empirical Mode Decomposition (CEEMDAN).
+
+    EMD adaptively decomposes non-stationary signals into Intrinsic Mode
+    Functions (IMFs) that capture time-varying frequency content -- unlike
+    FFT which assumes stationarity. CEEMDAN adds noise-assisted ensemble
+    averaging for robustness.
+
+    Falls back to FFT if EMD-signal is not installed.
+    """
+    try:
+        from PyEMD import CEEMDAN
+    except ImportError:
+        logger.debug("EMD-signal not installed, falling back to FFT")
+        return _fourier_decomposition(series, min_period, max_period, top_n)
+
+    n = len(series)
+    if n < 2 * min_period:
+        return []
+
+    try:
+        # Detrend before EMD
+        x = np.arange(n, dtype=float)
+        slope, intercept = np.polyfit(x, series, 1)
+        detrended = series - (slope * x + intercept)
+
+        # Run CEEMDAN (noise-robust EMD variant)
+        ceemdan = CEEMDAN(trials=50, epsilon=0.05, ext_EMD=None)
+        ceemdan.noise_seed(42)
+        imfs = ceemdan.ceemdan(detrended)
+
+        cycles: list[DominantCycle] = []
+        for imf in imfs:
+            # Estimate dominant period of each IMF via zero-crossing rate
+            zero_crossings = np.where(np.diff(np.sign(imf)))[0]
+            if len(zero_crossings) < 2:
+                continue
+            # Average half-period = mean distance between zero crossings
+            half_periods = np.diff(zero_crossings)
+            avg_period = float(np.mean(half_periods)) * 2.0
+
+            if avg_period < min_period or avg_period > max_period:
+                continue
+
+            amplitude = float(np.std(imf) * 2)  # ~peak-to-peak
+            # Phase at the end of the series
+            phase = float(np.arctan2(imf[-1], imf[-2])) if n >= 2 else 0.0
+
+            cycles.append(DominantCycle(
+                period_days=round(avg_period, 1),
+                amplitude=round(amplitude, 6),
+                phase=round(phase, 4),
+                label=_label_period(avg_period),
+            ))
+
+        # Sort by amplitude descending, take top N
+        cycles.sort(key=lambda c: c.amplitude, reverse=True)
+        cycles = cycles[:top_n]
+
+        if cycles:
+            logger.info(
+                "EMD decomposition: %d IMFs -> %d valid cycles (top: %.0fd)",
+                len(imfs), len(cycles), cycles[0].period_days,
+            )
+        return cycles
+
+    except Exception as exc:
+        logger.debug("EMD decomposition failed, falling back to FFT: %s", exc)
+        return _fourier_decomposition(series, min_period, max_period, top_n)
+
+
 def run_cycle_decomposition(
     cache: pd.DataFrame,
     variable: str = "close",
@@ -219,8 +295,10 @@ def _run_cycle_impl(
     if len(series) < 30:
         return CycleResult(available=False, error="Insufficient data for cycle analysis")
 
-    # Fourier
-    dominant_cycles = _fourier_decomposition(series)
+    # Try EMD first (adaptive, handles non-stationarity), fall back to FFT
+    dominant_cycles = _emd_decomposition(series)
+    if not dominant_cycles:
+        dominant_cycles = _fourier_decomposition(series)
 
     # Wavelet
     wavelet_energy = _wavelet_decomposition(series)
