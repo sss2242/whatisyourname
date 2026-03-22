@@ -828,6 +828,39 @@ class EarlyRegimeResult:
     error: str | None = None
 
 
+def compute_online_change_scores(
+    returns: np.ndarray,
+    r: float = 0.01,
+    order: int = 1,
+    smooth: int = 7,
+) -> np.ndarray | None:
+    """Compute online change point scores using ChangeFinder (SDAR algorithm).
+
+    Unlike batch PELT, ChangeFinder updates sequentially and detects regime
+    changes in real-time with no look-ahead. High scores indicate probable
+    change points.
+
+    Returns an array of anomaly scores (same length as input), or None
+    if changefinder is not installed.
+    """
+    try:
+        import changefinder as cf_lib
+    except ImportError:
+        return None
+
+    try:
+        detector = cf_lib.ChangeFinder(r=r, order=order, smooth=smooth)
+        scores = np.array([detector.update(float(x)) for x in returns])
+        logger.info(
+            "ChangeFinder: %d scores computed, max=%.3f, mean=%.3f",
+            len(scores), float(np.max(scores)), float(np.mean(scores)),
+        )
+        return scores
+    except Exception as exc:
+        logger.debug("ChangeFinder failed: %s", exc)
+        return None
+
+
 def run_early_regime_detection(
     cache: pd.DataFrame,
     *,

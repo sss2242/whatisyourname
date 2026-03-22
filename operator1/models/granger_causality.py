@@ -95,7 +95,12 @@ def compute_granger_causality(
         result.error = "Need at least 2 variables for Granger causality"
         return result
 
-    # Try to import statsmodels
+    # Try PCMCI first (handles autocorrelation and confounders)
+    pcmci_result = _try_pcmci(cache, variables, max_lag, significance_level)
+    if pcmci_result is not None and pcmci_result.fitted:
+        return pcmci_result
+
+    # Fallback to standard Granger F-tests
     try:
         from statsmodels.tsa.stattools import grangercausalitytests
     except ImportError:
@@ -248,6 +253,228 @@ def _fallback_granger(
 
     result.fitted = True
     return result
+
+
+def _try_pcmci(
+    cache: pd.DataFrame,
+    variables: list[str],
+    max_lag: int = 5,
+    significance_level: float = 0.05,
+) -> GrangerResult | None:
+    """Run PCMCI causal discovery (handles autocorrelation, confounders).
+
+    PCMCI (Runge et al. 2019) is specifically designed for time series
+    causal discovery. Unlike Granger (which inflates significance when
+    variables share autocorrelation), PCMCI conditions on the past of
+    ALL variables simultaneously, producing a true causal graph.
+
+    Returns GrangerResult or None if tigramite is not available.
+    """
+    try:
+        from tigramite import data_processing as pp
+        from tigramite.pcmci import PCMCI
+        from tigramite.independence_tests.parcorr import ParCorr
+    except ImportError:
+        return None
+
+    df = cache[variables].dropna()
+    if len(df) < 50 or len(variables) < 2:
+        return None
+
+    try:
+        data = df.values
+        var_names = list(variables)
+        dataframe = pp.DataFrame(data, var_names=var_names)
+
+        parcorr = ParCorr(significance="analytic")
+        pcmci = PCMCI(dataframe=dataframe, cond_ind_test=parcorr, verbosity=0)
+        results = pcmci.run_pcmci(tau_max=max_lag, alpha_level=significance_level)
+
+        # Extract significant links
+        p_matrix = results["p_matrix"]
+        val_matrix = results["val_matrix"]
+
+        result = GrangerResult()
+        n_vars = len(var_names)
+
+        for i in range(n_vars):
+            for j in range(n_vars):
+                if i == j:
+                    continue
+                for lag in range(1, max_lag + 1):
+                    p_val = float(p_matrix[i, j, lag])
+                    if p_val < significance_level:
+                        pair_key = (var_names[i], var_names[j])
+                        # Keep the best (lowest p-value) lag
+                        existing_p = result.causality_matrix.get(pair_key, 1.0)
+                        if p_val < existing_p:
+                            result.causality_matrix[pair_key] = p_val
+                            result.significant_pairs.append({
+                                "source": var_names[i],
+                                "target": var_names[j],
+                                "p_value": round(p_val, 6),
+                                "best_lag": lag,
+                                "val_statistic": round(float(val_matrix[i, j, lag]), 4),
+                                "method": "pcmci",
+                            })
+
+        # Deduplicate significant pairs (keep lowest p-value per pair)
+        seen = {}
+        for pair in result.significant_pairs:
+            key = (pair["source"], pair["target"])
+            if key not in seen or pair["p_value"] < seen[key]["p_value"]:
+                seen[key] = pair
+        result.significant_pairs = list(seen.values())
+
+        causal_vars = set()
+        for pair in result.significant_pairs:
+            causal_vars.add(pair["source"])
+            causal_vars.add(pair["target"])
+
+        result.retained_variables = sorted(causal_vars)
+        result.pruned_variables = sorted(set(variables) - causal_vars)
+        result.n_tests = n_vars * (n_vars - 1) * max_lag
+
+        max_possible = n_vars * (n_vars - 1)
+        if max_possible > 0:
+            result.network_density = len(result.significant_pairs) / max_possible
+
+        result.fitted = True
+        logger.info(
+            "PCMCI causality: %d significant pairs (density=%.3f), %d retained, %d pruned",
+            len(result.significant_pairs), result.network_density,
+            len(result.retained_variables), len(result.pruned_variables),
+        )
+        return result
+
+    except Exception as exc:
+        logger.debug("PCMCI failed: %s", exc)
+        return None
+
+
+def compute_time_varying_granger(
+    cache: pd.DataFrame,
+    variables: list[str] | None = None,
+    *,
+    window_size: int = 126,
+    step_size: int = 21,
+    max_lag: int = 5,
+    significance_level: float = 0.05,
+    min_observations: int = 50,
+) -> dict[str, Any]:
+    """Run rolling-window Granger causality to detect time-varying causal links.
+
+    Instead of a single static causal graph, this produces a temporal causal
+    graph showing when relationships emerge and disappear. Feature pruning
+    can then use the DAG for the CURRENT regime, not a static aggregate.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache DataFrame.
+    variables:
+        Columns to test (auto-selected if None).
+    window_size:
+        Rolling window size in days (default ~6 months).
+    step_size:
+        How many days to slide between windows (default ~1 month).
+    max_lag:
+        Maximum lag order for Granger F-tests.
+    significance_level:
+        P-value threshold.
+    min_observations:
+        Minimum non-NaN observations per window.
+
+    Returns
+    -------
+    Dict with:
+        - ``windows``: list of {start_date, end_date, significant_pairs, density}
+        - ``emerging_pairs``: pairs that became significant in recent windows
+        - ``disappearing_pairs``: pairs that were significant but are no longer
+        - ``current_window_result``: GrangerResult for the most recent window
+    """
+    if cache is None or cache.empty:
+        return {"error": "No data", "windows": []}
+
+    if variables is None:
+        variables = [
+            c for c in cache.columns
+            if cache[c].dtype in ("float64", "float32")
+            and cache[c].notna().sum() >= min_observations
+        ][:20]
+
+    if len(variables) < 2:
+        return {"error": "Need >= 2 variables", "windows": []}
+
+    n_rows = len(cache)
+    if n_rows < window_size + step_size:
+        return {"error": "Insufficient data for rolling windows", "windows": []}
+
+    windows_results: list[dict[str, Any]] = []
+    prev_pairs: set[tuple[str, str]] = set()
+
+    # Slide windows
+    for start in range(0, n_rows - window_size + 1, step_size):
+        end = start + window_size
+        window_cache = cache.iloc[start:end]
+
+        # Run Granger on this window
+        window_result = compute_granger_causality(
+            window_cache,
+            variables=variables,
+            max_lag=max_lag,
+            significance_level=significance_level,
+            min_observations=min(min_observations, window_size // 2),
+        )
+
+        current_pairs = {
+            (p["source"], p["target"])
+            for p in window_result.significant_pairs
+        }
+
+        start_date = str(cache.index[start])[:10] if hasattr(cache.index, "strftime") else str(start)
+        end_date = str(cache.index[end - 1])[:10] if hasattr(cache.index, "strftime") else str(end)
+
+        windows_results.append({
+            "start_date": start_date,
+            "end_date": end_date,
+            "n_significant": len(window_result.significant_pairs),
+            "density": window_result.network_density,
+            "pairs": list(current_pairs),
+        })
+
+        prev_pairs = current_pairs
+
+    # Identify emerging and disappearing pairs from the last two windows
+    emerging: list[tuple[str, str]] = []
+    disappearing: list[tuple[str, str]] = []
+    if len(windows_results) >= 2:
+        prev_set = set(tuple(p) for p in windows_results[-2].get("pairs", []))
+        curr_set = set(tuple(p) for p in windows_results[-1].get("pairs", []))
+        emerging = [p for p in curr_set - prev_set]
+        disappearing = [p for p in prev_set - curr_set]
+
+    # Current window result (most recent)
+    current_result = compute_granger_causality(
+        cache.iloc[-window_size:],
+        variables=variables,
+        max_lag=max_lag,
+        significance_level=significance_level,
+        min_observations=min(min_observations, window_size // 2),
+    )
+
+    logger.info(
+        "Time-varying Granger: %d windows, %d emerging pairs, %d disappearing",
+        len(windows_results), len(emerging), len(disappearing),
+    )
+
+    return {
+        "windows": windows_results,
+        "emerging_pairs": [{"source": p[0], "target": p[1]} for p in emerging],
+        "disappearing_pairs": [{"source": p[0], "target": p[1]} for p in disappearing],
+        "current_window_result": current_result,
+        "n_windows": len(windows_results),
+    }
 
 
 def prune_features_by_causality(

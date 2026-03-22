@@ -92,6 +92,10 @@ class GraphRiskResult:
     # Per-node PageRank
     pagerank_scores: dict[str, float] = field(default_factory=dict)
 
+    # Systemic risk measures (CoVaR, SRISK)
+    covar_scores: dict[str, float] = field(default_factory=dict)
+    srisk: float = 0.0
+
     available: bool = True
     error: str = ""
 
@@ -110,6 +114,8 @@ class GraphRiskResult:
             "top_pagerank": dict(
                 sorted(self.pagerank_scores.items(), key=lambda x: x[1], reverse=True)[:5]
             ),
+            "covar_scores": self.covar_scores,
+            "srisk": round(self.srisk, 2),
             "error": self.error,
         }
 
@@ -342,6 +348,129 @@ def _concentration_label(hhi_val: float) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _compute_covar(
+    target_returns: np.ndarray,
+    entity_returns: dict[str, np.ndarray],
+    quantile: float = 0.05,
+) -> dict[str, float]:
+    """Compute CoVaR (Conditional Value-at-Risk) for each linked entity.
+
+    CoVaR measures how much the target's VaR increases when a linked
+    entity is in distress (below its own VaR). Higher CoVaR means the
+    target is more exposed to the linked entity's downside.
+
+    Returns {entity_id: delta_covar} where delta_covar > 0 means the
+    target's risk increases when the entity is in distress.
+    """
+    covar_results: dict[str, float] = {}
+
+    # Target unconditional VaR
+    target_var = float(np.quantile(target_returns, quantile))
+
+    for ent_id, ent_ret in entity_returns.items():
+        n = min(len(target_returns), len(ent_ret))
+        if n < 30:
+            continue
+
+        t_ret = target_returns[:n]
+        e_ret = ent_ret[:n]
+
+        # Entity VaR
+        ent_var = np.quantile(e_ret, quantile)
+
+        # Conditional: target returns when entity is below its VaR
+        stress_mask = e_ret <= ent_var
+        if stress_mask.sum() < 5:
+            continue
+
+        # CoVaR = VaR of target CONDITIONAL on entity being in distress
+        covar = float(np.quantile(t_ret[stress_mask], quantile))
+
+        # Delta CoVaR = CoVaR - unconditional VaR
+        delta = covar - target_var
+        covar_results[ent_id] = round(float(delta), 6)
+
+    return covar_results
+
+
+def _compute_srisk(
+    target_market_cap: float | None,
+    target_debt: float | None,
+    stress_return: float = -0.40,
+    prudential_ratio: float = 0.08,
+) -> float:
+    """Compute SRISK (Systemic Risk) for the target company.
+
+    SRISK = max(0, k * Debt - (1 - k) * Equity * (1 + stress_return))
+    where k = prudential capital ratio (Basel III: 8%).
+
+    Measures the capital shortfall under a severe market stress scenario.
+    Positive SRISK = company needs external capital in a crisis.
+    """
+    if target_market_cap is None or target_debt is None:
+        return 0.0
+    if target_market_cap <= 0:
+        return 0.0
+
+    equity = target_market_cap
+    debt = target_debt
+
+    srisk = max(
+        0.0,
+        prudential_ratio * debt
+        - (1.0 - prudential_ratio) * equity * (1.0 + stress_return),
+    )
+    return round(float(srisk), 2)
+
+
+def _weighted_contagion_sim(
+    adjacency: dict[int, list[int]],
+    n_nodes: int,
+    seed_node: int,
+    base_prob: float,
+    node_weights: dict[int, float],
+    max_steps: int = DEFAULT_CONTAGION_STEPS,
+    n_sims: int = DEFAULT_CONTAGION_SIMS,
+    random_state: int = 42,
+) -> tuple[float, int, float]:
+    """Edge-weighted contagion simulation.
+
+    Like _simulate_contagion but scales infection probability per edge
+    by the weight of the relationship (higher exposure = higher risk).
+    """
+    rng = np.random.RandomState(random_state)
+    infection_counts: list[int] = []
+    target_infected_count = 0
+
+    for _ in range(n_sims):
+        infected = {seed_node}
+        frontier = {seed_node}
+
+        for _step in range(max_steps):
+            new_frontier: set[int] = set()
+            for node in frontier:
+                for nb in adjacency.get(node, []):
+                    if nb not in infected:
+                        # Scale probability by edge weight
+                        weight = node_weights.get(nb, 1.0)
+                        eff_prob = min(1.0, base_prob * weight)
+                        if rng.random() < eff_prob:
+                            infected.add(nb)
+                            new_frontier.add(nb)
+            frontier = new_frontier
+            if not frontier:
+                break
+
+        infection_counts.append(len(infected))
+        if 0 in infected:
+            target_infected_count += 1
+
+    expected = float(np.mean(infection_counts))
+    max_inf = int(np.max(infection_counts))
+    target_prob = target_infected_count / n_sims
+    return expected, max_inf, target_prob
+
+
 def compute_graph_risk_metrics(
     target_isin: str,
     relationships: dict[str, list[dict[str, Any]]],
@@ -350,6 +479,8 @@ def compute_graph_risk_metrics(
     contagion_sims: int = DEFAULT_CONTAGION_SIMS,
     random_state: int = 42,
     edge_weights: dict[str, float] | None = None,
+    target_cache: "pd.DataFrame | None" = None,
+    linked_caches: dict[str, "pd.DataFrame"] | None = None,
 ) -> GraphRiskResult:
     """Compute all graph-theoretic risk metrics.
 
@@ -399,18 +530,35 @@ def compute_graph_risk_metrics(
         pr = _pagerank(adjacency, n)
         pr_named = {nodes[i].name or nodes[i].isin: v for i, v in pr.items()}
 
+        # Build node weight map from edge_weights (entity_id -> weight)
+        # Map entity ISINs to node indices for weighted contagion
+        node_weights: dict[int, float] = {}
+        if edge_weights:
+            for i, nd in enumerate(nodes):
+                w = edge_weights.get(nd.isin, edge_weights.get(nd.name, 1.0))
+                node_weights[i] = w
+
         # Contagion from each non-target node, measure impact on target
         # Pick the most connected non-target node as the seed
         non_target = [i for i in range(1, n)]
         if non_target:
-            # Seed from the node with highest degree
             seed = max(non_target, key=lambda i: len(adjacency.get(i, [])))
-            exp_inf, max_inf, target_prob = _simulate_contagion(
-                adjacency, n, seed,
-                contagion_prob=contagion_prob,
-                n_sims=contagion_sims,
-                random_state=random_state,
-            )
+            if edge_weights and node_weights:
+                # Edge-weighted contagion (3.6)
+                exp_inf, max_inf, target_prob = _weighted_contagion_sim(
+                    adjacency, n, seed,
+                    base_prob=contagion_prob,
+                    node_weights=node_weights,
+                    n_sims=contagion_sims,
+                    random_state=random_state,
+                )
+            else:
+                exp_inf, max_inf, target_prob = _simulate_contagion(
+                    adjacency, n, seed,
+                    contagion_prob=contagion_prob,
+                    n_sims=contagion_sims,
+                    random_state=random_state,
+                )
         else:
             exp_inf, max_inf, target_prob = 0.0, 0, 0.0
 
@@ -429,7 +577,7 @@ def compute_graph_risk_metrics(
         c_hhi = _hhi(customer_caps)
         o_hhi = _hhi(all_caps)
 
-        return GraphRiskResult(
+        result = GraphRiskResult(
             n_nodes=n,
             n_edges=n_edges,
             target_degree_centrality=deg_c,
@@ -444,6 +592,30 @@ def compute_graph_risk_metrics(
             pagerank_scores=pr_named,
             available=True,
         )
+
+        # CoVaR and SRISK systemic risk measures (2.5)
+        if target_cache is not None and linked_caches:
+            _ret_col = "return_1d"
+            if _ret_col in target_cache.columns:
+                t_ret = target_cache[_ret_col].dropna().values
+                entity_returns: dict[str, np.ndarray] = {}
+                for ent_id, ent_cache in linked_caches.items():
+                    if _ret_col in ent_cache.columns:
+                        entity_returns[ent_id] = ent_cache[_ret_col].dropna().values
+                if entity_returns:
+                    covar = _compute_covar(t_ret, entity_returns)
+                    result.covar_scores = covar  # type: ignore[attr-defined]
+
+            # SRISK from target's market cap and debt
+            _mc = target_cache.get("market_cap")
+            _td = target_cache.get("total_debt_asof")
+            if _mc is not None and _td is not None:
+                mc_val = float(_mc.dropna().iloc[-1]) if _mc.notna().any() else None
+                td_val = float(_td.dropna().iloc[-1]) if _td.notna().any() else None
+                srisk = _compute_srisk(mc_val, td_val)
+                result.srisk = srisk  # type: ignore[attr-defined]
+
+        return result
 
     except Exception as exc:
         logger.warning("Graph risk computation failed: %s", exc)

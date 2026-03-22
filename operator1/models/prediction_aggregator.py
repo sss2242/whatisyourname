@@ -158,6 +158,116 @@ DEFAULT_VOLATILITY: float = 0.02
 
 
 # ---------------------------------------------------------------------------
+# Fixed Share Forecaster (Herbster & Warmuth 1998)
+# ---------------------------------------------------------------------------
+
+
+class FixedShareForecaster:
+    """Online model weighting with fixed share redistribution.
+
+    At each step, a fraction ``alpha`` of total weight is redistributed
+    uniformly across all models. This prevents any model from reaching
+    zero weight, so when a previously poor model starts performing well
+    (e.g., after a regime change), it can gain weight rapidly.
+
+    Parameters
+    ----------
+    model_names:
+        List of model names participating in the ensemble.
+    alpha:
+        Share parameter (0-1). Fraction of weight redistributed per step.
+        0.05 is a good default for financial regime changes (~20-day
+        adaptation).
+    eta:
+        Learning rate for the multiplicative weight update.
+    """
+
+    def __init__(
+        self,
+        model_names: list[str],
+        alpha: float = 0.05,
+        eta: float = 0.5,
+    ) -> None:
+        self._models = list(model_names)
+        self._n = len(model_names)
+        self._alpha = alpha
+        self._eta = eta
+        # Initialize uniform weights
+        self._weights = {name: 1.0 / self._n for name in self._models}
+
+    def update(self, losses: dict[str, float]) -> None:
+        """Update weights based on model losses for the current step.
+
+        Parameters
+        ----------
+        losses:
+            Dict of {model_name: squared_error} for the current day.
+        """
+        if not losses or self._n == 0:
+            return
+
+        # Multiplicative weight update
+        for name in self._models:
+            loss = losses.get(name, 0.0)
+            if not np.isfinite(loss):
+                continue
+            self._weights[name] *= np.exp(-self._eta * loss)
+
+        # Fixed share redistribution
+        total = sum(self._weights.values())
+        if total > 0:
+            for name in self._models:
+                self._weights[name] = (
+                    (1 - self._alpha) * self._weights[name] / total
+                    + self._alpha / self._n
+                )
+
+    def get_weights(self) -> dict[str, float]:
+        """Return current normalized weights."""
+        total = sum(self._weights.values())
+        if total <= 0:
+            return {name: 1.0 / self._n for name in self._models}
+        return {name: w / total for name, w in self._weights.items()}
+
+    def filter_by_mcs(
+        self,
+        confidence_set: list[str] | None,
+    ) -> dict[str, float]:
+        """Get weights filtered by a Model Confidence Set.
+
+        Models not in the confidence set get zero weight. Remaining
+        weights are renormalized.
+
+        Parameters
+        ----------
+        confidence_set:
+            List of model names in the confidence set. If None, returns
+            all weights unfiltered.
+
+        Returns
+        -------
+        Dict of {model_name: weight} with non-MCS models zeroed out.
+        """
+        raw = self.get_weights()
+        if confidence_set is None:
+            return raw
+
+        filtered = {
+            name: (w if name in confidence_set else 0.0)
+            for name, w in raw.items()
+        }
+        total = sum(filtered.values())
+        if total > 0:
+            return {name: w / total for name, w in filtered.items()}
+        # Fallback: equal weight across confidence set
+        n_mcs = len(confidence_set)
+        return {
+            name: (1.0 / n_mcs if name in confidence_set else 0.0)
+            for name in self._models
+        }
+
+
+# ---------------------------------------------------------------------------
 # Result containers
 # ---------------------------------------------------------------------------
 

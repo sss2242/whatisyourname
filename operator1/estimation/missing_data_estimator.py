@@ -69,19 +69,14 @@ def _run_mice(
     feature_cols: list[str],
     mar_masks: dict[str, pd.Series],
 ) -> dict[str, tuple[pd.Series, pd.Series]]:
-    """Run MICE imputation using sklearn IterativeImputer.
+    """Run MICE imputation using miceforest (LightGBM-based) or sklearn fallback.
+
+    Prefers miceforest when available: 5-10x faster than sklearn MICE and
+    captures non-linear relationships via LightGBM decision trees.
 
     Returns dict of var -> (estimated_values, confidence_scores).
     """
     results: dict[str, tuple[pd.Series, pd.Series]] = {}
-
-    try:
-        from sklearn.experimental import enable_iterative_imputer  # noqa: F401
-        from sklearn.impute import IterativeImputer
-        from sklearn.linear_model import BayesianRidge
-    except ImportError:
-        logger.warning("sklearn IterativeImputer not available -- skipping MICE")
-        return results
 
     # Build the joint matrix: features + targets
     all_cols = list(set(feature_cols + variables))
@@ -93,21 +88,45 @@ def _run_mice(
         if col in X.columns:
             X[col] = X[col].ffill().bfill()
 
+    X_imputed = None
+
+    # Try miceforest first (faster, non-linear)
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            imputer = IterativeImputer(
-                estimator=BayesianRidge(),
-                max_iter=_MICE_MAX_ITER,
-                n_nearest_features=min(_MICE_N_NEAREST, len(all_cols) - 1),
-                sample_posterior=True,
-                random_state=42,
-                verbose=0,
-            )
-            X_imputed = imputer.fit_transform(X.values)
+        import miceforest as mf
+        kernel = mf.ImputationKernel(X, save_all_iterations=False, random_state=42)
+        kernel.mice(iterations=min(_MICE_MAX_ITER, 3))
+        X_imputed = kernel.complete_data().values
+        logger.info("MICE imputation via miceforest (LightGBM): %d cols", len(all_cols))
+    except ImportError:
+        pass
     except Exception as exc:
-        logger.warning("MICE failed: %s", exc)
-        return results
+        logger.debug("miceforest failed, falling back to sklearn: %s", exc)
+
+    # Fallback to sklearn IterativeImputer with BayesianRidge
+    if X_imputed is None:
+        try:
+            from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+            from sklearn.impute import IterativeImputer
+            from sklearn.linear_model import BayesianRidge
+        except ImportError:
+            logger.warning("sklearn IterativeImputer not available -- skipping MICE")
+            return results
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                imputer = IterativeImputer(
+                    estimator=BayesianRidge(),
+                    max_iter=_MICE_MAX_ITER,
+                    n_nearest_features=min(_MICE_N_NEAREST, len(all_cols) - 1),
+                    sample_posterior=True,
+                    random_state=42,
+                    verbose=0,
+                )
+                X_imputed = imputer.fit_transform(X.values)
+        except Exception as exc:
+            logger.warning("MICE failed: %s", exc)
+            return results
 
     X_imputed_df = pd.DataFrame(X_imputed, index=df.index, columns=all_cols)
 

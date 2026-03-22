@@ -574,6 +574,38 @@ def _compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     _new["is_missing_bollinger_upper"] = _new["bollinger_upper"].isna().astype(int)
     _new["is_missing_bollinger_lower"] = _new["bollinger_lower"].isna().astype(int)
 
+    # MACD Histogram
+    _new["macd_histogram"] = _new["macd"] - _new["macd_signal"]
+
+    # Bollinger Band Width (normalized)
+    bb_mid = sma_20
+    _new["bb_width"] = ((sma_20 + 2 * std_20) - (sma_20 - 2 * std_20)) / bb_mid.where(
+        bb_mid.abs() > EPSILON, other=np.nan
+    )
+    _new["is_missing_bb_width"] = _new["bb_width"].isna().astype(int)
+
+    # ADX (Average Directional Index) via ta library when available
+    try:
+        import ta
+        high = df.get("high")
+        low = df.get("low")
+        if high is not None and low is not None and close.notna().sum() > 30:
+            adx_indicator = ta.trend.ADXIndicator(high, low, close, window=14)
+            _new["adx"] = adx_indicator.adx()
+            _new["adx_pos"] = adx_indicator.adx_pos()
+            _new["adx_neg"] = adx_indicator.adx_neg()
+            _new["is_missing_adx"] = _new["adx"].isna().astype(int)
+
+            # OBV (On-Balance Volume)
+            volume = df.get("volume")
+            if volume is not None:
+                _new["obv"] = ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume()
+                _new["is_missing_obv"] = _new["obv"].isna().astype(int)
+    except ImportError:
+        pass  # ta library not installed, skip ADX/OBV
+    except Exception as _exc:
+        logger.debug("ta library indicators failed: %s", _exc)
+
     # Assign all columns at once to avoid fragmentation
     df = pd.concat([df, pd.DataFrame(_new, index=df.index)], axis=1)
 

@@ -1174,6 +1174,19 @@ Non-interactive examples:
     try:
         cache["company_survival_mode_flag"] = compute_company_survival_flag(cache)
         cache["survival_probability"] = compute_survival_probability(cache)
+        # Cox PH data-driven survival risk score (lifelines)
+        try:
+            from operator1.analysis.survival_mode import compute_cox_survival_score
+            _cox_score = compute_cox_survival_score(cache)
+            if _cox_score.notna().any():
+                cache["cox_survival_score"] = _cox_score
+                # Blend sigmoid + Cox for combined probability
+                _sig = cache["survival_probability"]
+                _cox = cache["cox_survival_score"].fillna(_sig)
+                cache["survival_probability"] = 0.4 * _sig + 0.6 * _cox
+                logger.info("Cox PH survival score computed and blended")
+        except Exception as _exc:
+            logger.debug("Cox PH survival score skipped: %s", _exc)
         cache = compute_hierarchy_weights(cache)
         for i in range(1, 6):
             col = f"hierarchy_tier{i}_weight"
@@ -1295,6 +1308,8 @@ Non-interactive examples:
             graph_risk_result = compute_graph_risk_metrics(
                 target_isin=target_profile.get("isin", ticker),
                 relationships=_rel_dicts,
+                target_cache=cache,
+                linked_caches=linked_caches if linked_caches else None,
             )
             logger.info(
                 "Graph risk: %d nodes, centrality=%.3f",
@@ -1574,6 +1589,17 @@ Non-interactive examples:
             cache, early_regime_result = run_early_regime_detection(
                 cache, target_variable=_regime_target,
             )
+            # Online change point detection via ChangeFinder
+            try:
+                from operator1.models.regime_detector import compute_online_change_scores
+                _ret_for_cf = cache.get(_regime_target)
+                if _ret_for_cf is not None and _ret_for_cf.notna().sum() > 30:
+                    _cf_scores = compute_online_change_scores(_ret_for_cf.fillna(0).values)
+                    if _cf_scores is not None:
+                        cache["online_change_score"] = _cf_scores
+                        logger.info("ChangeFinder online scores computed")
+            except Exception as _exc:
+                logger.debug("ChangeFinder skipped: %s", _exc)
             if early_regime_result and early_regime_result.fitted:
                 regime_detector = early_regime_result.detector
                 logger.info("Early regime detection complete")
@@ -1886,6 +1912,50 @@ Non-interactive examples:
         except Exception as exc:
             logger.warning("Walk-forward evaluation failed: %s", exc)
 
+        # Forward pass error aggregation + MCS + Fixed Share (Part 2)
+        _mode_confidence_sets = None
+        _fixed_share = None
+        try:
+            if forward_pass_result is not None and hasattr(forward_pass_result, "predictions_log"):
+                from operator1.models.walk_forward import (
+                    aggregate_forward_pass_errors,
+                    compute_mode_confidence_sets,
+                )
+                from operator1.models.prediction_aggregator import FixedShareForecaster
+
+                _fp_log = getattr(forward_pass_result, "predictions_log", [])
+                if _fp_log:
+                    _mode_errors = aggregate_forward_pass_errors(_fp_log, cache)
+                    if _mode_errors:
+                        _mode_confidence_sets = compute_mode_confidence_sets(_mode_errors)
+                        logger.info(
+                            "Mode confidence sets: %s",
+                            {m: len(v) for m, v in _mode_confidence_sets.items()},
+                        )
+
+                    # Initialize Fixed Share with all model names from forward pass
+                    _all_model_names = set()
+                    for mode_models in _mode_errors.values():
+                        _all_model_names.update(mode_models.keys())
+                    if _all_model_names:
+                        _fixed_share = FixedShareForecaster(sorted(_all_model_names))
+                        # Feed historical errors to warm up weights
+                        for mode_models in _mode_errors.values():
+                            _min_len = min(len(v) for v in mode_models.values()) if mode_models else 0
+                            for step in range(min(_min_len, 50)):
+                                step_losses = {
+                                    name: errs[step]
+                                    for name, errs in mode_models.items()
+                                    if step < len(errs)
+                                }
+                                _fixed_share.update(step_losses)
+                        logger.info(
+                            "Fixed Share weights: %s",
+                            {k: f"{v:.3f}" for k, v in _fixed_share.get_weights().items()},
+                        )
+        except Exception as exc:
+            logger.debug("Mode error aggregation / Fixed Share failed: %s", exc)
+
         # Monte Carlo
         # In private mode, use equity_change_rate instead of return_1d.
         try:
@@ -1950,10 +2020,16 @@ Non-interactive examples:
             logger.warning("Particle filter failed: %s", exc)
 
         # Conformal prediction (before aggregation so results feed in)
+        # Prefer ConformalPIDCalibrator (PID-controlled + Mondrian partitioning)
+        # with fallback to standard ConformalCalibrator.
         try:
-            from operator1.models.conformal import ConformalCalibrator, build_conformal_result
+            from operator1.models.conformal import ConformalPIDCalibrator, ConformalCalibrator, build_conformal_result
             if forecast_result is not None:
-                calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
+                try:
+                    calibrator = ConformalPIDCalibrator(target_coverage=0.9)
+                    logger.info("Using ConformalPIDCalibrator (PID + Mondrian)")
+                except Exception:
+                    calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
                 if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
                     for r in forecast_result.residuals:
                         calibrator.update(r)
@@ -1991,7 +2067,10 @@ Non-interactive examples:
                 _dtw_vars = [c for c in ["equity_value", "revenue", "net_income",
                              "total_debt", "operating_cash_flow"]
                              if c in cache.columns and cache[c].notna().sum() > 30]
-            dtw_result = find_historical_analogs(cache, variables=_dtw_vars)
+            dtw_result = find_historical_analogs(
+                cache, variables=_dtw_vars,
+                linked_caches=linked_caches if linked_caches else None,
+            )
             logger.info("DTW analogs complete")
         except Exception as exc:
             logger.warning("DTW historical analogs failed: %s", exc)
@@ -2054,6 +2133,58 @@ Non-interactive examples:
             logger.info("Sobol sensitivity analysis complete")
         except Exception as exc:
             logger.warning("Sobol sensitivity failed: %s", exc)
+
+        # Sobol -> Hierarchy feedback loop (Proposal 1.5)
+        # Adjusts hierarchy weights toward data-driven Sobol importance
+        try:
+            from operator1.models.sensitivity import adjust_hierarchy_from_sobol
+            _adjusted_weights = adjust_hierarchy_from_sobol(sobol_result, weights)
+            if _adjusted_weights != weights:
+                weights = _adjusted_weights
+                logger.info("Hierarchy weights adjusted from Sobol: %s", weights)
+        except Exception as exc:
+            logger.debug("Sobol hierarchy feedback skipped: %s", exc)
+
+        # Time-varying Granger causality (Proposal 3.5)
+        _tv_granger_result = None
+        try:
+            from operator1.models.granger_causality import compute_time_varying_granger
+            _tv_granger_result = compute_time_varying_granger(cache, variables=_gc_vars[:15] if '_gc_vars' in dir() else None)
+            if _tv_granger_result and _tv_granger_result.get("emerging_pairs"):
+                logger.info(
+                    "Time-varying Granger: %d windows, %d emerging, %d disappearing",
+                    _tv_granger_result.get("n_windows", 0),
+                    len(_tv_granger_result.get("emerging_pairs", [])),
+                    len(_tv_granger_result.get("disappearing_pairs", [])),
+                )
+        except Exception as exc:
+            logger.debug("Time-varying Granger failed: %s", exc)
+
+        # Multivariate Monte Carlo (Proposal 3.3)
+        _mv_mc_result = None
+        try:
+            from operator1.models.monte_carlo import run_multivariate_monte_carlo
+            _copula_corr = None
+            if copula_result is not None and hasattr(copula_result, "copula_correlation"):
+                # Extract correlation matrix from dict format
+                _cop_vars = list(copula_result.copula_correlation.keys())
+                if _cop_vars:
+                    import numpy as _np
+                    _copula_corr = _np.array([
+                        [copula_result.copula_correlation[vi].get(vj, 0.0) for vj in _cop_vars]
+                        for vi in _cop_vars
+                    ])
+            _mv_mc_result = run_multivariate_monte_carlo(
+                cache, copula_correlation=_copula_corr,
+            )
+            if _mv_mc_result and _mv_mc_result.get("available"):
+                logger.info(
+                    "Multivariate MC: survival=%.4f, vars=%s",
+                    _mv_mc_result.get("survival_probability", 0),
+                    _mv_mc_result.get("variables_simulated", []),
+                )
+        except Exception as exc:
+            logger.debug("Multivariate Monte Carlo failed: %s", exc)
 
         # Genetic Algorithm
         try:
@@ -2327,6 +2458,19 @@ Non-interactive examples:
                 "n_pruned": len(granger_result.pruned_variables),
                 "top_pairs": granger_result.significant_pairs[:10],
             }
+
+        # Time-varying Granger causality (Proposal 3.5)
+        if _tv_granger_result is not None and _tv_granger_result.get("n_windows", 0) > 0:
+            profile["extended_models"]["time_varying_granger"] = {
+                "available": True,
+                "n_windows": _tv_granger_result["n_windows"],
+                "emerging_pairs": _tv_granger_result.get("emerging_pairs", []),
+                "disappearing_pairs": _tv_granger_result.get("disappearing_pairs", []),
+            }
+
+        # Multivariate Monte Carlo (Proposal 3.3)
+        if _mv_mc_result is not None and _mv_mc_result.get("available"):
+            profile["extended_models"]["multivariate_monte_carlo"] = _mv_mc_result
 
         # Dual regimes
         if dual_regime_result is not None and dual_regime_result.fitted:

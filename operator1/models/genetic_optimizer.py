@@ -37,6 +37,9 @@ class GAResult:
     # Per-tier best weights: {tier: {model_name: weight}}
     tier_weights: dict[str, dict[str, float]] = field(default_factory=dict)
 
+    # Per-regime best weights: {regime_label: {model_name: weight}}
+    regime_weights: dict[str, dict[str, float]] = field(default_factory=dict)
+
     # Fitness history (best fitness per generation)
     fitness_history: list[float] = field(default_factory=list)
 
@@ -121,6 +124,66 @@ def _evaluate_fitness(
 
     rmse = np.sqrt(np.mean(residuals[valid] ** 2))
     return -rmse  # Negative RMSE as fitness (maximize = minimize RMSE)
+
+
+def _try_optuna_optimization(
+    model_predictions: dict[str, np.ndarray],
+    actuals: np.ndarray,
+    active_models: list[str],
+    n_trials: int = 100,
+) -> dict[str, float] | None:
+    """Try Optuna TPE optimization for ensemble weights.
+
+    TPE (Tree-structured Parzen Estimator) often converges faster than
+    GA for continuous weight optimization. Returns None if optuna is
+    not installed or optimization fails.
+    """
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except ImportError:
+        return None
+
+    try:
+        def objective(trial):
+            weights = [trial.suggest_float(name, 0.001, 1.0) for name in active_models]
+            total = sum(weights)
+            if total <= 0:
+                return float("inf")
+            weights = [w / total for w in weights]
+
+            ensemble = np.zeros_like(actuals)
+            for w, name in zip(weights, active_models):
+                if name in model_predictions:
+                    pred = model_predictions[name]
+                    n = min(len(pred), len(ensemble))
+                    ensemble[:n] += w * pred[:n]
+
+            valid = ~np.isnan(actuals - ensemble)
+            if valid.sum() < 5:
+                return float("inf")
+            return float(np.sqrt(np.mean((actuals[valid] - ensemble[valid]) ** 2)))
+
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=42),
+        )
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+        best = study.best_params
+        weights = [best[name] for name in active_models]
+        total = sum(weights)
+        if total <= 0:
+            return None
+        result = {name: round(w / total, 6) for name, w in zip(active_models, weights)}
+        logger.info(
+            "Optuna TPE: best_rmse=%.6f in %d trials, weights=%s",
+            study.best_value, len(study.trials), result,
+        )
+        return result
+    except Exception as exc:
+        logger.debug("Optuna optimization failed: %s", exc)
+        return None
 
 
 def run_genetic_optimization(
@@ -223,6 +286,21 @@ def run_genetic_optimization(
                 inv_rmse = {k: 1.0 / v for k, v in model_rmse.items()}
                 total = sum(inv_rmse.values())
                 _informed_weights = {k: v / total for k, v in inv_rmse.items()}
+
+    # Try Optuna TPE first (faster convergence for continuous weights)
+    if len(model_predictions) >= 2:
+        optuna_weights = _try_optuna_optimization(
+            model_predictions, actuals, list(model_predictions.keys()),
+        )
+        if optuna_weights is not None:
+            result.best_weights = optuna_weights
+            for name in MODEL_NAMES:
+                result.best_weights.setdefault(name, 0.0)
+            result.fitted = True
+            result.n_generations = 0
+            result.converged = True
+            # Still run GA below for per-tier and per-regime weights
+            # but use Optuna result as the global best
 
     if len(model_predictions) < 2:
         # Not enough model predictions, use inverse-RMSE fallback
@@ -346,6 +424,74 @@ def run_genetic_optimization(
         if total > 0:
             tier_w = {k: round(v / total, 6) for k, v in tier_w.items()}
         result.tier_weights[tier] = tier_w
+
+    # Per-regime weight optimization (Proposal 1.3)
+    # Run separate GA passes for each regime, producing regime-specific
+    # weight vectors. The prediction aggregator can then switch between
+    # weight vectors based on the current regime.
+    regime_col = "regime_label"
+    if regime_col in cache.columns and len(result.best_weights) > 0:
+        regime_weights: dict[str, dict[str, float]] = {}
+        regimes_in_cache = cache[regime_col].dropna().unique()
+
+        for regime in regimes_in_cache:
+            regime_str = str(regime)
+            regime_mask = cache[regime_col] == regime
+            regime_actuals = cache.loc[regime_mask, target_col].values[-validation_window:]
+
+            if len(regime_actuals) < 10 or np.isnan(regime_actuals).all():
+                regime_weights[regime_str] = dict(result.best_weights)
+                continue
+
+            # Build per-regime model predictions
+            regime_preds: dict[str, np.ndarray] = {}
+            for name, preds in model_predictions.items():
+                regime_p = cache.loc[regime_mask].iloc[-validation_window:]
+                if len(regime_p) == len(regime_actuals):
+                    regime_preds[name] = preds[-len(regime_actuals):] if len(preds) >= len(regime_actuals) else preds
+                else:
+                    regime_preds[name] = preds[-len(regime_actuals):]
+
+            # Quick GA for this regime (fewer generations)
+            r_population = [_random_weights(n_active, rng) for _ in range(20)]
+            # Seed with global best
+            r_population[0] = best_ever_weights.copy()
+
+            r_best_fitness = float("-inf")
+            r_best_w = best_ever_weights.copy()
+
+            for _gen in range(10):
+                r_scores = [
+                    _evaluate_fitness(ind, regime_preds, regime_actuals, active_models)
+                    for ind in r_population
+                ]
+                r_ranked = sorted(zip(r_scores, r_population), key=lambda x: x[0], reverse=True)
+                if r_ranked[0][0] > r_best_fitness:
+                    r_best_fitness = r_ranked[0][0]
+                    r_best_w = r_ranked[0][1].copy()
+
+                r_new = [r_ranked[0][1].copy()]
+                while len(r_new) < 20:
+                    p1 = rng.choice(len(r_population))
+                    p2 = rng.choice(len(r_population))
+                    child = _crossover(r_population[p1], r_population[p2], rng)
+                    child = _mutate(child, mutation_rate, rng)
+                    r_new.append(child)
+                r_population = r_new[:20]
+
+            rw: dict[str, float] = {}
+            for i, name in enumerate(active_models):
+                rw[name] = round(float(r_best_w[i]), 6)
+            for name in MODEL_NAMES:
+                if name not in rw:
+                    rw[name] = 0.0
+            regime_weights[regime_str] = rw
+
+        if regime_weights:
+            result.regime_weights = regime_weights  # type: ignore[attr-defined]
+            logger.info(
+                "Per-regime GA weights computed for %d regimes", len(regime_weights),
+            )
 
     result.fitted = True
     logger.info(

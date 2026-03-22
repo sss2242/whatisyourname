@@ -32,6 +32,10 @@ class CopulaResult:
     tail_dependence: dict[str, float] = field(default_factory=dict)
     # Joint crisis probability estimates
     joint_crisis_probability: float = 0.0
+    # Best copula type selected by AIC (gaussian, student_t, clayton)
+    best_copula: str = "gaussian"
+    # AIC scores per copula type
+    aic_scores: dict[str, float] = field(default_factory=dict)
     available: bool = True
     error: str = ""
 
@@ -39,6 +43,8 @@ class CopulaResult:
         return {
             "available": self.available,
             "error": self.error,
+            "best_copula": self.best_copula,
+            "aic_scores": self.aic_scores,
             "copula_correlation": self.copula_correlation,
             "tail_dependence": self.tail_dependence,
             "joint_crisis_probability": self.joint_crisis_probability,
@@ -88,6 +94,139 @@ def _fit_gaussian_copula(uniform_data: np.ndarray) -> np.ndarray:
         corr = np.nan_to_num(corr, nan=0.0)
 
     return corr
+
+
+def _fit_student_t_copula(
+    uniform_data: np.ndarray,
+) -> tuple[np.ndarray, float, float]:
+    """Fit a Student-t copula using the copulae library.
+
+    Returns (correlation_matrix, degrees_of_freedom, log_likelihood).
+    Falls back to Gaussian copula parameters if copulae is not installed.
+    """
+    try:
+        from copulae import StudentCopula
+        d = uniform_data.shape[1]
+        cop = StudentCopula(dim=d)
+        cop.fit(uniform_data)
+        corr = np.array(cop.params.corr)
+        df = float(cop.params.df)
+        ll = float(cop.log_lik(uniform_data))
+        logger.debug("Student-t copula fitted: df=%.1f, log_lik=%.2f", df, ll)
+        return corr, df, ll
+    except ImportError:
+        logger.debug("copulae not installed, skipping Student-t copula")
+        return np.eye(uniform_data.shape[1]), 30.0, float("-inf")
+    except Exception as exc:
+        logger.debug("Student-t copula fitting failed: %s", exc)
+        return np.eye(uniform_data.shape[1]), 30.0, float("-inf")
+
+
+def _fit_clayton_copula(
+    uniform_data: np.ndarray,
+) -> tuple[float, float]:
+    """Fit a Clayton copula (captures lower-tail dependence).
+
+    Returns (theta, log_likelihood).
+    Falls back to theta=1.0 if copulae is not installed.
+    """
+    try:
+        from copulae import ClaytonCopula
+        d = uniform_data.shape[1]
+        if d != 2:
+            # Clayton copula in copulae only supports bivariate; for d>2
+            # fit pairwise and average theta.
+            thetas = []
+            lls = []
+            for i in range(d):
+                for j in range(i + 1, d):
+                    try:
+                        pair = uniform_data[:, [i, j]]
+                        cop = ClaytonCopula(dim=2)
+                        cop.fit(pair)
+                        thetas.append(float(cop.params))
+                        lls.append(float(cop.log_lik(pair)))
+                    except Exception:
+                        pass
+            if thetas:
+                return float(np.mean(thetas)), float(np.mean(lls))
+            return 1.0, float("-inf")
+        cop = ClaytonCopula(dim=2)
+        cop.fit(uniform_data)
+        theta = float(cop.params)
+        ll = float(cop.log_lik(uniform_data))
+        logger.debug("Clayton copula fitted: theta=%.3f, log_lik=%.2f", theta, ll)
+        return theta, ll
+    except ImportError:
+        logger.debug("copulae not installed, skipping Clayton copula")
+        return 1.0, float("-inf")
+    except Exception as exc:
+        logger.debug("Clayton copula fitting failed: %s", exc)
+        return 1.0, float("-inf")
+
+
+def _compute_aic(log_lik: float, n_params: int) -> float:
+    """Compute Akaike Information Criterion: AIC = 2k - 2*ln(L)."""
+    if not np.isfinite(log_lik):
+        return float("inf")
+    return 2 * n_params - 2 * log_lik
+
+
+def _select_best_copula(
+    uniform_data: np.ndarray,
+    gaussian_corr: np.ndarray,
+) -> tuple[str, np.ndarray, dict[str, float]]:
+    """Fit Gaussian, Student-t, and Clayton copulas; select best by AIC.
+
+    Returns (best_type, best_correlation, aic_scores).
+    """
+    d = uniform_data.shape[1]
+    n_corr_params = d * (d - 1) // 2  # unique off-diagonal elements
+
+    # Gaussian AIC: compute log-likelihood from multivariate normal
+    normal_data = stats.norm.ppf(np.clip(uniform_data, 1e-6, 1 - 1e-6))
+    mask = np.isfinite(normal_data).all(axis=1)
+    normal_clean = normal_data[mask]
+    try:
+        from scipy.stats import multivariate_normal
+        gauss_ll = float(np.sum(multivariate_normal.logpdf(
+            normal_clean, mean=np.zeros(d), cov=gaussian_corr,
+        )))
+    except Exception:
+        gauss_ll = float("-inf")
+
+    gauss_aic = _compute_aic(gauss_ll, n_corr_params)
+
+    # Student-t: correlation + degrees of freedom
+    t_corr, t_df, t_ll = _fit_student_t_copula(uniform_data)
+    t_aic = _compute_aic(t_ll, n_corr_params + 1)
+
+    # Clayton: single theta parameter
+    c_theta, c_ll = _fit_clayton_copula(uniform_data)
+    c_aic = _compute_aic(c_ll, 1)
+
+    aic_scores = {
+        "gaussian": round(gauss_aic, 2),
+        "student_t": round(t_aic, 2),
+        "clayton": round(c_aic, 2),
+    }
+
+    # Select best (lowest AIC)
+    best = min(aic_scores, key=lambda k: aic_scores[k])
+
+    if best == "student_t" and np.isfinite(t_aic):
+        logger.info(
+            "Best copula: Student-t (df=%.1f), AIC=%s", t_df, aic_scores,
+        )
+        return "student_t", t_corr, aic_scores
+    elif best == "clayton" and np.isfinite(c_aic):
+        logger.info(
+            "Best copula: Clayton (theta=%.3f), AIC=%s", c_theta, aic_scores,
+        )
+        return "clayton", gaussian_corr, aic_scores
+    else:
+        logger.info("Best copula: Gaussian, AIC=%s", aic_scores)
+        return "gaussian", gaussian_corr, aic_scores
 
 
 def _estimate_tail_dependence(
@@ -227,13 +366,16 @@ def _run_copula_impl(
     # Step 1: Transform to uniform marginals
     uniform = _to_uniform_marginals(data)
 
-    # Step 2: Fit Gaussian copula
-    copula_corr = _fit_gaussian_copula(uniform)
+    # Step 2: Fit Gaussian copula (always available as baseline)
+    gaussian_corr = _fit_gaussian_copula(uniform)
 
-    # Step 3: Estimate tail dependence
+    # Step 3: Model selection -- fit Student-t and Clayton, pick best by AIC
+    best_type, best_corr, aic_scores = _select_best_copula(uniform, gaussian_corr)
+
+    # Step 4: Estimate tail dependence
     tail_dep = _estimate_tail_dependence(data, var_names)
 
-    # Step 4: Joint crisis probability
+    # Step 5: Joint crisis probability
     joint_crisis = _estimate_joint_crisis_prob(data, var_names)
 
     # Format correlation as nested dict
@@ -241,15 +383,17 @@ def _run_copula_impl(
     for i, vi in enumerate(var_names):
         corr_dict[vi] = {}
         for j, vj in enumerate(var_names):
-            corr_dict[vi][vj] = round(float(copula_corr[i, j]), 4)
+            corr_dict[vi][vj] = round(float(best_corr[i, j]), 4)
 
     logger.info(
-        "Copula analysis: %d variables, joint crisis prob = %.4f",
-        len(var_names), joint_crisis,
+        "Copula analysis: %d variables, best=%s, joint crisis prob = %.4f",
+        len(var_names), best_type, joint_crisis,
     )
 
     return CopulaResult(
         copula_correlation=corr_dict,
         tail_dependence=tail_dep,
         joint_crisis_probability=round(joint_crisis, 4),
+        best_copula=best_type,
+        aic_scores=aic_scores,
     )
