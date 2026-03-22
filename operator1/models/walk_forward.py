@@ -561,3 +561,140 @@ def get_mode_weights_from_walk_forward(
             result[mode] = {name: 1.0 / n for name in inv_mae}
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Forward pass error aggregation by survival mode (Part 2)
+# ---------------------------------------------------------------------------
+
+
+def aggregate_forward_pass_errors(
+    predictions_log: list[dict[str, Any]],
+    cache: pd.DataFrame,
+    target_variable: str = "close",
+) -> dict[str, dict[str, list[float]]]:
+    """Aggregate forward pass errors by survival mode.
+
+    Extracts per-model, per-day errors from the forward pass predictions
+    log and groups them by the survival mode active on each day. This
+    eliminates the need for a separate walk-forward loop.
+
+    Parameters
+    ----------
+    predictions_log:
+        List of dicts from forward_pass_result.predictions_log.
+        Each entry should have: day_idx, model_name, predicted, actual.
+    cache:
+        Daily cache with 'survival_mode' column.
+    target_variable:
+        Variable to aggregate errors for.
+
+    Returns
+    -------
+    Dict of {mode: {model_name: [squared_errors]}}.
+    """
+    from collections import defaultdict
+
+    mode_errors: dict[str, dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list),
+    )
+
+    has_mode = "survival_mode" in cache.columns
+
+    for entry in predictions_log:
+        if not isinstance(entry, dict):
+            continue
+
+        day_idx = entry.get("day_idx", entry.get("day", -1))
+        if day_idx < 0 or day_idx >= len(cache):
+            continue
+
+        model = entry.get("model_name", "unknown")
+        predicted = entry.get("predicted")
+        actual = entry.get("actual")
+        var = entry.get("variable", target_variable)
+
+        if predicted is None or actual is None:
+            continue
+        if math.isnan(predicted) or math.isnan(actual):
+            continue
+
+        mode = str(cache["survival_mode"].iloc[day_idx]) if has_mode else "normal"
+        sq_error = (actual - predicted) ** 2
+        mode_errors[mode][model].append(sq_error)
+
+    return dict(mode_errors)
+
+
+def compute_mode_confidence_sets(
+    mode_errors: dict[str, dict[str, list[float]]],
+    significance: float = 0.10,
+) -> dict[str, list[str]]:
+    """Compute Model Confidence Sets per survival mode.
+
+    Uses arch.bootstrap.MCS (Hansen, Lunde & Nason 2011) when available.
+    Falls back to a simple threshold-based selection when arch MCS is
+    not available.
+
+    Models in the confidence set are statistically indistinguishable
+    from the best model. Models outside are significantly worse.
+
+    Parameters
+    ----------
+    mode_errors:
+        From aggregate_forward_pass_errors().
+    significance:
+        MCS significance level (default 0.10).
+
+    Returns
+    -------
+    Dict of {mode: [model_names_in_confidence_set]}.
+    """
+    mode_mcs: dict[str, list[str]] = {}
+
+    for mode, model_sq_errors in mode_errors.items():
+        model_names = list(model_sq_errors.keys())
+        if len(model_names) < 2:
+            mode_mcs[mode] = model_names
+            continue
+
+        # Align to same length (min across models)
+        min_len = min(len(errs) for errs in model_sq_errors.values())
+        if min_len < 10:
+            mode_mcs[mode] = model_names  # too few, keep all
+            continue
+
+        try:
+            from arch.bootstrap import MCS as ArchMCS
+            import pandas as _pd
+
+            # Build loss DataFrame (columns = models, rows = days)
+            losses_dict = {
+                name: errs[:min_len]
+                for name, errs in model_sq_errors.items()
+            }
+            losses_df = _pd.DataFrame(losses_dict)
+
+            mcs = ArchMCS(losses_df, size=significance)
+            mcs.compute()
+            included = list(mcs.included)
+            if included:
+                mode_mcs[mode] = included
+                logger.info(
+                    "MCS for mode '%s': %d/%d models in confidence set: %s",
+                    mode, len(included), len(model_names), included,
+                )
+            else:
+                mode_mcs[mode] = model_names
+        except ImportError:
+            logger.debug("arch.bootstrap.MCS not available, using threshold fallback")
+            # Fallback: include models within 20% of best MAE
+            maes = {name: np.mean(errs[:min_len]) for name, errs in model_sq_errors.items()}
+            best_mae = min(maes.values())
+            threshold = best_mae * 1.20
+            mode_mcs[mode] = [name for name, mae in maes.items() if mae <= threshold]
+        except Exception as exc:
+            logger.debug("MCS computation failed for mode '%s': %s", mode, exc)
+            mode_mcs[mode] = model_names
+
+    return mode_mcs
