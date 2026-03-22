@@ -2077,6 +2077,7 @@ Non-interactive examples:
                 forecast_result=forecast_result,
                 mc_result=mc_result,
                 pattern_drift_multiplier=_pattern_drift,
+                cycle_result=cycle_result,
             )
             if ohlc_result and ohlc_result.fitted:
                 logger.info("OHLC prediction complete")
