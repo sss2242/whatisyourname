@@ -1138,7 +1138,7 @@ Non-interactive examples:
     logger.info("Step 5: Computing derived features...")
 
     from operator1.features.derived_variables import compute_derived_variables
-    from operator1.analysis.survival_mode import compute_company_survival_flag
+    from operator1.analysis.survival_mode import compute_company_survival_flag, compute_survival_probability
     from operator1.analysis.hierarchy_weights import compute_hierarchy_weights
 
     try:
@@ -1173,6 +1173,7 @@ Non-interactive examples:
     weights: dict = {f"tier{i}": 20.0 for i in range(1, 6)}
     try:
         cache["company_survival_mode_flag"] = compute_company_survival_flag(cache)
+        cache["survival_probability"] = compute_survival_probability(cache)
         cache = compute_hierarchy_weights(cache)
         for i in range(1, 6):
             col = f"hierarchy_tier{i}_weight"
