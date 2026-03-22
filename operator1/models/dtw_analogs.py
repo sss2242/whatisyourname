@@ -171,6 +171,8 @@ def find_historical_analogs(
     k: int = DEFAULT_K_ANALOGS,
     forecast_horizon: int = DEFAULT_FORECAST_HORIZON,
     min_gap: int = 10,
+    linked_caches: dict[str, pd.DataFrame] | None = None,
+    peer_weight: float = 0.7,
 ) -> DTWAnalogResult:
     """Find the K closest historical analogs to the current state.
 
@@ -190,6 +192,14 @@ def find_historical_analogs(
     min_gap:
         Minimum gap (in days) between analog end and present, to avoid
         matching the query with itself.
+    linked_caches:
+        Optional dict of peer company caches (entity_id -> DataFrame).
+        When provided, analogs are searched across peer histories too,
+        expanding the candidate pool. Peer analogs are weighted by
+        ``peer_weight`` (default 0.7x) to reflect cross-company noise.
+    peer_weight:
+        Weight multiplier for peer-company analogs (0-1). Default 0.7
+        means peer analogs are 30% less trusted than same-company analogs.
 
     Returns
     -------
@@ -247,6 +257,38 @@ def find_historical_analogs(
         candidate = normalised[start:end]
         dist = _dtw_distance(query, candidate)
         candidates.append((dist, start, end))
+
+    # Cross-company analog search (Phase 3.4 improvement)
+    # Search peer company histories for additional analog candidates.
+    # Peer analogs are weighted by peer_weight (default 0.7x) to reflect
+    # the noise from cross-company comparison.
+    if linked_caches:
+        for entity_id, peer_cache in linked_caches.items():
+            try:
+                peer_vars = [v for v in variables if v in peer_cache.columns]
+                if len(peer_vars) < 2 or len(peer_cache) < query_window + forecast_horizon:
+                    continue
+                peer_matrix = peer_cache[peer_vars].values.astype(np.float64)
+                peer_norm, _, _ = _normalise_features(peer_matrix)
+                peer_rows = len(peer_norm)
+                peer_search_end = peer_rows - query_window - forecast_horizon
+                for start in range(0, max(peer_search_end, 0)):
+                    end = start + query_window
+                    candidate = peer_norm[start:end]
+                    # Use the subset of features common to both
+                    query_subset = query[:, :len(peer_vars)]
+                    dist = _dtw_distance(query_subset, candidate)
+                    # Apply peer weight penalty (higher distance = less similar)
+                    dist = dist / max(peer_weight, 0.01)
+                    candidates.append((dist, start, end))
+            except Exception as exc:
+                logger.debug("Peer DTW search failed for %s: %s", entity_id, exc)
+
+        if linked_caches:
+            logger.info(
+                "Cross-company DTW: searched %d peer histories, total candidates=%d",
+                len(linked_caches), len(candidates),
+            )
 
     # Sort by distance (ascending)
     candidates.sort(key=lambda x: x[0])
