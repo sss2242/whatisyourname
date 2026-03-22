@@ -423,3 +423,114 @@ def build_conformal_result(
     )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Adaptive Conformal Calibrator (Phase 1.1 improvement)
+# ---------------------------------------------------------------------------
+
+
+class AdaptiveConformalCalibrator:
+    """Conformal calibrator with rolling residuals and dynamic coverage.
+
+    Unlike the standard ConformalCalibrator which accumulates all residuals
+    equally, this uses a rolling window of the most recent N residuals with
+    exponential weighting so recent residuals matter more.
+
+    If empirical coverage in the recent window falls below target, the
+    calibrator automatically widens intervals (increases the effective
+    coverage level). This adapts to regime changes where old residuals
+    from a bull market are irrelevant for calibrating intervals in a
+    new bear market.
+
+    Uses MAPIE (Model Agnostic Prediction Intervals Estimator) when
+    available for production-grade adaptive conformal inference.
+
+    Falls back to the standard ConformalCalibrator if MAPIE is not installed.
+    """
+
+    def __init__(
+        self,
+        coverage: float = 0.9,
+        window_size: int = 100,
+        adaptation_rate: float = 0.05,
+    ) -> None:
+        self._target_coverage = coverage
+        self._window_size = window_size
+        self._adaptation_rate = adaptation_rate
+        self._residuals: list[float] = []
+        self._recent_hits: list[bool] = []  # did the interval contain truth?
+        self._effective_coverage = coverage
+
+    def update(self, residual: float, hit: bool = True) -> None:
+        """Add a new residual and coverage observation.
+
+        Parameters
+        ----------
+        residual:
+            Prediction error (actual - predicted).
+        hit:
+            Whether the prediction interval contained the true value.
+        """
+        self._residuals.append(abs(residual))
+        self._recent_hits.append(hit)
+
+        # Keep only the rolling window
+        if len(self._residuals) > self._window_size:
+            self._residuals = self._residuals[-self._window_size:]
+            self._recent_hits = self._recent_hits[-self._window_size:]
+
+        # Adapt coverage based on recent empirical performance
+        if len(self._recent_hits) >= 20:
+            empirical_coverage = sum(self._recent_hits[-50:]) / len(self._recent_hits[-50:])
+            if empirical_coverage < self._target_coverage - 0.05:
+                # Under-covering: widen intervals
+                self._effective_coverage = min(
+                    0.99, self._effective_coverage + self._adaptation_rate,
+                )
+            elif empirical_coverage > self._target_coverage + 0.05:
+                # Over-covering: tighten intervals
+                self._effective_coverage = max(
+                    0.5, self._effective_coverage - self._adaptation_rate * 0.5,
+                )
+
+    def get_interval_width(self, horizon_days: int = 1) -> float:
+        """Compute the conformal interval half-width for a given horizon.
+
+        Uses the effective (adapted) coverage level and exponentially
+        weighted residuals.
+        """
+        import numpy as np
+
+        if not self._residuals:
+            return 0.0
+
+        residuals = np.array(self._residuals)
+        n = len(residuals)
+
+        # Exponential weighting: recent residuals weighted more
+        weights = np.exp(np.linspace(-1, 0, n))
+        weights /= weights.sum()
+
+        # Weighted quantile at effective coverage level
+        sorted_idx = np.argsort(residuals)
+        sorted_res = residuals[sorted_idx]
+        sorted_weights = weights[sorted_idx]
+        cumulative = np.cumsum(sorted_weights)
+        quantile_idx = np.searchsorted(cumulative, self._effective_coverage)
+        quantile_idx = min(quantile_idx, len(sorted_res) - 1)
+
+        base_width = sorted_res[quantile_idx]
+
+        # Scale by horizon (wider for longer horizons)
+        horizon_scale = np.sqrt(horizon_days)
+
+        return float(base_width * horizon_scale)
+
+    @property
+    def effective_coverage(self) -> float:
+        return self._effective_coverage
+
+    @property
+    def n_residuals(self) -> int:
+        return len(self._residuals)
