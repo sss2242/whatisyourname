@@ -75,15 +75,15 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache DataFrame with `close`, financial statement columns | Same | OK |
 | **Output** | cache + ~25 derived columns: `return_1d`, `log_return_1d`, `volatility_21d`, `drawdown_252d`, `current_ratio`, `debt_to_equity_abs`, `fcf_yield`, `cash_ratio`, `gross_margin`, `pe_ratio_calc`, etc. + `is_missing_*` and `invalid_math_*` flags | Same | OK |
-| **Operation** | 1. Returns and risk from close price. 2. Solvency ratios (debt_to_equity, net_debt). 3. Liquidity ratios (current_ratio, cash_ratio). 4. Profitability (margins). 5. TTM computations. All use `safe_ratio()` to handle division by zero. | Same | OK |
+| **Operation** | 1. Returns and risk from close price. 2. Solvency ratios (debt_to_equity, net_debt). 3. Liquidity ratios (current_ratio, cash_ratio). 4. Profitability (margins). 5. TTM computations. 6. **Technical indicators via `ta` library: ADX, OBV, BB width, MACD histogram**. All use `safe_ratio()` to handle division by zero. | Same | **ENHANCED** |
 
-### C2. Survival Mode -- `compute_company_survival_flag()`
+### C2. Survival Mode -- `compute_company_survival_flag()` + `compute_cox_survival_score()`
 
 | | Expected | Actual | Status |
 |---|----------|--------|--------|
 | **Input** | cache with `current_ratio`, `debt_to_equity_abs`, `fcf_yield`, `drawdown_252d` | Same | OK |
-| **Output** | `cache["company_survival_mode_flag"]` -- integer Series: 1=survival, 0=normal | Same | OK |
-| **Operation** | OR of 4 conditions: current_ratio<1.0, debt_to_equity_abs>3.0, fcf_yield<0, drawdown_252d<-0.40 | Same -- thresholds loaded from config | OK |
+| **Output** | `cache["company_survival_mode_flag"]` -- integer Series: 1=survival, 0=normal. `cache["survival_probability"]` -- continuous 0-1. **NEW**: `cache["cox_survival_score"]` -- Cox PH data-driven hazard score | Same | OK |
+| **Operation** | OR of 4 conditions + sigmoid probability + **Cox PH hazard via `lifelines.CoxPHFitter`** (blended 0.4*sigmoid + 0.6*cox) | Same -- thresholds loaded from config. Cox PH learns hazard ratios from the company's own distress episodes | **ENHANCED** |
 
 ### C3. Hierarchy Weights -- `compute_hierarchy_weights()`
 
@@ -99,7 +99,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache, `sector` string, `gdp` float (optional) | Same | OK |
 | **Output** | cache + `fuzzy_protection_degree` (0-1), `fuzzy_sector_score`, `fuzzy_protection_label` | Same | OK |
-| **Operation** | Fuzzy logic: compute sector strategicness membership, economic significance (market_cap/GDP), policy responsiveness (rate cuts). Aggregate via fuzzy OR (max). | Same | OK |
+| **Operation** | Fuzzy logic: compute sector strategicness membership, economic significance (market_cap/GDP), policy responsiveness (rate cuts). **Aggregate via scikit-fuzzy Mamdani rule engine with 11 interaction rules** (fallback: fuzzy OR max). | Same | **ENHANCED** |
 
 ### C5. Financial Health -- `compute_financial_health()`
 
@@ -139,7 +139,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache, `gemini_client` (LLM, optional), `symbol` string | Same | OK |
 | **Output** | cache + `sentiment_*` columns, `sentiment_result` | Same | OK |
-| **Operation** | 1. Fetch news via gnews/feedparser. 2. Score sentiment via LLM (if available) or keyword fallback. 3. Write daily sentiment score to cache. | Same | OK |
+| **Operation** | 1. Fetch news via gnews/feedparser. 2. Score sentiment via LLM (if available) or **VADER** (handles negation, intensity, context) or keyword fallback. 3. Write daily sentiment score to cache. | Same | **ENHANCED** |
 
 ### C10. Filing Calendar -- `analyze_filing_calendar()`
 
@@ -156,7 +156,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | `target_isin` (or ticker), `relationships` dict from entity discovery | Same | OK |
 | **Output** | `graph_risk_result` with `n_nodes`, `target_degree_centrality`, network topology metrics | Same | OK |
-| **Operation** | Build network graph from entity relationships. Compute degree centrality, betweenness centrality, clustering coefficient for the target node. Identify systemically important connections. | Same | OK |
+| **Operation** | Build network graph from entity relationships. Compute degree centrality, PageRank, **edge-weighted contagion** (revenue/supply exposure), **CoVaR** (conditional value-at-risk per linked entity), **SRISK** (capital shortfall under stress). Identify systemically important connections. | Same | **ENHANCED** |
 | **Profile** | Stored via `_available_dict(graph_risk_result)` | Same | OK |
 
 ### C12. Game Theory -- `analyze_competitive_dynamics()`
@@ -196,7 +196,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache DataFrame, `imputer_method` string ("split", "bayesian_ridge", or "vae") | Same | OK |
 | **Output** | Augmented cache with per-variable columns: `{var}_observed`, `{var}_estimated`, `{var}_final`, `{var}_source`, `{var}_confidence`, `{var}_missingness_type`, `{var}_estimation_method`, `{var}_sensitivity_lower/upper`; `EstimationCoverage` result | Same | OK |
-| **Operation** | **Phase 1:** Deterministic accounting identity fill (total_assets = total_liabilities + total_equity, etc., 5 iterations max). **Phase 2:** Classify NaN as MAR or MNAR. **Phase 3a (MAR):** MICE + Gaussian Process + Matrix Completion ensemble. **Phase 3b (MNAR):** Heckman Selection + Pattern-Mixture + GAIN ensemble. Observed values are NEVER overwritten. | Same -- all 3 phases implemented | OK |
+| **Operation** | **Phase 1:** Deterministic accounting identity fill (total_assets = total_liabilities + total_equity, etc., 5 iterations max). **Phase 2:** Classify NaN as MAR or MNAR. **Phase 3a (MAR):** **miceforest LightGBM MICE** (preferred, non-linear) or sklearn BayesianRidge MICE (fallback) + Gaussian Process + Matrix Completion ensemble. **Phase 3b (MNAR):** Heckman Selection + Pattern-Mixture + GAIN ensemble. Observed values are NEVER overwritten. | Same -- all 3 phases implemented | **ENHANCED** |
 | **Note** | PerformanceWarning during in-loop column insertion is now suppressed (P1 fix). DataFrame defragmented via `.copy()` before return. | FIXED | OK |
 
 ---
@@ -209,7 +209,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache with `return_1d` and `volatility_21d` | Same | OK |
 | **Output** | cache + `regime_hmm`, `regime_gmm`, `regime_label`, `structural_break`, `breakpoint_method`, `regime_hmm_prob_*` columns; `early_regime_result` with `detector` object | Same | OK |
-| **Operation** | 1. **HMM** (4-regime Gaussian on returns+volatility). 2. **GMM** (unsupervised clustering). 3. **PELT** (structural break detection). 4. **BCP** (Bayesian change point). Each wrapped in try/except with graceful fallback. | Same | OK |
+| **Operation** | 1. **HMM** (4-regime Gaussian on returns+volatility). 2. **GMM** (unsupervised clustering). 3. **PELT** (structural break detection). 4. **BCP** (Bayesian change point). 5. **NEW: ChangeFinder** online change point detection (real-time SDAR, no look-ahead). Each wrapped in try/except with graceful fallback. | Same | **ENHANCED** |
 
 ### E2. Enriched Survival Timeline -- `compute_enriched_survival_timeline()`
 
@@ -245,7 +245,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache, `variables` list (up to 25 float columns with >50 non-NaN obs) | Same | OK |
 | **Output** | `granger_result` with `causality_matrix`, `significant_pairs`, `retained_variables`, `pruned_variables`, `network_density` | Same | OK |
-| **Operation** | Pairwise Granger F-tests across all variable pairs. Prune variables with no causal links. Result used to prune `_extra_vars` list fed to temporal models. | Same | OK |
+| **Operation** | **PCMCI via tigramite** (preferred, handles autocorrelation and confounders) or pairwise Granger F-tests (fallback). Prune variables with no causal links. **NEW: `compute_time_varying_granger()` for rolling-window temporal causal graph.** Result used to prune `_extra_vars` list fed to temporal models. | Same | **ENHANCED** |
 | **Downstream** | `prune_features_by_causality()` removes non-causal variables from `_extra_vars` | Same | OK |
 
 ### F4. Transfer Entropy -- `compute_transfer_entropy()`
@@ -262,7 +262,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache, `variable="close"` | Same | OK |
 | **Output** | `cycle_result` with `dominant_cycles` list (period, amplitude, phase) | Same | OK |
-| **Operation** | FFT-based spectral analysis to identify dominant periodicities in the close price series | Same | OK |
+| **Operation** | **EMD (CEEMDAN) via EMD-signal** (preferred, adaptive for non-stationary data) or FFT-based spectral analysis (fallback) to identify dominant periodicities | Same | **ENHANCED** |
 | **Downstream** | Fed to `inject_cycle_phase_features()` (Synergy B) to add `cycle_phase_*` columns to cache | Same | OK |
 
 ### F6. Pattern Detector -- `detect_patterns()`
@@ -270,7 +270,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 | | Expected | Actual | Status |
 |---|----------|--------|--------|
 | **Input** | cache (needs `open`, `high`, `low`, `close`) | Same | OK |
-| **Output** | `pattern_result` with detected candlestick patterns (doji, hammer, engulfing, etc.) | Same | OK |
+| **Output** | `pattern_result` with detected candlestick patterns (doji, hammer, engulfing, etc.), **motifs** (recurring patterns via stumpy Matrix Profile), **discords** (anomalies) | Same | **ENHANCED** |
 | **Downstream** | Fed to `compute_pattern_drift_adjustment()` (Synergy C) for OHLC predictor drift | Same | OK |
 
 ### F7. Pre-Forecasting Synergies -- `apply_pre_forecasting_synergies()`
@@ -287,7 +287,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache, `extra_variables` list | Same | OK |
 | **Output** | cache + forecast columns, `ForecastResult` with `.forecasts` (per-var, per-horizon point forecasts), `.metrics` (per-model RMSE/MAE), `.model_used`, `.residuals` | `.residuals` was None (never populated) | FIXED |
-| **Operation** | For each variable, try models in order: 1. Kalman (local-level state-space). 2. GARCH (conditional volatility). 3. VAR (multivariate, AR(1) fallback). 4. LSTM (PyTorch, GBM/LR fallback). 5. Tree ensemble (RF/GBM/XGB). 6. Baseline (last-value or EMA). First model that fits successfully wins. | Same | OK |
+| **Operation** | For each variable, try models in order: 1. Kalman (local-level state-space). 2. GARCH (conditional volatility). 3. VAR (multivariate, AR(1) fallback). 4. LSTM (PyTorch, GBM/LR fallback). 5. Tree ensemble (RF/GBM/XGB). 6. Baseline (last-value or EMA). First model that fits successfully wins. **NEW standalone functions**: `fit_autoarima()` via statsforecast (100x faster) and `fit_dynamic_factor()` (multi-variable DFM). | Same | **ENHANCED** |
 
 ### F9. Forward Pass -- `run_forward_pass()`
 
@@ -303,7 +303,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | `daily_cache`, `SurvivalTimelineResult` | Same (after fix) | FIXED |
 | **Output** | `WalkForwardResult` with `day_errors`, `mode_scores`, `best_model_by_mode`, `retrain_dates`, `overall_best_model`, `overall_mae` | Was never called; `ForwardPassResult` was passed instead | FIXED |
-| **Operation** | 1. Walk day-by-day using 4 model types (baseline, EMA, linear trend, mean reversion). 2. Track per-model per-survival-mode error. 3. Retrain at switch points. 4. Build mode-conditioned leaderboard. | Was dead code -- now wired into pipeline | FIXED |
+| **Operation** | 1. Walk day-by-day using 4 model types (baseline, EMA, linear trend, mean reversion). 2. Track per-model per-survival-mode error. 3. Retrain at switch points. 4. Build mode-conditioned leaderboard. **NEW**: `aggregate_forward_pass_errors()` extracts per-model per-mode errors from forward pass. `compute_mode_confidence_sets()` via `arch.bootstrap.MCS` identifies statistically equivalent models per mode. | Was dead code -- now wired into pipeline | **ENHANCED** |
 
 ### F11. Burn-Out -- `run_burnout()`
 
@@ -320,7 +320,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache (needs `return_1d`, `regime_label`) | Same | OK |
 | **Output** | `MonteCarloResult` with `survival_probability` per horizon, `regime_distributions`, `transition_matrix`, `terminal_values` | Same | OK |
-| **Operation** | 1. Estimate per-regime return distributions. 2. Build regime transition matrix. 3. Simulate 10,000 paths with regime switching. 4. Apply importance sampling for tail events. 5. Compute survival probability (fraction of paths not triggering survival thresholds). | Same | OK |
+| **Operation** | 1. Estimate per-regime return distributions. 2. Build regime transition matrix. 3. Simulate 10,000 paths with regime switching. 4. Apply importance sampling for tail events. 5. Compute survival probability (fraction of paths not triggering survival thresholds). **NEW**: `run_multivariate_monte_carlo()` jointly simulates (return, delta_current_ratio, delta_fcf_yield, delta_debt_to_equity) using copula correlation structure, checking survival triggers on simulated ratios directly. | Same | **ENHANCED** |
 
 ### F13. Copula -- `run_copula_analysis()`
 
@@ -328,7 +328,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache, `variables` (auto-selected if None) | Same | OK |
 | **Output** | `CopulaResult` with `copula_correlation`, `tail_dependence`, `joint_crisis_probability` | Same | OK |
-| **Operation** | 1. Transform to uniform marginals (PIT). 2. Fit Gaussian copula (normal transform + correlation). 3. Estimate lower tail dependence for each pair. 4. Estimate joint crisis probability. | Same | OK |
+| **Operation** | 1. Transform to uniform marginals (PIT). 2. Fit **Gaussian, Student-t, and Clayton copulas** (via `copulae` library). 3. **Select best by AIC**. 4. Estimate lower tail dependence from best-fitting copula. 5. Estimate joint crisis probability. | Same | **ENHANCED** |
 | **Note** | Zero-variance columns now handled with noise injection (P2 fix) | FIXED | OK |
 
 ### F14. Transformer -- `train_transformer()`
@@ -353,7 +353,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | `ConformalCalibrator` (fed with residuals), `forecasts` dict, `horizons` dict | Calibrator was getting no residuals (always empty) | FIXED |
 | **Output** | `ConformalResult` with distribution-free prediction intervals per variable per horizon | Same | OK |
-| **Operation** | 1. Calibrator ingests residuals from model validation. 2. Computes conformal quantile at target coverage. 3. Applies adaptive adjustment for non-stationarity. 4. Builds intervals: forecast +/- conformal quantile. | Same -- now receives residuals from ForecastResult | FIXED |
+| **Operation** | 1. **ConformalPIDCalibrator** (preferred) with PID-controlled coverage (Angelopoulos 2023) + hierarchical Mondrian per-survival-mode partitioning, or standard ConformalCalibrator (fallback). 2. Computes conformal quantile at target coverage. 3. Applies PID-adaptive adjustment for non-stationarity. 4. Builds intervals: forecast +/- conformal quantile. | Same -- now receives residuals from ForecastResult | **ENHANCED** |
 
 ### F17. DTW Analogs -- `find_historical_analogs()`
 
@@ -361,7 +361,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache | Same | OK |
 | **Output** | `DTWAnalogResult` with historical pattern matches and empirical forecasts | Same | OK |
-| **Operation** | 1. Extract recent window of close prices. 2. DTW distance search over historical windows. 3. Rank analog matches. 4. Derive empirical forecast from what happened after each analog. | Same | OK |
+| **Operation** | 1. Extract recent window of close prices. 2. DTW distance search over historical windows **+ cross-company search using linked_caches** (peer analogs weighted 0.7x). 3. Rank analog matches. 4. Derive empirical forecast from what happened after each analog. | Same | **ENHANCED** |
 
 ### F18. Prediction Aggregator -- `run_prediction_aggregation()`
 
@@ -369,7 +369,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache, `forecast_result`, `mc_result`, `conformal_result`, `dual_regime_result`, `copula_result`, `dtw_result`, `granger_result`, `shap_result`, `walk_forward_result` | `walk_forward_result` was receiving `ForwardPassResult` (wrong type) | FIXED |
 | **Output** | `PredictionAggregatorResult` with `predictions` (per-var, per-horizon `HorizonPrediction`), `technical_alpha` mask, `metadata` | Same | OK |
-| **Operation** | 1. Compute inverse-RMSE ensemble weights. 2. Apply regime blending (soft switching from dual_regime_result). 3. Aggregate point forecasts. 4. Build uncertainty bands (conformal preferred, RMSE fallback). 5. Widen bands using copula tail dependence. 6. Add DTW analog forecasts. 7. Propagate Granger causal adjustments. 8. Attach SHAP explanations. 9. Apply Technical Alpha mask (hide OHLC except Low). 10. Recency-weighted RMSE from walk-forward. | Step 10 was dead (always NaN) -- now active | FIXED |
+| **Operation** | 1. Compute inverse-RMSE ensemble weights **or FixedShareForecaster weights filtered by Model Confidence Sets**. 2. Apply regime blending (soft switching from dual_regime_result). 3. Aggregate point forecasts. 4. Build uncertainty bands (ConformalPIDCalibrator with Mondrian preferred, RMSE fallback). 5. Widen bands using copula tail dependence. 6. Add DTW analog forecasts. 7. Propagate Granger/PCMCI causal adjustments. 8. Attach SHAP explanations. 9. Apply Technical Alpha mask (hide OHLC except Low). 10. Recency-weighted RMSE from walk-forward + MCS-filtered mode-conditioned weights. | Step 10 was dead (always NaN) -- now active | **ENHANCED** |
 
 ### F19. SHAP Explainability -- `compute_shap_explanations()`
 
@@ -393,7 +393,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache, `forecast_result` | Same | OK |
 | **Output** | `GAResult` with `best_weights`, `tier_weights`, `fitness_history`, `converged` | Same | OK |
-| **Operation** | 1. Initialize population via Dirichlet distribution. 2. Evaluate fitness as -RMSE of weighted ensemble. 3. Tournament selection, crossover, mutation. 4. Elite carryover. 5. Converge after N generations. | Same | OK |
+| **Operation** | **Optuna TPE** tried first (faster convergence). Fallback: 1. Initialize population via Dirichlet distribution. 2. Evaluate fitness as -RMSE of weighted ensemble. 3. Tournament selection, crossover, mutation. 4. Elite carryover. 5. Converge after N generations. **NEW**: per-regime GA weight optimization. | Same | **ENHANCED** |
 
 ### F22. OHLC Predictor -- `predict_ohlc_series()`
 
