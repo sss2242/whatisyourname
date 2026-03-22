@@ -126,6 +126,24 @@ class PITClient(Protocol):
         """
         ...
 
+    def get_holder_history(self, identifier: str, years: int = 2) -> "pd.DataFrame":
+        """Return quarterly institutional ownership metrics over time.
+
+        Used for injecting ownership trends into the daily cache so
+        temporal models can learn from institutional behavior patterns.
+
+        Must return a DataFrame with columns:
+            - ``date_reported``: datetime -- the filing/report date
+            - ``inst_ownership_pct``: float -- total institutional ownership %
+            - ``inst_top5_concentration``: float -- HHI of top 5 holders
+            - ``inst_holder_count``: int -- number of institutional holders
+
+        Returns empty DataFrame if historical data is not available.
+        New markets: implement this method to plug into the ownership
+        pipeline automatically.
+        """
+        ...
+
 
 class PITClientError(Exception):
     """Base exception for PIT client errors."""

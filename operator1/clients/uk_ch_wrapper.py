@@ -860,3 +860,32 @@ class UKCompaniesHouseClient:
             logger.debug("yfinance UK holder fallback failed for %s: %s", identifier, exc)
 
         return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return institutional ownership metrics as a single-row snapshot.
+
+        UK Companies House PSC + yfinance only provide current data.
+        Returns a single-row DataFrame that gets forward-filled across the
+        daily cache. When a historical UK source becomes available, extend
+        this to return multiple rows.
+        """
+        holders = self.get_holders(identifier)
+        if not holders:
+            return pd.DataFrame()
+
+        from datetime import date as _date
+
+        total_pct = sum(h.get("percentage", 0) for h in holders)
+        top5 = holders[:5]
+        hhi = 0.0
+        if top5:
+            total_top5 = sum(h.get("percentage", 0) for h in top5)
+            if total_top5 > 0:
+                hhi = sum((h.get("percentage", 0) / total_top5) ** 2 for h in top5)
+
+        return pd.DataFrame([{
+            "date_reported": pd.Timestamp(_date.today()),
+            "inst_ownership_pct": round(total_pct, 2),
+            "inst_top5_concentration": round(hhi, 4),
+            "inst_holder_count": len(holders),
+        }])

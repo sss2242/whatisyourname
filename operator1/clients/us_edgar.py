@@ -703,6 +703,57 @@ class USEdgarClient:
             logger.debug("yfinance institutional holders failed for %s: %s", identifier, exc)
         return holders
 
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return institutional ownership metrics as a time-series DataFrame.
+
+        For US, yfinance provides current-quarter aggregate stats via
+        ``major_holders`` and top holder list via ``institutional_holders``.
+        This produces a single-row snapshot. When EDGAR 13F cross-reference
+        search becomes available, this can be extended to return multiple
+        quarterly rows.
+
+        Returns DataFrame with: date_reported, inst_ownership_pct,
+        inst_top5_concentration, inst_holder_count.
+        """
+        try:
+            import yfinance as yf
+            from datetime import date as _date
+            tick = yf.Ticker(identifier)
+
+            # Get aggregate stats
+            mh = tick.major_holders
+            inst_pct = 0.0
+            inst_count = 0
+            if mh is not None and not mh.empty:
+                for idx, row in mh.iterrows():
+                    breakdown = str(row.get("Breakdown", idx)).lower() if "Breakdown" in mh.columns else str(idx).lower()
+                    val = row.get("Value", row.iloc[-1]) if "Value" in mh.columns else row.iloc[-1]
+                    if "institutionspercentheld" in breakdown or "institutions" in breakdown and "percent" in breakdown:
+                        inst_pct = float(val) * 100 if float(val) < 1 else float(val)
+                    elif "institutionscount" in breakdown or "count" in breakdown:
+                        inst_count = int(float(val))
+
+            # Compute HHI from top holders
+            holders = self.get_holders(identifier)
+            hhi = 0.0
+            if holders:
+                top5 = holders[:5]
+                total_pct = sum(h.get("percentage", 0) for h in top5)
+                if total_pct > 0:
+                    hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
+
+            if inst_pct > 0 or inst_count > 0 or holders:
+                return pd.DataFrame([{
+                    "date_reported": pd.Timestamp(_date.today()),
+                    "inst_ownership_pct": round(inst_pct, 2),
+                    "inst_top5_concentration": round(hhi, 4),
+                    "inst_holder_count": inst_count or len(holders),
+                }])
+        except Exception as exc:
+            logger.debug("US holder history failed for %s: %s", identifier, exc)
+
+        return pd.DataFrame()
+
     # -- edgartools financial extraction -------------------------------------
 
     # Metadata columns returned by edgartools as_dataframe=True (v5.15+).
