@@ -888,7 +888,7 @@ class USEdgarClient:
             return {}
 
         # Canonical field names the LLM can choose from
-        from operator1.steps.cache_builder import STATEMENT_FIELDS
+        from operator1.types import STATEMENT_FIELDS
         canonical_list = ", ".join(STATEMENT_FIELDS)
 
         prompt = (

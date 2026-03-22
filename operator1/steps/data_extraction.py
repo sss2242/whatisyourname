@@ -26,7 +26,7 @@ from operator1.clients.canonical_translator import (
 )
 from operator1.config_loader import get_global_config
 from operator1.constants import CACHE_DIR, RAW_CACHE_DIR, DATE_START, DATE_END
-from operator1.steps.verify_identifiers import VerifiedTarget
+from operator1.types import VerifiedTarget
 
 logger = logging.getLogger(__name__)
 

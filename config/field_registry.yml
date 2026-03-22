@@ -1,0 +1,641 @@
+# Canonical field registry -- single source of truth for field name normalization.
+#
+# Every canonical field used in the pipeline is listed here with:
+#   - aliases: all known names from regional APIs, XBRL concepts, camelCase variants
+#   - statement_type: income, balance, cashflow, profile, or quote
+#   - variable_type: stock (balance sheet snapshot) or flow (period total)
+#   - tier: survival hierarchy tier (1-5) or null
+#
+# This file is loaded by the canonical_translator, data_reconciliation,
+# and cache_builder modules to eliminate scattered alias dictionaries.
+
+# ============================================================================
+# Income Statement Fields (flow variables)
+# ============================================================================
+
+revenue:
+  statement_type: income
+  variable_type: flow
+  tier: 5
+  aliases:
+    - totalRevenue
+    - total_revenue
+    - revenues
+    - netSales
+    - net_sales
+    - "ifrs-full:Revenue"
+    - "us-gaap:Revenues"
+    - "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
+    - Revenues
+    - RevenueFromContractWithCustomerExcludingAssessedTax
+    - "jppfs_cor:NetSales"
+    - "jppfs_cor:Revenue"
+    - "営業収入"
+    - "营业收入"
+    - "营业总收入"
+    - "營業收入合計"
+    - "매출액"
+    - "수익(매출액)"
+    - "매출"
+    - "영업수익"
+    - "Ingresos de actividades ordinarias"
+    - "3.01"
+    - "uk-gaap:Turnover"
+    - "uk-gaap:TurnoverRevenue"
+    - "frs102:TurnoverRevenue"
+    - "frs102:Turnover"
+    - Turnover
+    - TurnoverRevenue
+
+cost_of_revenue:
+  statement_type: income
+  variable_type: flow
+  tier: null
+  aliases:
+    - "ifrs-full:CostOfSales"
+    - "us-gaap:CostOfRevenue"
+    - "us-gaap:CostOfGoodsAndServicesSold"
+    - CostOfRevenue
+    - CostOfGoodsAndServicesSold
+    - "jppfs_cor:CostOfSales"
+    - "营业成本"
+    - "营业总成本"
+    - "營業成本合計"
+    - "매출원가"
+    - "Costo de ventas"
+    - "3.02"
+
+gross_profit:
+  statement_type: income
+  variable_type: flow
+  tier: null
+  aliases:
+    - grossProfit
+    - gross_profit
+    - "ifrs-full:GrossProfit"
+    - "us-gaap:GrossProfit"
+    - GrossProfit
+    - "jppfs_cor:GrossProfit"
+    - "毛利润"
+    - "營業毛利（毛損）"
+    - "매출총이익"
+    - "매출총이익(손실)"
+    - "Ganancia bruta"
+    - "uk-gaap:GrossProfitLoss"
+    - "frs102:GrossProfit"
+    - "frs102:GrossProfitLoss"
+
+operating_income:
+  statement_type: income
+  variable_type: flow
+  tier: null
+  aliases:
+    - operatingIncome
+    - operating_income
+    - "ifrs-full:ProfitLossFromOperatingActivities"
+    - "us-gaap:OperatingIncomeLoss"
+    - OperatingIncomeLoss
+    - "jppfs_cor:OperatingIncome"
+    - "营业利润"
+    - "營業利益（損失）"
+    - "영업이익"
+    - "영업이익(손실)"
+    - "Ganancia (pérdida) por actividades de operación"
+    - "3.05"
+    - "uk-gaap:OperatingProfitLoss"
+    - "frs102:OperatingProfit"
+    - "frs102:OperatingProfitLoss"
+    - OperatingProfit
+
+ebit:
+  statement_type: income
+  variable_type: flow
+  tier: null
+  aliases:
+    - pretax_income
+    - "ifrs-full:ProfitLossBeforeTax"
+    - "us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxes"
+    - IncomeLossFromContinuingOperationsBeforeIncomeTaxes
+    - IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest
+    - "jppfs_cor:OrdinaryIncome"
+    - "利润总额"
+    - "稅前淨利（淨損）"
+    - "법인세비용차감전순이익(손실)"
+    - "법인세비용차감전순이익"
+    - "법인세차감전순이익"
+    - "세전이익"
+    - "세전계속사업이익(손실)"
+    - "Ganancia (pérdida), antes de impuestos"
+    - "3.08"
+    - "uk-gaap:ProfitLossOnOrdinaryActivitiesBeforeTax"
+    - "frs102:ProfitLossBeforeTax"
+    - ProfitLossBeforeTax
+
+net_income:
+  statement_type: income
+  variable_type: flow
+  tier: null
+  aliases:
+    - netIncome
+    - net_income
+    - netIncomeLoss
+    - "ifrs-full:ProfitLoss"
+    - "us-gaap:NetIncomeLoss"
+    - NetIncomeLoss
+    - "jppfs_cor:ProfitLoss"
+    - "jppfs_cor:ProfitLossAttributableToOwnersOfParent"
+    - "净利润"
+    - "归属于母公司所有者的净利润"
+    - "本期淨利（淨損）"
+    - "당기순이익"
+    - "당기순이익(손실)"
+    - "지배기업의 소유주에게 귀속되는 당기순이익"
+    - "Ganancia (pérdida)"
+    - "3.11"
+    - "uk-gaap:ProfitLossForPeriod"
+    - "frs102:ProfitLossForPeriod"
+    - ProfitLossForPeriod
+
+interest_expense:
+  statement_type: income
+  variable_type: flow
+  tier: 2
+  aliases:
+    - interestExpense
+    - "ifrs-full:FinanceCosts"
+    - "us-gaap:InterestExpense"
+    - "us-gaap:InterestExpenseDebt"
+    - "us-gaap:InterestExpenseDebtExcludingAmortization"
+    - "us-gaap:InterestCostsIncurred"
+    - "us-gaap:InterestPaid"
+    - "us-gaap:InterestPaidNet"
+    - InterestExpense
+    - InterestExpenseDebt
+    - InterestExpenseDebtExcludingAmortization
+    - InterestCostsIncurred
+    - InterestPaid
+    - InterestPaidNet
+    - "jppfs_cor:InterestExpense"
+    - "利息支出"
+    - "财务费用"
+    - "利息費用"
+    - "이자비용"
+    - "금융비용"
+    - "금융원가"
+    - "Costos financieros"
+    - "uk-gaap:InterestPayableAndSimilarCharges"
+    - "frs102:InterestPayable"
+
+taxes:
+  statement_type: income
+  variable_type: flow
+  tier: null
+  aliases:
+    - incomeTaxExpense
+    - "ifrs-full:IncomeTaxExpenseContinuingOperations"
+    - "us-gaap:IncomeTaxExpenseBenefit"
+    - IncomeTaxExpenseBenefit
+    - "jppfs_cor:IncomeTaxes"
+    - "所得税费用"
+    - "所得稅費用（利益）"
+    - "법인세비용"
+    - "법인세비용(수익)"
+    - "Gasto por impuestos a las ganancias"
+    - "3.08.01"
+    - "uk-gaap:TaxOnProfitOnOrdinaryActivities"
+    - "frs102:TaxOnProfit"
+
+sga_expenses:
+  statement_type: income
+  variable_type: flow
+  tier: null
+  aliases:
+    - sgaExpenses
+    - sga_expense
+    - sellingGeneralAndAdministrativeExpenses
+    - "ifrs-full:SellingGeneralAndAdministrativeExpense"
+    - "us-gaap:SellingGeneralAndAdministrativeExpense"  # not a real tag but commonly used
+    - SellingGeneralAndAdministrativeExpense
+    - "jppfs_cor:SellingGeneralAndAdministrativeExpenses"
+    - "판매비와관리비"
+    - "판매비와 관리비"
+    - "推銷費用"
+    - "3.04"
+
+rd_expenses:
+  statement_type: income
+  variable_type: flow
+  tier: null
+  aliases:
+    - rdExpenses
+    - research_and_development
+    - researchAndDevelopmentExpenses
+    - "ifrs-full:ResearchAndDevelopmentExpense"
+    - "us-gaap:ResearchAndDevelopmentExpense"
+    - ResearchAndDevelopmentExpense
+    - "研发费用"
+    - "研究發展費用"
+    - "연구개발비"
+    - "3.04.01"
+
+eps_basic:
+  statement_type: income
+  variable_type: flow
+  tier: null
+  aliases:
+    - earningsPerShare
+    - eps
+    - "ifrs-full:BasicEarningsLossPerShare"
+    - EarningsPerShareBasic
+    - "3.11.01"
+
+eps_diluted:
+  statement_type: income
+  variable_type: flow
+  tier: null
+  aliases:
+    - epsDiluted
+    - earningsPerShareDiluted
+    - "ifrs-full:DilutedEarningsLossPerShare"
+    - EarningsPerShareDiluted
+    - "3.11.02"
+
+# ============================================================================
+# Balance Sheet Fields (stock variables)
+# ============================================================================
+
+total_assets:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - totalAssets
+    - total_assets
+    - "ifrs-full:Assets"
+    - "us-gaap:Assets"
+    - Assets
+    - "jppfs_cor:TotalAssets"
+    - "资产总计"
+    - "資產總計"
+    - "자산총계"
+    - "Total de activos"
+    - "1"
+
+total_liabilities:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - totalLiabilities
+    - total_liabilities
+    - totalLiab
+    - "ifrs-full:Liabilities"
+    - "us-gaap:Liabilities"
+    - Liabilities
+    - "负债合计"
+    - "負債總計"
+    - "부채총계"
+    - "Total de pasivos"
+    - "2"
+
+total_equity:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - totalEquity
+    - total_equity
+    - stockholdersEquity
+    - stockholders_equity
+    - totalStockholdersEquity
+    - totalStockholderEquity
+    - "ifrs-full:Equity"
+    - "us-gaap:StockholdersEquity"
+    - StockholdersEquity
+    - "jppfs_cor:NetAssets"
+    - "所有者权益合计"
+    - "權益總計"
+    - "자본총계"
+    - "Total de patrimonio"
+    - "2.03"
+    - "uk-gaap:ShareholderFunds"
+    - "frs102:ShareholderFunds"
+    - "frs102:CalledUpShareCapital"
+    - ShareholderFunds
+    - CalledUpShareCapital
+
+cash_and_equivalents:
+  statement_type: balance
+  variable_type: stock
+  tier: 1
+  aliases:
+    - cashAndCashEquivalents
+    - cash_and_equivalents
+    - cashAndShortTermInvestments
+    - cash
+    - "ifrs-full:CashAndCashEquivalents"
+    - "us-gaap:CashAndCashEquivalentsAtCarryingValue"
+    - CashAndCashEquivalentsAtCarryingValue
+    - "jppfs_cor:CashAndDeposits"
+    - "货币资金"
+    - "現金及約當現金"
+    - "현금및현금성자산"
+    - "Efectivo y equivalentes al efectivo"
+    - "1.01.01"
+    - "uk-gaap:CashBankInHand"
+    - "frs102:CashBankInHand"
+    - "frs102:CashAtBankAndInHand"
+
+current_assets:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - totalCurrentAssets
+    - currentAssets
+    - current_assets
+    - "ifrs-full:CurrentAssets"
+    - "us-gaap:AssetsCurrent"
+    - AssetsCurrent
+    - "jppfs_cor:CurrentAssets"
+    - "流动资产合计"
+    - "流動資產合計"
+    - "유동자산"
+    - "Activos corrientes totales"
+    - "1.01"
+    - "uk-gaap:CurrentAssets"
+
+current_liabilities:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - totalCurrentLiabilities
+    - currentLiabilities
+    - current_liabilities
+    - "ifrs-full:CurrentLiabilities"
+    - "us-gaap:LiabilitiesCurrent"
+    - LiabilitiesCurrent
+    - "jppfs_cor:CurrentLiabilities"
+    - "流动负债合计"
+    - "流動負債合計"
+    - "유동부채"
+    - "Pasivos corrientes totales"
+    - "2.01"
+    - "uk-gaap:CreditorsDueWithinOneYear"
+    - "frs102:CreditorsDueWithinOneYear"
+
+short_term_debt:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - shortTermDebt
+    - short_term_debt
+    - "ifrs-full:CurrentBorrowings"
+    - "ifrs-full:ShorttermBorrowings"
+    - "us-gaap:ShortTermBorrowings"
+    - ShortTermBorrowings
+    - "jppfs_cor:ShortTermLoansPayable"
+    - "短期借款"
+    - "短期借款"
+    - "단기차입금"
+    - "Otros pasivos financieros corrientes"
+    - "2.01.04"
+
+long_term_debt:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - longTermDebt
+    - long_term_debt
+    - longTermDebtTotal
+    - "ifrs-full:NoncurrentLiabilities"
+    - "ifrs-full:NoncurrentBorrowings"
+    - "us-gaap:LongTermDebt"
+    - LongTermDebt
+    - "jppfs_cor:LongTermLoansPayable"
+    - "长期借款"
+    - "長期借款"
+    - "장기차입금"
+    - "Otros pasivos financieros no corrientes"
+    - "2.02.01"
+    - "uk-gaap:CreditorsDueAfterOneYear"
+    - "frs102:CreditorsDueAfterOneYear"
+
+receivables:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - netReceivables
+    - accountsReceivable
+    - "ifrs-full:TradeAndOtherCurrentReceivables"
+    - "us-gaap:AccountsReceivableNetCurrent"
+    - AccountsReceivableNetCurrent
+    - "jppfs_cor:NotesAndAccountsReceivableTrade"
+    - "应收账款"
+    - "應收帳款淨額"
+    - "매출채권"
+    - "Deudores comerciales y otras cuentas por cobrar corrientes"
+    - "1.01.03"
+
+inventory:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - "ifrs-full:Inventories"
+    - "us-gaap:InventoryNet"
+    - InventoryNet
+    - "jppfs_cor:MerchandiseAndFinishedGoods"
+    - "存货"
+    - "存貨"
+    - "재고자산"
+    - "Inventarios corrientes"
+    - "1.01.04"
+
+payables:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - "ifrs-full:TradeAndOtherCurrentPayables"
+    - "us-gaap:AccountsPayableCurrent"
+    - AccountsPayableCurrent
+    - AccountsPayableAndAccruedLiabilitiesCurrent
+    - "jppfs_cor:NotesAndAccountsPayableTrade"
+    - "应付账款"
+    - "應付帳款"
+    - "매입채무"
+    - "Cuentas por pagar comerciales y otras cuentas por pagar"
+    - "2.01.02"
+
+retained_earnings:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - "ifrs-full:RetainedEarnings"
+    - "us-gaap:RetainedEarningsAccumulatedDeficit"
+    - RetainedEarningsAccumulatedDeficit
+    - "jppfs_cor:RetainedEarnings"
+    - "未分配利润"
+    - "保留盈餘"
+    - "이익잉여금"
+    - "Ganancias acumuladas"
+    - "2.03.04"
+
+goodwill:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - "ifrs-full:Goodwill"
+    - "us-gaap:Goodwill"
+    - Goodwill
+    - "jppfs_cor:Goodwill"
+    - "商誉"
+    - "商譽"
+    - "영업권"
+    - "Plusvalía"
+    - "1.02.04"
+
+intangible_assets:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - "ifrs-full:IntangibleAssetsOtherThanGoodwill"
+    - "us-gaap:IntangibleAssetsNetExcludingGoodwill"
+    - IntangibleAssetsNetExcludingGoodwill
+    - FiniteLivedIntangibleAssetsNet
+    - "无形资产"
+    - "1.02.04.01"
+
+# ============================================================================
+# Cash Flow Fields (flow variables)
+# ============================================================================
+
+operating_cash_flow:
+  statement_type: cashflow
+  variable_type: flow
+  tier: 1
+  aliases:
+    - operatingCashFlow
+    - operating_cashflow
+    - totalCashFromOperatingActivities
+    - netCashFromOperations
+    - "ifrs-full:CashFlowsFromUsedInOperatingActivities"
+    - "us-gaap:NetCashProvidedByUsedInOperatingActivities"
+    - NetCashProvidedByUsedInOperatingActivities
+    - "jppfs_cor:NetCashProvidedByUsedInOperatingActivities"
+    - "经营活动产生的现金流量净额"
+    - "營業活動之淨現金流入（流出）"
+    - "영업활동현금흐름"
+    - "영업활동으로인한현금흐름"
+    - "Flujos de efectivo procedentes de actividades de operación"
+    - "6.01"
+    - "uk-gaap:NetCashInflowOutflowFromOperatingActivities"
+    - "frs102:NetCashFromOperatingActivities"
+
+capex:
+  statement_type: cashflow
+  variable_type: flow
+  tier: null
+  aliases:
+    - capitalExpenditure
+    - capitalExpenditures
+    - capital_expenditure
+    - "ifrs-full:PurchaseOfPropertyPlantAndEquipment"
+    - "us-gaap:PaymentsToAcquirePropertyPlantAndEquipment"
+    - PaymentsToAcquirePropertyPlantAndEquipment
+    - "jppfs_cor:PurchaseOfPropertyPlantAndEquipment"
+    - "购建固定资产、无形资产和其他长期资产支付的现金"
+    - "取得不動產、廠房及設備"
+    - "유형자산의 취득"
+    - "유형자산의취득"
+    - "Compras de propiedades, planta y equipo"
+    - "6.02.01"
+
+investing_cf:
+  statement_type: cashflow
+  variable_type: flow
+  tier: null
+  aliases:
+    - investingCashFlow
+    - investingActivitiesCashflow
+    - investing_cashflow
+    - totalCashflowsFromInvestingActivities
+    - "ifrs-full:CashFlowsFromUsedInInvestingActivities"
+    - "us-gaap:NetCashProvidedByUsedInInvestingActivities"
+    - NetCashProvidedByUsedInInvestingActivities
+    - "jppfs_cor:NetCashProvidedByUsedInInvestingActivities"
+    - "投资活动产生的现金流量净额"
+    - "投資活動之淨現金流入（流出）"
+    - "투자활동현금흐름"
+    - "Flujos de efectivo procedentes de actividades de inversión"
+    - "6.02"
+    - "uk-gaap:NetCashInflowOutflowFromInvestingActivities"
+    - "frs102:NetCashUsedInInvestingActivities"
+
+financing_cf:
+  statement_type: cashflow
+  variable_type: flow
+  tier: null
+  aliases:
+    - financingCashFlow
+    - financingActivitiesCashflow
+    - financing_cashflow
+    - totalCashFromFinancingActivities
+    - "ifrs-full:CashFlowsFromUsedInFinancingActivities"
+    - "us-gaap:NetCashProvidedByUsedInFinancingActivities"
+    - NetCashProvidedByUsedInFinancingActivities
+    - "jppfs_cor:NetCashProvidedByUsedInFinancingActivities"
+    - "筹资活动产生的现金流量净额"
+    - "籌資活動之淨現金流入（流出）"
+    - "재무활동현금흐름"
+    - "Flujos de efectivo procedentes de actividades de financiación"
+    - "6.03"
+    - "uk-gaap:NetCashInflowOutflowFromFinancingActivities"
+    - "frs102:NetCashUsedInFinancingActivities"
+
+dividends_paid:
+  statement_type: cashflow
+  variable_type: flow
+  tier: null
+  aliases:
+    - dividendsPaid
+    - paymentOfDividends
+    - "ifrs-full:DividendsPaid"
+    - "us-gaap:PaymentsOfDividends"
+    - PaymentsOfDividends
+    - "分配股利、利润或偿付利息支付的现金"
+    - "배당금지급"
+    - "6.03.04"
+
+# ============================================================================
+# Date field aliases
+# ============================================================================
+
+filing_date:
+  statement_type: meta
+  variable_type: null
+  tier: null
+  aliases:
+    - fillingDate
+    - filingDate
+    - acceptedDate
+    - accepted_date
+
+report_date:
+  statement_type: meta
+  variable_type: null
+  tier: null
+  aliases:
+    - periodOfReport
+    - period_of_report
+    - fiscalDateEnding
+    - fiscal_date_ending
+    - date

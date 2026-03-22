@@ -106,12 +106,27 @@ def normalize_field_names(df: pd.DataFrame) -> pd.DataFrame:
 
     Unknown columns are kept as-is.  Duplicate canonical names are
     resolved by keeping the first non-null column.
+
+    Uses the local alias dict first, then falls back to the centralized
+    field registry (config/field_registry.yml) for any unmatched columns.
     """
     rename_map = {}
     for col in df.columns:
         canonical = _FIELD_ALIASES.get(col)
         if canonical and canonical not in df.columns:
             rename_map[col] = canonical
+
+    # Fallback: try the centralized field registry for unmatched columns
+    unmatched = [c for c in df.columns if c not in rename_map and c not in _FIELD_ALIASES.values()]
+    if unmatched:
+        try:
+            from operator1.types import resolve_field_name
+            for col in unmatched:
+                canonical = resolve_field_name(col)
+                if canonical and canonical not in df.columns and col not in rename_map:
+                    rename_map[col] = canonical
+        except ImportError:
+            pass
 
     if rename_map:
         df = df.rename(columns=rename_map)

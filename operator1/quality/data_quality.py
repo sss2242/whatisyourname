@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-from operator1.steps.cache_builder import LookAheadError  # noqa: F401 -- re-export
+from operator1.types import LookAheadError  # noqa: F401 -- re-export
 
 
 class LookAheadBatchError(LookAheadError):
