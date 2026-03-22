@@ -126,6 +126,66 @@ def _evaluate_fitness(
     return -rmse  # Negative RMSE as fitness (maximize = minimize RMSE)
 
 
+def _try_optuna_optimization(
+    model_predictions: dict[str, np.ndarray],
+    actuals: np.ndarray,
+    active_models: list[str],
+    n_trials: int = 100,
+) -> dict[str, float] | None:
+    """Try Optuna TPE optimization for ensemble weights.
+
+    TPE (Tree-structured Parzen Estimator) often converges faster than
+    GA for continuous weight optimization. Returns None if optuna is
+    not installed or optimization fails.
+    """
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except ImportError:
+        return None
+
+    try:
+        def objective(trial):
+            weights = [trial.suggest_float(name, 0.001, 1.0) for name in active_models]
+            total = sum(weights)
+            if total <= 0:
+                return float("inf")
+            weights = [w / total for w in weights]
+
+            ensemble = np.zeros_like(actuals)
+            for w, name in zip(weights, active_models):
+                if name in model_predictions:
+                    pred = model_predictions[name]
+                    n = min(len(pred), len(ensemble))
+                    ensemble[:n] += w * pred[:n]
+
+            valid = ~np.isnan(actuals - ensemble)
+            if valid.sum() < 5:
+                return float("inf")
+            return float(np.sqrt(np.mean((actuals[valid] - ensemble[valid]) ** 2)))
+
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=42),
+        )
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+        best = study.best_params
+        weights = [best[name] for name in active_models]
+        total = sum(weights)
+        if total <= 0:
+            return None
+        result = {name: round(w / total, 6) for name, w in zip(active_models, weights)}
+        logger.info(
+            "Optuna TPE: best_rmse=%.6f in %d trials, weights=%s",
+            study.best_value, len(study.trials), result,
+        )
+        return result
+    except Exception as exc:
+        logger.debug("Optuna optimization failed: %s", exc)
+        return None
+
+
 def run_genetic_optimization(
     cache: pd.DataFrame,
     forecast_result: Any | None = None,
@@ -226,6 +286,21 @@ def run_genetic_optimization(
                 inv_rmse = {k: 1.0 / v for k, v in model_rmse.items()}
                 total = sum(inv_rmse.values())
                 _informed_weights = {k: v / total for k, v in inv_rmse.items()}
+
+    # Try Optuna TPE first (faster convergence for continuous weights)
+    if len(model_predictions) >= 2:
+        optuna_weights = _try_optuna_optimization(
+            model_predictions, actuals, list(model_predictions.keys()),
+        )
+        if optuna_weights is not None:
+            result.best_weights = optuna_weights
+            for name in MODEL_NAMES:
+                result.best_weights.setdefault(name, 0.0)
+            result.fitted = True
+            result.n_generations = 0
+            result.converged = True
+            # Still run GA below for per-tier and per-regime weights
+            # but use Optuna result as the global best
 
     if len(model_predictions) < 2:
         # Not enough model predictions, use inverse-RMSE fallback

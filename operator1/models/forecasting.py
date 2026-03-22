@@ -314,6 +314,74 @@ def fit_kalman(
 
 
 # ---------------------------------------------------------------------------
+# 1a. AutoARIMA via statsforecast (100x faster than statsmodels)
+# ---------------------------------------------------------------------------
+
+
+def fit_autoarima(
+    series: np.ndarray,
+    n_forecast: int = 1,
+    season_length: int = 63,
+) -> tuple[np.ndarray | None, ModelMetrics]:
+    """Fit AutoARIMA using statsforecast (fast Rust backend).
+
+    Automatically selects ARIMA(p,d,q) order via AIC. 100x faster than
+    statsmodels for single-series ARIMA fitting. Handles seasonality
+    (quarterly earnings cycle at ~63 business days).
+
+    Falls back to None if statsforecast is not installed.
+    """
+    metrics = ModelMetrics(model_name="autoarima")
+
+    try:
+        from statsforecast.models import AutoARIMA
+    except ImportError:
+        metrics.error = "statsforecast not installed -- skipping AutoARIMA"
+        return None, metrics
+
+    clean = series[~np.isnan(series)]
+    if len(clean) < _MIN_OBS_KALMAN:
+        metrics.error = f"Insufficient observations ({len(clean)})"
+        return None, metrics
+
+    try:
+        train, test = _split_train_test(clean)
+
+        model = AutoARIMA(season_length=min(season_length, len(train) // 3))
+        model.fit(train)
+
+        # Validation
+        if len(test) > 0:
+            preds = model.predict(h=len(test))["mean"]
+            mae, rmse = _compute_metrics(test, np.array(preds))
+            metrics.test_residuals = _compute_residuals(test, np.array(preds))
+        else:
+            mae, rmse = float("nan"), float("nan")
+
+        # Full refit for final forecast
+        full_model = AutoARIMA(season_length=min(season_length, len(clean) // 3))
+        full_model.fit(clean)
+        forecasts = full_model.predict(h=n_forecast)["mean"]
+
+        metrics.mae = mae
+        metrics.rmse = rmse
+        metrics.n_train = len(train)
+        metrics.n_test = len(test)
+        metrics.fitted = True
+
+        logger.info(
+            "AutoARIMA fit: %d train, %d test, MAE=%.6f",
+            len(train), len(test), mae,
+        )
+        return np.array(forecasts), metrics
+
+    except Exception as exc:
+        metrics.error = f"AutoARIMA failed: {exc}"
+        logger.debug(metrics.error)
+        return None, metrics
+
+
+# ---------------------------------------------------------------------------
 # 1b. Dynamic Factor Model (multi-variable state-space Kalman)
 # ---------------------------------------------------------------------------
 

@@ -95,7 +95,12 @@ def compute_granger_causality(
         result.error = "Need at least 2 variables for Granger causality"
         return result
 
-    # Try to import statsmodels
+    # Try PCMCI first (handles autocorrelation and confounders)
+    pcmci_result = _try_pcmci(cache, variables, max_lag, significance_level)
+    if pcmci_result is not None and pcmci_result.fitted:
+        return pcmci_result
+
+    # Fallback to standard Granger F-tests
     try:
         from statsmodels.tsa.stattools import grangercausalitytests
     except ImportError:
@@ -248,6 +253,103 @@ def _fallback_granger(
 
     result.fitted = True
     return result
+
+
+def _try_pcmci(
+    cache: pd.DataFrame,
+    variables: list[str],
+    max_lag: int = 5,
+    significance_level: float = 0.05,
+) -> GrangerResult | None:
+    """Run PCMCI causal discovery (handles autocorrelation, confounders).
+
+    PCMCI (Runge et al. 2019) is specifically designed for time series
+    causal discovery. Unlike Granger (which inflates significance when
+    variables share autocorrelation), PCMCI conditions on the past of
+    ALL variables simultaneously, producing a true causal graph.
+
+    Returns GrangerResult or None if tigramite is not available.
+    """
+    try:
+        from tigramite import data_processing as pp
+        from tigramite.pcmci import PCMCI
+        from tigramite.independence_tests.parcorr import ParCorr
+    except ImportError:
+        return None
+
+    df = cache[variables].dropna()
+    if len(df) < 50 or len(variables) < 2:
+        return None
+
+    try:
+        data = df.values
+        var_names = list(variables)
+        dataframe = pp.DataFrame(data, var_names=var_names)
+
+        parcorr = ParCorr(significance="analytic")
+        pcmci = PCMCI(dataframe=dataframe, cond_ind_test=parcorr, verbosity=0)
+        results = pcmci.run_pcmci(tau_max=max_lag, alpha_level=significance_level)
+
+        # Extract significant links
+        p_matrix = results["p_matrix"]
+        val_matrix = results["val_matrix"]
+
+        result = GrangerResult()
+        n_vars = len(var_names)
+
+        for i in range(n_vars):
+            for j in range(n_vars):
+                if i == j:
+                    continue
+                for lag in range(1, max_lag + 1):
+                    p_val = float(p_matrix[i, j, lag])
+                    if p_val < significance_level:
+                        pair_key = (var_names[i], var_names[j])
+                        # Keep the best (lowest p-value) lag
+                        existing_p = result.causality_matrix.get(pair_key, 1.0)
+                        if p_val < existing_p:
+                            result.causality_matrix[pair_key] = p_val
+                            result.significant_pairs.append({
+                                "source": var_names[i],
+                                "target": var_names[j],
+                                "p_value": round(p_val, 6),
+                                "best_lag": lag,
+                                "val_statistic": round(float(val_matrix[i, j, lag]), 4),
+                                "method": "pcmci",
+                            })
+
+        # Deduplicate significant pairs (keep lowest p-value per pair)
+        seen = {}
+        for pair in result.significant_pairs:
+            key = (pair["source"], pair["target"])
+            if key not in seen or pair["p_value"] < seen[key]["p_value"]:
+                seen[key] = pair
+        result.significant_pairs = list(seen.values())
+
+        causal_vars = set()
+        for pair in result.significant_pairs:
+            causal_vars.add(pair["source"])
+            causal_vars.add(pair["target"])
+
+        result.retained_variables = sorted(causal_vars)
+        result.pruned_variables = sorted(set(variables) - causal_vars)
+        result.n_tests = n_vars * (n_vars - 1) * max_lag
+
+        max_possible = n_vars * (n_vars - 1)
+        if max_possible > 0:
+            result.network_density = len(result.significant_pairs) / max_possible
+
+        result.fitted = True
+        logger.info(
+            "PCMCI causality: %d significant pairs (density=%.3f), %d retained, %d pruned",
+            len(result.significant_pairs), result.network_density,
+            len(result.retained_variables), len(result.pruned_variables),
+        )
+        return result
+
+    except Exception as exc:
+        logger.debug("PCMCI failed: %s", exc)
+        return None
 
 
 def compute_time_varying_granger(

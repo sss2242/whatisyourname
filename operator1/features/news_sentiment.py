@@ -87,9 +87,23 @@ class SentimentResult:
 
 
 def _keyword_score(text: str) -> float:
-    """Score a headline using keyword matching. Returns -1.0 to +1.0."""
+    """Score a headline for sentiment. Returns -1.0 to +1.0.
+
+    Prefers VADER (handles negation, intensity, context) when available.
+    Falls back to simple keyword matching.
+    """
     if not text:
         return 0.0
+
+    # Try VADER first (better accuracy: handles negation, degree modifiers)
+    try:
+        from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+        analyzer = SentimentIntensityAnalyzer()
+        return analyzer.polarity_scores(text)["compound"]
+    except ImportError:
+        pass
+
+    # Fallback: simple keyword matching
     words = set(re.findall(r'\w+', text.lower()))
     pos = len(words & _POSITIVE_KEYWORDS)
     neg = len(words & _NEGATIVE_KEYWORDS)

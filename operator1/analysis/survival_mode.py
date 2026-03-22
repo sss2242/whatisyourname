@@ -193,6 +193,85 @@ def compute_survival_probability(
     return probability
 
 
+def compute_cox_survival_score(
+    df: pd.DataFrame,
+) -> pd.Series:
+    """Compute data-driven survival risk score using Cox Proportional Hazards.
+
+    Uses lifelines CoxPHFitter to learn hazard ratios from the company's
+    own history of survival flag activations. Produces a continuous partial
+    hazard score that reflects learned (not assumed) risk weights.
+
+    Falls back to the sigmoid-based survival_probability if lifelines is
+    not available or if there are too few survival events to fit.
+
+    Returns
+    -------
+    pd.Series
+        Continuous hazard score (higher = more distressed). Normalized to [0, 1].
+    """
+    try:
+        from lifelines import CoxPHFitter
+    except ImportError:
+        logger.debug("lifelines not installed, skipping Cox PH survival score")
+        return pd.Series(np.nan, index=df.index, name="cox_survival_score")
+
+    import numpy as np
+
+    # Covariates for Cox model -- same ratios as threshold-based detection
+    covariates = []
+    for col in ("current_ratio", "debt_to_equity_abs", "fcf_yield", "drawdown_252d"):
+        if col in df.columns:
+            covariates.append(col)
+
+    if len(covariates) < 2:
+        return pd.Series(np.nan, index=df.index, name="cox_survival_score")
+
+    # Need an event column (binary survival flag)
+    if "company_survival_mode_flag" not in df.columns:
+        return pd.Series(np.nan, index=df.index, name="cox_survival_score")
+
+    # Prepare data for Cox
+    cox_df = df[covariates + ["company_survival_mode_flag"]].copy()
+    cox_df = cox_df.dropna()
+
+    # Need enough events (at least 5 survival days) for meaningful fit
+    n_events = int(cox_df["company_survival_mode_flag"].sum())
+    if n_events < 5 or len(cox_df) < 50:
+        logger.debug("Too few survival events (%d) for Cox PH", n_events)
+        return pd.Series(np.nan, index=df.index, name="cox_survival_score")
+
+    try:
+        # Add duration column (time index)
+        cox_df["duration"] = range(1, len(cox_df) + 1)
+
+        cph = CoxPHFitter(penalizer=0.1)  # regularization for stability
+        cph.fit(
+            cox_df,
+            duration_col="duration",
+            event_col="company_survival_mode_flag",
+        )
+
+        # Partial hazard = exp(beta * X) -- continuous risk score
+        hazard = cph.predict_partial_hazard(df[covariates].ffill().bfill())
+
+        # Normalize to [0, 1] using sigmoid of log-hazard
+        log_h = np.log(hazard.clip(lower=1e-10))
+        normalized = 1.0 / (1.0 + np.exp(-log_h))
+        normalized.name = "cox_survival_score"
+
+        logger.info(
+            "Cox PH survival score: %d obs, %d events, hazard_ratios=%s",
+            len(cox_df), n_events,
+            {col: round(float(cph.hazard_ratios_[col]), 3) for col in covariates},
+        )
+        return normalized
+
+    except Exception as exc:
+        logger.debug("Cox PH fitting failed: %s", exc)
+        return pd.Series(np.nan, index=df.index, name="cox_survival_score")
+
+
 # ---------------------------------------------------------------------------
 # Country survival
 # ---------------------------------------------------------------------------
