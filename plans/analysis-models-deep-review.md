@@ -347,11 +347,33 @@ Key change: instead of `ConformalCalibrator.update(residual)` accumulating all r
 | `dowhy` (Microsoft) | pypi.org/project/dowhy | Causal inference -- provides DAG-based causal reasoning for the granger/TE modules |
 | `networkx` (optional, already in many envs) | pypi.org/project/networkx | Graph risk -- provides betweenness centrality, community detection, and Katz centrality that our numpy-only graph module lacks |
 
+**Additional PyPI packages discovered (searched 2026-03-22):**
+
+| Package | Version | What It Does | Relevant Module |
+|---------|---------|-------------|-----------------|
+| `copulae` | 0.8.0 | Student-t, Clayton, Frank, Gumbel copulas with fitting | copula.py |
+| `pyvinecopulib` | 0.7.5 | Vine copula modeling (high-dimensional dependencies) | copula.py |
+| `EMD-signal` | 1.9.0 | Empirical Mode Decomposition + variants (EEMD, CEEMDAN) | cycle_decomposition.py |
+| `tslearn` | 0.8.1 | DTW barycenter averaging, DTW clustering, kernel-DTW | dtw_analogs.py |
+| `stumpy` | 1.14.1 | Matrix Profile -- finds all recurring patterns in O(n log n) | pattern_detector.py |
+| `tsfresh` | 0.21.1 | Automatic time series feature extraction (800+ features) | derived_variables.py |
+| `systemic-risk` | 0.0.10 | CoVaR, MES, SRISK systemic risk measures | graph_risk.py |
+| `riskfolio-lib` | 7.2.1 | CVaR, drawdown optimization, risk parity | monte_carlo.py, prediction_aggregator.py |
+
+**GitHub repos found:**
+
+| Repo | Stars | Relevance |
+|------|-------|-----------|
+| `vdamov/financial-risk-analyzer` | 7 | Altman Z-Score + VaR toolkit (validates our financial_health approach) |
+| `emrulahsanda/Project-1` | 0 | Mamdani fuzzy inference for loan risk (36 expert rules -- similar to our fuzzy protection) |
+
 **Priority note**: The most impactful community library integrations would be:
 1. `mapie` for adaptive conformal prediction (already installed, just needs wiring)
-2. `copulas` for Student-t/Clayton copulas (small install, high impact on tail risk)
-3. `scikit-fuzzy` for rule-based protection (small install, better dimension interactions)
-4. `emd` for non-stationary cycle analysis (small install, better than FFT)
+2. `copulae` for Student-t/Clayton copulas (better than our Gaussian-only, handles tail risk)
+3. `EMD-signal` for non-stationary cycle analysis (CEEMDAN variant is noise-robust)
+4. `stumpy` for Matrix Profile pattern discovery (O(n log n), finds ALL recurring motifs -- more systematic than our candlestick-only detector)
+5. `scikit-fuzzy` for rule-based protection (Mamdani engine with dimension interactions)
+6. `systemic-risk` for CoVaR/SRISK measures (complements our graph-based contagion model)
 
 ---
 
