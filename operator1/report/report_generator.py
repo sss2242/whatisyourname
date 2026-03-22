@@ -2210,47 +2210,6 @@ def _build_economic_position(profile: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _build_portfolio_fit(profile: dict[str, Any]) -> str:
-    """Build the Portfolio Fit section (user portfolio context)."""
-    ctx = profile.get("portfolio_context", {})
-    if not ctx.get("available"):
-        return "*Portfolio context not available (no --portfolio flag provided).*"
-
-    lines = [
-        "### Correlation with Existing Holdings",
-        "",
-        f"- **Portfolio correlation**: {_fmt(ctx.get('correlation_with_portfolio'))}",
-        f"- **Diversification benefit**: {ctx.get('diversification_benefit', 'unknown').title()}",
-        f"- **Marginal risk contribution**: {_fmt(ctx.get('marginal_var_contribution'))}",
-        f"- **Sector concentration** (after adding this position): "
-        f"{_fmt(ctx.get('sector_concentration'), '.0%')}",
-        "",
-    ]
-
-    adjustment = ctx.get("recommendation_adjustment", "")
-    if adjustment:
-        lines.append(f"**Assessment**: {adjustment}")
-        lines.append("")
-
-    # Per-holding detail
-    holdings = ctx.get("holdings_detail", [])
-    if holdings:
-        lines.append("### Correlation with Individual Holdings")
-        lines.append("")
-        lines.append("| Holding | Weight | Sector | Correlation |")
-        lines.append("|---------|--------|--------|-------------|")
-        for h in holdings:
-            corr = h.get("correlation_with_target")
-            corr_str = _fmt(corr) if corr is not None else "N/A"
-            lines.append(
-                f"| {h.get('symbol', '?')} | {h.get('weight', 0):.0f}% | "
-                f"{h.get('sector', 'N/A')} | {corr_str} |"
-            )
-        lines.append("")
-
-    return "\n".join(lines)
-
-
 
     lines: list[str] = []
 
