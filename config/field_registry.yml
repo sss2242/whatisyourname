@@ -238,6 +238,32 @@ rd_expenses:
     - "연구개발비"
     - "3.04.01"
 
+ebitda:
+  statement_type: income
+  variable_type: flow
+  tier: null
+  aliases:
+    - ebitda
+    - EBITDA
+    - "3.09"
+
+# ============================================================================
+# Balance Sheet Fields (stock variables)
+# ============================================================================
+
+total_debt:
+  statement_type: balance
+  variable_type: stock
+  tier: null
+  aliases:
+    - totalDebt
+    - total_debt
+    - "us-gaap:DebtAndCapitalLeaseObligations"
+    - DebtAndCapitalLeaseObligations
+    - LongTermDebtAndCapitalLeaseObligations
+    - "ifrs-full:Borrowings"
+    - "2.01.04+2.02.01"
+
 eps_basic:
   statement_type: income
   variable_type: flow
@@ -600,6 +626,26 @@ financing_cf:
     - "6.03"
     - "uk-gaap:NetCashInflowOutflowFromFinancingActivities"
     - "frs102:NetCashUsedInFinancingActivities"
+
+free_cash_flow:
+  statement_type: cashflow
+  variable_type: flow
+  tier: null
+  aliases:
+    - freeCashFlow
+    - free_cash_flow
+
+stock_buybacks:
+  statement_type: cashflow
+  variable_type: flow
+  tier: null
+  aliases:
+    - commonStockRepurchased
+    - stockBuybacks
+    - share_buyback
+    - buybacks
+    - "us-gaap:PaymentsForRepurchaseOfCommonStock"
+    - PaymentsForRepurchaseOfCommonStock
 
 dividends_paid:
   statement_type: cashflow
