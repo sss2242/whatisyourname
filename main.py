@@ -657,6 +657,16 @@ Non-interactive examples:
     except Exception as exc:
         logger.debug("Holder fetch skipped: %s", exc)
 
+    # Step 2b.1: Fetch insider transactions (US only via yfinance)
+    target_insiders: list[dict] = []
+    try:
+        if hasattr(pit_client, "get_insider_transactions"):
+            target_insiders = pit_client.get_insider_transactions(identifier)
+            if target_insiders:
+                logger.info("Insider transactions loaded: %d for %s", len(target_insiders), ticker)
+    except Exception as exc:
+        logger.debug("Insider transaction fetch skipped: %s", exc)
+
     # ------------------------------------------------------------------
     # Step 3: Fetch PIT financial data
     # ------------------------------------------------------------------
@@ -1210,6 +1220,16 @@ Non-interactive examples:
     except Exception as exc:
         logger.warning("Private company proxy computation failed: %s", exc)
 
+    # Step 5.inst: Institutional flow features (from inst_* cache columns)
+    try:
+        from operator1.features.institutional_flow import compute_institutional_flow
+        cache = compute_institutional_flow(cache, insider_transactions=target_insiders)
+        _n_inst = sum(1 for c in cache.columns if c.startswith("inst_") and cache[c].notna().any())
+        if _n_inst > 0:
+            logger.info("Institutional flow: %d inst_* columns with data", _n_inst)
+    except Exception as exc:
+        logger.debug("Institutional flow computation skipped: %s", exc)
+
     # Survival mode
     weights: dict = {f"tier{i}": 20.0 for i in range(1, 6)}
     try:
@@ -1303,6 +1323,8 @@ Non-interactive examples:
     game_theory_result = None
     linked_caches: dict[str, pd.DataFrame] = {}
     linked_agg_df: pd.DataFrame | None = None
+    contagion_result = None
+    _ownership_edge_weights: dict[str, float] = {}
 
     # Build the LLM client once for the whole pipeline
     from operator1.clients.llm_factory import create_llm_client
@@ -1487,6 +1509,75 @@ Non-interactive examples:
                     "Linked entity data: %d/%d entities fetched",
                     len(linked_caches), len(_all_linked),
                 )
+
+            # Step 5f.1: Fetch competitor holders for ownership contagion
+            _competitor_holders: dict[str, list[dict]] = {}
+            if target_holders and hasattr(pit_client, "get_holders"):
+                _comp_ids = _entity_groups.get("competitors", [])
+                for _cid in _comp_ids[:5]:  # cap at 5 competitors
+                    try:
+                        _ch = pit_client.get_holders(_cid)
+                        if _ch:
+                            _competitor_holders[_cid] = _ch
+                    except Exception:
+                        pass
+                if _competitor_holders:
+                    logger.info(
+                        "Competitor holders fetched: %d/%d competitors",
+                        len(_competitor_holders), len(_comp_ids),
+                    )
+
+            # Step 5f.2: Ownership contagion analysis (MHHI + crowding + liquidation)
+            if target_holders:
+                try:
+                    from operator1.models.ownership_contagion import (
+                        compute_ownership_contagion,
+                        inject_contagion_into_cache,
+                        get_ownership_edge_weights,
+                    )
+                    contagion_result = compute_ownership_contagion(
+                        target_holders=target_holders,
+                        competitor_holders=_competitor_holders,
+                        cache=cache,
+                    )
+                    if contagion_result and contagion_result.available:
+                        cache = inject_contagion_into_cache(cache, contagion_result)
+                        _ownership_edge_weights = get_ownership_edge_weights(contagion_result)
+                        logger.info(
+                            "Ownership contagion: MHHI=%.3f, crowding=%.3f, "
+                            "liquidation=%.0fd, shared_inst=%d",
+                            contagion_result.mhhi_delta,
+                            contagion_result.crowding_score,
+                            contagion_result.liquidation_days,
+                            contagion_result.n_shared_institutions,
+                        )
+                    # Re-run graph_risk with ownership edge weights for second
+                    # contagion channel (shared holders amplify contagion).
+                    # graph_risk was first computed at Step 5e with unweighted
+                    # edges; now we enhance it with ownership overlap weights.
+                    if _ownership_edge_weights and graph_risk_result is not None:
+                        try:
+                            from operator1.models.graph_risk import compute_graph_risk_metrics as _grc
+                            _enhanced_gr = _grc(
+                                target_isin=target_profile.get("isin", ticker),
+                                relationships=_rel_dicts if "_rel_dicts" in dir() else {},
+                                edge_weights=_ownership_edge_weights,
+                                target_cache=cache,
+                                linked_caches=linked_caches if linked_caches else None,
+                            )
+                            if _enhanced_gr.available:
+                                graph_risk_result = _enhanced_gr
+                                logger.info(
+                                    "Graph risk re-computed with ownership edge weights: "
+                                    "contagion=%.3f (was %.3f)",
+                                    _enhanced_gr.contagion_target_infection_prob,
+                                    graph_risk_result.contagion_target_infection_prob,
+                                )
+                        except Exception as _gr_exc:
+                            logger.debug("Graph risk re-computation skipped: %s", _gr_exc)
+
+                except Exception as exc:
+                    logger.debug("Ownership contagion skipped: %s", exc)
 
             # Step 5g: Compute linked aggregates
             if linked_caches:
@@ -2277,6 +2368,19 @@ Non-interactive examples:
     from operator1.report.profile_builder import build_company_profile
     from dataclasses import asdict as _asdict
 
+    def _safe_float(val) -> float | None:
+        """Convert to JSON-safe float (None for NaN/Inf/None)."""
+        import math as _math
+        if val is None:
+            return None
+        try:
+            f = float(val)
+            if _math.isnan(f) or _math.isinf(f):
+                return None
+            return round(f, 6)
+        except (TypeError, ValueError):
+            return None
+
     def _to_dict(obj):
         """Convert a dataclass or dict-like object to a plain dict."""
         if obj is None:
@@ -2444,6 +2548,52 @@ Non-interactive examples:
             }
         else:
             profile["institutional_holders"] = {"available": False}
+
+        # Inject institutional ownership deep analysis (contagion + flow)
+        _inst_analysis: dict[str, Any] = {"available": False}
+        try:
+            _has_contagion = contagion_result is not None and contagion_result.available
+            _has_flow = "inst_flow_momentum" in cache.columns and cache["inst_flow_momentum"].notna().any()
+
+            if _has_contagion or _has_flow:
+                _inst_analysis = {"available": True}
+
+                if _has_contagion:
+                    _inst_analysis["contagion"] = {
+                        "mhhi_delta": _safe_float(contagion_result.mhhi_delta),
+                        "mhhi_label": (
+                            "high" if contagion_result.mhhi_delta > 0.3
+                            else "moderate" if contagion_result.mhhi_delta > 0.1
+                            else "low"
+                        ),
+                        "shared_institutions": contagion_result.shared_institutions[:5],
+                        "n_shared": contagion_result.n_shared_institutions,
+                        "bipartite_centrality": _safe_float(contagion_result.target_bipartite_centrality),
+                        "network_density": _safe_float(contagion_result.ownership_network_density),
+                        "most_influential_institution": contagion_result.most_connected_institution,
+                        "crowding_score": _safe_float(contagion_result.crowding_score),
+                        "crowded_trade_flag": contagion_result.crowded_trade_flag,
+                        "liquidation_days": _safe_float(contagion_result.liquidation_days),
+                        "liquidation_risk": _safe_float(contagion_result.liquidation_risk),
+                    }
+
+                if _has_flow:
+                    _latest = cache.iloc[-1]
+                    _inst_analysis["flow"] = {
+                        "momentum_latest": _safe_float(_latest.get("inst_flow_momentum")),
+                        "momentum_label": str(_latest.get("inst_flow_momentum_label", "unknown")),
+                        "crowding_risk_latest": _safe_float(_latest.get("inst_crowding_risk")),
+                        "crowding_risk_label": str(_latest.get("inst_crowding_risk_label", "unknown")),
+                        "smart_money_signal": _safe_float(_latest.get("inst_smart_money_signal")),
+                        "smart_money_label": str(_latest.get("inst_smart_money_label", "unknown")),
+                        "insider_signal": _safe_float(_latest.get("inst_insider_signal")),
+                        "insider_label": str(_latest.get("inst_insider_label", "unknown")),
+                        "amihud_illiquidity": _safe_float(_latest.get("inst_amihud_illiquidity")),
+                    }
+        except Exception as _exc:
+            logger.debug("Institutional ownership analysis profile section failed: %s", _exc)
+
+        profile["institutional_ownership_analysis"] = _inst_analysis
 
         # Inject extended model results into profile
         if "extended_models" not in profile:

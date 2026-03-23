@@ -144,6 +144,22 @@ class PITClient(Protocol):
         """
         ...
 
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Return insider buy/sell transactions for the company.
+
+        Each dict should contain at minimum:
+            - ``insider_name``: str -- name of the insider
+            - ``position``: str -- role (CEO, CFO, Director, etc.)
+            - ``date``: str -- transaction date (ISO format)
+            - ``transaction``: str -- type (Purchase, Sale, etc.)
+            - ``shares``: int -- number of shares transacted
+            - ``value``: float -- dollar value of transaction
+
+        Returns empty list if insider data is not available.
+        Used by the institutional flow predictor for smart money signals.
+        """
+        ...
+
 
 class PITClientError(Exception):
     """Base exception for PIT client errors."""

@@ -88,8 +88,8 @@ class ReportMode(str, Enum):
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20},
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 7, 11, 14, 16, 17, 18, 195, 196, 197, 20},
-    ReportTier.PREMIUM: set(range(1, 23)) | {195, 196, 197},  # all 22 sections + geopolitical + SIX + holders
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 7, 11, 14, 16, 17, 18, 195, 196, 197, 198, 20},
+    ReportTier.PREMIUM: set(range(1, 23)) | {195, 196, 197, 198},  # all 22 sections + geopolitical + SIX + holders + ownership deep
 }
 
 
@@ -2489,6 +2489,87 @@ def _build_institutional_holders_section(profile: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_institutional_ownership_deep_section(profile: dict[str, Any]) -> str:
+    """Build Institutional Ownership Deep Analysis section (19.8).
+
+    Renders MHHI common ownership, crowding risk, flow signals,
+    insider activity, and liquidity analysis from the contagion scorer
+    and institutional flow predictor.
+    """
+    data = profile.get("institutional_ownership_analysis", {})
+    if not data.get("available"):
+        return "*Institutional ownership deep analysis not available.*\n"
+
+    lines: list[str] = []
+
+    # Contagion sub-section
+    contagion = data.get("contagion", {})
+    if contagion:
+        lines.append("### Common Ownership Analysis (MHHI)")
+        lines.append("")
+        mhhi = contagion.get("mhhi_delta", 0)
+        label = contagion.get("mhhi_label", "unknown")
+        lines.append(f"**MHHI Delta:** {mhhi:.3f} ({label.upper()})")
+        lines.append("")
+
+        shared = contagion.get("shared_institutions", [])
+        if shared:
+            lines.append(f"**Shared institutions ({contagion.get('n_shared', 0)}):** {', '.join(shared[:5])}")
+            lines.append("")
+
+        lines.append("| Metric | Value |")
+        lines.append("|--------|-------|")
+        lines.append(f"| Bipartite centrality | {contagion.get('bipartite_centrality', 0):.3f} |")
+        lines.append(f"| Network density | {contagion.get('network_density', 0):.3f} |")
+        lines.append(f"| Most influential institution | {contagion.get('most_influential_institution', 'N/A')} |")
+        lines.append("")
+
+        lines.append("### Crowding & Liquidity Risk")
+        lines.append("")
+        cs = contagion.get("crowding_score", 0)
+        flag = contagion.get("crowded_trade_flag", False)
+        flag_str = "CROWDED" if flag else "Normal"
+        lines.append(f"**Crowding score:** {cs:.3f} ({flag_str})")
+        lines.append(f"**Liquidation days:** {contagion.get('liquidation_days', 0):.0f} days")
+        lines.append(f"**Liquidation risk:** {contagion.get('liquidation_risk', 0):.3f}")
+        lines.append("")
+
+    # Flow sub-section
+    flow = data.get("flow", {})
+    if flow:
+        lines.append("### Institutional Flow Signals")
+        lines.append("")
+        lines.append("| Signal | Value | Label |")
+        lines.append("|--------|-------|-------|")
+
+        momentum = flow.get("momentum_latest")
+        mom_str = f"{momentum:.3f}" if momentum is not None else "N/A"
+        lines.append(f"| Flow momentum | {mom_str} | {flow.get('momentum_label', 'unknown')} |")
+
+        cr = flow.get("crowding_risk_latest")
+        cr_str = f"{cr:.3f}" if cr is not None else "N/A"
+        lines.append(f"| Crowding risk | {cr_str} | {flow.get('crowding_risk_label', 'unknown')} |")
+
+        sm = flow.get("smart_money_signal")
+        sm_str = f"{sm:.3f}" if sm is not None else "N/A"
+        lines.append(f"| Smart money | {sm_str} | {flow.get('smart_money_label', 'unknown')} |")
+
+        insider = flow.get("insider_signal")
+        ins_str = f"{insider:.3f}" if insider is not None else "N/A"
+        lines.append(f"| Insider signal | {ins_str} | {flow.get('insider_label', 'unknown')} |")
+
+        amihud = flow.get("amihud_illiquidity")
+        if amihud is not None:
+            lines.append(f"| Amihud illiquidity | {amihud:.6f} | -- |")
+
+        lines.append("")
+
+    if not lines:
+        return "*No institutional ownership analysis data available.*\n"
+
+    return "\n".join(lines)
+
+
 def _build_geopolitical_risk_section(profile: dict[str, Any]) -> str:
     """Build Geopolitical & Conflict Risk section from conflict_risk data."""
     lines: list[str] = []
@@ -2873,6 +2954,7 @@ def _build_fallback_report(
         195: ("19.5. Geopolitical & Conflict Risk", _build_geopolitical_risk_section(profile)),
         196: ("19.6. SIX Swiss Exchange Analysis", _build_six_swiss_exchange_section(profile)),
         197: ("19.7. Institutional / Major Holders", _build_institutional_holders_section(profile)),
+        198: ("19.8. Institutional Ownership Deep Analysis", _build_institutional_ownership_deep_section(profile)),
         20: ("20. Risk Factors & Limitations", (
             _build_risk_assessment(profile) + "\n\n### 20.1 LIMITATIONS\n\n" + _build_limitations(profile)
         )),
