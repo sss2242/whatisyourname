@@ -820,13 +820,15 @@ class SGSgxClient:
         except Exception as exc:
             logger.debug("SGX DOI scraping failed for %s: %s", identifier, exc)
 
-        # SECONDARY: SGX filing discoverer + fuzzy PDF parser for shareholding
-        # data from annual report / disclosure PDFs.  SGX annual reports often
-        # include "Statistics of Shareholdings" or "Analysis of Shareholdings"
-        # sections with detailed category breakdowns.
+        # SECONDARY: SGX filing discoverer + fuzzy_pdf_parser for shareholding
+        # data from annual report / disclosure PDFs.  Uses the existing
+        # fuzzy_pdf_parser module (camelot-py + fuzzy string matching) for
+        # table extraction, then _parse_sgx_shareholding_text for
+        # substantial shareholder pattern matching.
         if not holders:
             try:
-                from operator1.clients.filing_discoverer import try_filing_extraction, SGXFilingDiscoverer
+                from operator1.clients.filing_discoverer import SGXFilingDiscoverer
+                from operator1.clients.fuzzy_pdf_parser import extract_financials_from_pdf
                 discoverer = SGXFilingDiscoverer()
                 discovery = discoverer.discover_filings(identifier, years=1)
 
@@ -837,28 +839,38 @@ class SGSgxClient:
                             if not pdf_bytes or pdf_bytes[:4] != b"%PDF":
                                 continue
 
-                            import pdfplumber as _pdfp
-                            import io as _io
+                            # Use fuzzy parser for structured extraction
+                            rows = extract_financials_from_pdf(
+                                pdf_bytes,
+                                filing_date=filing.filing_date or "",
+                                report_date=filing.report_date or "",
+                                statement_type="balance",
+                            )
 
-                            with _pdfp.open(_io.BytesIO(pdf_bytes)) as pdf:
-                                for page in pdf.pages:
-                                    text = page.extract_text() or ""
-                                    text_lower = text.lower()
-                                    if ("substantial shareholder" in text_lower or
-                                            "statistics of shareholding" in text_lower or
-                                            "analysis of shareholding" in text_lower):
-                                        # Parse substantial shareholder data from PDF
-                                        _parse_sgx_shareholding_text(text, holders, filing.filing_date or "")
-                                        break
+                            # Also extract raw text for shareholding patterns
+                            try:
+                                from operator1.clients.fuzzy_pdf_parser import _extract_tables_text
+                                text = _extract_tables_text(pdf_bytes)
+                            except (ImportError, AttributeError):
+                                import pdfplumber as _pdfp, io as _io
+                                with _pdfp.open(_io.BytesIO(pdf_bytes)) as pdf:
+                                    text = "\n".join(
+                                        (p.extract_text() or "") for p in pdf.pages
+                                    )
+
+                            if text and ("substantial shareholder" in text.lower() or
+                                         "statistics of shareholding" in text.lower() or
+                                         "analysis of shareholding" in text.lower()):
+                                _parse_sgx_shareholding_text(text, holders, filing.filing_date or "")
 
                             if holders:
                                 logger.info(
-                                    "SGX shareholding for %s: extracted from filing PDF (%s)",
+                                    "SGX shareholding for %s: extracted via fuzzy parser (%s)",
                                     identifier, filing.filing_date,
                                 )
                                 break
                         except Exception as exc:
-                            logger.debug("SGX filing PDF shareholding extraction failed: %s", exc)
+                            logger.debug("SGX fuzzy shareholding extraction failed: %s", exc)
                             continue
             except Exception as exc:
                 logger.debug("SGX filing discoverer for shareholding failed for %s: %s", identifier, exc)
