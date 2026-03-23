@@ -15,6 +15,15 @@ Company search: BSE ListofScripData API (works globally, returns all
 Profile: BSE ComHeadernew API (works globally) for sector, industry,
     ISIN, EPS, PE, market cap. No yfinance dependency for core metadata.
 
+Holder data: yfinance (.NS suffix) + BSE BoardMeetings/CorporateAction APIs
+    - yfinance provides major_holders (insiders%, institutions%, count)
+      and insider_transactions for NSE-listed Indian companies
+    - BSE BoardMeetings API (works globally) returns board meeting
+      announcements with PDF attachments (shareholding outcomes)
+    - BSE CorporateAction API (works globally) returns dividend data
+    - Uses the HKEX scraper pattern: persistent session, paginated
+      queries, client-side filtering
+
 OHLCV: handled separately via ohlcv_provider.py (yfinance/nselib).
 
 No date range limit: BSE announcements API returns all filings for the
@@ -27,6 +36,11 @@ BSE API access notes:
     - ComHeadernew: WORKS globally (per-scrip detail with ISIN, sector)
     - FinancialResult: WORKS globally (quarterly results HTML table)
     - AnnSubCategoryGetData: WORKS globally (filing announcements)
+    - BoardMeetings: WORKS globally (board meetings with attachments)
+    - CorporateAction: WORKS globally (dividends, splits, bonuses)
+    - shpSecurities.aspx: JS-rendered (not scrapable with requests)
+    - InsiderTrading/w: BLOCKED (302 -> error page)
+    - ShareHoldPat/w: BLOCKED (302 -> error page)
 
 Coverage: ~4,800+ listed companies on BSE, ~$4T market cap.
 """
@@ -36,11 +50,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +180,465 @@ def _search_scrip_directory(
 
     matches.sort(key=_mktcap, reverse=True)
     return matches[:max_results]
+
+
+# ---------------------------------------------------------------------------
+# BSE holder/disclosure scraper (HKEX scraper pattern)
+# ---------------------------------------------------------------------------
+#
+# Uses BSE AnnSubCategoryGetData API with strCat='Insider Trading / SAST'
+# to fetch SEBI SAST (Substantial Acquisition of Shares & Takeovers)
+# disclosure filings.  This is the same API endpoint and parameter pattern
+# used by BSEFilingDiscoverer for financial results (strCat='Result').
+#
+# Key discoveries from API probing:
+#   - AnnSubCategoryGetData/w with strCat='Insider Trading / SAST': WORKS
+#     Returns Reg. 29(1), 29(2), 31(1), 31(2) disclosures + trading window
+#   - The HEADLINE field contains the substantial shareholder name directly
+#     (e.g. "Bhairavi Madhusudhan Shibulal")
+#   - SAST PDFs live at /xml-data/corpfiling/AttachHis/ (not AttachLive!)
+#   - BoardMeetings/w: WORKS, returns JSON with board outcomes
+#   - CorporateAction/w: WORKS, returns dividend/split/bonus data
+#   - ShareHoldPat/w, InsiderTrading/w: blocked (302 redirect)
+#   - shpSecurities.aspx: JS-rendered, not scrapable with requests
+#
+# Uses the HKEX scraper pattern: persistent session for cookie reuse,
+# Referer header for BSE API access, client-side filtering.
+
+# BSE PDF base URLs -- SAST filings use AttachHis, not AttachLive
+_BSE_PDF_ATTACH_HIS = "https://www.bseindia.com/xml-data/corpfiling/AttachHis"
+_BSE_PDF_ATTACH_LIVE = "https://www.bseindia.com/xml-data/corpfiling/AttachLive"
+
+_bse_session: requests.Session | None = None
+
+# Rate limit between BSE API requests (no documented limit, be polite)
+_BSE_REQUEST_DELAY_S = 0.3
+
+
+def _get_bse_session() -> requests.Session:
+    """Create or return a persistent requests session for BSE API calls.
+
+    Mirrors the HKEX scraper pattern: persistent session reuses
+    cookies and TCP connections.  The Referer header is critical
+    for BSE API access (requests without it get 302 redirects).
+    """
+    global _bse_session
+    if _bse_session is None:
+        _bse_session = requests.Session()
+        _bse_session.headers.update(_BSE_HEADERS)
+    return _bse_session
+
+
+def _resolve_scrip_code(identifier: str) -> str:
+    """Resolve a ticker symbol to a BSE scrip code.
+
+    BSE APIs require numeric scrip codes (e.g. 500325 for Reliance).
+    If the identifier is already numeric, return as-is.  Otherwise,
+    look it up in the scrip directory.
+    """
+    stripped = identifier.strip()
+    if stripped.isdigit():
+        return stripped
+
+    directory = _get_scrip_directory()
+    matches = [
+        d for d in directory
+        if d.get("scrip_id", "").lower() == stripped.lower()
+    ]
+    if matches:
+        return str(matches[0].get("SCRIP_CD", ""))
+    return stripped
+
+
+def _resolve_nse_ticker(identifier: str) -> str:
+    """Resolve a BSE identifier to an NSE ticker for yfinance.
+
+    yfinance uses NSE tickers with .NS suffix (e.g. RELIANCE.NS).
+    The BSE scrip directory contains scrip_id which is usually the
+    NSE ticker symbol.
+    """
+    stripped = identifier.strip()
+
+    # If already a ticker symbol (non-numeric), use it directly
+    if not stripped.isdigit():
+        return stripped.upper()
+
+    # Numeric scrip code -- look up the ticker in the directory
+    directory = _get_scrip_directory()
+    matches = [d for d in directory if d.get("SCRIP_CD", "") == stripped]
+    if matches:
+        return matches[0].get("scrip_id", stripped).upper()
+    return stripped
+
+
+def _fetch_bse_sast_disclosures(
+    scrip_code: str,
+    session: requests.Session | None = None,
+    years: int = 2,
+) -> list[dict[str, Any]]:
+    """Fetch SEBI SAST disclosure filings from BSE AnnSubCategoryGetData.
+
+    Uses the exact same API endpoint and parameter pattern as
+    BSEFilingDiscoverer.discover_filings() (strCat='Result'), but
+    with strCat='Insider Trading / SAST' to get:
+      - Reg. 29(1): disclosure on acquisition of shares
+      - Reg. 29(2): disclosure on change in shareholding
+      - Reg. 31(1): disclosure of shareholding pattern
+      - Reg. 31(2): disclosure of aggregate shareholding
+      - Closure of Trading Window notices
+
+    The HEADLINE field contains the substantial shareholder name
+    directly (e.g. "disclosure under Regulation 29(2) ... for
+    Bhairavi Madhusudhan Shibulal").
+
+    Parameters
+    ----------
+    scrip_code:
+        BSE numeric scrip code (e.g. '500325').
+    session:
+        Optional pre-existing requests session.
+    years:
+        How many years back to search.
+
+    Returns
+    -------
+    List of raw BSE announcement dicts with keys: NEWSID, SCRIP_CD,
+    NEWSSUB, HEADLINE, NEWS_DT, ATTACHMENTNAME, SUBCATNAME, etc.
+    """
+    if session is None:
+        session = _get_bse_session()
+
+    today = date.today()
+    from_date = today - timedelta(days=365 * years)
+
+    try:
+        resp = session.get(
+            f"{_BSE_BASE}/AnnSubCategoryGetData/w",
+            params={
+                "Ession": "",
+                "strCat": "Insider Trading / SAST",
+                "strPrevDate": from_date.strftime("%Y%m%d"),
+                "strScrip": scrip_code,
+                "strSearch": "P",
+                "strToDate": today.strftime("%Y%m%d"),
+                "strType": "C",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        table = data.get("Table", [])
+        logger.info(
+            "BSE SAST disclosures for %s: %d filings (2yr window)",
+            scrip_code, len(table),
+        )
+        return table
+    except Exception as exc:
+        logger.debug("BSE SAST API failed for %s: %s", scrip_code, exc)
+        return []
+
+
+def _extract_holders_from_sast(
+    filings: list[dict[str, Any]],
+    scrip_code: str,
+    session: requests.Session | None = None,
+) -> list[dict[str, Any]]:
+    """Extract substantial shareholder data from BSE SAST disclosures.
+
+    Two extraction strategies:
+
+    1. **HEADLINE field** (fast, no PDF download needed): BSE includes
+       the shareholder name directly in the HEADLINE field for Reg. 29
+       disclosures (e.g. "disclosure under Regulation 29(2) ... for
+       Bhairavi Madhusudhan Shibulal").
+
+    2. **PDF extraction** (detailed): SAST PDFs at AttachHis/ contain
+       the full SEBI disclosure form with shareholder name, shares held,
+       percentage, and transaction details.  Parsed via pdfplumber.
+
+    Parameters
+    ----------
+    filings:
+        List of BSE SAST announcement dicts from _fetch_bse_sast_disclosures().
+    scrip_code:
+        BSE scrip code (for logging).
+    session:
+        Active requests session.
+
+    Returns
+    -------
+    List of holder dicts with keys: name, shares, percentage,
+    holder_type, date_reported, source, regulation.
+    """
+    if session is None:
+        session = _get_bse_session()
+
+    holders: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for filing in filings:
+        subcatname = filing.get("SUBCATNAME", "")
+        headline = filing.get("HEADLINE", "")
+        news_dt = (filing.get("NEWS_DT") or "")[:10]
+        attachment = filing.get("ATTACHMENTNAME", "")
+
+        # Skip Closure of Trading Window (no shareholder data)
+        if "closure" in subcatname.lower():
+            continue
+
+        # Strategy 1: Extract shareholder name from HEADLINE field
+        # HEADLINE format: "The Exchange has received the disclosure under
+        # Regulation 29(2) of SEBI (SAST) Regulations, 2011 for <NAME>"
+        shareholder_name = ""
+        if headline:
+            # Extract name after "for " at the end of the headline
+            match = re.search(
+                r"\bfor\s+([A-Z][A-Za-z\s.()]+?)\.?\s*$",
+                headline,
+            )
+            if match:
+                shareholder_name = match.group(1).strip().rstrip(".")
+            elif " for " in headline:
+                parts = headline.rsplit(" for ", 1)
+                if len(parts) == 2 and len(parts[1].strip()) > 3:
+                    shareholder_name = parts[1].strip().rstrip(".")
+
+        if shareholder_name and shareholder_name.lower() not in seen_names:
+            seen_names.add(shareholder_name.lower())
+
+            # Determine regulation type
+            regulation = ""
+            if "29(1)" in subcatname:
+                regulation = "Reg. 29(1) - Acquisition"
+            elif "29(2)" in subcatname:
+                regulation = "Reg. 29(2) - Change in Shareholding"
+            elif "31(1)" in subcatname:
+                regulation = "Reg. 31(1) - Shareholding Pattern"
+            elif "31(2)" in subcatname:
+                regulation = "Reg. 31(2) - Aggregate Shareholding"
+
+            holders.append({
+                "name": shareholder_name,
+                "shares": 0,
+                "percentage": 0.0,
+                "holder_type": "substantial",
+                "date_reported": news_dt,
+                "source": "bse_sast_headline",
+                "regulation": regulation,
+            })
+
+        # Strategy 2: Try downloading the SAST PDF for detailed data
+        # SAST PDFs use AttachHis (not AttachLive)
+        if attachment and len(holders) < 20:
+            for base_url in [_BSE_PDF_ATTACH_HIS, _BSE_PDF_ATTACH_LIVE]:
+                pdf_url = f"{base_url}/{attachment}"
+                try:
+                    resp = session.get(pdf_url, timeout=30)
+                    if resp.status_code != 200 or resp.content[:4] != b"%PDF":
+                        continue
+
+                    # Parse SAST PDF for shareholding data
+                    try:
+                        import pdfplumber
+                        import io
+
+                        with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
+                            text = ""
+                            for page in pdf.pages[:5]:
+                                text += (page.extract_text() or "") + "\n"
+
+                        if text.strip():
+                            _parse_sast_pdf_text(
+                                text, holders, shareholder_name, news_dt,
+                            )
+                    except ImportError:
+                        pass
+                    except Exception as exc:
+                        logger.debug("SAST PDF parse failed: %s", exc)
+
+                    time.sleep(_BSE_REQUEST_DELAY_S)
+                    break  # Found the PDF, don't try other base URLs
+                except Exception:
+                    continue
+
+    return holders
+
+
+def _parse_sast_pdf_text(
+    text: str,
+    holders: list[dict[str, Any]],
+    shareholder_name: str,
+    news_dt: str,
+) -> None:
+    """Parse a SEBI SAST disclosure PDF for shareholding percentages.
+
+    SAST forms (Reg. 29/31) contain structured data including:
+    - Name of the acquirer/substantial shareholder
+    - Number of shares held before and after the transaction
+    - Percentage of shares held
+    - Type of shares (equity, preference, convertible)
+
+    Extracts percentage from common SAST form patterns.
+    """
+    # Look for percentage patterns in SAST forms
+    pct_patterns = [
+        # "XX.XX% of the total share/voting capital"
+        r"([\d.]+)\s*%\s*(?:of\s+(?:the\s+)?(?:total|paid[- ]?up|issued))",
+        # "Percentage of shareholding: XX.XX%"
+        r"(?:[Pp]ercentage|%)\s*(?:of\s+)?(?:share(?:holding)?|voting)[^:]*?:\s*([\d.]+)",
+        # "XX.XX % of voting rights"
+        r"([\d.]+)\s*%\s*(?:of\s+)?voting\s+rights",
+    ]
+
+    for pattern in pct_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                pct = float(match.group(1))
+                if 0.01 < pct < 100:
+                    # Update the existing holder entry if we have a name match
+                    for h in holders:
+                        if (
+                            h["name"].lower() == shareholder_name.lower()
+                            and h["percentage"] == 0.0
+                        ):
+                            h["percentage"] = round(pct, 2)
+                            h["source"] = "bse_sast_pdf"
+                            break
+                    break
+            except ValueError:
+                pass
+
+    # Also look for number of shares
+    shares_patterns = [
+        r"(?:[Nn]umber\s+of\s+shares)[^:]*?:\s*([\d,]+)",
+        r"(?:[Tt]otal\s+shares)\s*(?:held)?[^:]*?:\s*([\d,]+)",
+    ]
+
+    for pattern in shares_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                shares = int(match.group(1).replace(",", ""))
+                for h in holders:
+                    if (
+                        h["name"].lower() == shareholder_name.lower()
+                        and h["shares"] == 0
+                    ):
+                        h["shares"] = shares
+                        break
+                break
+            except ValueError:
+                pass
+
+    # Parse category-level shareholding patterns if present
+    # (Reg. 31 forms contain full shareholding breakdown)
+    _parse_shareholding_text(text, holders, {"Fin_Year": news_dt})
+
+
+def _fetch_bse_board_meetings(
+    scrip_code: str,
+    session: requests.Session | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch board meeting announcements from BSE for a given scrip code.
+
+    Uses the BSE BoardMeetings/w endpoint which works globally and
+    returns JSON with meeting subjects and PDF attachment paths.
+    """
+    if session is None:
+        session = _get_bse_session()
+
+    try:
+        resp = session.get(
+            f"{_BSE_BASE}/BoardMeetings/w",
+            params={"scripcode": scrip_code},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+    except Exception as exc:
+        logger.debug("BSE BoardMeetings failed for %s: %s", scrip_code, exc)
+
+    return []
+
+
+def _fetch_bse_corporate_actions(
+    scrip_code: str,
+    session: requests.Session | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch corporate actions (dividends, splits, bonuses) from BSE.
+
+    Uses the BSE CorporateAction/w endpoint which returns structured
+    JSON with action type, date, and amount.
+    """
+    if session is None:
+        session = _get_bse_session()
+
+    try:
+        resp = session.get(
+            f"{_BSE_BASE}/CorporateAction/w",
+            params={"scripcode": scrip_code},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict):
+            return data.get("Table", [])
+        if isinstance(data, list):
+            return data
+    except Exception as exc:
+        logger.debug("BSE CorporateAction failed for %s: %s", scrip_code, exc)
+
+    return []
+
+
+def _parse_shareholding_text(
+    text: str,
+    holders: list[dict[str, Any]],
+    meeting: dict[str, Any],
+) -> None:
+    """Parse shareholding pattern text from a BSE PDF.
+
+    Looks for SEBI-mandated shareholding pattern categories:
+    - Promoter & Promoter Group
+    - Public (Institutional + Non-Institutional)
+    - FII / FPI
+    - DII / Mutual Funds
+    - Custodians (for GDR/ADR)
+    """
+    patterns = [
+        (r"(?:Promoter\s*(?:&|and)\s*Promoter\s*Group)[^\d]*([\d.]+)\s*%?", "Promoter & Promoter Group"),
+        (r"(?:Total\s+)?Public\s+Shareholding[^\d]*([\d.]+)\s*%?", "Public Shareholding"),
+        (r"(?:Foreign\s+)?(?:Institutional\s+Investor|FII|FPI)[^\d]*([\d.]+)\s*%?", "Foreign Institutional Investors"),
+        (r"(?:Domestic\s+)?(?:Institutional\s+Investor|DII)[^\d]*([\d.]+)\s*%?", "Domestic Institutional Investors"),
+        (r"Mutual\s+Fund[s]?[^\d]*([\d.]+)\s*%?", "Mutual Funds"),
+        (r"Insurance\s+Compan(?:y|ies)[^\d]*([\d.]+)\s*%?", "Insurance Companies"),
+        (r"Bank[s]?\s*[,/&]\s*Financial\s+Institution[s]?[^\d]*([\d.]+)\s*%?", "Banks & Financial Institutions"),
+        (r"(?:Non[- ]?Resident\s+Indian|NRI)[^\d]*([\d.]+)\s*%?", "Non-Resident Indians"),
+        (r"Custodian[s]?\s*(?:for|of)?\s*(?:GDR|ADR|DR)[^\d]*([\d.]+)\s*%?", "Custodians (GDR/ADR)"),
+    ]
+
+    fin_year = meeting.get("Fin_Year", "")
+
+    for pattern, category in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                pct = float(match.group(1))
+                if 0.01 < pct < 100:
+                    if not any(h["name"] == category for h in holders):
+                        holders.append({
+                            "name": category,
+                            "shares": 0,
+                            "percentage": round(pct, 2),
+                            "holder_type": "category",
+                            "date_reported": fin_year,
+                            "source": "bse_sast_pdf",
+                        })
+            except ValueError:
+                pass
 
 
 class INBseClient:
@@ -492,3 +967,245 @@ class INBseClient:
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
+
+    # -- Institutional holders (yfinance + BSE scraping) ---------------------
+
+    def _yf_ticker(self, identifier: str) -> str:
+        """Convert BSE identifier to yfinance NSE format (e.g. '500325' -> 'RELIANCE.NS')."""
+        nse_ticker = _resolve_nse_ticker(identifier)
+        return f"{nse_ticker}.NS"
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch institutional holders via yfinance + BSE board meeting scraping.
+
+        Two-source strategy (mirrors HKHkexClient pattern):
+
+        1. **yfinance** (.NS suffix): provides major_holders aggregate stats
+           (insiders%, institutions%, count) for NSE-listed Indian companies.
+           Note: yfinance institutional_holders and mutualfund_holders return
+           empty for most Indian stocks -- the aggregate stats from
+           major_holders are the primary value.
+
+        2. **BSE BoardMeetings API**: fetches board meeting outcomes that
+           reference shareholding patterns.  When meetings have PDF
+           attachments, downloads and parses them for SEBI-mandated
+           shareholding category breakdowns (Promoter, Public, FII, DII,
+           Mutual Funds, etc.) using pdfplumber.
+
+        Uses the HKEX scraper pattern: persistent session for cookie reuse,
+        BSE Referer header for API access, rate limiting between requests.
+        """
+        holders: list[dict[str, Any]] = []
+        scrip_code = _resolve_scrip_code(identifier)
+
+        # Primary: yfinance major_holders for aggregate ownership stats
+        try:
+            import yfinance as yf
+            yf_ticker = self._yf_ticker(identifier)
+            tick = yf.Ticker(yf_ticker)
+
+            # major_holders provides insiders%, institutions%, count
+            mh = tick.major_holders
+            if mh is not None and not mh.empty:
+                for idx, row in mh.iterrows():
+                    breakdown = (
+                        str(row.get("Breakdown", idx)).lower()
+                        if "Breakdown" in mh.columns
+                        else str(idx).lower()
+                    )
+                    val = (
+                        row.get("Value", row.iloc[-1])
+                        if "Value" in mh.columns
+                        else row.iloc[-1]
+                    )
+                    try:
+                        pct = float(val) * 100 if float(val) < 1 else float(val)
+                    except (ValueError, TypeError):
+                        continue
+
+                    if "insiderspercentheld" in breakdown or "insider" in breakdown:
+                        holders.append({
+                            "name": "Insiders / Promoters",
+                            "shares": 0,
+                            "percentage": round(pct, 2),
+                            "holder_type": "promoter",
+                            "date_reported": "",
+                            "source": "yfinance_major",
+                        })
+                    elif "institutionspercentheld" in breakdown or (
+                        "institutions" in breakdown and "percent" in breakdown
+                    ):
+                        holders.append({
+                            "name": "Institutional Investors",
+                            "shares": 0,
+                            "percentage": round(pct, 2),
+                            "holder_type": "institutional",
+                            "date_reported": "",
+                            "source": "yfinance_major",
+                        })
+
+            # Try institutional_holders (usually empty for Indian stocks)
+            inst = tick.institutional_holders
+            if inst is not None and not inst.empty:
+                for _, row in inst.iterrows():
+                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                    if isinstance(pct, (int, float)) and 0 < pct < 1:
+                        pct = pct * 100
+                    holders.append({
+                        "name": str(row.get("Holder", "")),
+                        "shares": int(row.get("Shares", 0)),
+                        "value": float(row.get("Value", 0)),
+                        "percentage": round(float(pct), 2),
+                        "holder_type": "institutional",
+                        "date_reported": str(row.get("Date Reported", "")),
+                        "source": "yfinance",
+                    })
+
+            # Try mutualfund_holders (usually empty for Indian stocks)
+            mf = tick.mutualfund_holders
+            if mf is not None and not mf.empty:
+                for _, row in mf.iterrows():
+                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                    if isinstance(pct, (int, float)) and 0 < pct < 1:
+                        pct = pct * 100
+                    holders.append({
+                        "name": str(row.get("Holder", "")),
+                        "shares": int(row.get("Shares", 0)),
+                        "value": float(row.get("Value", 0)),
+                        "percentage": round(float(pct), 2),
+                        "holder_type": "mutualfund",
+                        "date_reported": str(row.get("Date Reported", "")),
+                        "source": "yfinance",
+                    })
+
+            if holders:
+                logger.info(
+                    "BSE holders for %s: %d from yfinance (%s)",
+                    identifier, len(holders), yf_ticker,
+                )
+        except Exception as exc:
+            logger.debug("yfinance holders failed for BSE %s: %s", identifier, exc)
+
+        # Supplement: BSE SAST disclosures (Reg. 29/31) via AnnSubCategoryGetData
+        # Uses the same API pattern as BSEFilingDiscoverer (strCat='Result')
+        # but with strCat='Insider Trading / SAST' for shareholding data.
+        # HEADLINE field contains shareholder names; PDFs at AttachHis/ have details.
+        try:
+            bse_session = _get_bse_session()
+            sast_filings = _fetch_bse_sast_disclosures(scrip_code, bse_session)
+            if sast_filings:
+                sast_holders = _extract_holders_from_sast(
+                    sast_filings, scrip_code, bse_session,
+                )
+                if sast_holders:
+                    existing_names = {h["name"].lower() for h in holders}
+                    for sh in sast_holders:
+                        if sh["name"].lower() not in existing_names:
+                            holders.append(sh)
+                            existing_names.add(sh["name"].lower())
+                    logger.info(
+                        "BSE SAST disclosures for %s: %d substantial shareholders",
+                        identifier, len(sast_holders),
+                    )
+        except Exception as exc:
+            logger.debug("BSE SAST scraping failed for %s: %s", identifier, exc)
+
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return institutional ownership metrics as a single-row snapshot.
+
+        Uses yfinance major_holders to extract aggregate ownership stats
+        for Indian companies.  yfinance provides a current-quarter snapshot.
+
+        Uses the same pattern as HKHkexClient.get_holder_history().
+        """
+        try:
+            import yfinance as yf
+            from datetime import date as _date
+            yf_ticker = self._yf_ticker(identifier)
+            tick = yf.Ticker(yf_ticker)
+
+            mh = tick.major_holders
+            inst_pct = 0.0
+            inst_count = 0
+            if mh is not None and not mh.empty:
+                for idx, row in mh.iterrows():
+                    breakdown = (
+                        str(row.get("Breakdown", idx)).lower()
+                        if "Breakdown" in mh.columns
+                        else str(idx).lower()
+                    )
+                    val = (
+                        row.get("Value", row.iloc[-1])
+                        if "Value" in mh.columns
+                        else row.iloc[-1]
+                    )
+                    if (
+                        "institutionspercentheld" in breakdown
+                        or ("institutions" in breakdown and "percent" in breakdown)
+                    ):
+                        inst_pct = float(val) * 100 if float(val) < 1 else float(val)
+                    elif "institutionscount" in breakdown or "count" in breakdown:
+                        inst_count = int(float(val))
+
+            holders = self.get_holders(identifier)
+            hhi = 0.0
+            if holders:
+                top5 = [h for h in holders if h.get("holder_type") != "category"][:5]
+                if not top5:
+                    top5 = holders[:5]
+                total_pct = sum(h.get("percentage", 0) for h in top5)
+                if total_pct > 0:
+                    hhi = sum(
+                        (h.get("percentage", 0) / total_pct) ** 2 for h in top5
+                    )
+
+            if inst_pct > 0 or inst_count > 0 or holders:
+                return pd.DataFrame([{
+                    "date_reported": pd.Timestamp(_date.today()),
+                    "inst_ownership_pct": round(inst_pct, 2),
+                    "inst_top5_concentration": round(hhi, 4),
+                    "inst_holder_count": inst_count or len(holders),
+                }])
+        except Exception as exc:
+            logger.debug("BSE holder history failed for %s: %s", identifier, exc)
+        return pd.DataFrame()
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch insider transactions via yfinance for BSE/NSE-listed companies.
+
+        Uses the same pattern as HKHkexClient.get_insider_transactions().
+        yfinance returns SEBI SAST disclosure data for Indian companies.
+        """
+        transactions: list[dict[str, Any]] = []
+        try:
+            import yfinance as yf
+            yf_ticker = self._yf_ticker(identifier)
+            tick = yf.Ticker(yf_ticker)
+            insider = tick.insider_transactions
+            if insider is not None and not insider.empty:
+                for _, row in insider.iterrows():
+                    shares = 0
+                    try:
+                        shares = int(row.get("Shares", 0))
+                    except (ValueError, TypeError):
+                        pass
+                    transactions.append({
+                        "insider_name": str(row.get("Insider", "")),
+                        "position": str(row.get("Position", "")),
+                        "date": str(row.get("Start Date", "")),
+                        "transaction": str(row.get("Transaction", "")),
+                        "shares": shares,
+                        "value": float(row.get("Value", 0) or 0),
+                    })
+                logger.info(
+                    "BSE insider transactions for %s: %d (%s)",
+                    identifier, len(transactions), yf_ticker,
+                )
+        except Exception as exc:
+            logger.debug(
+                "yfinance insider transactions failed for BSE %s: %s",
+                identifier, exc,
+            )
+        return transactions
