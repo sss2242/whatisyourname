@@ -252,6 +252,87 @@ def _fetch_company_directory() -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
+# Foreign ownership table (cached, 411 companies)
+# ---------------------------------------------------------------------------
+
+_foreign_ownership_cache: dict[str, dict] | None = None
+_foreign_ownership_cache_time: float = 0.0
+_FOREIGN_OWNERSHIP_TTL = 3600  # 1 hour
+
+
+def _fetch_foreign_ownership_table() -> dict[str, dict]:
+    """Fetch and cache the full Tadawul foreign ownership table.
+
+    The page at /newsandreports/reports-publications/foreign-ownership
+    serves a server-rendered HTML table with 411 companies.  No JavaScript,
+    no pagination needed.  curl_cffi Chrome impersonation required.
+
+    Returns dict keyed by symbol: {company, max_foreign_pct,
+    actual_foreign_pct, strategic_foreign_pct}.
+    """
+    global _foreign_ownership_cache, _foreign_ownership_cache_time
+
+    now = time.time()
+    if _foreign_ownership_cache is not None and (now - _foreign_ownership_cache_time) < _FOREIGN_OWNERSHIP_TTL:
+        return _foreign_ownership_cache
+
+    result: dict[str, dict] = {}
+    try:
+        s = _get_session()
+        r = s.get(
+            f"{_TADAWUL_BASE}/wps/portal/saudiexchange/newsandreports/"
+            "reports-publications/foreign-ownership?locale=en",
+            timeout=30,
+        )
+        if r.status_code != 200:
+            logger.warning("Tadawul foreign ownership page: %d", r.status_code)
+            return _foreign_ownership_cache or result
+
+        tables = re.findall(r"<table[^>]*>(.*?)</table>", r.text, re.DOTALL | re.I)
+        if not tables:
+            return result
+
+        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", tables[0], re.DOTALL | re.I)
+        for row in rows:
+            cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)
+            cells_clean = [re.sub(r"<[^>]+>", "", c).strip() for c in cells]
+            if len(cells_clean) < 5 or not cells_clean[0] or not cells_clean[0][0].isdigit():
+                continue
+
+            symbol = cells_clean[0]
+            try:
+                max_pct = float(cells_clean[2].replace("%", "").strip())
+            except (ValueError, TypeError):
+                max_pct = 49.0
+            try:
+                actual_pct = float(cells_clean[3].replace("%", "").strip())
+            except (ValueError, TypeError):
+                actual_pct = 0.0
+            try:
+                strategic_pct = float(cells_clean[4].replace("%", "").strip())
+            except (ValueError, TypeError):
+                strategic_pct = 0.0
+
+            result[symbol] = {
+                "company": cells_clean[1],
+                "max_foreign_pct": max_pct,
+                "actual_foreign_pct": actual_pct,
+                "strategic_foreign_pct": strategic_pct,
+            }
+
+        logger.info("Tadawul foreign ownership table: %d companies", len(result))
+        _foreign_ownership_cache = result
+        _foreign_ownership_cache_time = now
+
+    except Exception as exc:
+        logger.warning("Tadawul foreign ownership fetch failed: %s", exc)
+        if _foreign_ownership_cache is not None:
+            return _foreign_ownership_cache
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # XBRL financial extraction
 # ---------------------------------------------------------------------------
 
@@ -764,3 +845,212 @@ class SATadawulClient:
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
+
+    # -- Institutional holders (native Tadawul foreign ownership page) --------
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch foreign ownership data from Tadawul's native HTML table.
+
+        Data source: The Tadawul foreign-ownership page at
+        ``/newsandreports/reports-publications/foreign-ownership``
+        serves a server-rendered HTML table with **411 companies** containing:
+          - Total Foreign Ownership Maximum Limit (%)
+          - Total Foreign Ownership Actual (%)
+          - Foreign Strategic Investors Ownership (%)
+
+        The full table is fetched once and cached at module level (1-hour TTL)
+        to avoid re-downloading 760KB for each company lookup.
+
+        All fetched via curl_cffi Chrome impersonation (same as financials).
+        No yfinance, no LLM needed.
+
+        Probing notes (2026-03-23):
+          - OwnershipServlet, ShareholderServlet: 404 (don't exist)
+          - TickerServlet: no ownership fields (trade data only)
+          - WPS profile page: 0 NJ resource paths for ownership tabs
+          - statementsTabData type=4: filing calendar (dates only)
+          - statementsTabData type=5: board report calendar (dates only)
+          - Per-company major shareholder detail requires CMA authentication
+          - The foreign-ownership HTML table is the ONLY public holder endpoint
+        """
+        holders: list[dict[str, Any]] = []
+
+        # Use the cached foreign ownership table
+        ownership = _fetch_foreign_ownership_table()
+        symbol = identifier.upper().strip()
+        company_data = ownership.get(symbol)
+
+        if not company_data:
+            logger.debug("Tadawul: no foreign ownership data for %s", symbol)
+            return holders
+
+        company_name = company_data["company"]
+        actual_pct = company_data["actual_foreign_pct"]
+        strategic_pct = company_data["strategic_foreign_pct"]
+        max_pct = company_data["max_foreign_pct"]
+
+        if actual_pct > 0:
+            holders.append({
+                "name": "Foreign Investors (aggregate)",
+                "shares": 0,
+                "value": 0.0,
+                "percentage": round(actual_pct, 2),
+                "holder_type": "foreign_aggregate",
+                "date_reported": str(date.today()),
+                "source": "tadawul_foreign_ownership",
+                "max_foreign_limit_pct": round(max_pct, 2),
+            })
+        if strategic_pct > 0:
+            holders.append({
+                "name": "Foreign Strategic Investors",
+                "shares": 0,
+                "value": 0.0,
+                "percentage": round(strategic_pct, 2),
+                "holder_type": "foreign_strategic",
+                "date_reported": str(date.today()),
+                "source": "tadawul_foreign_ownership",
+            })
+        # Non-strategic foreign (retail foreign investors)
+        retail_foreign = actual_pct - strategic_pct
+        if retail_foreign > 0.01:
+            holders.append({
+                "name": "Foreign Retail Investors (implied)",
+                "shares": 0,
+                "value": 0.0,
+                "percentage": round(retail_foreign, 2),
+                "holder_type": "foreign_retail",
+                "date_reported": str(date.today()),
+                "source": "tadawul_foreign_ownership",
+            })
+        # Implied domestic ownership
+        domestic_pct = 100.0 - actual_pct
+        if domestic_pct > 0:
+            holders.append({
+                "name": "Domestic Investors (implied)",
+                "shares": 0,
+                "value": 0.0,
+                "percentage": round(domestic_pct, 2),
+                "holder_type": "domestic_aggregate",
+                "date_reported": str(date.today()),
+                "source": "tadawul_foreign_ownership",
+            })
+
+        if holders:
+            logger.info(
+                "Tadawul holders for %s (%s): foreign=%.2f%% (strategic=%.2f%%), "
+                "domestic=%.2f%%, max_limit=%.0f%%",
+                symbol, company_name, actual_pct, strategic_pct,
+                domestic_pct, max_pct,
+            )
+
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return ownership metrics from Tadawul foreign ownership data.
+
+        Currently returns a single-row snapshot.  Tadawul does not expose
+        historical foreign ownership data via public API (would require
+        scraping the page periodically and storing locally).
+        """
+        try:
+            holders = self.get_holders(identifier)
+            if not holders:
+                return pd.DataFrame()
+
+            foreign = next(
+                (h for h in holders if h["holder_type"] == "foreign_aggregate"),
+                None,
+            )
+            foreign_pct = foreign["percentage"] if foreign else 0.0
+            strategic = next(
+                (h for h in holders if h["holder_type"] == "foreign_strategic"),
+                None,
+            )
+            strategic_pct = strategic["percentage"] if strategic else 0.0
+
+            return pd.DataFrame([{
+                "date_reported": pd.Timestamp(date.today()),
+                "inst_ownership_pct": round(foreign_pct, 2),
+                "inst_top5_concentration": 0.0,
+                "inst_holder_count": len(holders),
+                "foreign_strategic_pct": round(strategic_pct, 2),
+            }])
+        except Exception as exc:
+            logger.debug("Tadawul holder history failed for %s: %s", identifier, exc)
+        return pd.DataFrame()
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch board report filing dates from statementsTabData type=5.
+
+        Tadawul does not expose per-transaction insider data via public API.
+        However, statementsTabData with statementType=5 returns board report
+        and ESG report filing dates, which indicate governance disclosure
+        events.  Each date represents a board-approved filing.
+
+        Probing confirmed: statementType=5 returns Annual/Quarterly board
+        report dates + ESG report dates for each company.
+        """
+        transactions: list[dict[str, Any]] = []
+        try:
+            directory = _fetch_company_directory()
+            company = directory.get(identifier.upper(), {})
+            profile_path = company.get("_profile_url", "")
+
+            if not profile_path:
+                return transactions
+
+            s = _get_session()
+            profile_url = (
+                profile_path
+                if profile_path.startswith("http")
+                else f"{_TADAWUL_BASE}{profile_path}"
+            )
+
+            # Load profile page first (needed for WPS session)
+            s.get(profile_url, timeout=25)
+
+            profile_base = profile_url.rsplit("/", 1)[0] + "/"
+            r = s.get(
+                profile_base + _STMT_TAB_PATH,
+                params={
+                    "statementType": "5",
+                    "reportType": "Q",
+                    "requestLocale": "en",
+                    "symbol": identifier.upper(),
+                },
+                timeout=15,
+            )
+            if r.status_code != 200 or len(r.text) < 200:
+                return transactions
+
+            # Parse board report dates from the table
+            rows = re.findall(r"<tr[^>]*>(.*?)</tr>", r.text, re.DOTALL | re.I)
+            for row in rows:
+                cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)
+                cells_clean = [re.sub(r"<[^>]+>", "", c).strip() for c in cells]
+                if not cells_clean:
+                    continue
+                report_type = cells_clean[0] if cells_clean else ""
+                if report_type not in ("Annual", "Q1", "Q2", "Q3", "Q4", "Board Report", "ESG Report"):
+                    continue
+                # Each subsequent cell is a date for a year column
+                for cell in cells_clean[1:]:
+                    if cell and cell != "-" and re.match(r"\d{4}-\d{2}-\d{2}", cell):
+                        transactions.append({
+                            "insider_name": f"Board ({report_type})",
+                            "position": "Board of Directors",
+                            "date": cell,
+                            "transaction": f"Board Report Filing ({report_type})",
+                            "shares": 0,
+                            "value": 0.0,
+                            "source": "tadawul_statementsTabData_type5",
+                        })
+
+            if transactions:
+                logger.info(
+                    "Tadawul board report dates for %s: %d filings",
+                    identifier, len(transactions),
+                )
+        except Exception as exc:
+            logger.debug("Tadawul board report fetch failed for %s: %s", identifier, exc)
+        return transactions

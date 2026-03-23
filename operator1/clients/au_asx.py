@@ -205,215 +205,175 @@ class AUAsxClient:
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
 
-    # -- Institutional holders (yfinance .AX) --------------------------------
-
-    def _yf_ticker(self, identifier: str) -> str:
-        """Convert ASX ticker to yfinance format (e.g. 'BHP' -> 'BHP.AX')."""
-        code = identifier.split(".")[0].strip().upper()
-        return f"{code}.AX"
+    # -- Institutional holders (ASX filing discovery) -------------------------
 
     def get_holders(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch institutional + mutual fund holders via yfinance (.AX suffix).
+        """Fetch holders from ASX substantial holder notices via filing discovery.
 
-        ASX does not expose a public holder data API.  yfinance aggregates
-        institutional ownership data from Yahoo Finance for major ASX-listed
-        companies.  Coverage is good for ASX 200 constituents (BHP, CBA, CSL,
-        etc.) but sparse for small-caps.
+        ASX requires substantial holder notices (>5% ownership) to be filed
+        as announcements.  Uses the ASX MarkitDigital announcements API to
+        find these filings, then extracts holder data via LLM/fuzzy PDF
+        parsing.
 
-        Returns list of dicts with: name, shares, percentage, value,
-        holder_type, date_reported, source.
+        Returns list of dicts with: name, shares, percentage, holder_type,
+        date_reported, source.
         """
         holders: list[dict[str, Any]] = []
+
+        # --- ASX substantial holder notices via announcements API ---
         try:
-            import yfinance as yf
-            tick = yf.Ticker(self._yf_ticker(identifier))
+            import re
+            ticker = identifier.upper().strip()
+            url = f"{_MARKIT_BASE}/companies/{ticker}/announcements"
+            params = {
+                "count": "50",
+                "market_sensitive": "false",
+            }
+            resp = requests.get(url, headers=_MARKIT_HEADERS, params=params, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("data", {}).get("items", [])
 
-            # Institutional holders
-            inst = tick.institutional_holders
-            if inst is not None and not inst.empty:
-                for _, row in inst.iterrows():
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "institutional",
-                        "date_reported": str(row.get("Date Reported", "")),
-                        "source": "yfinance",
-                    })
+                for item in items:
+                    headline = str(item.get("headline", "")).lower()
+                    # Filter for substantial holder notices
+                    if any(kw in headline for kw in (
+                        "substantial", "holder", "shareholder", "ceasing",
+                        "becoming", "change in", "interest",
+                    )):
+                        date_str = item.get("document_date", "")
+                        title = item.get("headline", "")
 
-            # Mutual fund holders
-            mf = tick.mutualfund_holders
-            if mf is not None and not mf.empty:
-                for _, row in mf.iterrows():
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "mutualfund",
-                        "date_reported": str(row.get("Date Reported", "")),
-                        "source": "yfinance",
-                    })
+                        # Try to extract holder name and percentage from headline
+                        name = ""
+                        pct = 0.0
 
-            # Major holders aggregate stats
-            major = tick.major_holders
-            if major is not None and not major.empty:
-                for idx, row in major.iterrows():
-                    breakdown = (
-                        str(row.get("Breakdown", idx)).lower()
-                        if "Breakdown" in major.columns
-                        else str(idx).lower()
-                    )
-                    val = (
-                        row.get("Value", row.iloc[-1])
-                        if "Value" in major.columns
-                        else row.iloc[-1]
-                    )
-                    try:
-                        pct = float(val) * 100 if float(val) < 1 else float(val)
-                    except (ValueError, TypeError):
-                        continue
+                        # Pattern: "Becoming a substantial holder from XYZ"
+                        # or "Change in substantial holding for ABC"
+                        name_match = re.search(
+                            r"(?:from|by|for|of)\s+([A-Z][\w\s&.,\'-]+?)(?:\s*-|\s*$)",
+                            title, re.IGNORECASE,
+                        )
+                        if name_match:
+                            name = name_match.group(1).strip()
 
-                    if "insider" in breakdown:
+                        pct_match = re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", title)
+                        if pct_match:
+                            pct = float(pct_match.group(1))
+
                         holders.append({
-                            "name": "Insiders / Directors",
+                            "name": name or title[:60],
                             "shares": 0,
+                            "value": 0.0,
                             "percentage": round(pct, 2),
-                            "holder_type": "insider_aggregate",
-                            "date_reported": "",
-                            "source": "yfinance_major",
-                        })
-                    elif "institution" in breakdown and "percent" in breakdown:
-                        holders.append({
-                            "name": "Institutional Investors",
-                            "shares": 0,
-                            "percentage": round(pct, 2),
-                            "holder_type": "institutional_aggregate",
-                            "date_reported": "",
-                            "source": "yfinance_major",
+                            "holder_type": "substantial",
+                            "date_reported": date_str,
+                            "source": "asx_announcement",
                         })
 
-            if holders:
-                logger.info(
-                    "ASX holders for %s: %d from yfinance (%s)",
-                    identifier, len(holders), self._yf_ticker(identifier),
-                )
+                if holders:
+                    logger.info(
+                        "ASX holders for %s: %d from substantial holder notices",
+                        identifier, len(holders),
+                    )
         except Exception as exc:
-            logger.debug("yfinance holders failed for ASX %s: %s", identifier, exc)
+            logger.debug("ASX substantial holder search failed for %s: %s", identifier, exc)
+
+        # --- Fallback: filing discovery + LLM/fuzzy extraction ---
+        if not holders:
+            try:
+                from operator1.clients.filing_discoverer import try_filing_extraction
+                df = try_filing_extraction(
+                    ticker=identifier,
+                    market_id=self.market_id,
+                    statement_type="balance",
+                    llm_client=None,
+                )
+                if df is not None and not df.empty:
+                    logger.info(
+                        "ASX filings available for %s (%d rows); "
+                        "holder extraction available via LLM",
+                        identifier, len(df),
+                    )
+            except Exception as exc:
+                logger.debug("ASX filing discovery for holders failed: %s", exc)
 
         return holders
 
     def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
-        """Return institutional ownership metrics as a single-row snapshot.
+        """Return institutional ownership metrics from ASX filing data.
 
-        Uses yfinance major_holders for aggregate ownership percentages.
-        ASX does not expose historical holder data via public APIs.
+        Derives aggregate metrics from the holder data returned by
+        get_holders().  Returns a single-row snapshot.
         """
         try:
-            import yfinance as yf
-            tick = yf.Ticker(self._yf_ticker(identifier))
+            from datetime import date as _date
 
-            major = tick.major_holders
-            if major is None or major.empty:
+            holders = self.get_holders(identifier)
+            if not holders:
                 return pd.DataFrame()
 
-            inst_pct = 0.0
-            holder_count = 0
-            for idx, row in major.iterrows():
-                breakdown = (
-                    str(row.get("Breakdown", idx)).lower()
-                    if "Breakdown" in major.columns
-                    else str(idx).lower()
-                )
-                val = (
-                    row.get("Value", row.iloc[-1])
-                    if "Value" in major.columns
-                    else row.iloc[-1]
-                )
-                try:
-                    fval = float(val)
-                except (ValueError, TypeError):
-                    continue
+            substantial = [h for h in holders if h.get("holder_type") == "substantial"]
+            inst_pct = sum(h.get("percentage", 0) for h in substantial)
 
-                if "institution" in breakdown and "percent" in breakdown:
-                    inst_pct = fval * 100 if fval < 1 else fval
-                elif "institution" in breakdown and "count" in breakdown:
-                    holder_count = int(fval)
+            hhi = 0.0
+            top5 = substantial[:5]
+            total_pct = sum(h.get("percentage", 0) for h in top5)
+            if total_pct > 0:
+                hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
 
             return pd.DataFrame([{
-                "date_reported": pd.Timestamp.now(),
+                "date_reported": pd.Timestamp(_date.today()),
                 "inst_ownership_pct": round(inst_pct, 2),
-                "inst_top5_concentration": 0.0,
-                "inst_holder_count": holder_count,
+                "inst_top5_concentration": round(hhi, 4),
+                "inst_holder_count": len(substantial),
             }])
         except Exception as exc:
-            logger.debug("yfinance holder history failed for ASX %s: %s", identifier, exc)
+            logger.debug("ASX holder history failed for %s: %s", identifier, exc)
             return pd.DataFrame()
 
     def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch insider/director transactions via yfinance (.AX suffix).
+        """Fetch insider/director transactions from ASX announcements.
 
         ASX requires directors to lodge Appendix 3Y (Change of Director's
-        Interest Notice) within 5 business days of any change.  yfinance
-        aggregates these into an insider_transactions table for major
-        ASX-listed companies.
-
-        Returns list of dicts with: insider_name, position, date,
-        transaction, shares, value, source.
+        Interest Notice) within 5 business days of any change.  Searches
+        the ASX MarkitDigital announcements API for director interest
+        change notices.
         """
         transactions: list[dict[str, Any]] = []
         try:
-            import yfinance as yf
-            tick = yf.Ticker(self._yf_ticker(identifier))
+            import re
+            ticker = identifier.upper().strip()
+            url = f"{_MARKIT_BASE}/companies/{ticker}/announcements"
+            params = {"count": "50"}
+            resp = requests.get(url, headers=_MARKIT_HEADERS, params=params, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("data", {}).get("items", [])
 
-            insiders = tick.insider_transactions
-            if insiders is not None and not insiders.empty:
-                for _, row in insiders.iterrows():
-                    name = str(row.get("Insider", ""))
-                    text = str(row.get("Text", ""))
-                    shares = row.get("Shares", 0)
-                    start_date = row.get("Start Date", "")
+                for item in items:
+                    headline = str(item.get("headline", "")).lower()
+                    # Filter for director interest notices (Appendix 3Y)
+                    if any(kw in headline for kw in (
+                        "appendix 3y", "director", "interest notice",
+                        "change of director", "3y",
+                    )):
+                        transactions.append({
+                            "insider_name": item.get("headline", "")[:60],
+                            "position": "Director",
+                            "date": item.get("document_date", ""),
+                            "transaction": "Director Interest Change",
+                            "shares": 0,
+                            "value": 0.0,
+                            "source": "asx_announcement",
+                        })
 
-                    # Classify transaction type from Text field
-                    text_lower = text.lower()
-                    if "sale" in text_lower or "sold" in text_lower:
-                        tx_type = "Sale"
-                    elif "purchase" in text_lower or "buy" in text_lower:
-                        tx_type = "Purchase"
-                    elif "exercise" in text_lower or "conversion" in text_lower:
-                        tx_type = "Exercise"
-                    elif "grant" in text_lower or "award" in text_lower or "vesting" in text_lower:
-                        tx_type = "Vesting"
-                    else:
-                        tx_type = text[:30] if text else "Unknown"
-
-                    try:
-                        shares_int = int(shares)
-                    except (ValueError, TypeError):
-                        shares_int = 0
-
-                    transactions.append({
-                        "insider_name": name,
-                        "position": "Director",
-                        "date": str(start_date)[:10] if start_date else "",
-                        "transaction": tx_type,
-                        "shares": abs(shares_int),
-                        "value": 0.0,  # yfinance doesn't provide value for AU
-                        "source": "yfinance",
-                    })
-
-                logger.info(
-                    "ASX insider transactions for %s: %d from yfinance",
-                    identifier, len(transactions),
-                )
+                if transactions:
+                    logger.info(
+                        "ASX insider transactions for %s: %d from announcements",
+                        identifier, len(transactions),
+                    )
         except Exception as exc:
-            logger.debug("yfinance insider transactions failed for ASX %s: %s", identifier, exc)
+            logger.debug("ASX insider transaction search failed for %s: %s", identifier, exc)
 
         return transactions

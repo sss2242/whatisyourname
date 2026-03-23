@@ -670,138 +670,290 @@ class USEdgarClient:
         return []
 
     def get_holders(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch institutional holders via yfinance (backed by Yahoo Finance).
+        """Fetch beneficial owners from SEC EDGAR SC 13D/13G filings.
 
-        Yahoo Finance aggregates 13F filing data into a convenient
-        institutional_holders table.  This avoids parsing raw 13F XML
-        which requires cross-referencing thousands of filer CIKs.
+        Searches EDGAR for Schedule 13D/13G filings (required for >5%
+        beneficial ownership) and parses filer names and ownership
+        percentages.  Also extracts ownership data from the most recent
+        DEF 14A proxy statement's "Security Ownership" section via the
+        LLM filing extractor or fuzzy PDF parser.
 
         Returns list of dicts with: name, shares, percentage, value,
-        holder_type, date_reported.
+        holder_type, date_reported, source.
         """
         holders: list[dict[str, Any]] = []
-        try:
-            import yfinance as yf
-            tick = yf.Ticker(identifier)
-            inst = tick.institutional_holders
-            if inst is not None and not inst.empty:
-                for _, row in inst.iterrows():
-                    # yfinance uses 'pctHeld' (fraction, e.g. 0.097 = 9.7%)
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100  # Convert fraction to percentage
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "institutional",
-                        "date_reported": str(row.get("Date Reported", "")),
-                    })
-                logger.info("US holders for %s: %d institutional from yfinance", identifier, len(holders))
 
-            # 2. Mutual fund holders (adds breadth for ownership overlap analysis)
-            mf = tick.mutualfund_holders
-            if mf is not None and not mf.empty:
-                for _, row in mf.iterrows():
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "mutualfund",
-                        "date_reported": str(row.get("Date Reported", "")),
-                    })
-                logger.info("US holders for %s: +%d mutual fund from yfinance", identifier, len(mf))
+        # --- Path 1: SC 13D/13G filings (>5% beneficial owners) ---
+        try:
+            self._init_edgartools()
+            company = self._get_edgar_company(identifier)
+            if company is not None:
+                for form_type in ("SC 13G/A", "SC 13G", "SC 13D/A", "SC 13D"):
+                    try:
+                        filings = company.get_filings(form=form_type)
+                        if filings is None or len(filings) == 0:
+                            continue
+                        seen_filers: set[str] = set()
+                        for filing in filings[:15]:
+                            try:
+                                filer_name = str(getattr(filing, "company", ""))
+                                if not filer_name:
+                                    filer_name = str(getattr(filing, "filer", ""))
+                                if not filer_name or filer_name in seen_filers:
+                                    continue
+                                seen_filers.add(filer_name)
+                                filing_date = str(getattr(filing, "filing_date", ""))
+                                # Try to extract percentage from filing text
+                                pct = 0.0
+                                try:
+                                    import re
+                                    text = filing.text()[:5000] if hasattr(filing, "text") else ""
+                                    pct_match = re.search(
+                                        r"(?:percent|percentage|%).*?(\d{1,3}(?:\.\d+)?)\s*%",
+                                        text, re.IGNORECASE,
+                                    )
+                                    if pct_match:
+                                        pct = float(pct_match.group(1))
+                                    else:
+                                        pct_match = re.search(r"(\d{1,3}\.\d+)%", text)
+                                        if pct_match:
+                                            pct = float(pct_match.group(1))
+                                except Exception:
+                                    pass
+                                holders.append({
+                                    "name": filer_name,
+                                    "shares": 0,
+                                    "value": 0.0,
+                                    "percentage": round(pct, 2),
+                                    "holder_type": "institutional",
+                                    "date_reported": filing_date,
+                                    "source": f"sec_edgar_{form_type.lower().replace(' ', '_').replace('/', '')}",
+                                })
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+                if holders:
+                    logger.info(
+                        "US holders for %s: %d from SEC EDGAR SC 13D/13G",
+                        identifier, len(holders),
+                    )
         except Exception as exc:
-            logger.debug("yfinance holders failed for %s: %s", identifier, exc)
+            logger.debug("SEC EDGAR SC 13D/13G search failed for %s: %s", identifier, exc)
+
+        # --- Path 2: DEF 14A proxy statement (beneficial ownership table) ---
+        if len(holders) < 3:
+            try:
+                self._init_edgartools()
+                company = self._get_edgar_company(identifier)
+                if company is not None:
+                    proxy_filings = company.get_filings(form="DEF 14A")
+                    if proxy_filings is not None and len(proxy_filings) > 0:
+                        latest_proxy = proxy_filings[0]
+                        proxy_text = ""
+                        try:
+                            proxy_text = latest_proxy.text()[:20000] if hasattr(latest_proxy, "text") else ""
+                        except Exception:
+                            pass
+                        if proxy_text:
+                            proxy_holders = self._extract_holders_from_proxy_text(proxy_text)
+                            filing_date = str(getattr(latest_proxy, "filing_date", ""))
+                            for ph in proxy_holders:
+                                ph["date_reported"] = filing_date
+                                ph["source"] = "sec_edgar_def14a"
+                            # Only add holders not already found via SC 13D/13G
+                            existing_names = {h["name"].lower() for h in holders}
+                            new_holders = [
+                                h for h in proxy_holders
+                                if h["name"].lower() not in existing_names
+                            ]
+                            holders.extend(new_holders)
+                            if new_holders:
+                                logger.info(
+                                    "US holders for %s: +%d from DEF 14A proxy",
+                                    identifier, len(new_holders),
+                                )
+            except Exception as exc:
+                logger.debug("DEF 14A holder extraction failed for %s: %s", identifier, exc)
+
+        return holders
+
+    @staticmethod
+    def _extract_holders_from_proxy_text(text: str) -> list[dict[str, Any]]:
+        """Extract beneficial ownership data from DEF 14A proxy text.
+
+        Searches for the 'Security Ownership' section and parses the
+        tabular data using regex patterns common in SEC proxy statements.
+        """
+        import re
+        holders: list[dict[str, Any]] = []
+
+        # Find the beneficial ownership section
+        ownership_section = ""
+        markers = [
+            r"security ownership of certain beneficial owners",
+            r"beneficial ownership of common stock",
+            r"principal stockholders",
+            r"security ownership",
+        ]
+        for marker in markers:
+            match = re.search(marker, text, re.IGNORECASE)
+            if match:
+                start = match.start()
+                # Extract ~3000 chars after the marker
+                ownership_section = text[start:start + 3000]
+                break
+
+        if not ownership_section:
+            return holders
+
+        # Pattern: Name followed by percentage (e.g. "The Vanguard Group... 8.2%")
+        # or shares count followed by percentage
+        lines = ownership_section.split("\n")
+        for line in lines:
+            line = line.strip()
+            if not line or len(line) < 10:
+                continue
+            # Look for lines with a percentage
+            pct_match = re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", line)
+            if not pct_match:
+                continue
+            pct = float(pct_match.group(1))
+            if pct < 1.0 or pct > 99.0:
+                continue
+            # Extract name (text before the first number or percentage)
+            name_match = re.match(r"^([A-Za-z][\w\s&.,\'-]+?)(?:\s{2,}|\s*\d)", line)
+            if name_match:
+                name = name_match.group(1).strip()
+                if len(name) > 3 and name.lower() not in ("name", "title", "percent", "shares"):
+                    # Try to extract shares count
+                    shares = 0
+                    shares_match = re.search(r"([\d,]+)\s+(?:shares|common)", line, re.IGNORECASE)
+                    if shares_match:
+                        try:
+                            shares = int(shares_match.group(1).replace(",", ""))
+                        except ValueError:
+                            pass
+                    holders.append({
+                        "name": name,
+                        "shares": shares,
+                        "value": 0.0,
+                        "percentage": round(pct, 2),
+                        "holder_type": "institutional" if pct >= 5 else "insider",
+                    })
+
         return holders
 
     def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch insider buy/sell transactions via yfinance.
+        """Fetch insider transactions from SEC EDGAR Form 4 filings.
 
-        Returns list of dicts with: insider_name, position, date,
-        transaction, shares, value.
+        Form 4 is filed within 2 business days of an insider transaction.
+        Uses edgartools to fetch recent Form 4 filings and extracts
+        transaction details from the filing metadata and text.
         """
         transactions: list[dict[str, Any]] = []
         try:
-            import yfinance as yf
-            tick = yf.Ticker(identifier)
-            insider = tick.insider_transactions
-            if insider is not None and not insider.empty:
-                for _, row in insider.iterrows():
+            self._init_edgartools()
+            company = self._get_edgar_company(identifier)
+            if company is None:
+                return transactions
+
+            form4_filings = company.get_filings(form="4")
+            if form4_filings is None or len(form4_filings) == 0:
+                return transactions
+
+            import re
+
+            for filing in form4_filings[:20]:
+                try:
+                    insider_name = str(getattr(filing, "company", ""))
+                    if not insider_name:
+                        insider_name = str(getattr(filing, "filer", ""))
+                    filing_date = str(getattr(filing, "filing_date", ""))
+
+                    # Try to extract transaction details from filing text
                     shares = 0
-                    try:
-                        shares = int(row.get("Shares", 0))
-                    except (ValueError, TypeError):
-                        pass
                     value = 0.0
+                    txn_type = "unknown"
+                    position = ""
                     try:
-                        value = float(row.get("Value", 0))
-                    except (ValueError, TypeError):
+                        text = filing.text()[:5000] if hasattr(filing, "text") else ""
+                        # Look for transaction type
+                        if re.search(r"\b(?:purchase|acquired|bought)\b", text, re.IGNORECASE):
+                            txn_type = "Purchase"
+                        elif re.search(r"\b(?:sale|sold|disposed)\b", text, re.IGNORECASE):
+                            txn_type = "Sale"
+                        elif re.search(r"\b(?:grant|award|exercise)\b", text, re.IGNORECASE):
+                            txn_type = "Grant/Award"
+                        # Try to extract shares
+                        shares_match = re.search(r"(\d[\d,]+)\s*(?:shares|common)", text, re.IGNORECASE)
+                        if shares_match:
+                            shares = int(shares_match.group(1).replace(",", ""))
+                        # Try to extract position/title
+                        pos_match = re.search(
+                            r"(?:title|position|officer)\s*[:=]\s*([^\n]+)",
+                            text, re.IGNORECASE,
+                        )
+                        if pos_match:
+                            position = pos_match.group(1).strip()[:50]
+                    except Exception:
                         pass
+
                     transactions.append({
-                        "insider_name": str(row.get("Insider", "")),
-                        "position": str(row.get("Position", "")),
-                        "date": str(row.get("Start Date", "")),
-                        "transaction": str(row.get("Transaction", "")),
+                        "insider_name": insider_name,
+                        "position": position,
+                        "date": filing_date,
+                        "transaction": txn_type,
                         "shares": shares,
                         "value": value,
+                        "source": "sec_edgar_form4",
                     })
-                logger.info("US insider transactions for %s: %d", identifier, len(transactions))
+                except Exception:
+                    continue
+
+            if transactions:
+                logger.info(
+                    "US insider transactions for %s: %d from SEC EDGAR Form 4",
+                    identifier, len(transactions),
+                )
         except Exception as exc:
-            logger.debug("yfinance insider transactions failed for %s: %s", identifier, exc)
+            logger.debug("SEC EDGAR Form 4 parsing failed for %s: %s", identifier, exc)
         return transactions
 
     def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
-        """Return institutional ownership metrics as a time-series DataFrame.
+        """Return institutional ownership metrics from SEC EDGAR filings.
 
-        For US, yfinance provides current-quarter aggregate stats via
-        ``major_holders`` and top holder list via ``institutional_holders``.
-        This produces a single-row snapshot. When EDGAR 13F cross-reference
-        search becomes available, this can be extended to return multiple
-        quarterly rows.
+        Derives ownership snapshot from SC 13D/13G filings and DEF 14A
+        proxy statements.  Returns a single-row DataFrame with aggregate
+        metrics computed from the holder data.
 
         Returns DataFrame with: date_reported, inst_ownership_pct,
         inst_top5_concentration, inst_holder_count.
         """
         try:
-            import yfinance as yf
             from datetime import date as _date
-            tick = yf.Ticker(identifier)
 
-            # Get aggregate stats
-            mh = tick.major_holders
-            inst_pct = 0.0
-            inst_count = 0
-            if mh is not None and not mh.empty:
-                for idx, row in mh.iterrows():
-                    breakdown = str(row.get("Breakdown", idx)).lower() if "Breakdown" in mh.columns else str(idx).lower()
-                    val = row.get("Value", row.iloc[-1]) if "Value" in mh.columns else row.iloc[-1]
-                    if "institutionspercentheld" in breakdown or "institutions" in breakdown and "percent" in breakdown:
-                        inst_pct = float(val) * 100 if float(val) < 1 else float(val)
-                    elif "institutionscount" in breakdown or "count" in breakdown:
-                        inst_count = int(float(val))
-
-            # Compute HHI from top holders
             holders = self.get_holders(identifier)
-            hhi = 0.0
-            if holders:
-                top5 = holders[:5]
-                total_pct = sum(h.get("percentage", 0) for h in top5)
-                if total_pct > 0:
-                    hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
+            if not holders:
+                return pd.DataFrame()
 
-            if inst_pct > 0 or inst_count > 0 or holders:
-                return pd.DataFrame([{
-                    "date_reported": pd.Timestamp(_date.today()),
-                    "inst_ownership_pct": round(inst_pct, 2),
-                    "inst_top5_concentration": round(hhi, 4),
-                    "inst_holder_count": inst_count or len(holders),
-                }])
+            # Compute aggregate metrics from holder data
+            inst_holders = [h for h in holders if h.get("holder_type") == "institutional"]
+            inst_pct = sum(h.get("percentage", 0) for h in inst_holders)
+
+            # HHI concentration from top 5
+            hhi = 0.0
+            top5 = inst_holders[:5]
+            total_pct = sum(h.get("percentage", 0) for h in top5)
+            if total_pct > 0:
+                hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
+
+            return pd.DataFrame([{
+                "date_reported": pd.Timestamp(_date.today()),
+                "inst_ownership_pct": round(inst_pct, 2),
+                "inst_top5_concentration": round(hhi, 4),
+                "inst_holder_count": len(inst_holders),
+            }])
         except Exception as exc:
             logger.debug("US holder history failed for %s: %s", identifier, exc)
 

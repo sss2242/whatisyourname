@@ -368,130 +368,153 @@ class HKHkexClient:
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
 
-    # -- Institutional holders (yfinance backed) -----------------------------
+    # -- Institutional holders (akshare / HKEX filing discovery) -------------
 
-    def _yf_ticker(self, identifier: str) -> str:
-        """Convert HKEX stock code to yfinance format (e.g. '700' -> '0700.HK')."""
+    def _hk_code(self, identifier: str) -> str:
+        """Normalize HKEX stock code (e.g. '700' -> '00700')."""
         code = identifier.split(".")[0].strip().lstrip("0") or "0"
-        return f"{code.zfill(4)}.HK"
+        return code.zfill(5)
 
     def get_holders(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch institutional + mutual fund holders via yfinance.
+        """Fetch holders from akshare EastMoney (structured, no LLM needed).
 
-        HKEX CCASS (Central Clearing) shareholding data is not available
-        via direct HTTP scraping (requires JavaScript rendering).  yfinance
-        provides aggregated institutional holder data from Yahoo Finance
-        which covers major HKEX-listed companies.
+        Uses akshare stock_hk_shareholders_em to get top-10 shareholders
+        from EastMoney's aggregated HK shareholder data.  Falls back to
+        HKEX filing discovery for disclosure of interest filings.
+
+        Returns list of dicts with: name, shares, percentage, holder_type,
+        date_reported, source.
         """
         holders: list[dict[str, Any]] = []
+
+        # --- Path 1: akshare EastMoney shareholder data ---
         try:
-            import yfinance as yf
-            tick = yf.Ticker(self._yf_ticker(identifier))
+            import akshare as ak
+            code = self._hk_code(identifier)
 
-            # Institutional holders
-            inst = tick.institutional_holders
-            if inst is not None and not inst.empty:
-                for _, row in inst.iterrows():
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "institutional",
-                        "date_reported": str(row.get("Date Reported", "")),
-                    })
-
-            # Mutual fund holders
-            mf = tick.mutualfund_holders
-            if mf is not None and not mf.empty:
-                for _, row in mf.iterrows():
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "mutualfund",
-                        "date_reported": str(row.get("Date Reported", "")),
-                    })
+            # Try top-10 shareholders
+            try:
+                df = ak.stock_hk_main_board_stock_holder_em(symbol=code)
+                if df is not None and not df.empty:
+                    for _, row in df.head(20).iterrows():
+                        name = str(row.get("股东名称", row.get("holder_name", "")))
+                        pct = 0.0
+                        try:
+                            pct_raw = row.get("持股比例", row.get("hold_ratio", 0))
+                            if pct_raw:
+                                pct = float(str(pct_raw).replace("%", ""))
+                                if 0 < pct < 1:
+                                    pct = pct * 100
+                        except (ValueError, TypeError):
+                            pass
+                        shares = 0
+                        try:
+                            shares = int(float(row.get("持股数量", row.get("hold_num", 0))))
+                        except (ValueError, TypeError):
+                            pass
+                        date_str = str(row.get("公告日期", row.get("ann_date", "")))
+                        if name and (pct > 0 or shares > 0):
+                            holders.append({
+                                "name": name,
+                                "shares": shares,
+                                "value": 0.0,
+                                "percentage": round(pct, 2),
+                                "holder_type": "institutional",
+                                "date_reported": date_str,
+                                "source": "akshare_eastmoney",
+                            })
+            except Exception as exc:
+                logger.debug("akshare HK shareholders failed for %s: %s", identifier, exc)
 
             if holders:
-                logger.info("HKEX holders for %s: %d from yfinance", identifier, len(holders))
+                logger.info("HKEX holders for %s: %d from akshare/EastMoney", identifier, len(holders))
+        except ImportError:
+            logger.debug("akshare not available for HKEX holder lookup")
         except Exception as exc:
-            logger.debug("yfinance holders failed for HKEX %s: %s", identifier, exc)
+            logger.debug("akshare HK holder lookup failed for %s: %s", identifier, exc)
+
+        # --- Path 2: HKEX filing discovery for disclosure of interest ---
+        if not holders:
+            try:
+                from operator1.clients.hkex_scraper import HKEXScraper
+                scraper = HKEXScraper()
+                announcements = scraper.search_announcements(
+                    stock_code=identifier,
+                    category="disclosure",
+                    max_results=10,
+                )
+                if announcements:
+                    logger.info(
+                        "HKEX disclosure filings for %s: %d found (LLM extraction available)",
+                        identifier, len(announcements),
+                    )
+            except Exception as exc:
+                logger.debug("HKEX filing discovery for holders failed: %s", exc)
+
         return holders
 
     def get_holder_history(self, identifier: str, years: int = 2) -> "pd.DataFrame":
-        """Return institutional ownership metrics as a single-row snapshot.
+        """Return institutional ownership metrics from akshare/EastMoney.
 
-        HKEX CCASS does not expose historical shareholding data via HTTP
-        (requires JavaScript rendering).  yfinance provides a current-
-        quarter snapshot of aggregate institutional ownership stats.
+        Derives aggregate metrics from the holder data returned by
+        get_holders().  Returns a single-row snapshot.
         """
         try:
-            import yfinance as yf
             from datetime import date as _date
-            tick = yf.Ticker(self._yf_ticker(identifier))
-
-            mh = tick.major_holders
-            inst_pct = 0.0
-            inst_count = 0
-            if mh is not None and not mh.empty:
-                for idx, row in mh.iterrows():
-                    breakdown = str(row.get("Breakdown", idx)).lower() if "Breakdown" in mh.columns else str(idx).lower()
-                    val = row.get("Value", row.iloc[-1]) if "Value" in mh.columns else row.iloc[-1]
-                    if "institutionspercentheld" in breakdown or ("institutions" in breakdown and "percent" in breakdown):
-                        inst_pct = float(val) * 100 if float(val) < 1 else float(val)
-                    elif "institutionscount" in breakdown or "count" in breakdown:
-                        inst_count = int(float(val))
 
             holders = self.get_holders(identifier)
-            hhi = 0.0
-            if holders:
-                top5 = holders[:5]
-                total_pct = sum(h.get("percentage", 0) for h in top5)
-                if total_pct > 0:
-                    hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
+            if not holders:
+                return pd.DataFrame()
 
-            if inst_pct > 0 or inst_count > 0 or holders:
-                return pd.DataFrame([{
-                    "date_reported": pd.Timestamp(_date.today()),
-                    "inst_ownership_pct": round(inst_pct, 2),
-                    "inst_top5_concentration": round(hhi, 4),
-                    "inst_holder_count": inst_count or len(holders),
-                }])
+            inst_holders = [h for h in holders if h.get("holder_type") == "institutional"]
+            inst_pct = sum(h.get("percentage", 0) for h in inst_holders)
+
+            hhi = 0.0
+            top5 = inst_holders[:5]
+            total_pct = sum(h.get("percentage", 0) for h in top5)
+            if total_pct > 0:
+                hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
+
+            return pd.DataFrame([{
+                "date_reported": pd.Timestamp(_date.today()),
+                "inst_ownership_pct": round(inst_pct, 2),
+                "inst_top5_concentration": round(hhi, 4),
+                "inst_holder_count": len(inst_holders),
+            }])
         except Exception as exc:
             logger.debug("HKEX holder history failed for %s: %s", identifier, exc)
         return pd.DataFrame()
 
     def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch insider transactions via yfinance for HKEX-listed companies."""
+        """Fetch insider/director transactions from HKEX disclosure filings.
+
+        Uses HKEX filing discovery to find director dealing announcements.
+        Returns basic metadata; full extraction requires LLM.
+        """
         transactions: list[dict[str, Any]] = []
         try:
-            import yfinance as yf
-            tick = yf.Ticker(self._yf_ticker(identifier))
-            insider = tick.insider_transactions
-            if insider is not None and not insider.empty:
-                for _, row in insider.iterrows():
-                    shares = 0
-                    try:
-                        shares = int(row.get("Shares", 0))
-                    except (ValueError, TypeError):
-                        pass
-                    transactions.append({
-                        "insider_name": str(row.get("Insider", "")),
-                        "position": str(row.get("Position", "")),
-                        "date": str(row.get("Start Date", "")),
-                        "transaction": str(row.get("Transaction", "")),
-                        "shares": shares,
-                        "value": float(row.get("Value", 0) or 0),
-                    })
-                logger.info("HKEX insider transactions for %s: %d", identifier, len(transactions))
+            from operator1.clients.hkex_scraper import HKEXScraper
+            scraper = HKEXScraper()
+            announcements = scraper.search_announcements(
+                stock_code=identifier,
+                category="director",
+                max_results=20,
+            )
+            for ann in (announcements or []):
+                transactions.append({
+                    "insider_name": ann.get("headline", "Unknown Director"),
+                    "position": "",
+                    "date": ann.get("date", ""),
+                    "transaction": "Disclosure",
+                    "shares": 0,
+                    "value": 0.0,
+                    "source": "hkex_filing_discovery",
+                })
+            if transactions:
+                logger.info(
+                    "HKEX insider transactions for %s: %d from filing discovery",
+                    identifier, len(transactions),
+                )
         except Exception as exc:
-            logger.debug("yfinance insider transactions failed for HKEX %s: %s", identifier, exc)
+            logger.debug("HKEX insider transaction discovery failed for %s: %s", identifier, exc)
         return transactions

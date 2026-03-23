@@ -495,165 +495,244 @@ class BRCvmClient:
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
 
-    # -- Institutional holders (yfinance backed) -----------------------------
-
-    def _yf_ticker(self, identifier: str) -> str:
-        """Convert B3 ticker to yfinance format.
-
-        Brazilian stocks use numeric suffixes (3=ON, 4=PN, 11=units).
-        yfinance expects ``{ticker}.SA``. If identifier already has .SA,
-        return as-is. Otherwise try common suffixes.
-        """
-        if ".SA" in identifier.upper():
-            return identifier
-        base = identifier.upper().replace(".SA", "").strip()
-        # If it already ends with a digit (e.g. PETR4), use directly
-        if base and base[-1].isdigit():
-            return f"{base}.SA"
-        # Try common suffixes: 4 (PN preferred), 3 (ON), 11 (units)
-        return f"{base}4.SA"
-
-    def _try_yf_tickers(self, identifier: str):
-        """Try yfinance ticker variants for B3 stocks."""
-        try:
-            import yfinance as yf
-        except ImportError:
-            return None
-
-        base = identifier.upper().replace(".SA", "").strip()
-        # Build variants
-        if base and base[-1].isdigit():
-            variants = [f"{base}.SA"]
-        else:
-            variants = [f"{base}4.SA", f"{base}3.SA", f"{base}11.SA"]
-
-        for v in variants:
-            try:
-                tick = yf.Ticker(v)
-                mh = tick.major_holders
-                if mh is not None and not mh.empty:
-                    return tick
-            except Exception:
-                continue
-        return None
+    # -- Institutional holders (CVM FRE archives) -----------------------------
 
     def get_holders(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch institutional holders via yfinance.
+        """Fetch shareholder composition from CVM FRE (Formulario de Referencia).
 
-        CVM Open Data does not publish per-company shareholder data
-        through the API (confirmed: 54 datasets, none with acionista/
-        composicao_capital). yfinance provides aggregate stats from
-        Yahoo Finance which covers major B3-listed companies.
+        CVM FRE archives contain 'posicao_acionaria' (shareholder position)
+        data with names, share counts, and percentages for all companies
+        registered with CVM.  This is regulatory PIT data filed annually.
 
-        Note: Yahoo Finance typically returns major_holders aggregate
-        for Brazilian stocks but individual holder detail is sparse.
+        Falls back to LLM extraction from CVM annual reports (DFP) if
+        FRE archives don't contain shareholder data for this company.
         """
         holders: list[dict[str, Any]] = []
+
+        # --- Path 1: CVM FRE archives (posicao_acionaria) ---
         try:
-            tick = self._try_yf_tickers(identifier)
-            if tick is None:
+            cd_cvm = self._resolve_cd_cvm(identifier)
+            if not cd_cvm:
+                logger.debug("BR holders: could not resolve CD_CVM for %s", identifier)
                 return holders
 
-            inst = tick.institutional_holders
-            if inst is not None and not inst.empty:
-                for _, row in inst.iterrows():
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "institutional",
-                        "date_reported": str(row.get("Date Reported", "")),
-                    })
+            import zipfile
+            from io import BytesIO
+            from datetime import date as _date
 
-            mf = tick.mutualfund_holders
-            if mf is not None and not mf.empty:
-                for _, row in mf.iterrows():
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "mutualfund",
-                        "date_reported": str(row.get("Date Reported", "")),
-                    })
+            # CVM FRE master ZIP contains posicao_acionaria CSV with
+            # structured shareholder data (name, shares, percentage,
+            # controlling flag, nationality).  The correct URL is the
+            # master ZIP: fre_cia_aberta_{year}.zip which contains
+            # fre_cia_aberta_posicao_acionaria_{year}.csv inside it.
+            current_year = _date.today().year
+            for year in range(current_year, current_year - 3, -1):
+                url = f"{_CVM_DATASET_BASE}/DOC/FRE/DADOS/fre_cia_aberta_{year}.zip"
+                try:
+                    resp = requests.get(url, timeout=120)
+                    if resp.status_code != 200:
+                        continue
+                    z = zipfile.ZipFile(BytesIO(resp.content))
 
-            if holders:
-                logger.info("BR holders for %s: %d from yfinance", identifier, len(holders))
+                    # Find the posicao_acionaria CSV inside the master ZIP
+                    target_csv = f"fre_cia_aberta_posicao_acionaria_{year}.csv"
+                    if target_csv not in z.namelist():
+                        # Try case-insensitive match
+                        target_csv = next(
+                            (n for n in z.namelist() if "posicao_acionaria" in n.lower()),
+                            "",
+                        )
+                    if not target_csv:
+                        logger.debug("CVM FRE %d: no posicao_acionaria CSV found", year)
+                        continue
+
+                    with z.open(target_csv) as f:
+                        try:
+                            df = pd.read_csv(
+                                f, sep=";", encoding="latin-1",
+                                dtype=str, on_bad_lines="skip",
+                            )
+                        except Exception:
+                            continue
+
+                    # Filter for this company by CNPJ or Nome_Companhia
+                    # First try matching by company name from CVM registry
+                    matches = self.list_companies(query=identifier)
+                    company_name = matches[0].get("name", "") if matches else ""
+                    cnpj = matches[0].get("cnpj", "") if matches else ""
+
+                    company_rows = pd.DataFrame()
+                    if cnpj and "CNPJ_Companhia" in df.columns:
+                        company_rows = df[df["CNPJ_Companhia"] == cnpj]
+                    if company_rows.empty and company_name and "Nome_Companhia" in df.columns:
+                        company_rows = df[
+                            df["Nome_Companhia"].str.contains(
+                                company_name.split()[0], case=False, na=False,
+                            )
+                        ]
+                    if company_rows.empty:
+                        continue
+
+                    # Extract holder data from CVM FRE posicao_acionaria columns
+                    for _, row in company_rows.iterrows():
+                        holder_name = str(row.get("Acionista", "")).strip()
+                        if not holder_name or holder_name.lower() in ("outros", "acoes tesouraria"):
+                            continue
+
+                        pct = 0.0
+                        for col in ("Percentual_Total_Acoes_Circulacao",
+                                    "Percentual_Acao_Ordinaria_Circulacao"):
+                            val = row.get(col)
+                            if pd.notna(val):
+                                try:
+                                    pct = float(str(val).replace(",", "."))
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+
+                        shares = 0
+                        for col in ("Quantidade_Total_Acoes_Circulacao",
+                                    "Quantidade_Acao_Ordinaria_Circulacao"):
+                            val = row.get(col)
+                            if pd.notna(val):
+                                try:
+                                    shares = int(float(str(val).replace(",", "")))
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+
+                        date_str = str(row.get("Data_Referencia", ""))
+                        is_controller = str(row.get("Acionista_Controlador", "")) == "S"
+                        nationality = str(row.get("Nacionalidade", ""))
+
+                        if holder_name and (pct > 0 or shares > 0):
+                            holders.append({
+                                "name": holder_name,
+                                "shares": shares,
+                                "value": 0.0,
+                                "percentage": round(pct, 2),
+                                "holder_type": "controlling" if is_controller else "institutional",
+                                "date_reported": date_str,
+                                "nationality": nationality,
+                                "source": f"cvm_fre_posicao_acionaria_{year}",
+                            })
+
+                    if holders:
+                        logger.info(
+                            "BR holders for %s: %d from CVM FRE %d posicao_acionaria",
+                            identifier, len(holders), year,
+                        )
+                        return holders
+                except Exception as exc:
+                    logger.debug("CVM FRE %d fetch failed: %s", year, exc)
+                    continue
         except Exception as exc:
-            logger.debug("yfinance holders failed for BR %s: %s", identifier, exc)
+            logger.debug("CVM FRE holder extraction failed for %s: %s", identifier, exc)
+
         return holders
 
     def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
-        """Return institutional ownership metrics as a single-row snapshot."""
+        """Return institutional ownership metrics from CVM FRE data."""
         try:
             from datetime import date as _date
-            tick = self._try_yf_tickers(identifier)
-            if tick is None:
-                return pd.DataFrame()
-
-            mh = tick.major_holders
-            inst_pct = 0.0
-            inst_count = 0
-            if mh is not None and not mh.empty:
-                for idx, row in mh.iterrows():
-                    breakdown = str(row.get("Breakdown", idx)).lower() if "Breakdown" in mh.columns else str(idx).lower()
-                    val = row.get("Value", row.iloc[-1]) if "Value" in mh.columns else row.iloc[-1]
-                    if "institutionspercentheld" in breakdown or ("institutions" in breakdown and "percent" in breakdown):
-                        inst_pct = float(val) * 100 if float(val) < 1 else float(val)
-                    elif "institutionscount" in breakdown or "count" in breakdown:
-                        inst_count = int(float(val))
 
             holders = self.get_holders(identifier)
-            hhi = 0.0
-            if holders:
-                top5 = holders[:5]
-                total_pct = sum(h.get("percentage", 0) for h in top5)
-                if total_pct > 0:
-                    hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
+            if not holders:
+                return pd.DataFrame()
 
-            if inst_pct > 0 or inst_count > 0 or holders:
-                return pd.DataFrame([{
-                    "date_reported": pd.Timestamp(_date.today()),
-                    "inst_ownership_pct": round(inst_pct, 2),
-                    "inst_top5_concentration": round(hhi, 4),
-                    "inst_holder_count": inst_count or len(holders),
-                }])
+            inst_pct = sum(h.get("percentage", 0) for h in holders)
+            hhi = 0.0
+            top5 = holders[:5]
+            total_pct = sum(h.get("percentage", 0) for h in top5)
+            if total_pct > 0:
+                hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
+
+            return pd.DataFrame([{
+                "date_reported": pd.Timestamp(_date.today()),
+                "inst_ownership_pct": round(inst_pct, 2),
+                "inst_top5_concentration": round(hhi, 4),
+                "inst_holder_count": len(holders),
+            }])
         except Exception as exc:
             logger.debug("BR holder history failed for %s: %s", identifier, exc)
         return pd.DataFrame()
 
     def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch insider transactions via yfinance for B3-listed companies."""
+        """Fetch insider transactions from CVM FRE archives.
+
+        CVM FRE contains 'negocios_administradores' (administrator trades)
+        data.  Returns empty if the specific FRE dataset is not available.
+        """
         transactions: list[dict[str, Any]] = []
         try:
-            tick = self._try_yf_tickers(identifier)
-            if tick is None:
+            cd_cvm = self._resolve_cd_cvm(identifier)
+            if not cd_cvm:
                 return transactions
 
-            insider = tick.insider_transactions
-            if insider is not None and not insider.empty:
-                for _, row in insider.iterrows():
-                    shares = 0
-                    try:
-                        shares = int(row.get("Shares", 0))
-                    except (ValueError, TypeError):
-                        pass
-                    transactions.append({
-                        "insider_name": str(row.get("Insider", "")),
-                        "position": str(row.get("Position", "")),
-                        "date": str(row.get("Start Date", "")),
-                        "transaction": str(row.get("Transaction", "")),
-                        "shares": shares,
-                        "value": float(row.get("Value", 0) or 0),
-                    })
-                logger.info("BR insider transactions for %s: %d", identifier, len(transactions))
+            import zipfile
+            from io import BytesIO
+            from datetime import date as _date
+
+            current_year = _date.today().year
+            for year in range(current_year, current_year - 2, -1):
+                url = f"{_CVM_DATASET_BASE}/DOC/FRE/DADOS/fre_cia_aberta_valor_mobiliario_negociado_{year}.zip"
+                try:
+                    resp = requests.get(url, timeout=60)
+                    if resp.status_code != 200:
+                        continue
+                    z = zipfile.ZipFile(BytesIO(resp.content))
+                    for name in z.namelist():
+                        if name.endswith(".csv"):
+                            with z.open(name) as f:
+                                try:
+                                    df = pd.read_csv(f, sep=";", encoding="latin-1", dtype=str, on_bad_lines="skip")
+                                except Exception:
+                                    continue
+                                cvm_col = None
+                                for c in ("CD_CVM", "cd_cvm"):
+                                    if c in df.columns:
+                                        cvm_col = c
+                                        break
+                                if cvm_col is None:
+                                    continue
+                                company_rows = df[df[cvm_col].astype(str).str.strip() == str(cd_cvm)]
+                                for _, row in company_rows.head(20).iterrows():
+                                    insider_name = ""
+                                    for col in ("NM_ADMINISTRADOR", "Nm_Administrador", "nm_administrador"):
+                                        if col in row.index and pd.notna(row[col]):
+                                            insider_name = str(row[col]).strip()
+                                            break
+                                    txn_date = ""
+                                    for col in ("DT_NEGOCIO", "Dt_Negocio", "dt_negocio"):
+                                        if col in row.index and pd.notna(row[col]):
+                                            txn_date = str(row[col]).strip()
+                                            break
+                                    shares = 0
+                                    for col in ("QT_NEGOCIADA", "Qt_Negociada"):
+                                        if col in row.index and pd.notna(row[col]):
+                                            try:
+                                                shares = int(float(str(row[col]).replace(",", "")))
+                                            except (ValueError, TypeError):
+                                                pass
+                                            break
+                                    if insider_name:
+                                        transactions.append({
+                                            "insider_name": insider_name,
+                                            "position": "",
+                                            "date": txn_date,
+                                            "transaction": "Trade",
+                                            "shares": shares,
+                                            "value": 0.0,
+                                            "source": f"cvm_fre_{year}",
+                                        })
+                                if transactions:
+                                    break
+                    if transactions:
+                        break
+                except Exception as exc:
+                    logger.debug("CVM FRE insider %d failed: %s", year, exc)
+            if transactions:
+                logger.info("BR insider transactions for %s: %d from CVM FRE", identifier, len(transactions))
         except Exception as exc:
-            logger.debug("yfinance insider transactions failed for BR %s: %s", identifier, exc)
+            logger.debug("CVM insider transaction extraction failed for BR %s: %s", identifier, exc)
         return transactions

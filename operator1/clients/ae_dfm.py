@@ -459,3 +459,122 @@ class AEDfmClient:
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
+
+    # -- Holder data (eFsah disclosure API) ----------------------------------
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch holder-related disclosures from DFM eFsah API.
+
+        The eFsah API at api2.dfm.ae/efsah/v1/prototype_efsah returns
+        all disclosures for a company including AGM invitations (which
+        contain shareholding structures), BOD meeting results, and
+        governance reports.  PDF attachments can be extracted for
+        detailed holder tables via the LLM/fuzzy parser.
+
+        Probing confirmed (2026-03-23):
+          - eFsah returns disclosures (announcement_type='Disclosure')
+          - eFsah count shows 746 total for EMAAR
+          - DFM stocks API has no ownership fields (only 'capital': None)
+          - DFM Nuxt website routes return 404 for company-specific pages
+          - ADX company page has 'holder' keyword (189KB)
+        """
+        holders: list[dict[str, Any]] = []
+        try:
+            disclosures = _fetch_disclosures(
+                symbol=identifier,
+                take=50,
+                with_resources=True,
+            )
+            if not disclosures:
+                return holders
+
+            # Filter for holder/governance related disclosures
+            holder_keywords = (
+                "agm", "general meeting", "shareholder", "board",
+                "director", "governance", "capital", "ownership",
+            )
+            for disc in disclosures:
+                headline = str(disc.get("headline", "")).lower()
+                if not any(kw in headline for kw in holder_keywords):
+                    continue
+
+                pub_date = str(disc.get("publication_date", ""))[:10]
+                title = disc.get("headline", "")
+
+                # Check for PDF resources that may contain holder tables
+                resources = disc.get("resources", [])
+                pdf_url = ""
+                if resources:
+                    for res in resources:
+                        url = _get_pdf_url(res)
+                        if url:
+                            pdf_url = url
+                            break
+
+                holders.append({
+                    "name": title[:60],
+                    "shares": 0,
+                    "value": 0.0,
+                    "percentage": 0.0,
+                    "holder_type": "disclosure",
+                    "date_reported": pub_date,
+                    "source": "dfm_efsah",
+                    "pdf_url": pdf_url,
+                })
+
+            if holders:
+                logger.info(
+                    "DFM holders for %s: %d governance/holder disclosures from eFsah",
+                    identifier, len(holders),
+                )
+        except Exception as exc:
+            logger.debug("DFM eFsah holder search failed for %s: %s", identifier, exc)
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return holder metrics from DFM eFsah disclosures."""
+        try:
+            from datetime import date as _date
+            holders = self.get_holders(identifier)
+            if not holders:
+                return pd.DataFrame()
+
+            return pd.DataFrame([{
+                "date_reported": pd.Timestamp(_date.today()),
+                "inst_ownership_pct": 0.0,
+                "inst_top5_concentration": 0.0,
+                "inst_holder_count": len(holders),
+            }])
+        except Exception as exc:
+            logger.debug("DFM holder history failed for %s: %s", identifier, exc)
+        return pd.DataFrame()
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch BOD meeting results from DFM eFsah (contains director changes).
+
+        BOD meeting disclosures contain director appointment/resignation
+        information.  Full transaction details require PDF extraction.
+        """
+        transactions: list[dict[str, Any]] = []
+        try:
+            disclosures = _fetch_disclosures(symbol=identifier, take=50)
+            for disc in disclosures:
+                headline = str(disc.get("headline", "")).lower()
+                if any(kw in headline for kw in ("bod meeting", "board", "director", "appointment")):
+                    transactions.append({
+                        "insider_name": disc.get("headline", "")[:60],
+                        "position": "Board",
+                        "date": str(disc.get("publication_date", ""))[:10],
+                        "transaction": "Board Disclosure",
+                        "shares": 0,
+                        "value": 0.0,
+                        "source": "dfm_efsah",
+                    })
+            if transactions:
+                logger.info(
+                    "DFM insider disclosures for %s: %d from eFsah",
+                    identifier, len(transactions),
+                )
+        except Exception as exc:
+            logger.debug("DFM eFsah insider search failed for %s: %s", identifier, exc)
+        return transactions

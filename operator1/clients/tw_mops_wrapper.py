@@ -650,3 +650,184 @@ class TWMopsClient:
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
+
+    # -- Institutional holders (TWSE OpenAPI) --------------------------------
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch holder data from TWSE OpenAPI (native, no yfinance).
+
+        Two TWSE OpenAPI datasets discovered by probing (2026-03-23):
+
+        1. **t187ap02_L** (1,039 items): Major shareholder names per company
+           (大股東名稱).  One row per company with the major shareholder name.
+
+        2. **t187ap11_L** (27,224 items): Director/officer shareholdings
+           with monthly updates.  Columns: 職稱 (position), 姓名 (name),
+           目前持股 (current shares), 設質股數 (pledged), 選任時持股 (at election).
+
+        Probing confirmed dead endpoints:
+          - MOPS API t05st09/t05st21/t05st22: JS redirect (894 bytes)
+          - MOPS server-java t05st*: 404
+          - TDCC shareholder dispersion: JS-rendered (needs browser)
+          - twstock library: no holder methods
+        """
+        holders: list[dict[str, Any]] = []
+        code = identifier.strip()
+
+        # --- Path 1: TWSE t187ap11_L -- director/officer shareholdings ---
+        try:
+            from curl_cffi import requests as cf_requests
+            sess = cf_requests.Session(impersonate="chrome")
+            r = sess.get(
+                "https://openapi.twse.com.tw/v1/opendata/t187ap11_L",
+                timeout=30,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    # Filter for this company code
+                    company_rows = [
+                        d for d in data
+                        if d.get("公司代號", "").strip() == code
+                    ]
+                    for row in company_rows:
+                        name = row.get("姓名", "").strip()
+                        position = row.get("職稱", "").strip()
+                        current_shares = 0
+                        try:
+                            current_shares = int(
+                                row.get("目前持股", "0").replace(",", "")
+                            )
+                        except (ValueError, TypeError):
+                            pass
+                        pledged = 0
+                        try:
+                            pledged = int(
+                                row.get("設質股數", "0").replace(",", "")
+                            )
+                        except (ValueError, TypeError):
+                            pass
+                        date_str = row.get("資料年月", "")
+                        report_date = row.get("出表日期", "")
+
+                        if name and current_shares > 0:
+                            holders.append({
+                                "name": name,
+                                "shares": current_shares,
+                                "value": 0.0,
+                                "percentage": 0.0,
+                                "holder_type": "director" if "董事" in position else "officer",
+                                "position": position,
+                                "pledged_shares": pledged,
+                                "date_reported": date_str,
+                                "source": "twse_openapi_t187ap11",
+                            })
+
+                    if holders:
+                        logger.info(
+                            "TW holders for %s: %d directors/officers from TWSE OpenAPI",
+                            identifier, len(holders),
+                        )
+        except Exception as exc:
+            logger.debug("TWSE t187ap11 failed for %s: %s", identifier, exc)
+
+        # --- Path 2: TWSE t187ap02_L -- major shareholder names ---
+        if not holders:
+            try:
+                from curl_cffi import requests as cf_requests
+                sess = cf_requests.Session(impersonate="chrome")
+                r = sess.get(
+                    "https://openapi.twse.com.tw/v1/opendata/t187ap02_L",
+                    timeout=30,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, list):
+                        company_rows = [
+                            d for d in data
+                            if d.get("公司代號", "").strip() == code
+                        ]
+                        for row in company_rows:
+                            name = row.get("大股東名稱", "").strip()
+                            if name:
+                                holders.append({
+                                    "name": name,
+                                    "shares": 0,
+                                    "value": 0.0,
+                                    "percentage": 0.0,
+                                    "holder_type": "major_shareholder",
+                                    "date_reported": row.get("出表日期", ""),
+                                    "source": "twse_openapi_t187ap02",
+                                })
+                        if holders:
+                            logger.info(
+                                "TW holders for %s: %d major shareholders from TWSE OpenAPI",
+                                identifier, len(holders),
+                            )
+            except Exception as exc:
+                logger.debug("TWSE t187ap02 failed for %s: %s", identifier, exc)
+
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return ownership metrics from TWSE director shareholding data."""
+        try:
+            holders = self.get_holders(identifier)
+            if not holders:
+                return pd.DataFrame()
+
+            directors = [h for h in holders if h.get("holder_type") in ("director", "officer")]
+            total_shares = sum(h.get("shares", 0) for h in directors)
+            total_pledged = sum(h.get("pledged_shares", 0) for h in directors)
+
+            return pd.DataFrame([{
+                "date_reported": pd.Timestamp(date.today()),
+                "inst_ownership_pct": 0.0,
+                "inst_top5_concentration": 0.0,
+                "inst_holder_count": len(directors),
+                "director_total_shares": total_shares,
+                "director_pledged_shares": total_pledged,
+            }])
+        except Exception as exc:
+            logger.debug("TW holder history failed for %s: %s", identifier, exc)
+        return pd.DataFrame()
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch insider transfer notifications from TWSE OpenAPI t187ap12_L.
+
+        Returns insider stock transfer pre-notifications filed with TWSE.
+        """
+        transactions: list[dict[str, Any]] = []
+        code = identifier.strip()
+        try:
+            from curl_cffi import requests as cf_requests
+            sess = cf_requests.Session(impersonate="chrome")
+            r = sess.get(
+                "https://openapi.twse.com.tw/v1/opendata/t187ap12_L",
+                timeout=15,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    company_rows = [
+                        d for d in data
+                        if d.get("公司代號", "").strip() == code
+                    ]
+                    for row in company_rows:
+                        transactions.append({
+                            "insider_name": row.get("姓名", ""),
+                            "position": row.get("申報人身分", ""),
+                            "date": row.get("出表日期", ""),
+                            "transaction": row.get("預定轉讓方式及股數-轉讓方式", "Transfer"),
+                            "shares": int(row.get("預定轉讓方式及股數-轉讓股數", "0").replace(",", "") or 0),
+                            "value": 0.0,
+                            "source": "twse_openapi_t187ap12",
+                        })
+                    if transactions:
+                        logger.info(
+                            "TW insider transactions for %s: %d from TWSE OpenAPI",
+                            identifier, len(transactions),
+                        )
+        except Exception as exc:
+            logger.debug("TWSE t187ap12 failed for %s: %s", identifier, exc)
+        return transactions
