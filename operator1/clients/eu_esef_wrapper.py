@@ -799,10 +799,14 @@ class EUEsefClient:
     def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
         """Fetch financial data by downloading XBRL JSON from filings.
 
-        This is the key fix: instead of looking for inline facts or
-        a non-existent /facts endpoint, we download the actual XBRL
-        JSON file from each filing's json_url attribute and extract
-        IFRS concepts directly.
+        For most EU countries, downloads XBRL JSON files from filings.xbrl.org.
+        For Germany (DE): filings.xbrl.org has 0 German filings because
+        Germany uses the Bundesanzeiger as its OAM. Falls back to the
+        Bundesanzeiger scraper with ONNX captcha solving.
+
+        Fallback chain:
+        1. filings.xbrl.org XBRL JSON (works for NL, ES, IT, SE, FR, etc.)
+        2. Bundesanzeiger scraper (DE only -- ONNX captcha + HTML tables)
         """
         # Check cache
         cache_key = f"{statement_type}_financials.json"
@@ -820,6 +824,12 @@ class EUEsefClient:
 
         entity_id = self._find_entity_id(identifier)
         if not entity_id:
+            # For DE, entity won't be found on filings.xbrl.org (0 filings).
+            # Fall back to Bundesanzeiger scraper directly.
+            if self._country_code == "DE":
+                return self._fetch_financials_bundesanzeiger(
+                    identifier, statement_type,
+                )
             logger.info("ESEF: entity not found for '%s'", identifier)
             return pd.DataFrame()
 
@@ -861,6 +871,12 @@ class EUEsefClient:
             time.sleep(0.5)
 
         if not all_rows:
+            # For Germany: filings.xbrl.org has 0 filings.
+            # Fall back to Bundesanzeiger scraper (ONNX captcha + HTML tables).
+            if self._country_code == "DE":
+                return self._fetch_financials_bundesanzeiger(
+                    identifier, statement_type,
+                )
             return pd.DataFrame()
 
         df = pd.DataFrame(all_rows)
@@ -883,6 +899,66 @@ class EUEsefClient:
             df["report_date"].nunique() if "report_date" in df.columns else 0,
         )
         return df
+
+    # -- Bundesanzeiger fallback (Germany only) ------------------------------
+
+    def _fetch_financials_bundesanzeiger(
+        self, identifier: str, statement_type: str,
+    ) -> pd.DataFrame:
+        """Fetch German financial data from Bundesanzeiger.
+
+        Germany's ESEF filings are NOT on filings.xbrl.org (0 filings).
+        German companies publish their Jahresabschlüsse (annual accounts)
+        on the Bundesanzeiger (Federal Gazette), which requires solving
+        a CAPTCHA to access documents.
+
+        Uses a community-trained ONNX neural network (from
+        ``dre808/bundesanzeiger-scraper``, MIT license) to solve the
+        CAPTCHA automatically, then extracts financial data from HTML
+        tables with German field name -> canonical mapping.
+
+        Fallback chain within this method:
+        1. Bundesanzeiger scraper (ONNX captcha + HTML table extraction)
+        2. Empty DataFrame (no data available)
+        """
+        cache_key = f"ba_{statement_type}_financials.json"
+        cached = self._read_cache(identifier, cache_key)
+        if cached:
+            try:
+                df = pd.DataFrame(cached)
+                if not df.empty:
+                    for col in ("filing_date", "report_date"):
+                        if col in df.columns:
+                            df[col] = pd.to_datetime(df[col], errors="coerce")
+                    return df
+            except Exception:
+                pass
+
+        try:
+            from operator1.clients.bundesanzeiger_scraper import fetch_german_financials
+            df = fetch_german_financials(
+                company_name=identifier,
+                statement_type=statement_type,
+                max_filings=3,
+            )
+            if df is not None and not df.empty:
+                self._write_cache(
+                    identifier, cache_key, df.to_dict(orient="records"),
+                )
+                logger.info(
+                    "DE Bundesanzeiger %s %s: %d records via ONNX captcha solver",
+                    identifier, statement_type, len(df),
+                )
+                return df
+        except ImportError:
+            logger.debug(
+                "bundesanzeiger_scraper not available "
+                "(needs: onnxruntime, beautifulsoup4, Pillow)"
+            )
+        except Exception as exc:
+            logger.warning("Bundesanzeiger extraction failed for %s: %s", identifier, exc)
+
+        return pd.DataFrame()
 
     # -- Price data ----------------------------------------------------------
 
