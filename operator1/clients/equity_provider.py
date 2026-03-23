@@ -115,6 +115,21 @@ class _JPJquantsAdapter:
         # The OHLCV provider (yfinance with .T suffix) handles this.
         return pd.DataFrame()
 
+    def get_holders(self, identifier: str) -> list:
+        if hasattr(self._client, "get_holders"):
+            return self._client.get_holders(identifier)
+        return []
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        if hasattr(self._client, "get_holder_history"):
+            return self._client.get_holder_history(identifier, years)
+        return pd.DataFrame()
+
+    def get_insider_transactions(self, identifier: str) -> list:
+        if hasattr(self._client, "get_insider_transactions"):
+            return self._client.get_insider_transactions(identifier)
+        return []
+
 
 def create_pit_client(
     market_id: str,
