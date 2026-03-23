@@ -774,3 +774,278 @@ class CHSixClient:
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
+
+    # -- Institutional holders (yfinance .SW) --------------------------------
+
+    def _yf_ticker(self, identifier: str) -> str:
+        """Convert SIX ticker to yfinance format (e.g. 'NESN' -> 'NESN.SW')."""
+        code = identifier.split(".")[0].strip().upper()
+        return f"{code}.SW"
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch institutional + mutual fund holders via yfinance (.SW suffix).
+
+        SIX does not expose shareholder data through its public APIs.
+        The Share Details API (sheldon) provides dividends, capital structure,
+        and corporate actions but not ownership data.  The Official Notices
+        API (349K+ notices) has a pagination bug that returns 0 items.
+        The Disclosure Office (Offenlegungsstelle) publishes significant
+        shareholding notifications as static HTML/PDF -- no structured API.
+
+        yfinance aggregates institutional ownership data from Yahoo Finance
+        for major SIX-listed companies (Nestle, Novartis, Roche, UBS, etc.).
+
+        Returns list of dicts with: name, shares, percentage, value,
+        holder_type, date_reported, source.
+        """
+        holders: list[dict[str, Any]] = []
+        try:
+            import yfinance as yf
+            tick = yf.Ticker(self._yf_ticker(identifier))
+
+            # Institutional holders
+            inst = tick.institutional_holders
+            if inst is not None and not inst.empty:
+                for _, row in inst.iterrows():
+                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                    if isinstance(pct, (int, float)) and 0 < pct < 1:
+                        pct = pct * 100
+                    holders.append({
+                        "name": str(row.get("Holder", "")),
+                        "shares": int(row.get("Shares", 0)),
+                        "value": float(row.get("Value", 0)),
+                        "percentage": round(float(pct), 2),
+                        "holder_type": "institutional",
+                        "date_reported": str(row.get("Date Reported", "")),
+                        "source": "yfinance",
+                    })
+
+            # Mutual fund holders
+            mf = tick.mutualfund_holders
+            if mf is not None and not mf.empty:
+                for _, row in mf.iterrows():
+                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                    if isinstance(pct, (int, float)) and 0 < pct < 1:
+                        pct = pct * 100
+                    holders.append({
+                        "name": str(row.get("Holder", "")),
+                        "shares": int(row.get("Shares", 0)),
+                        "value": float(row.get("Value", 0)),
+                        "percentage": round(float(pct), 2),
+                        "holder_type": "mutualfund",
+                        "date_reported": str(row.get("Date Reported", "")),
+                        "source": "yfinance",
+                    })
+
+            # Major holders aggregate stats
+            major = tick.major_holders
+            if major is not None and not major.empty:
+                for idx, row in major.iterrows():
+                    breakdown = (
+                        str(row.get("Breakdown", idx)).lower()
+                        if "Breakdown" in major.columns
+                        else str(idx).lower()
+                    )
+                    val = (
+                        row.get("Value", row.iloc[-1])
+                        if "Value" in major.columns
+                        else row.iloc[-1]
+                    )
+                    try:
+                        pct = float(val) * 100 if float(val) < 1 else float(val)
+                    except (ValueError, TypeError):
+                        continue
+
+                    if "insider" in breakdown:
+                        holders.append({
+                            "name": "Insiders / Directors",
+                            "shares": 0,
+                            "percentage": round(pct, 2),
+                            "holder_type": "insider_aggregate",
+                            "date_reported": "",
+                            "source": "yfinance_major",
+                        })
+                    elif "institution" in breakdown and "percent" in breakdown:
+                        holders.append({
+                            "name": "Institutional Investors",
+                            "shares": 0,
+                            "percentage": round(pct, 2),
+                            "holder_type": "institutional_aggregate",
+                            "date_reported": "",
+                            "source": "yfinance_major",
+                        })
+
+            if holders:
+                logger.info(
+                    "SIX holders for %s: %d from yfinance (%s)",
+                    identifier, len(holders), self._yf_ticker(identifier),
+                )
+        except Exception as exc:
+            logger.debug("yfinance holders failed for SIX %s: %s", identifier, exc)
+
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return institutional ownership metrics as a single-row snapshot.
+
+        Uses yfinance major_holders for aggregate ownership percentages.
+        SIX does not expose historical holder data via public APIs.
+        """
+        try:
+            import yfinance as yf
+            tick = yf.Ticker(self._yf_ticker(identifier))
+
+            major = tick.major_holders
+            if major is None or major.empty:
+                return pd.DataFrame()
+
+            inst_pct = 0.0
+            holder_count = 0
+            for idx, row in major.iterrows():
+                breakdown = (
+                    str(row.get("Breakdown", idx)).lower()
+                    if "Breakdown" in major.columns
+                    else str(idx).lower()
+                )
+                val = (
+                    row.get("Value", row.iloc[-1])
+                    if "Value" in major.columns
+                    else row.iloc[-1]
+                )
+                try:
+                    fval = float(val)
+                except (ValueError, TypeError):
+                    continue
+
+                if "institution" in breakdown and "percent" in breakdown:
+                    inst_pct = fval * 100 if fval < 1 else fval
+                elif "institution" in breakdown and "count" in breakdown:
+                    holder_count = int(fval)
+
+            return pd.DataFrame([{
+                "date_reported": pd.Timestamp.now(),
+                "inst_ownership_pct": round(inst_pct, 2),
+                "inst_top5_concentration": 0.0,
+                "inst_holder_count": holder_count,
+            }])
+        except Exception as exc:
+            logger.debug("yfinance holder history failed for SIX %s: %s", identifier, exc)
+            return pd.DataFrame()
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch management transactions from the native SIX API.
+
+        Uses the undocumented SIX management_transactions API discovered
+        by reverse-engineering the Vue component at:
+        ``/etc.clientlibs/ihcc/components/content/management_transactions_teaser/``
+
+        Endpoint: ``/sheldon/management_transactions/v1/overview.json``
+
+        This is the official SIX Exchange Regulation management transaction
+        register.  Swiss listed companies must disclose board and management
+        share dealings.  The API returns 6,700+ transactions across all
+        SIX-listed companies.  We filter client-side by ISIN.
+
+        Fields per transaction:
+        - ``transactionDate``: YYYYMMDD format
+        - ``transactionSize``: number of shares
+        - ``transactionAmountCHF``: total value in CHF
+        - ``transactionAmountPerSecurityCHF``: price per share
+        - ``buySellIndicator``: 1=buy, 2=sell
+        - ``obligorFunctionCode``: 1=board/management
+        - ``notificationSubmitter``: company name
+        - ``ISIN``: security ISIN
+
+        Returns list of dicts with: insider_name, position, date,
+        transaction, shares, value, price_per_share, source.
+        """
+        transactions: list[dict[str, Any]] = []
+
+        # Resolve ISIN from ticker
+        isin = ""
+        fqs = _fqs_search(ticker=identifier, page_size=1)
+        if fqs:
+            isin = fqs[0].get("isin", "")
+        if not isin:
+            # Try from cached profile
+            cached = self._read_cache(identifier, "profile.json")
+            if cached:
+                isin = cached.get("isin", "")
+        if not isin:
+            logger.debug("SIX: could not resolve ISIN for %s", identifier)
+            return transactions
+
+        # Fetch management transactions (client-side ISIN filter)
+        # pageSize=200 covers ~2 weeks of all SIX transactions
+        try:
+            url = f"{_SIX_BASE}/sheldon/management_transactions/v1/overview.json"
+            resp = requests.get(
+                url,
+                params={"pageSize": 200},
+                headers=_SIX_HEADERS,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status") != "Ok":
+                return transactions
+
+            all_items = data.get("itemList", [])
+        except Exception as exc:
+            logger.debug("SIX management transactions API failed: %s", exc)
+            return transactions
+
+        # Filter by ISIN
+        _FUNCTION_MAP = {
+            "1": "Board/Management",
+            "2": "Executive Management",
+            "3": "Related Party",
+        }
+        _BUYSELL_MAP = {
+            "1": "Purchase",
+            "2": "Sale",
+            "3": "Subscription",
+            "4": "Other",
+        }
+
+        for item in all_items:
+            if item.get("ISIN") != isin:
+                continue
+
+            tx_date_raw = str(item.get("transactionDate", ""))
+            tx_date = ""
+            if len(tx_date_raw) == 8:
+                tx_date = f"{tx_date_raw[:4]}-{tx_date_raw[4:6]}-{tx_date_raw[6:]}"
+
+            bsi = str(item.get("buySellIndicator", ""))
+            tx_type = _BUYSELL_MAP.get(bsi, "Unknown")
+            func_code = str(item.get("obligorFunctionCode", ""))
+            position = _FUNCTION_MAP.get(func_code, "Management")
+
+            try:
+                shares = int(item.get("transactionSize", 0))
+            except (ValueError, TypeError):
+                shares = 0
+
+            value = float(item.get("transactionAmountCHF", 0) or 0)
+            price = float(item.get("transactionAmountPerSecurityCHF", 0) or 0)
+            submitter = item.get("notificationSubmitter", "")
+
+            transactions.append({
+                "insider_name": submitter,
+                "position": position,
+                "date": tx_date,
+                "transaction": tx_type,
+                "shares": abs(shares),
+                "value": value,
+                "price_per_share": price,
+                "notification_id": item.get("notificationId", ""),
+                "source": "six_management_transactions",
+            })
+
+        if transactions:
+            logger.info(
+                "SIX management transactions for %s (%s): %d from native API",
+                identifier, isin, len(transactions),
+            )
+        return transactions

@@ -998,95 +998,7 @@ class INBseClient:
         holders: list[dict[str, Any]] = []
         scrip_code = _resolve_scrip_code(identifier)
 
-        # Primary: yfinance major_holders for aggregate ownership stats
-        try:
-            import yfinance as yf
-            yf_ticker = self._yf_ticker(identifier)
-            tick = yf.Ticker(yf_ticker)
-
-            # major_holders provides insiders%, institutions%, count
-            mh = tick.major_holders
-            if mh is not None and not mh.empty:
-                for idx, row in mh.iterrows():
-                    breakdown = (
-                        str(row.get("Breakdown", idx)).lower()
-                        if "Breakdown" in mh.columns
-                        else str(idx).lower()
-                    )
-                    val = (
-                        row.get("Value", row.iloc[-1])
-                        if "Value" in mh.columns
-                        else row.iloc[-1]
-                    )
-                    try:
-                        pct = float(val) * 100 if float(val) < 1 else float(val)
-                    except (ValueError, TypeError):
-                        continue
-
-                    if "insiderspercentheld" in breakdown or "insider" in breakdown:
-                        holders.append({
-                            "name": "Insiders / Promoters",
-                            "shares": 0,
-                            "percentage": round(pct, 2),
-                            "holder_type": "promoter",
-                            "date_reported": "",
-                            "source": "yfinance_major",
-                        })
-                    elif "institutionspercentheld" in breakdown or (
-                        "institutions" in breakdown and "percent" in breakdown
-                    ):
-                        holders.append({
-                            "name": "Institutional Investors",
-                            "shares": 0,
-                            "percentage": round(pct, 2),
-                            "holder_type": "institutional",
-                            "date_reported": "",
-                            "source": "yfinance_major",
-                        })
-
-            # Try institutional_holders (usually empty for Indian stocks)
-            inst = tick.institutional_holders
-            if inst is not None and not inst.empty:
-                for _, row in inst.iterrows():
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "institutional",
-                        "date_reported": str(row.get("Date Reported", "")),
-                        "source": "yfinance",
-                    })
-
-            # Try mutualfund_holders (usually empty for Indian stocks)
-            mf = tick.mutualfund_holders
-            if mf is not None and not mf.empty:
-                for _, row in mf.iterrows():
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "mutualfund",
-                        "date_reported": str(row.get("Date Reported", "")),
-                        "source": "yfinance",
-                    })
-
-            if holders:
-                logger.info(
-                    "BSE holders for %s: %d from yfinance (%s)",
-                    identifier, len(holders), yf_ticker,
-                )
-        except Exception as exc:
-            logger.debug("yfinance holders failed for BSE %s: %s", identifier, exc)
-
-        # Supplement: BSE SAST disclosures (Reg. 29/31) via AnnSubCategoryGetData
+        # PRIMARY: BSE SAST disclosures (Reg. 29/31) via AnnSubCategoryGetData
         # Uses the same API pattern as BSEFilingDiscoverer (strCat='Result')
         # but with strCat='Insider Trading / SAST' for shareholding data.
         # HEADLINE field contains shareholder names; PDFs at AttachHis/ have details.
@@ -1109,6 +1021,114 @@ class INBseClient:
                     )
         except Exception as exc:
             logger.debug("BSE SAST scraping failed for %s: %s", identifier, exc)
+
+        # SECONDARY: BSE filing discoverer + fuzzy_pdf_parser for shareholding
+        # patterns from quarterly result PDFs (SEBI LODR Reg. 31 filings often
+        # include shareholding pattern data as appendices).
+        # Uses the existing fuzzy_pdf_parser module (camelot-py + fuzzy matching)
+        # which handles Indian number formats (lakhs, crores, parenthetical
+        # negatives) and SEBI-format table extraction with ~98% accuracy.
+        if not any(h.get("holder_type") == "category" for h in holders):
+            try:
+                from operator1.clients.filing_discoverer import BSEFilingDiscoverer
+                from operator1.clients.fuzzy_pdf_parser import extract_financials_from_pdf
+                discoverer = BSEFilingDiscoverer()
+                discovery = discoverer.discover_filings(scrip_code, years=1)
+
+                if discovery.has_filings:
+                    for filing in discovery.filings[:3]:
+                        try:
+                            pdf_bytes = discoverer.download_filing(filing)
+                            if not pdf_bytes or pdf_bytes[:4] != b"%PDF":
+                                continue
+
+                            # Use the fuzzy parser for structured extraction
+                            rows = extract_financials_from_pdf(
+                                pdf_bytes,
+                                filing_date=filing.filing_date or "",
+                                report_date=filing.report_date or "",
+                                statement_type="balance",  # shareholding is in balance-like tables
+                            )
+
+                            # Also parse raw text for shareholding patterns
+                            # (fuzzy parser handles financials; _parse_shareholding_text
+                            # handles SEBI-mandated category breakdowns)
+                            try:
+                                from operator1.clients.fuzzy_pdf_parser import _extract_tables_text
+                                text = _extract_tables_text(pdf_bytes)
+                            except (ImportError, AttributeError):
+                                import pdfplumber as _pdfp, io as _io
+                                with _pdfp.open(_io.BytesIO(pdf_bytes)) as pdf:
+                                    text = "\n".join(
+                                        (p.extract_text() or "") for p in pdf.pages
+                                    )
+
+                            if text and ("promoter" in text.lower() or "category of shareholder" in text.lower()):
+                                _parse_shareholding_text(
+                                    text, holders,
+                                    {"Fin_Year": filing.filing_date or filing.report_date or ""},
+                                )
+
+                            if any(h.get("holder_type") == "category" for h in holders):
+                                logger.info(
+                                    "BSE shareholding pattern for %s: extracted via fuzzy parser (%s)",
+                                    identifier, filing.filing_date,
+                                )
+                                break
+                        except Exception as exc:
+                            logger.debug("BSE fuzzy shareholding extraction failed: %s", exc)
+                            continue
+            except Exception as exc:
+                logger.debug("BSE filing discoverer for shareholding failed for %s: %s", identifier, exc)
+
+        # FALLBACK: yfinance aggregate stats (only if native sources returned nothing)
+        if not holders:
+            try:
+                import yfinance as yf
+                yf_ticker = self._yf_ticker(identifier)
+                tick = yf.Ticker(yf_ticker)
+
+                mh = tick.major_holders
+                if mh is not None and not mh.empty:
+                    for idx, row in mh.iterrows():
+                        breakdown = (
+                            str(row.get("Breakdown", idx)).lower()
+                            if "Breakdown" in mh.columns
+                            else str(idx).lower()
+                        )
+                        val = (
+                            row.get("Value", row.iloc[-1])
+                            if "Value" in mh.columns
+                            else row.iloc[-1]
+                        )
+                        try:
+                            pct = float(val) * 100 if float(val) < 1 else float(val)
+                        except (ValueError, TypeError):
+                            continue
+
+                        if "insider" in breakdown:
+                            holders.append({
+                                "name": "Insiders / Promoters",
+                                "shares": 0,
+                                "percentage": round(pct, 2),
+                                "holder_type": "promoter",
+                                "date_reported": "",
+                                "source": "yfinance_major",
+                            })
+                        elif "institution" in breakdown and "percent" in breakdown:
+                            holders.append({
+                                "name": "Institutional Investors",
+                                "shares": 0,
+                                "percentage": round(pct, 2),
+                                "holder_type": "institutional",
+                                "date_reported": "",
+                                "source": "yfinance_major",
+                            })
+
+                if holders:
+                    logger.info("BSE holders fallback for %s: %d from yfinance", identifier, len(holders))
+            except Exception as exc:
+                logger.debug("yfinance holders fallback failed for BSE %s: %s", identifier, exc)
 
         return holders
 

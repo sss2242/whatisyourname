@@ -198,5 +198,222 @@ class AUAsxClient:
     def get_quotes(self, identifier: str) -> pd.DataFrame:
         """ASX does not provide OHLCV data. Handled by ohlcv_provider."""
         return pd.DataFrame()
-    def get_peers(self, identifier: str) -> list[str]: return []
-    def get_executives(self, identifier: str) -> list[dict[str, Any]]: return []
+
+    def get_peers(self, identifier: str) -> list[str]:
+        return []
+
+    def get_executives(self, identifier: str) -> list[dict[str, Any]]:
+        return []
+
+    # -- Institutional holders (yfinance .AX) --------------------------------
+
+    def _yf_ticker(self, identifier: str) -> str:
+        """Convert ASX ticker to yfinance format (e.g. 'BHP' -> 'BHP.AX')."""
+        code = identifier.split(".")[0].strip().upper()
+        return f"{code}.AX"
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch institutional + mutual fund holders via yfinance (.AX suffix).
+
+        ASX does not expose a public holder data API.  yfinance aggregates
+        institutional ownership data from Yahoo Finance for major ASX-listed
+        companies.  Coverage is good for ASX 200 constituents (BHP, CBA, CSL,
+        etc.) but sparse for small-caps.
+
+        Returns list of dicts with: name, shares, percentage, value,
+        holder_type, date_reported, source.
+        """
+        holders: list[dict[str, Any]] = []
+        try:
+            import yfinance as yf
+            tick = yf.Ticker(self._yf_ticker(identifier))
+
+            # Institutional holders
+            inst = tick.institutional_holders
+            if inst is not None and not inst.empty:
+                for _, row in inst.iterrows():
+                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                    if isinstance(pct, (int, float)) and 0 < pct < 1:
+                        pct = pct * 100
+                    holders.append({
+                        "name": str(row.get("Holder", "")),
+                        "shares": int(row.get("Shares", 0)),
+                        "value": float(row.get("Value", 0)),
+                        "percentage": round(float(pct), 2),
+                        "holder_type": "institutional",
+                        "date_reported": str(row.get("Date Reported", "")),
+                        "source": "yfinance",
+                    })
+
+            # Mutual fund holders
+            mf = tick.mutualfund_holders
+            if mf is not None and not mf.empty:
+                for _, row in mf.iterrows():
+                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                    if isinstance(pct, (int, float)) and 0 < pct < 1:
+                        pct = pct * 100
+                    holders.append({
+                        "name": str(row.get("Holder", "")),
+                        "shares": int(row.get("Shares", 0)),
+                        "value": float(row.get("Value", 0)),
+                        "percentage": round(float(pct), 2),
+                        "holder_type": "mutualfund",
+                        "date_reported": str(row.get("Date Reported", "")),
+                        "source": "yfinance",
+                    })
+
+            # Major holders aggregate stats
+            major = tick.major_holders
+            if major is not None and not major.empty:
+                for idx, row in major.iterrows():
+                    breakdown = (
+                        str(row.get("Breakdown", idx)).lower()
+                        if "Breakdown" in major.columns
+                        else str(idx).lower()
+                    )
+                    val = (
+                        row.get("Value", row.iloc[-1])
+                        if "Value" in major.columns
+                        else row.iloc[-1]
+                    )
+                    try:
+                        pct = float(val) * 100 if float(val) < 1 else float(val)
+                    except (ValueError, TypeError):
+                        continue
+
+                    if "insider" in breakdown:
+                        holders.append({
+                            "name": "Insiders / Directors",
+                            "shares": 0,
+                            "percentage": round(pct, 2),
+                            "holder_type": "insider_aggregate",
+                            "date_reported": "",
+                            "source": "yfinance_major",
+                        })
+                    elif "institution" in breakdown and "percent" in breakdown:
+                        holders.append({
+                            "name": "Institutional Investors",
+                            "shares": 0,
+                            "percentage": round(pct, 2),
+                            "holder_type": "institutional_aggregate",
+                            "date_reported": "",
+                            "source": "yfinance_major",
+                        })
+
+            if holders:
+                logger.info(
+                    "ASX holders for %s: %d from yfinance (%s)",
+                    identifier, len(holders), self._yf_ticker(identifier),
+                )
+        except Exception as exc:
+            logger.debug("yfinance holders failed for ASX %s: %s", identifier, exc)
+
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return institutional ownership metrics as a single-row snapshot.
+
+        Uses yfinance major_holders for aggregate ownership percentages.
+        ASX does not expose historical holder data via public APIs.
+        """
+        try:
+            import yfinance as yf
+            tick = yf.Ticker(self._yf_ticker(identifier))
+
+            major = tick.major_holders
+            if major is None or major.empty:
+                return pd.DataFrame()
+
+            inst_pct = 0.0
+            holder_count = 0
+            for idx, row in major.iterrows():
+                breakdown = (
+                    str(row.get("Breakdown", idx)).lower()
+                    if "Breakdown" in major.columns
+                    else str(idx).lower()
+                )
+                val = (
+                    row.get("Value", row.iloc[-1])
+                    if "Value" in major.columns
+                    else row.iloc[-1]
+                )
+                try:
+                    fval = float(val)
+                except (ValueError, TypeError):
+                    continue
+
+                if "institution" in breakdown and "percent" in breakdown:
+                    inst_pct = fval * 100 if fval < 1 else fval
+                elif "institution" in breakdown and "count" in breakdown:
+                    holder_count = int(fval)
+
+            return pd.DataFrame([{
+                "date_reported": pd.Timestamp.now(),
+                "inst_ownership_pct": round(inst_pct, 2),
+                "inst_top5_concentration": 0.0,
+                "inst_holder_count": holder_count,
+            }])
+        except Exception as exc:
+            logger.debug("yfinance holder history failed for ASX %s: %s", identifier, exc)
+            return pd.DataFrame()
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch insider/director transactions via yfinance (.AX suffix).
+
+        ASX requires directors to lodge Appendix 3Y (Change of Director's
+        Interest Notice) within 5 business days of any change.  yfinance
+        aggregates these into an insider_transactions table for major
+        ASX-listed companies.
+
+        Returns list of dicts with: insider_name, position, date,
+        transaction, shares, value, source.
+        """
+        transactions: list[dict[str, Any]] = []
+        try:
+            import yfinance as yf
+            tick = yf.Ticker(self._yf_ticker(identifier))
+
+            insiders = tick.insider_transactions
+            if insiders is not None and not insiders.empty:
+                for _, row in insiders.iterrows():
+                    name = str(row.get("Insider", ""))
+                    text = str(row.get("Text", ""))
+                    shares = row.get("Shares", 0)
+                    start_date = row.get("Start Date", "")
+
+                    # Classify transaction type from Text field
+                    text_lower = text.lower()
+                    if "sale" in text_lower or "sold" in text_lower:
+                        tx_type = "Sale"
+                    elif "purchase" in text_lower or "buy" in text_lower:
+                        tx_type = "Purchase"
+                    elif "exercise" in text_lower or "conversion" in text_lower:
+                        tx_type = "Exercise"
+                    elif "grant" in text_lower or "award" in text_lower or "vesting" in text_lower:
+                        tx_type = "Vesting"
+                    else:
+                        tx_type = text[:30] if text else "Unknown"
+
+                    try:
+                        shares_int = int(shares)
+                    except (ValueError, TypeError):
+                        shares_int = 0
+
+                    transactions.append({
+                        "insider_name": name,
+                        "position": "Director",
+                        "date": str(start_date)[:10] if start_date else "",
+                        "transaction": tx_type,
+                        "shares": abs(shares_int),
+                        "value": 0.0,  # yfinance doesn't provide value for AU
+                        "source": "yfinance",
+                    })
+
+                logger.info(
+                    "ASX insider transactions for %s: %d from yfinance",
+                    identifier, len(transactions),
+                )
+        except Exception as exc:
+            logger.debug("yfinance insider transactions failed for ASX %s: %s", identifier, exc)
+
+        return transactions
