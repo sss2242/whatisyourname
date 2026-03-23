@@ -186,21 +186,28 @@ def _search_scrip_directory(
 # BSE holder/disclosure scraper (HKEX scraper pattern)
 # ---------------------------------------------------------------------------
 #
-# BSE's dedicated shareholding endpoints (ShareHoldPat, InsiderTrading,
-# CatWiseShrhlding) are all geo-blocked or require JavaScript rendering.
+# Uses BSE AnnSubCategoryGetData API with strCat='Insider Trading / SAST'
+# to fetch SEBI SAST (Substantial Acquisition of Shares & Takeovers)
+# disclosure filings.  This is the same API endpoint and parameter pattern
+# used by BSEFilingDiscoverer for financial results (strCat='Result').
 #
-# Working BSE API endpoints for holder data:
-#   - BoardMeetings/w: board meeting outcomes with PDF attachment links
-#   - CorporateAction/w: dividends, splits, bonuses
-#   - AnnSubCategoryGetData/w: filing announcements by category
-#
-# Strategy:
-#   1. yfinance (.NS suffix) for major_holders + insider_transactions
-#   2. BSE BoardMeetings API for shareholding-related board outcomes
-#   3. BSE AnnSubCategoryGetData for shareholding pattern filings
+# Key discoveries from API probing:
+#   - AnnSubCategoryGetData/w with strCat='Insider Trading / SAST': WORKS
+#     Returns Reg. 29(1), 29(2), 31(1), 31(2) disclosures + trading window
+#   - The HEADLINE field contains the substantial shareholder name directly
+#     (e.g. "Bhairavi Madhusudhan Shibulal")
+#   - SAST PDFs live at /xml-data/corpfiling/AttachHis/ (not AttachLive!)
+#   - BoardMeetings/w: WORKS, returns JSON with board outcomes
+#   - CorporateAction/w: WORKS, returns dividend/split/bonus data
+#   - ShareHoldPat/w, InsiderTrading/w: blocked (302 redirect)
+#   - shpSecurities.aspx: JS-rendered, not scrapable with requests
 #
 # Uses the HKEX scraper pattern: persistent session for cookie reuse,
 # Referer header for BSE API access, client-side filtering.
+
+# BSE PDF base URLs -- SAST filings use AttachHis, not AttachLive
+_BSE_PDF_ATTACH_HIS = "https://www.bseindia.com/xml-data/corpfiling/AttachHis"
+_BSE_PDF_ATTACH_LIVE = "https://www.bseindia.com/xml-data/corpfiling/AttachLive"
 
 _bse_session: requests.Session | None = None
 
@@ -264,6 +271,271 @@ def _resolve_nse_ticker(identifier: str) -> str:
     return stripped
 
 
+def _fetch_bse_sast_disclosures(
+    scrip_code: str,
+    session: requests.Session | None = None,
+    years: int = 2,
+) -> list[dict[str, Any]]:
+    """Fetch SEBI SAST disclosure filings from BSE AnnSubCategoryGetData.
+
+    Uses the exact same API endpoint and parameter pattern as
+    BSEFilingDiscoverer.discover_filings() (strCat='Result'), but
+    with strCat='Insider Trading / SAST' to get:
+      - Reg. 29(1): disclosure on acquisition of shares
+      - Reg. 29(2): disclosure on change in shareholding
+      - Reg. 31(1): disclosure of shareholding pattern
+      - Reg. 31(2): disclosure of aggregate shareholding
+      - Closure of Trading Window notices
+
+    The HEADLINE field contains the substantial shareholder name
+    directly (e.g. "disclosure under Regulation 29(2) ... for
+    Bhairavi Madhusudhan Shibulal").
+
+    Parameters
+    ----------
+    scrip_code:
+        BSE numeric scrip code (e.g. '500325').
+    session:
+        Optional pre-existing requests session.
+    years:
+        How many years back to search.
+
+    Returns
+    -------
+    List of raw BSE announcement dicts with keys: NEWSID, SCRIP_CD,
+    NEWSSUB, HEADLINE, NEWS_DT, ATTACHMENTNAME, SUBCATNAME, etc.
+    """
+    if session is None:
+        session = _get_bse_session()
+
+    today = date.today()
+    from_date = today - timedelta(days=365 * years)
+
+    try:
+        resp = session.get(
+            f"{_BSE_BASE}/AnnSubCategoryGetData/w",
+            params={
+                "Ession": "",
+                "strCat": "Insider Trading / SAST",
+                "strPrevDate": from_date.strftime("%Y%m%d"),
+                "strScrip": scrip_code,
+                "strSearch": "P",
+                "strToDate": today.strftime("%Y%m%d"),
+                "strType": "C",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        table = data.get("Table", [])
+        logger.info(
+            "BSE SAST disclosures for %s: %d filings (2yr window)",
+            scrip_code, len(table),
+        )
+        return table
+    except Exception as exc:
+        logger.debug("BSE SAST API failed for %s: %s", scrip_code, exc)
+        return []
+
+
+def _extract_holders_from_sast(
+    filings: list[dict[str, Any]],
+    scrip_code: str,
+    session: requests.Session | None = None,
+) -> list[dict[str, Any]]:
+    """Extract substantial shareholder data from BSE SAST disclosures.
+
+    Two extraction strategies:
+
+    1. **HEADLINE field** (fast, no PDF download needed): BSE includes
+       the shareholder name directly in the HEADLINE field for Reg. 29
+       disclosures (e.g. "disclosure under Regulation 29(2) ... for
+       Bhairavi Madhusudhan Shibulal").
+
+    2. **PDF extraction** (detailed): SAST PDFs at AttachHis/ contain
+       the full SEBI disclosure form with shareholder name, shares held,
+       percentage, and transaction details.  Parsed via pdfplumber.
+
+    Parameters
+    ----------
+    filings:
+        List of BSE SAST announcement dicts from _fetch_bse_sast_disclosures().
+    scrip_code:
+        BSE scrip code (for logging).
+    session:
+        Active requests session.
+
+    Returns
+    -------
+    List of holder dicts with keys: name, shares, percentage,
+    holder_type, date_reported, source, regulation.
+    """
+    if session is None:
+        session = _get_bse_session()
+
+    holders: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for filing in filings:
+        subcatname = filing.get("SUBCATNAME", "")
+        headline = filing.get("HEADLINE", "")
+        news_dt = (filing.get("NEWS_DT") or "")[:10]
+        attachment = filing.get("ATTACHMENTNAME", "")
+
+        # Skip Closure of Trading Window (no shareholder data)
+        if "closure" in subcatname.lower():
+            continue
+
+        # Strategy 1: Extract shareholder name from HEADLINE field
+        # HEADLINE format: "The Exchange has received the disclosure under
+        # Regulation 29(2) of SEBI (SAST) Regulations, 2011 for <NAME>"
+        shareholder_name = ""
+        if headline:
+            # Extract name after "for " at the end of the headline
+            match = re.search(
+                r"\bfor\s+([A-Z][A-Za-z\s.()]+?)\.?\s*$",
+                headline,
+            )
+            if match:
+                shareholder_name = match.group(1).strip().rstrip(".")
+            elif " for " in headline:
+                parts = headline.rsplit(" for ", 1)
+                if len(parts) == 2 and len(parts[1].strip()) > 3:
+                    shareholder_name = parts[1].strip().rstrip(".")
+
+        if shareholder_name and shareholder_name.lower() not in seen_names:
+            seen_names.add(shareholder_name.lower())
+
+            # Determine regulation type
+            regulation = ""
+            if "29(1)" in subcatname:
+                regulation = "Reg. 29(1) - Acquisition"
+            elif "29(2)" in subcatname:
+                regulation = "Reg. 29(2) - Change in Shareholding"
+            elif "31(1)" in subcatname:
+                regulation = "Reg. 31(1) - Shareholding Pattern"
+            elif "31(2)" in subcatname:
+                regulation = "Reg. 31(2) - Aggregate Shareholding"
+
+            holders.append({
+                "name": shareholder_name,
+                "shares": 0,
+                "percentage": 0.0,
+                "holder_type": "substantial",
+                "date_reported": news_dt,
+                "source": "bse_sast_headline",
+                "regulation": regulation,
+            })
+
+        # Strategy 2: Try downloading the SAST PDF for detailed data
+        # SAST PDFs use AttachHis (not AttachLive)
+        if attachment and len(holders) < 20:
+            for base_url in [_BSE_PDF_ATTACH_HIS, _BSE_PDF_ATTACH_LIVE]:
+                pdf_url = f"{base_url}/{attachment}"
+                try:
+                    resp = session.get(pdf_url, timeout=30)
+                    if resp.status_code != 200 or resp.content[:4] != b"%PDF":
+                        continue
+
+                    # Parse SAST PDF for shareholding data
+                    try:
+                        import pdfplumber
+                        import io
+
+                        with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
+                            text = ""
+                            for page in pdf.pages[:5]:
+                                text += (page.extract_text() or "") + "\n"
+
+                        if text.strip():
+                            _parse_sast_pdf_text(
+                                text, holders, shareholder_name, news_dt,
+                            )
+                    except ImportError:
+                        pass
+                    except Exception as exc:
+                        logger.debug("SAST PDF parse failed: %s", exc)
+
+                    time.sleep(_BSE_REQUEST_DELAY_S)
+                    break  # Found the PDF, don't try other base URLs
+                except Exception:
+                    continue
+
+    return holders
+
+
+def _parse_sast_pdf_text(
+    text: str,
+    holders: list[dict[str, Any]],
+    shareholder_name: str,
+    news_dt: str,
+) -> None:
+    """Parse a SEBI SAST disclosure PDF for shareholding percentages.
+
+    SAST forms (Reg. 29/31) contain structured data including:
+    - Name of the acquirer/substantial shareholder
+    - Number of shares held before and after the transaction
+    - Percentage of shares held
+    - Type of shares (equity, preference, convertible)
+
+    Extracts percentage from common SAST form patterns.
+    """
+    # Look for percentage patterns in SAST forms
+    pct_patterns = [
+        # "XX.XX% of the total share/voting capital"
+        r"([\d.]+)\s*%\s*(?:of\s+(?:the\s+)?(?:total|paid[- ]?up|issued))",
+        # "Percentage of shareholding: XX.XX%"
+        r"(?:[Pp]ercentage|%)\s*(?:of\s+)?(?:share(?:holding)?|voting)[^:]*?:\s*([\d.]+)",
+        # "XX.XX % of voting rights"
+        r"([\d.]+)\s*%\s*(?:of\s+)?voting\s+rights",
+    ]
+
+    for pattern in pct_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                pct = float(match.group(1))
+                if 0.01 < pct < 100:
+                    # Update the existing holder entry if we have a name match
+                    for h in holders:
+                        if (
+                            h["name"].lower() == shareholder_name.lower()
+                            and h["percentage"] == 0.0
+                        ):
+                            h["percentage"] = round(pct, 2)
+                            h["source"] = "bse_sast_pdf"
+                            break
+                    break
+            except ValueError:
+                pass
+
+    # Also look for number of shares
+    shares_patterns = [
+        r"(?:[Nn]umber\s+of\s+shares)[^:]*?:\s*([\d,]+)",
+        r"(?:[Tt]otal\s+shares)\s*(?:held)?[^:]*?:\s*([\d,]+)",
+    ]
+
+    for pattern in shares_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                shares = int(match.group(1).replace(",", ""))
+                for h in holders:
+                    if (
+                        h["name"].lower() == shareholder_name.lower()
+                        and h["shares"] == 0
+                    ):
+                        h["shares"] = shares
+                        break
+                break
+            except ValueError:
+                pass
+
+    # Parse category-level shareholding patterns if present
+    # (Reg. 31 forms contain full shareholding breakdown)
+    _parse_shareholding_text(text, holders, {"Fin_Year": news_dt})
+
+
 def _fetch_bse_board_meetings(
     scrip_code: str,
     session: requests.Session | None = None,
@@ -272,21 +544,6 @@ def _fetch_bse_board_meetings(
 
     Uses the BSE BoardMeetings/w endpoint which works globally and
     returns JSON with meeting subjects and PDF attachment paths.
-
-    Board meetings often include outcomes related to shareholding
-    patterns, dividend declarations, and insider trading disclosures.
-
-    Parameters
-    ----------
-    scrip_code:
-        BSE numeric scrip code (e.g. '500325').
-    session:
-        Optional pre-existing requests session.
-
-    Returns
-    -------
-    List of board meeting dicts with keys from the BSE API:
-    AnnCategory, Sub_Ann, Attchment_name, Fin_Year.
     """
     if session is None:
         session = _get_bse_session()
@@ -315,17 +572,6 @@ def _fetch_bse_corporate_actions(
 
     Uses the BSE CorporateAction/w endpoint which returns structured
     JSON with action type, date, and amount.
-
-    Parameters
-    ----------
-    scrip_code:
-        BSE numeric scrip code (e.g. '500325').
-    session:
-        Optional pre-existing requests session.
-
-    Returns
-    -------
-    List of corporate action dicts.
     """
     if session is None:
         session = _get_bse_session()
@@ -348,91 +594,6 @@ def _fetch_bse_corporate_actions(
     return []
 
 
-def _extract_holders_from_board_meetings(
-    meetings: list[dict[str, Any]],
-    scrip_code: str,
-    session: requests.Session | None = None,
-) -> list[dict[str, Any]]:
-    """Extract shareholder data from board meeting announcement PDFs.
-
-    Board meeting outcome announcements on BSE often contain references
-    to shareholding patterns (e.g. "Approved the Shareholding Pattern",
-    "Declaration of Dividend").  The attachment PDFs may contain
-    detailed shareholder data.
-
-    Uses the HKEX scraper pattern: session-based PDF download +
-    text extraction for shareholder names and percentages.
-
-    Parameters
-    ----------
-    meetings:
-        List of board meeting dicts from BSE BoardMeetings/w.
-    scrip_code:
-        BSE scrip code (for logging).
-    session:
-        Active requests session.
-
-    Returns
-    -------
-    List of holder dicts extracted from meeting attachments.
-    """
-    if session is None:
-        session = _get_bse_session()
-
-    holders: list[dict[str, Any]] = []
-
-    shareholding_keywords = (
-        "shareholding", "shareholder", "promoter", "institutional",
-        "public", "fii", "dii", "mutual fund",
-    )
-
-    for meeting in meetings:
-        subject = (meeting.get("Sub_Ann") or "").lower()
-        attachment = meeting.get("Attchment_name", "")
-
-        # Only process meetings related to shareholding outcomes
-        if not any(kw in subject for kw in shareholding_keywords):
-            continue
-
-        if not attachment:
-            continue
-
-        # Construct full URL for the PDF attachment
-        if attachment.startswith("/"):
-            pdf_url = f"https://www.bseindia.com{attachment}"
-        else:
-            pdf_url = attachment
-
-        # Download and parse the PDF for shareholder data
-        try:
-            resp = session.get(pdf_url, timeout=30)
-            if resp.status_code != 200 or resp.content[:4] != b"%PDF":
-                continue
-
-            # Extract text from PDF for shareholding pattern data
-            try:
-                import pdfplumber
-                import io
-
-                with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
-                    text = ""
-                    for page in pdf.pages[:5]:  # First 5 pages max
-                        text += (page.extract_text() or "") + "\n"
-
-                # Parse promoter/public/institutional percentages
-                _parse_shareholding_text(text, holders, meeting)
-            except ImportError:
-                logger.debug("pdfplumber not available for BSE PDF parsing")
-            except Exception as exc:
-                logger.debug("PDF text extraction failed: %s", exc)
-
-            time.sleep(_BSE_REQUEST_DELAY_S)
-        except Exception as exc:
-            logger.debug("BSE PDF download failed for %s: %s", pdf_url, exc)
-
-    return holders
-
-
 def _parse_shareholding_text(
     text: str,
     holders: list[dict[str, Any]],
@@ -446,12 +607,7 @@ def _parse_shareholding_text(
     - FII / FPI
     - DII / Mutual Funds
     - Custodians (for GDR/ADR)
-
-    Extracts category name + percentage from text patterns like:
-    "Promoter & Promoter Group  50.30%"
-    "Total Public Shareholding  49.70%"
     """
-    # Common shareholding pattern line formats in Indian filings
     patterns = [
         (r"(?:Promoter\s*(?:&|and)\s*Promoter\s*Group)[^\d]*([\d.]+)\s*%?", "Promoter & Promoter Group"),
         (r"(?:Total\s+)?Public\s+Shareholding[^\d]*([\d.]+)\s*%?", "Public Shareholding"),
@@ -472,7 +628,6 @@ def _parse_shareholding_text(
             try:
                 pct = float(match.group(1))
                 if 0.01 < pct < 100:
-                    # Check for duplicate
                     if not any(h["name"] == category for h in holders):
                         holders.append({
                             "name": category,
@@ -480,7 +635,7 @@ def _parse_shareholding_text(
                             "percentage": round(pct, 2),
                             "holder_type": "category",
                             "date_reported": fin_year,
-                            "source": "bse_board_meeting",
+                            "source": "bse_sast_pdf",
                         })
             except ValueError:
                 pass
@@ -931,27 +1086,29 @@ class INBseClient:
         except Exception as exc:
             logger.debug("yfinance holders failed for BSE %s: %s", identifier, exc)
 
-        # Supplement: BSE BoardMeetings API for shareholding pattern data
-        # Uses HKEX scraper pattern: session-based, rate-limited queries
+        # Supplement: BSE SAST disclosures (Reg. 29/31) via AnnSubCategoryGetData
+        # Uses the same API pattern as BSEFilingDiscoverer (strCat='Result')
+        # but with strCat='Insider Trading / SAST' for shareholding data.
+        # HEADLINE field contains shareholder names; PDFs at AttachHis/ have details.
         try:
-            session = _get_bse_session()
-            meetings = _fetch_bse_board_meetings(scrip_code, session)
-            if meetings:
-                bse_holders = _extract_holders_from_board_meetings(
-                    meetings, scrip_code, session,
+            bse_session = _get_bse_session()
+            sast_filings = _fetch_bse_sast_disclosures(scrip_code, bse_session)
+            if sast_filings:
+                sast_holders = _extract_holders_from_sast(
+                    sast_filings, scrip_code, bse_session,
                 )
-                if bse_holders:
+                if sast_holders:
                     existing_names = {h["name"].lower() for h in holders}
-                    for bh in bse_holders:
-                        if bh["name"].lower() not in existing_names:
-                            holders.append(bh)
-                            existing_names.add(bh["name"].lower())
+                    for sh in sast_holders:
+                        if sh["name"].lower() not in existing_names:
+                            holders.append(sh)
+                            existing_names.add(sh["name"].lower())
                     logger.info(
-                        "BSE board meetings for %s: %d additional holder categories",
-                        identifier, len(bse_holders),
+                        "BSE SAST disclosures for %s: %d substantial shareholders",
+                        identifier, len(sast_holders),
                     )
         except Exception as exc:
-            logger.debug("BSE board meeting scraping failed for %s: %s", identifier, exc)
+            logger.debug("BSE SAST scraping failed for %s: %s", identifier, exc)
 
         return holders
 
