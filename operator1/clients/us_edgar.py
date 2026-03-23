@@ -698,10 +698,63 @@ class USEdgarClient:
                         "holder_type": "institutional",
                         "date_reported": str(row.get("Date Reported", "")),
                     })
-                logger.info("US holders for %s: %d from yfinance", identifier, len(holders))
+                logger.info("US holders for %s: %d institutional from yfinance", identifier, len(holders))
+
+            # 2. Mutual fund holders (adds breadth for ownership overlap analysis)
+            mf = tick.mutualfund_holders
+            if mf is not None and not mf.empty:
+                for _, row in mf.iterrows():
+                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                    if isinstance(pct, (int, float)) and 0 < pct < 1:
+                        pct = pct * 100
+                    holders.append({
+                        "name": str(row.get("Holder", "")),
+                        "shares": int(row.get("Shares", 0)),
+                        "value": float(row.get("Value", 0)),
+                        "percentage": round(float(pct), 2),
+                        "holder_type": "mutualfund",
+                        "date_reported": str(row.get("Date Reported", "")),
+                    })
+                logger.info("US holders for %s: +%d mutual fund from yfinance", identifier, len(mf))
         except Exception as exc:
-            logger.debug("yfinance institutional holders failed for %s: %s", identifier, exc)
+            logger.debug("yfinance holders failed for %s: %s", identifier, exc)
         return holders
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch insider buy/sell transactions via yfinance.
+
+        Returns list of dicts with: insider_name, position, date,
+        transaction, shares, value.
+        """
+        transactions: list[dict[str, Any]] = []
+        try:
+            import yfinance as yf
+            tick = yf.Ticker(identifier)
+            insider = tick.insider_transactions
+            if insider is not None and not insider.empty:
+                for _, row in insider.iterrows():
+                    shares = 0
+                    try:
+                        shares = int(row.get("Shares", 0))
+                    except (ValueError, TypeError):
+                        pass
+                    value = 0.0
+                    try:
+                        value = float(row.get("Value", 0))
+                    except (ValueError, TypeError):
+                        pass
+                    transactions.append({
+                        "insider_name": str(row.get("Insider", "")),
+                        "position": str(row.get("Position", "")),
+                        "date": str(row.get("Start Date", "")),
+                        "transaction": str(row.get("Transaction", "")),
+                        "shares": shares,
+                        "value": value,
+                    })
+                logger.info("US insider transactions for %s: %d", identifier, len(transactions))
+        except Exception as exc:
+            logger.debug("yfinance insider transactions failed for %s: %s", identifier, exc)
+        return transactions
 
     def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
         """Return institutional ownership metrics as a time-series DataFrame.

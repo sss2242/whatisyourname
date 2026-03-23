@@ -93,6 +93,19 @@ def compute_company_survival_flag(
         dd = df["drawdown_252d"]
         conditions.append(dd.notna() & (dd < t.get("drawdown_252d_lt", -0.40)))
 
+    # Institutional selling: extreme outflow triggers survival mode
+    if "inst_flow_momentum" in df.columns:
+        ifm = df["inst_flow_momentum"]
+        conditions.append(ifm.notna() & (ifm < t.get("inst_flow_momentum_lt", -0.15)))
+
+    # Crowded + illiquid: fragile ownership structure
+    if "inst_crowding_score" in df.columns and "inst_amihud_illiquidity" in df.columns:
+        cs = df["inst_crowding_score"]
+        ai = df["inst_amihud_illiquidity"]
+        high_crowd = cs.notna() & (cs > t.get("inst_crowding_score_gt", 0.8))
+        high_illiq = ai.notna() & (ai > ai.quantile(0.9))
+        conditions.append(high_crowd & high_illiq)
+
     # Geopolitical conflict: country_conflict_flag OR intensity > 0.7 OR sanctions
     if "country_conflict_flag" in df.columns:
         cf = df["country_conflict_flag"]
