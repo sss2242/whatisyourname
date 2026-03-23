@@ -764,3 +764,135 @@ class SATadawulClient:
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
+
+    # -- Institutional holders (native Tadawul foreign ownership page) --------
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch foreign ownership data from Tadawul's native HTML table.
+
+        The Tadawul foreign-ownership page at
+        /newsandreports/reports-publications/foreign-ownership
+        serves a server-rendered HTML table with 411 companies containing:
+          - Total Foreign Ownership Maximum Limit (%)
+          - Total Foreign Ownership Actual (%)
+          - Foreign Strategic Investors Ownership (%)
+
+        All fetched via curl_cffi Chrome impersonation (same as financials).
+        No yfinance, no LLM needed.
+        """
+        holders: list[dict[str, Any]] = []
+        try:
+            import re
+            s = _get_session()
+            r = s.get(
+                f"{_TADAWUL_BASE}/wps/portal/saudiexchange/newsandreports/"
+                "reports-publications/foreign-ownership?locale=en",
+                timeout=25,
+            )
+            if r.status_code != 200:
+                logger.debug("Tadawul foreign ownership page: %d", r.status_code)
+                return holders
+
+            # Parse the HTML table
+            tables = re.findall(r"<table[^>]*>(.*?)</table>", r.text, re.DOTALL | re.I)
+            if not tables:
+                return holders
+
+            rows = re.findall(r"<tr[^>]*>(.*?)</tr>", tables[0], re.DOTALL | re.I)
+            symbol = identifier.upper().strip()
+
+            for row in rows:
+                cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)
+                cells_clean = [re.sub(r"<[^>]+>", "", c).strip() for c in cells]
+                if len(cells_clean) < 5:
+                    continue
+                if cells_clean[0] != symbol:
+                    continue
+
+                # Found the company row
+                company_name = cells_clean[1]
+                max_foreign = cells_clean[2].replace("%", "").strip()
+                actual_foreign = cells_clean[3].replace("%", "").strip()
+                strategic_foreign = cells_clean[4].replace("%", "").strip()
+
+                try:
+                    actual_pct = float(actual_foreign)
+                except (ValueError, TypeError):
+                    actual_pct = 0.0
+                try:
+                    strategic_pct = float(strategic_foreign)
+                except (ValueError, TypeError):
+                    strategic_pct = 0.0
+                try:
+                    max_pct = float(max_foreign)
+                except (ValueError, TypeError):
+                    max_pct = 49.0
+
+                if actual_pct > 0:
+                    holders.append({
+                        "name": "Foreign Investors (aggregate)",
+                        "shares": 0,
+                        "value": 0.0,
+                        "percentage": round(actual_pct, 2),
+                        "holder_type": "foreign_aggregate",
+                        "date_reported": str(date.today()),
+                        "source": "tadawul_foreign_ownership",
+                        "max_foreign_limit_pct": round(max_pct, 2),
+                    })
+                if strategic_pct > 0:
+                    holders.append({
+                        "name": "Foreign Strategic Investors",
+                        "shares": 0,
+                        "value": 0.0,
+                        "percentage": round(strategic_pct, 2),
+                        "holder_type": "foreign_strategic",
+                        "date_reported": str(date.today()),
+                        "source": "tadawul_foreign_ownership",
+                    })
+                # Implied domestic ownership
+                domestic_pct = 100.0 - actual_pct
+                if domestic_pct > 0:
+                    holders.append({
+                        "name": "Domestic Investors (implied)",
+                        "shares": 0,
+                        "value": 0.0,
+                        "percentage": round(domestic_pct, 2),
+                        "holder_type": "domestic_aggregate",
+                        "date_reported": str(date.today()),
+                        "source": "tadawul_foreign_ownership",
+                    })
+
+                if holders:
+                    logger.info(
+                        "Tadawul holders for %s (%s): foreign=%.2f%%, strategic=%.2f%%",
+                        symbol, company_name, actual_pct, strategic_pct,
+                    )
+                break
+
+        except Exception as exc:
+            logger.debug("Tadawul foreign ownership lookup failed for %s: %s", identifier, exc)
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return ownership metrics from Tadawul foreign ownership data."""
+        try:
+            holders = self.get_holders(identifier)
+            if not holders:
+                return pd.DataFrame()
+
+            foreign = next((h for h in holders if h["holder_type"] == "foreign_aggregate"), None)
+            foreign_pct = foreign["percentage"] if foreign else 0.0
+
+            return pd.DataFrame([{
+                "date_reported": pd.Timestamp(date.today()),
+                "inst_ownership_pct": round(foreign_pct, 2),
+                "inst_top5_concentration": 0.0,
+                "inst_holder_count": len(holders),
+            }])
+        except Exception as exc:
+            logger.debug("Tadawul holder history failed for %s: %s", identifier, exc)
+        return pd.DataFrame()
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Tadawul does not expose insider transaction data via public API."""
+        return []
