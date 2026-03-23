@@ -483,6 +483,176 @@ class MXBmvClient:
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
 
+    # -- Institutional holders (yfinance backed) -----------------------------
+
+    def _yf_ticker(self, identifier: str) -> str:
+        """Convert BMV ticker to yfinance format.
+
+        Mexican stocks have series suffixes (A, B, L, CPO, etc.).
+        yfinance expects ``{ticker}.MX`` format.  If the identifier
+        already has .MX, return as-is.  Otherwise try common series
+        suffixes until one works.
+        """
+        if ".MX" in identifier.upper():
+            return identifier
+        # Try the identifier directly first, then with common series
+        return f"{identifier}.MX"
+
+    def _try_yf_tickers(self, identifier: str) -> "yf.Ticker | None":
+        """Try multiple yfinance ticker variants for BMV stocks.
+
+        Mexican stocks use series suffixes (AMXB, AMXL, WALMEX, etc.).
+        Returns the first Ticker that has major_holders data.
+        """
+        try:
+            import yfinance as yf
+        except ImportError:
+            return None
+
+        # Strip .MX if present
+        base = identifier.upper().replace(".MX", "").strip()
+
+        # Try these variants in order
+        variants = [
+            f"{base}.MX",           # direct (WALMEX.MX)
+            f"{base}B.MX",          # B-series (AMXB.MX)
+            f"{base}A.MX",          # A-series
+            f"{base}L.MX",          # L-series (AMXL.MX)
+            f"{base}CPO.MX",        # CPO series (TLEVISACPO.MX)
+        ]
+
+        for variant in variants:
+            try:
+                tick = yf.Ticker(variant)
+                mh = tick.major_holders
+                if mh is not None and not mh.empty:
+                    logger.debug("BMV yfinance ticker resolved: %s -> %s", identifier, variant)
+                    return tick
+            except Exception:
+                continue
+
+        return None
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch institutional + mutual fund holders via yfinance.
+
+        BMV (EMISNET) does publish holder disclosures but the API
+        requires CAPTCHA-solving or JavaScript rendering.  yfinance
+        provides aggregated holder data for major BMV-listed companies.
+        Series-aware ticker resolution handles the A/B/L/CPO suffix.
+        """
+        holders: list[dict[str, Any]] = []
+        try:
+            tick = self._try_yf_tickers(identifier)
+            if tick is None:
+                return holders
+
+            # Institutional holders
+            inst = tick.institutional_holders
+            if inst is not None and not inst.empty:
+                for _, row in inst.iterrows():
+                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                    if isinstance(pct, (int, float)) and 0 < pct < 1:
+                        pct = pct * 100
+                    holders.append({
+                        "name": str(row.get("Holder", "")),
+                        "shares": int(row.get("Shares", 0)),
+                        "value": float(row.get("Value", 0)),
+                        "percentage": round(float(pct), 2),
+                        "holder_type": "institutional",
+                        "date_reported": str(row.get("Date Reported", "")),
+                    })
+
+            # Mutual fund holders
+            mf = tick.mutualfund_holders
+            if mf is not None and not mf.empty:
+                for _, row in mf.iterrows():
+                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                    if isinstance(pct, (int, float)) and 0 < pct < 1:
+                        pct = pct * 100
+                    holders.append({
+                        "name": str(row.get("Holder", "")),
+                        "shares": int(row.get("Shares", 0)),
+                        "value": float(row.get("Value", 0)),
+                        "percentage": round(float(pct), 2),
+                        "holder_type": "mutualfund",
+                        "date_reported": str(row.get("Date Reported", "")),
+                    })
+
+            if holders:
+                logger.info("BMV holders for %s: %d from yfinance", identifier, len(holders))
+        except Exception as exc:
+            logger.debug("yfinance holders failed for BMV %s: %s", identifier, exc)
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return institutional ownership metrics as a single-row snapshot."""
+        try:
+            from datetime import date as _date
+            tick = self._try_yf_tickers(identifier)
+            if tick is None:
+                return pd.DataFrame()
+
+            mh = tick.major_holders
+            inst_pct = 0.0
+            inst_count = 0
+            if mh is not None and not mh.empty:
+                for idx, row in mh.iterrows():
+                    breakdown = str(row.get("Breakdown", idx)).lower() if "Breakdown" in mh.columns else str(idx).lower()
+                    val = row.get("Value", row.iloc[-1]) if "Value" in mh.columns else row.iloc[-1]
+                    if "institutionspercentheld" in breakdown or ("institutions" in breakdown and "percent" in breakdown):
+                        inst_pct = float(val) * 100 if float(val) < 1 else float(val)
+                    elif "institutionscount" in breakdown or "count" in breakdown:
+                        inst_count = int(float(val))
+
+            holders = self.get_holders(identifier)
+            hhi = 0.0
+            if holders:
+                top5 = holders[:5]
+                total_pct = sum(h.get("percentage", 0) for h in top5)
+                if total_pct > 0:
+                    hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
+
+            if inst_pct > 0 or inst_count > 0 or holders:
+                return pd.DataFrame([{
+                    "date_reported": pd.Timestamp(_date.today()),
+                    "inst_ownership_pct": round(inst_pct, 2),
+                    "inst_top5_concentration": round(hhi, 4),
+                    "inst_holder_count": inst_count or len(holders),
+                }])
+        except Exception as exc:
+            logger.debug("BMV holder history failed for %s: %s", identifier, exc)
+        return pd.DataFrame()
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch insider transactions via yfinance for BMV-listed companies."""
+        transactions: list[dict[str, Any]] = []
+        try:
+            tick = self._try_yf_tickers(identifier)
+            if tick is None:
+                return transactions
+
+            insider = tick.insider_transactions
+            if insider is not None and not insider.empty:
+                for _, row in insider.iterrows():
+                    shares = 0
+                    try:
+                        shares = int(row.get("Shares", 0))
+                    except (ValueError, TypeError):
+                        pass
+                    transactions.append({
+                        "insider_name": str(row.get("Insider", "")),
+                        "position": str(row.get("Position", "")),
+                        "date": str(row.get("Start Date", "")),
+                        "transaction": str(row.get("Transaction", "")),
+                        "shares": shares,
+                        "value": float(row.get("Value", 0) or 0),
+                    })
+                logger.info("BMV insider transactions for %s: %d", identifier, len(transactions))
+        except Exception as exc:
+            logger.debug("yfinance insider transactions failed for BMV %s: %s", identifier, exc)
+        return transactions
+
 
 # ---------------------------------------------------------------------------
 # BMV XBRL Financial Data Extraction (fast path, no LLM needed)
