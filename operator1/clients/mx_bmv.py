@@ -65,34 +65,90 @@ class _BMVTokenManager:
     from a public endpoint (no credentials) and must be included in
     all API requests. The token has a very long expiry but we refresh
     periodically.
+
+    As of 2026-03, the BMV token endpoint sometimes returns an empty
+    response string instead of an access_token dict. This manager
+    handles both the old format (dict with access_token) and the new
+    error format (empty string + error message) gracefully.
     """
 
     def __init__(self) -> None:
         self._token: str = ""
         self._obtained_at: float = 0.0
+        self._session: requests.Session | None = None
+        self._failed_attempts: int = 0
+
+    def _get_session(self) -> requests.Session:
+        """Get or create a persistent session with BMV cookies."""
+        if self._session is None:
+            self._session = requests.Session()
+            self._session.headers.update(_BMV_HEADERS)
+            # Load main page first to get JSESSIONID + F5 cookies
+            # (similar to HKEX scraper pattern)
+            try:
+                self._session.get(_BMV_BASE_URL, timeout=15)
+            except Exception:
+                pass
+        return self._session
 
     def get_token(self) -> str:
-        """Return a valid Bearer token, refreshing if needed."""
+        """Return a valid Bearer token, refreshing if needed.
+
+        Returns empty string if the BMV token service is unavailable,
+        allowing callers to fall back to yfinance.
+        """
         now = time.time()
         if self._token and (now - self._obtained_at) < _TOKEN_REFRESH_INTERVAL_S:
             return self._token
 
+        # Skip repeated attempts if we already know the service is down
+        if self._failed_attempts >= 3:
+            if (now - self._obtained_at) < 300:  # retry every 5 min
+                return self._token  # return stale or empty
+
+        session = self._get_session()
+
         try:
-            resp = requests.get(
+            resp = session.get(
                 _BMV_TOKEN_URL,
-                headers=_BMV_HEADERS,
+                headers={
+                    "Referer": f"{_BMV_BASE_URL}/",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
                 timeout=15,
             )
             resp.raise_for_status()
             data = resp.json()
-            self._token = data["response"]["access_token"]
-            self._obtained_at = now
-            logger.debug("BMV token obtained: %s...", self._token[:12])
+
+            # Handle both response formats:
+            # Old: {"response": {"access_token": "xxx", ...}}
+            # New/error: {"response": "", "mensaje": {"Error": "..."}}
+            response = data.get("response", "")
+            if isinstance(response, dict) and response.get("access_token"):
+                self._token = response["access_token"]
+                self._obtained_at = now
+                self._failed_attempts = 0
+                logger.debug("BMV token obtained: %s...", self._token[:12])
+            elif isinstance(response, str) and response:
+                # Some responses return the token as a plain string
+                self._token = response
+                self._obtained_at = now
+                self._failed_attempts = 0
+            else:
+                # Empty response or error -- token service is down
+                error_msg = data.get("mensaje", {}).get("Error", "unknown")
+                self._failed_attempts += 1
+                logger.info(
+                    "BMV token service returned empty response (attempt %d): %s",
+                    self._failed_attempts, error_msg,
+                )
         except Exception as exc:
-            logger.warning("Failed to obtain BMV token: %s", exc)
-            # Return stale token if we have one
-            if not self._token:
-                raise
+            self._failed_attempts += 1
+            logger.info(
+                "BMV token service unavailable (attempt %d): %s",
+                self._failed_attempts, exc,
+            )
 
         return self._token
 
@@ -124,6 +180,12 @@ def _bmv_search(
     """
     token = _token_manager.get_token()
 
+    # If no token available, BMV API is down -- return empty immediately
+    # so callers can fall through to yfinance without waiting for a 503
+    if not token:
+        logger.debug("BMV search skipped: no token available (API may be down)")
+        return {}
+
     # Split multi-word terms for the API's two-term fields
     parts = term.strip().split(" ", 1)
     term1 = parts[0]
@@ -140,20 +202,22 @@ def _bmv_search(
     }
 
     try:
-        resp = requests.post(
+        session = _token_manager._get_session()
+        resp = session.post(
             _BMV_SEARCH_URL,
             json=payload,
             headers={
-                **_BMV_HEADERS,
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
+                "Referer": f"{_BMV_BASE_URL}/",
+                "Origin": _BMV_BASE_URL,
             },
             timeout=15,
         )
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
-        logger.warning("BMV search failed for '%s': %s", term, exc)
+        logger.debug("BMV search failed for '%s': %s", term, exc)
         return {}
 
 
