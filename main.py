@@ -1323,6 +1323,8 @@ Non-interactive examples:
     game_theory_result = None
     linked_caches: dict[str, pd.DataFrame] = {}
     linked_agg_df: pd.DataFrame | None = None
+    contagion_result = None
+    _ownership_edge_weights: dict[str, float] = {}
 
     # Build the LLM client once for the whole pipeline
     from operator1.clients.llm_factory import create_llm_client
@@ -1526,8 +1528,6 @@ Non-interactive examples:
                     )
 
             # Step 5f.2: Ownership contagion analysis (MHHI + crowding + liquidation)
-            contagion_result = None
-            _ownership_edge_weights: dict[str, float] = {}
             if target_holders:
                 try:
                     from operator1.models.ownership_contagion import (
@@ -1551,6 +1551,31 @@ Non-interactive examples:
                             contagion_result.liquidation_days,
                             contagion_result.n_shared_institutions,
                         )
+                    # Re-run graph_risk with ownership edge weights for second
+                    # contagion channel (shared holders amplify contagion).
+                    # graph_risk was first computed at Step 5e with unweighted
+                    # edges; now we enhance it with ownership overlap weights.
+                    if _ownership_edge_weights and graph_risk_result is not None:
+                        try:
+                            from operator1.models.graph_risk import compute_graph_risk_metrics as _grc
+                            _enhanced_gr = _grc(
+                                target_isin=target_profile.get("isin", ticker),
+                                relationships=_rel_dicts if "_rel_dicts" in dir() else {},
+                                edge_weights=_ownership_edge_weights,
+                                target_cache=cache,
+                                linked_caches=linked_caches if linked_caches else None,
+                            )
+                            if _enhanced_gr.available:
+                                graph_risk_result = _enhanced_gr
+                                logger.info(
+                                    "Graph risk re-computed with ownership edge weights: "
+                                    "contagion=%.3f (was %.3f)",
+                                    _enhanced_gr.contagion_target_infection_prob,
+                                    graph_risk_result.contagion_target_infection_prob,
+                                )
+                        except Exception as _gr_exc:
+                            logger.debug("Graph risk re-computation skipped: %s", _gr_exc)
+
                 except Exception as exc:
                     logger.debug("Ownership contagion skipped: %s", exc)
 
