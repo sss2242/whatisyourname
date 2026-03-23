@@ -542,6 +542,72 @@ def _scrape_sgx_announcement_page(
     return holders
 
 
+def _parse_sgx_shareholding_text(
+    text: str,
+    holders: list[dict[str, Any]],
+    date_reported: str = "",
+) -> None:
+    """Parse shareholding data from SGX annual report PDF text.
+
+    SGX annual reports typically include "Statistics of Shareholdings"
+    or "Analysis of Shareholdings" sections with:
+    - Substantial shareholders (>5%) with name, shares, percentage
+    - Shareholding distribution by size
+    - Top 20 shareholders list
+
+    Uses regex patterns similar to BSE's _parse_shareholding_text().
+    """
+    import re as _re
+
+    # Pattern 1: Substantial shareholder lines
+    # "Name of Substantial Shareholder ... Direct Interest ... Deemed Interest"
+    # "Temasek Holdings ... 1,234,567 ... 28.18%"
+    sub_patterns = [
+        _re.compile(
+            r"([A-Z][A-Za-z\s&.,()'-]+?)\s+"
+            r"([\d,]+)\s+"           # direct shares
+            r"([\d.]+)\s*%",         # percentage
+            _re.MULTILINE,
+        ),
+        _re.compile(
+            r"([A-Z][A-Za-z\s&.,()'-]{5,}?)\s+"
+            r".*?"
+            r"([\d.]+)\s*%\s*$",
+            _re.MULTILINE,
+        ),
+    ]
+
+    for pat in sub_patterns:
+        for m in pat.finditer(text):
+            name = m.group(1).strip()
+            # Skip table headers and labels
+            if any(skip in name.lower() for skip in [
+                "name", "shareholder", "interest", "total", "percentage",
+                "direct", "deemed", "number", "class",
+            ]):
+                continue
+            try:
+                pct = float(m.groups()[-1])
+            except (ValueError, IndexError):
+                continue
+            if 0.1 < pct < 100 and len(name) > 3:
+                try:
+                    shares_str = m.group(2).replace(",", "") if len(m.groups()) >= 3 else "0"
+                    shares = int(shares_str)
+                except (ValueError, IndexError):
+                    shares = 0
+
+                if not any(h["name"].lower() == name.lower() for h in holders):
+                    holders.append({
+                        "name": name,
+                        "shares": shares,
+                        "percentage": round(pct, 2),
+                        "holder_type": "substantial",
+                        "date_reported": date_reported,
+                        "source": "sgx_filing_pdf",
+                    })
+
+
 class SGSgxClient:
     """PIT client for Singapore SGX equities.
 
@@ -735,51 +801,7 @@ class SGSgxClient:
         """
         holders: list[dict[str, Any]] = []
 
-        # Primary: yfinance institutional + mutual fund holders
-        try:
-            import yfinance as yf
-            tick = yf.Ticker(self._yf_ticker(identifier))
-
-            # Institutional holders
-            inst = tick.institutional_holders
-            if inst is not None and not inst.empty:
-                for _, row in inst.iterrows():
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "institutional",
-                        "date_reported": str(row.get("Date Reported", "")),
-                        "source": "yfinance",
-                    })
-
-            # Mutual fund holders
-            mf = tick.mutualfund_holders
-            if mf is not None and not mf.empty:
-                for _, row in mf.iterrows():
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "mutualfund",
-                        "date_reported": str(row.get("Date Reported", "")),
-                        "source": "yfinance",
-                    })
-
-            if holders:
-                logger.info("SGX holders for %s: %d from yfinance", identifier, len(holders))
-        except Exception as exc:
-            logger.debug("yfinance holders failed for SGX %s: %s", identifier, exc)
-
-        # Supplement: SGX Financial Reports API disclosure announcements
+        # PRIMARY: SGX Financial Reports API disclosure announcements
         # Uses the HKEX scraper pattern: session-based, paginated queries
         # to find Disclosure of Interest filings via the financial reports API
         try:
@@ -797,6 +819,92 @@ class SGSgxClient:
                 )
         except Exception as exc:
             logger.debug("SGX DOI scraping failed for %s: %s", identifier, exc)
+
+        # SECONDARY: SGX filing discoverer + fuzzy PDF parser for shareholding
+        # data from annual report / disclosure PDFs.  SGX annual reports often
+        # include "Statistics of Shareholdings" or "Analysis of Shareholdings"
+        # sections with detailed category breakdowns.
+        if not holders:
+            try:
+                from operator1.clients.filing_discoverer import try_filing_extraction, SGXFilingDiscoverer
+                discoverer = SGXFilingDiscoverer()
+                discovery = discoverer.discover_filings(identifier, years=1)
+
+                if discovery.has_filings:
+                    for filing in discovery.filings[:3]:
+                        try:
+                            pdf_bytes = discoverer.download_filing(filing)
+                            if not pdf_bytes or pdf_bytes[:4] != b"%PDF":
+                                continue
+
+                            import pdfplumber as _pdfp
+                            import io as _io
+
+                            with _pdfp.open(_io.BytesIO(pdf_bytes)) as pdf:
+                                for page in pdf.pages:
+                                    text = page.extract_text() or ""
+                                    text_lower = text.lower()
+                                    if ("substantial shareholder" in text_lower or
+                                            "statistics of shareholding" in text_lower or
+                                            "analysis of shareholding" in text_lower):
+                                        # Parse substantial shareholder data from PDF
+                                        _parse_sgx_shareholding_text(text, holders, filing.filing_date or "")
+                                        break
+
+                            if holders:
+                                logger.info(
+                                    "SGX shareholding for %s: extracted from filing PDF (%s)",
+                                    identifier, filing.filing_date,
+                                )
+                                break
+                        except Exception as exc:
+                            logger.debug("SGX filing PDF shareholding extraction failed: %s", exc)
+                            continue
+            except Exception as exc:
+                logger.debug("SGX filing discoverer for shareholding failed for %s: %s", identifier, exc)
+
+        # FALLBACK: yfinance (only if native sources returned nothing)
+        if not holders:
+            try:
+                import yfinance as yf
+                tick = yf.Ticker(self._yf_ticker(identifier))
+
+                inst = tick.institutional_holders
+                if inst is not None and not inst.empty:
+                    for _, row in inst.iterrows():
+                        pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                        if isinstance(pct, (int, float)) and 0 < pct < 1:
+                            pct = pct * 100
+                        holders.append({
+                            "name": str(row.get("Holder", "")),
+                            "shares": int(row.get("Shares", 0)),
+                            "value": float(row.get("Value", 0)),
+                            "percentage": round(float(pct), 2),
+                            "holder_type": "institutional",
+                            "date_reported": str(row.get("Date Reported", "")),
+                            "source": "yfinance",
+                        })
+
+                mf = tick.mutualfund_holders
+                if mf is not None and not mf.empty:
+                    for _, row in mf.iterrows():
+                        pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                        if isinstance(pct, (int, float)) and 0 < pct < 1:
+                            pct = pct * 100
+                        holders.append({
+                            "name": str(row.get("Holder", "")),
+                            "shares": int(row.get("Shares", 0)),
+                            "value": float(row.get("Value", 0)),
+                            "percentage": round(float(pct), 2),
+                            "holder_type": "mutualfund",
+                            "date_reported": str(row.get("Date Reported", "")),
+                            "source": "yfinance",
+                        })
+
+                if holders:
+                    logger.info("SGX holders fallback for %s: %d from yfinance", identifier, len(holders))
+            except Exception as exc:
+                logger.debug("yfinance holders fallback failed for SGX %s: %s", identifier, exc)
 
         return holders
 
