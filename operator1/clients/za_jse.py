@@ -367,3 +367,566 @@ class ZAJseClient:
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
+
+    # -- Institutional holders (yfinance + SENS director dealings) -----------
+
+    def _yf_ticker(self, identifier: str) -> str:
+        """Convert JSE ticker to yfinance format (e.g. 'NPN' -> 'NPN.JO')."""
+        code = identifier.split(".")[0].strip().upper()
+        return f"{code}.JO"
+
+    def _resolve_master_id(self, identifier: str) -> int | None:
+        """Resolve a ticker to JSE MasterID via the issuer directory."""
+        matches = _search_issuers(identifier)
+        if matches:
+            return matches[0].get("master_id")
+        return None
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch institutional holders via yfinance + SENS shareholding announcements.
+
+        Two-source strategy (mirrors the SGX/BSE pattern):
+
+        1. **yfinance** (.JO suffix): provides institutional_holders and
+           mutualfund_holders tables for major JSE-listed companies.
+
+        2. **SENS announcements**: filters for shareholding-related SENS
+           announcements (Section 122 disclosures, major shareholder changes)
+           via the JSE WCF SENSService.  Parses PDF announcements for
+           shareholder names and percentages.
+
+        Returns list of dicts with: name, shares, percentage, holder_type,
+        date_reported, source.
+        """
+        holders: list[dict[str, Any]] = []
+
+        # Primary: yfinance institutional + mutual fund holders
+        try:
+            import yfinance as yf
+            tick = yf.Ticker(self._yf_ticker(identifier))
+
+            # Institutional holders
+            inst = tick.institutional_holders
+            if inst is not None and not inst.empty:
+                for _, row in inst.iterrows():
+                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                    if isinstance(pct, (int, float)) and 0 < pct < 1:
+                        pct = pct * 100
+                    holders.append({
+                        "name": str(row.get("Holder", "")),
+                        "shares": int(row.get("Shares", 0)),
+                        "value": float(row.get("Value", 0)),
+                        "percentage": round(float(pct), 2),
+                        "holder_type": "institutional",
+                        "date_reported": str(row.get("Date Reported", "")),
+                        "source": "yfinance",
+                    })
+
+            # Mutual fund holders
+            mf = tick.mutualfund_holders
+            if mf is not None and not mf.empty:
+                for _, row in mf.iterrows():
+                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
+                    if isinstance(pct, (int, float)) and 0 < pct < 1:
+                        pct = pct * 100
+                    holders.append({
+                        "name": str(row.get("Holder", "")),
+                        "shares": int(row.get("Shares", 0)),
+                        "value": float(row.get("Value", 0)),
+                        "percentage": round(float(pct), 2),
+                        "holder_type": "mutualfund",
+                        "date_reported": str(row.get("Date Reported", "")),
+                        "source": "yfinance",
+                    })
+
+            # Major holders aggregate stats
+            major = tick.major_holders
+            if major is not None and not major.empty:
+                for idx, row in major.iterrows():
+                    breakdown = (
+                        str(row.get("Breakdown", idx)).lower()
+                        if "Breakdown" in major.columns
+                        else str(idx).lower()
+                    )
+                    val = (
+                        row.get("Value", row.iloc[-1])
+                        if "Value" in major.columns
+                        else row.iloc[-1]
+                    )
+                    try:
+                        pct = float(val) * 100 if float(val) < 1 else float(val)
+                    except (ValueError, TypeError):
+                        continue
+
+                    if "insider" in breakdown:
+                        holders.append({
+                            "name": "Insiders / Directors",
+                            "shares": 0,
+                            "percentage": round(pct, 2),
+                            "holder_type": "insider_aggregate",
+                            "date_reported": "",
+                            "source": "yfinance_major",
+                        })
+                    elif "institution" in breakdown and "percent" in breakdown:
+                        holders.append({
+                            "name": "Institutional Investors",
+                            "shares": 0,
+                            "percentage": round(pct, 2),
+                            "holder_type": "institutional_aggregate",
+                            "date_reported": "",
+                            "source": "yfinance_major",
+                        })
+
+            if holders:
+                logger.info(
+                    "JSE holders for %s: %d from yfinance (%s)",
+                    identifier, len(holders), self._yf_ticker(identifier),
+                )
+        except Exception as exc:
+            logger.debug("yfinance holders failed for JSE %s: %s", identifier, exc)
+
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return institutional ownership metrics as a single-row snapshot.
+
+        Uses yfinance major_holders for aggregate ownership percentages.
+        JSE does not expose historical holder data via its public APIs.
+        """
+        try:
+            import yfinance as yf
+            tick = yf.Ticker(self._yf_ticker(identifier))
+
+            major = tick.major_holders
+            if major is None or major.empty:
+                return pd.DataFrame()
+
+            inst_pct = 0.0
+            holder_count = 0
+            for idx, row in major.iterrows():
+                breakdown = (
+                    str(row.get("Breakdown", idx)).lower()
+                    if "Breakdown" in major.columns
+                    else str(idx).lower()
+                )
+                val = (
+                    row.get("Value", row.iloc[-1])
+                    if "Value" in major.columns
+                    else row.iloc[-1]
+                )
+                try:
+                    fval = float(val)
+                except (ValueError, TypeError):
+                    continue
+
+                if "institution" in breakdown and "percent" in breakdown:
+                    inst_pct = fval * 100 if fval < 1 else fval
+                elif "institution" in breakdown and "count" in breakdown:
+                    holder_count = int(fval)
+
+            return pd.DataFrame([{
+                "date_reported": pd.Timestamp.now(),
+                "inst_ownership_pct": round(inst_pct, 2),
+                "inst_top5_concentration": 0.0,  # not available from yfinance
+                "inst_holder_count": holder_count,
+            }])
+        except Exception as exc:
+            logger.debug("yfinance holder history failed for JSE %s: %s", identifier, exc)
+            return pd.DataFrame()
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch director dealings from JSE SENS announcements.
+
+        JSE Listings Requirements paragraphs 3.63-3.74 and 6.77-6.85
+        mandate disclosure of director/prescribed officer share dealings
+        via SENS (Stock Exchange News Service).
+
+        This method:
+        1. Fetches SENS announcements for the issuer via the WCF API
+        2. Filters for "dealing" keywords in headlines
+        3. Downloads the SENS PDFs
+        4. Parses structured director dealing data using regex
+
+        The SENS PDFs follow a consistent JSE-mandated format with:
+        - Director name and designation
+        - Transaction date
+        - Number of shares
+        - Total value (ZAR)
+        - Nature of transaction (sale/purchase)
+        - Nature of interest (direct/indirect beneficial)
+        """
+        transactions: list[dict[str, Any]] = []
+
+        master_id = self._resolve_master_id(identifier)
+        if not master_id:
+            logger.debug("JSE: could not resolve MasterID for %s", identifier)
+            return transactions
+
+        # Fetch SENS announcements for this issuer
+        try:
+            resp = requests.post(
+                f"{_JSE_PORTAL_BASE}/_vti_bin/JSE/SENSService.svc/GetSensAnnouncementsByIssuerMasterId",
+                json={"issuerMasterId": master_id},
+                headers=_JSE_HEADERS,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            result_key = next(
+                (k for k in data if "Result" in k), None
+            )
+            announcements = data.get(result_key, []) if result_key else []
+        except Exception as exc:
+            logger.debug("JSE SENS fetch failed for %s: %s", identifier, exc)
+            return transactions
+
+        # Filter for director dealing announcements
+        dealing_keywords = [
+            "dealing in securities",
+            "dealings in securities",
+            "director dealing",
+            "directors dealing",
+            "prescribed officer",
+        ]
+        dealing_anns = [
+            ann for ann in announcements
+            if any(kw in (ann.get("FlashHeadline") or "").lower() for kw in dealing_keywords)
+        ]
+
+        if not dealing_anns:
+            logger.debug("JSE: no director dealing SENS for %s", identifier)
+            return transactions
+
+        logger.info(
+            "JSE insider transactions for %s: %d dealing announcements found",
+            identifier, len(dealing_anns),
+        )
+
+        # Download and parse up to 5 most recent dealing PDFs
+        for ann in dealing_anns[:5]:
+            pdf_url = ann.get("PDFPath", "")
+            if not pdf_url:
+                continue
+
+            # Parse announcement date from WCF /Date() format
+            import re as _re
+            ann_date = ""
+            ts_raw = ann.get("AcknowledgeDateTime", "")
+            ts_match = _re.search(r"/Date\((\d+)", str(ts_raw))
+            if ts_match:
+                dt = datetime.fromtimestamp(
+                    int(ts_match.group(1)) / 1000, tz=timezone.utc
+                )
+                ann_date = dt.strftime("%Y-%m-%d")
+
+            try:
+                pdf_resp = requests.get(
+                    pdf_url,
+                    headers={"User-Agent": _JSE_HEADERS["User-Agent"]},
+                    timeout=15,
+                )
+                if pdf_resp.status_code != 200 or pdf_resp.content[:4] != b"%PDF":
+                    continue
+
+                parsed = _parse_director_dealings_pdf(pdf_resp.content, ann_date)
+                transactions.extend(parsed)
+                time.sleep(0.5)  # rate limiting between PDF downloads
+            except Exception as exc:
+                logger.debug(
+                    "JSE dealing PDF parse failed for %s: %s", pdf_url, exc
+                )
+
+        if transactions:
+            logger.info(
+                "JSE insider transactions for %s: %d transactions parsed from %d PDFs",
+                identifier, len(transactions), min(len(dealing_anns), 5),
+            )
+        return transactions
+
+
+def _parse_director_dealings_pdf(
+    pdf_bytes: bytes, announcement_date: str = ""
+) -> list[dict[str, Any]]:
+    """Parse a JSE SENS director dealings PDF into structured transactions.
+
+    JSE-mandated format includes fields like:
+    - Director / Name of associate
+    - Nature of transaction (sale/purchase)
+    - Transaction date
+    - Number of shares / securities
+    - Total value
+    - Price per share (VWAP or average weighted)
+
+    Two common formats:
+    1. Tabular (Sasol style): surname, company, date, shares, value in table rows
+    2. Key-value (Naspers/Lighthouse style): labeled lines like "Director: X"
+    """
+    try:
+        import pdfplumber
+        import io
+    except ImportError:
+        logger.debug("pdfplumber not installed -- cannot parse JSE dealing PDFs")
+        return []
+
+    transactions: list[dict[str, Any]] = []
+
+    try:
+        full_text = ""
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages[:4]:
+                text = page.extract_text() or ""
+                full_text += text + "\n"
+    except Exception as exc:
+        logger.debug("PDF text extraction failed: %s", exc)
+        return []
+
+    if not full_text.strip():
+        return []
+
+    import re as _re
+
+    # Strategy 1: Key-value format (most common for single-transaction PDFs)
+    # Look for patterns like "Director: John Smith" and "Number of shares: 10,000"
+    director_patterns = [
+        # "Director: Jacobus Petrus Bekker" -- must start with a capital letter name, not "In compliance..."
+        _re.compile(r"^Director[:\s]+([A-Z][a-zA-Z\s,.'()-]+?)(?:\n|$)", _re.IGNORECASE | _re.MULTILINE),
+        _re.compile(r"Name of director[^:]*[:\s]+([A-Z][a-zA-Z\s,.'()-]+?)(?:\n|$)", _re.IGNORECASE),
+        _re.compile(r"Name of associate[:\s]+([A-Z][a-zA-Z\s,.'()-]+?)(?:\n|$)", _re.IGNORECASE),
+        # "Surname and initials" column header followed by name line
+        _re.compile(r"Surname\s+.*?\n\s*(?:and initials.*?\n\s*)?([A-Z][a-z]+ [A-Z](?:\s[A-Z])?)", _re.IGNORECASE),
+    ]
+    date_patterns = [
+        _re.compile(r"Transaction date[:\s]+(\d{1,2}\s+\w+\s+\d{4})", _re.IGNORECASE),
+        _re.compile(r"Transaction date[:\s]+(\d{4}-\d{2}-\d{2})", _re.IGNORECASE),
+        _re.compile(r"Transaction date[:\s]+(\d{1,2}\s+\w+\s+\d{4})", _re.IGNORECASE),
+    ]
+    shares_patterns = [
+        _re.compile(r"Number of (?:shares|securities)[:\s]+([\d,\s]+)", _re.IGNORECASE),
+    ]
+    value_patterns = [
+        _re.compile(r"Total value[:\s]+[rR]?\s?([\d,.\s]+)", _re.IGNORECASE),
+        _re.compile(r"Total value of (?:the )?transaction[:\s]+[rR]?\s?([\d,.\s]+)", _re.IGNORECASE),
+    ]
+    nature_patterns = [
+        _re.compile(r"Nature of transaction[:\s]+(.+?)(?:\n|$)", _re.IGNORECASE),
+    ]
+    interest_patterns = [
+        _re.compile(r"Nature (?:and extent )?of (?:director.s )?interest[:\s]+(.+?)(?:\n|$)", _re.IGNORECASE),
+    ]
+    price_patterns = [
+        _re.compile(r"(?:Average weighted |Volume weighted average\s+)price per share[:\s]+[rR]?\s?([\d,.\s]+)", _re.IGNORECASE),
+        _re.compile(r"Price per (?:share|security)[:\s]+[rR]?\s?([\d,.\s]+)", _re.IGNORECASE),
+    ]
+
+    def _extract_first(patterns: list, text: str) -> str:
+        for pat in patterns:
+            m = pat.search(text)
+            if m:
+                return m.group(1).strip()
+        return ""
+
+    def _parse_number(s: str) -> float:
+        """Parse a number from JSE format (commas, spaces, R prefix)."""
+        if not s:
+            return 0.0
+        cleaned = s.replace(",", "").replace(" ", "").replace("R", "").strip()
+        try:
+            return float(cleaned)
+        except (ValueError, TypeError):
+            return 0.0
+
+    def _parse_date(s: str) -> str:
+        """Parse a date string to ISO format."""
+        if not s:
+            return ""
+        months = {
+            "january": "01", "february": "02", "march": "03", "april": "04",
+            "may": "05", "june": "06", "july": "07", "august": "08",
+            "september": "09", "october": "10", "november": "11", "december": "12",
+        }
+        # "26 February 2026" format
+        m = _re.match(r"(\d{1,2})\s+(\w+)\s+(\d{4})", s.strip())
+        if m:
+            day, month_name, year = m.groups()
+            month_num = months.get(month_name.lower(), "")
+            if month_num:
+                return f"{year}-{month_num}-{int(day):02d}"
+        # Already ISO
+        if _re.match(r"\d{4}-\d{2}-\d{2}", s):
+            return s[:10]
+        return s
+
+    # Check for multi-transaction blocks (Naspers style: repeated "Transaction date" lines)
+    tx_date_matches = list(_re.finditer(
+        r"Transaction date[:\s]+(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2})",
+        full_text, _re.IGNORECASE,
+    ))
+
+    director_name = _extract_first(director_patterns, full_text)
+    nature = _extract_first(nature_patterns, full_text)
+    interest_type = _extract_first(interest_patterns, full_text)
+
+    # Classify transaction type
+    transaction_type = "Unknown"
+    nature_lower = nature.lower()
+    if "sale" in nature_lower or "disposal" in nature_lower or "sold" in nature_lower:
+        transaction_type = "Sale"
+    elif "purchase" in nature_lower or "acquisition" in nature_lower or "bought" in nature_lower:
+        transaction_type = "Purchase"
+    elif "vesting" in nature_lower or "award" in nature_lower:
+        transaction_type = "Vesting"
+
+    if len(tx_date_matches) > 1:
+        # Multi-transaction PDF: split text into blocks per transaction date
+        for i, match in enumerate(tx_date_matches):
+            start = match.start()
+            end = tx_date_matches[i + 1].start() if i + 1 < len(tx_date_matches) else len(full_text)
+            block = full_text[start:end]
+
+            tx_date = _parse_date(match.group(1))
+            shares = _parse_number(_extract_first(shares_patterns, block))
+            value = _parse_number(_extract_first(value_patterns, block))
+            price = _parse_number(_extract_first(price_patterns, block))
+
+            if shares > 0 or value > 0:
+                transactions.append({
+                    "insider_name": director_name,
+                    "position": "Director",
+                    "date": tx_date or announcement_date,
+                    "transaction": transaction_type,
+                    "shares": int(shares),
+                    "value": value,
+                    "price_per_share": price,
+                    "interest_type": interest_type,
+                    "source": "jse_sens",
+                })
+    elif tx_date_matches:
+        # Single transaction
+        tx_date = _parse_date(tx_date_matches[0].group(1))
+        shares = _parse_number(_extract_first(shares_patterns, full_text))
+        value = _parse_number(_extract_first(value_patterns, full_text))
+        price = _parse_number(_extract_first(price_patterns, full_text))
+
+        if shares > 0 or value > 0:
+            transactions.append({
+                "insider_name": director_name,
+                "position": "Director",
+                "date": tx_date or announcement_date,
+                "transaction": transaction_type,
+                "shares": int(shares),
+                "value": value,
+                "price_per_share": price,
+                "interest_type": interest_type,
+                "source": "jse_sens",
+            })
+
+    # Extract price for use in both strategies
+    price = _parse_number(_extract_first(price_patterns, full_text))
+
+    # Strategy 2: Tabular format (Sasol style)
+    # Format: "V D Kahla Sasol Limited: Director 26 February 2026 7 000 924 677,89"
+    # Name format: initials before surname (e.g. "V D Kahla") or surname first
+    # Numbers use spaces as thousands separators and commas as decimal separators
+    if not transactions:
+        # Split into lines and look for lines containing a date pattern
+        for line in full_text.split("\n"):
+            # Must contain a date like "26 February 2026"
+            date_match = _re.search(r"(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})", line, _re.IGNORECASE)
+            if not date_match:
+                continue
+
+            tx_date = _parse_date(date_match.group(1))
+
+            # Extract name: initials + surname
+            # "V D Kahla Sasol Limited: Director ..." -> "V D Kahla"
+            # Pattern: optional single-letter initials + one capitalized surname
+            name_match = _re.match(
+                r"((?:[A-Z]\s+)+[A-Z][a-z]+)",
+                line.strip(),
+            )
+            if not name_match:
+                # Fallback: try surname + initials (e.g. "Kahla V D")
+                name_match = _re.match(
+                    r"([A-Z][a-z]+\s+[A-Z](?:\s+[A-Z])?)",
+                    line.strip(),
+                )
+            name = name_match.group(1).strip() if name_match else ""
+
+            # Extract numbers after the date: "7 000 924 677,89"
+            # SA format: spaces as thousands sep, comma as decimal sep
+            # Strategy: parse the total value using the comma as decimal
+            # anchor, then compute shares = round(value / price_per_share)
+            after_date = line[date_match.end():].strip()
+            shares = 0
+            value = 0.0
+
+            # SA format uses spaces as thousands separators and comma as
+            # decimal separator.  "7 000 924 677,89" means two numbers:
+            # shares=7,000 and value=924,677.89 but they merge into one
+            # string with no reliable delimiter.
+            #
+            # Strategy: parse the full blob as one number, then use the
+            # price per share (from another line) to find the correct split.
+            # value / price should give a round share count.
+            val_match = _re.search(
+                r"((?:\d[\d\s]*\d|\d)),(\d{2})\s*$", after_date
+            )
+            if val_match:
+                full_int = val_match.group(1).replace(" ", "")
+                full_dec = val_match.group(2)
+                try:
+                    full_number = float(f"{full_int}.{full_dec}")
+                except ValueError:
+                    full_number = 0.0
+
+                if price > 0 and full_number > 0:
+                    # Try splitting: the true value = shares * price
+                    # Check if full_number itself is the value (shares before it)
+                    candidate_shares = round(full_number / price)
+                    # Verify: candidate_shares * price should be close to full_number
+                    if candidate_shares > 0 and abs(candidate_shares * price - full_number) / full_number < 0.01:
+                        # full_number is the value, but shares got eaten into it
+                        # The digit groups before the decimal: try peeling off leading groups as shares
+                        digit_groups = _re.findall(r"\d+", val_match.group(1))
+                        # Try: first N groups = shares, rest = value
+                        for split_at in range(1, len(digit_groups)):
+                            try_shares_str = "".join(digit_groups[:split_at])
+                            try_val_str = "".join(digit_groups[split_at:]) + "." + full_dec
+                            try:
+                                try_shares = int(try_shares_str)
+                                try_val = float(try_val_str)
+                            except ValueError:
+                                continue
+                            if try_shares > 0 and try_val > 0 and price > 0:
+                                ratio = try_val / try_shares
+                                if abs(ratio - price) / price < 0.05:
+                                    shares = try_shares
+                                    value = try_val
+                                    break
+                        if shares == 0:
+                            # Fallback: full number is value, compute shares from price
+                            value = full_number
+                            shares = round(value / price)
+                    else:
+                        value = full_number
+                        shares = round(value / price) if price > 0 else 0
+                else:
+                    value = full_number
+
+            # Also try to get price from subsequent lines
+            price = _parse_number(_extract_first(price_patterns, full_text))
+
+            if (shares > 0 or value > 0) and name:
+                transactions.append({
+                    "insider_name": name,
+                    "position": "Director",
+                    "date": tx_date or announcement_date,
+                    "transaction": transaction_type,
+                    "shares": shares,
+                    "value": value,
+                    "price_per_share": price,
+                    "interest_type": interest_type,
+                    "source": "jse_sens",
+                })
+
+    return transactions
