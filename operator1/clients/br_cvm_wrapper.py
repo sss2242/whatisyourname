@@ -520,89 +520,109 @@ class BRCvmClient:
             from io import BytesIO
             from datetime import date as _date
 
-            # FRE archives contain shareholder composition
+            # CVM FRE master ZIP contains posicao_acionaria CSV with
+            # structured shareholder data (name, shares, percentage,
+            # controlling flag, nationality).  The correct URL is the
+            # master ZIP: fre_cia_aberta_{year}.zip which contains
+            # fre_cia_aberta_posicao_acionaria_{year}.csv inside it.
             current_year = _date.today().year
             for year in range(current_year, current_year - 3, -1):
-                url = f"{_CVM_DATASET_BASE}/DOC/FRE/DADOS/fre_cia_aberta_posicao_acionaria_{year}.zip"
+                url = f"{_CVM_DATASET_BASE}/DOC/FRE/DADOS/fre_cia_aberta_{year}.zip"
                 try:
-                    resp = requests.get(url, timeout=60)
+                    resp = requests.get(url, timeout=120)
                     if resp.status_code != 200:
                         continue
                     z = zipfile.ZipFile(BytesIO(resp.content))
-                    for name in z.namelist():
-                        if name.endswith(".csv"):
-                            with z.open(name) as f:
+
+                    # Find the posicao_acionaria CSV inside the master ZIP
+                    target_csv = f"fre_cia_aberta_posicao_acionaria_{year}.csv"
+                    if target_csv not in z.namelist():
+                        # Try case-insensitive match
+                        target_csv = next(
+                            (n for n in z.namelist() if "posicao_acionaria" in n.lower()),
+                            "",
+                        )
+                    if not target_csv:
+                        logger.debug("CVM FRE %d: no posicao_acionaria CSV found", year)
+                        continue
+
+                    with z.open(target_csv) as f:
+                        try:
+                            df = pd.read_csv(
+                                f, sep=";", encoding="latin-1",
+                                dtype=str, on_bad_lines="skip",
+                            )
+                        except Exception:
+                            continue
+
+                    # Filter for this company by CNPJ or Nome_Companhia
+                    # First try matching by company name from CVM registry
+                    matches = self.list_companies(query=identifier)
+                    company_name = matches[0].get("name", "") if matches else ""
+                    cnpj = matches[0].get("cnpj", "") if matches else ""
+
+                    company_rows = pd.DataFrame()
+                    if cnpj and "CNPJ_Companhia" in df.columns:
+                        company_rows = df[df["CNPJ_Companhia"] == cnpj]
+                    if company_rows.empty and company_name and "Nome_Companhia" in df.columns:
+                        company_rows = df[
+                            df["Nome_Companhia"].str.contains(
+                                company_name.split()[0], case=False, na=False,
+                            )
+                        ]
+                    if company_rows.empty:
+                        continue
+
+                    # Extract holder data from CVM FRE posicao_acionaria columns
+                    for _, row in company_rows.iterrows():
+                        holder_name = str(row.get("Acionista", "")).strip()
+                        if not holder_name or holder_name.lower() in ("outros", "acoes tesouraria"):
+                            continue
+
+                        pct = 0.0
+                        for col in ("Percentual_Total_Acoes_Circulacao",
+                                    "Percentual_Acao_Ordinaria_Circulacao"):
+                            val = row.get(col)
+                            if pd.notna(val):
                                 try:
-                                    df = pd.read_csv(
-                                        f, sep=";", encoding="latin-1",
-                                        dtype=str, on_bad_lines="skip",
-                                    )
-                                except Exception:
-                                    continue
+                                    pct = float(str(val).replace(",", "."))
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
 
-                                # Filter for this company
-                                cvm_col = None
-                                for c in ("CD_CVM", "cd_cvm"):
-                                    if c in df.columns:
-                                        cvm_col = c
-                                        break
-                                if cvm_col is None:
-                                    continue
+                        shares = 0
+                        for col in ("Quantidade_Total_Acoes_Circulacao",
+                                    "Quantidade_Acao_Ordinaria_Circulacao"):
+                            val = row.get(col)
+                            if pd.notna(val):
+                                try:
+                                    shares = int(float(str(val).replace(",", "")))
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
 
-                                company_rows = df[df[cvm_col].astype(str).str.strip() == str(cd_cvm)]
-                                if company_rows.empty:
-                                    continue
+                        date_str = str(row.get("Data_Referencia", ""))
+                        is_controller = str(row.get("Acionista_Controlador", "")) == "S"
+                        nationality = str(row.get("Nacionalidade", ""))
 
-                                # Extract holder data from FRE columns
-                                for _, row in company_rows.iterrows():
-                                    name = ""
-                                    pct = 0.0
-                                    shares = 0
-                                    for col in ("NM_ACIONISTA", "Nm_Acionista", "nm_acionista"):
-                                        if col in row.index and pd.notna(row[col]):
-                                            name = str(row[col]).strip()
-                                            break
-                                    for col in ("QT_ACOES_ON", "Qt_Acoes_On", "qt_acoes_on",
-                                                "QT_ACOES_PN", "Qt_Acoes_Pn", "qt_acoes_pn",
-                                                "QT_ACOES_TOTAL", "Qt_Acoes_Total"):
-                                        if col in row.index and pd.notna(row[col]):
-                                            try:
-                                                shares += int(float(str(row[col]).replace(",", "").replace(".", "")))
-                                            except (ValueError, TypeError):
-                                                pass
-                                    for col in ("PERC_TOTAL", "Perc_Total", "perc_total",
-                                                "VL_PARTICIPACAO", "Vl_Participacao"):
-                                        if col in row.index and pd.notna(row[col]):
-                                            try:
-                                                pct = float(str(row[col]).replace(",", "."))
-                                                if 0 < pct < 1:
-                                                    pct *= 100
-                                                break
-                                            except (ValueError, TypeError):
-                                                pass
-                                    date_str = ""
-                                    for col in ("DT_REFER", "Dt_Refer", "dt_refer"):
-                                        if col in row.index and pd.notna(row[col]):
-                                            date_str = str(row[col]).strip()
-                                            break
+                        if holder_name and (pct > 0 or shares > 0):
+                            holders.append({
+                                "name": holder_name,
+                                "shares": shares,
+                                "value": 0.0,
+                                "percentage": round(pct, 2),
+                                "holder_type": "controlling" if is_controller else "institutional",
+                                "date_reported": date_str,
+                                "nationality": nationality,
+                                "source": f"cvm_fre_posicao_acionaria_{year}",
+                            })
 
-                                    if name and (pct > 0 or shares > 0):
-                                        holders.append({
-                                            "name": name,
-                                            "shares": shares,
-                                            "value": 0.0,
-                                            "percentage": round(pct, 2),
-                                            "holder_type": "institutional",
-                                            "date_reported": date_str,
-                                            "source": f"cvm_fre_{year}",
-                                        })
-
-                                if holders:
-                                    logger.info(
-                                        "BR holders for %s: %d from CVM FRE %d",
-                                        identifier, len(holders), year,
-                                    )
-                                    return holders
+                    if holders:
+                        logger.info(
+                            "BR holders for %s: %d from CVM FRE %d posicao_acionaria",
+                            identifier, len(holders), year,
+                        )
+                        return holders
                 except Exception as exc:
                     logger.debug("CVM FRE %d fetch failed: %s", year, exc)
                     continue
