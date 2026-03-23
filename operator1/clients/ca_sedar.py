@@ -368,3 +368,204 @@ class CASedarClient:
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
+
+    # -- Institutional holders (TMX GraphQL for insider activity) -------------
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch insider activity summary from TMX GraphQL API.
+
+        Uses the ``getCompanyInsidersActivities`` GraphQL query discovered
+        by probing the TMX Money Next.js app JS bundles.  Returns
+        aggregated insider buy/sell activity per period.
+
+        For detailed insider transactions, see ``get_insider_transactions()``.
+
+        Probing confirmed (2026-03-23):
+          - SEDAR+ direct API: behind PerfDrive WAF (2.9KB challenge pages)
+          - SEDAR+ Catalyst form: insider/earlyWarning types return 404
+          - SEDI database: form-based, no REST API found
+          - TMX GraphQL: ``getInsiderTransactions`` returns full SEDI data
+          - TMX GraphQL: ``getCompanyInsidersActivities`` returns aggregated data
+          - TMX REST API: /api/* endpoints return health check page, no data
+          - TMX GraphQL introspection: blocked by Apollo Server
+        """
+        holders: list[dict[str, Any]] = []
+        import requests as _requests
+
+        try:
+            # getCompanyInsidersActivities returns aggregated insider activity
+            r = _requests.post(
+                _TMX_GRAPHQL_URL,
+                json={
+                    "query": (
+                        "query getCompanyInsidersActivities($symbol: String) {\n"
+                        "  getCompanyInsidersActivities(symbol: $symbol) {\n"
+                        "    insiderActivities {\n"
+                        "      periodkey\n"
+                        "      buy {\n"
+                        "        numberOfTransactions\n"
+                        "        shares\n"
+                        "        averagePrice\n"
+                        "        totalValue\n"
+                        "      }\n"
+                        "      sell {\n"
+                        "        numberOfTransactions\n"
+                        "        shares\n"
+                        "        averagePrice\n"
+                        "        totalValue\n"
+                        "      }\n"
+                        "    }\n"
+                        "  }\n"
+                        "}"
+                    ),
+                    "variables": {"symbol": identifier.upper()},
+                },
+                headers={
+                    **_TMX_HEADERS,
+                    "Content-Type": "application/json",
+                    "locale": "en",
+                },
+                timeout=15,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                activities = (
+                    data.get("data", {})
+                    .get("getCompanyInsidersActivities", {})
+                    .get("insiderActivities", [])
+                )
+                if activities:
+                    for act in activities:
+                        period = act.get("periodkey", "")
+                        buy = act.get("buy", {}) or {}
+                        sell = act.get("sell", {}) or {}
+                        buy_txns = buy.get("numberOfTransactions", 0) or 0
+                        sell_txns = sell.get("numberOfTransactions", 0) or 0
+                        buy_shares = buy.get("shares", 0) or 0
+                        sell_shares = sell.get("shares", 0) or 0
+
+                        if buy_txns > 0:
+                            holders.append({
+                                "name": f"Insider Buys ({period})",
+                                "shares": int(buy_shares),
+                                "value": float(buy.get("totalValue", 0) or 0),
+                                "percentage": 0.0,
+                                "holder_type": "insider_buy_aggregate",
+                                "date_reported": period,
+                                "source": "tmx_graphql_insiders",
+                                "transactions": int(buy_txns),
+                                "avg_price": float(buy.get("averagePrice", 0) or 0),
+                            })
+                        if sell_txns > 0:
+                            holders.append({
+                                "name": f"Insider Sells ({period})",
+                                "shares": int(sell_shares),
+                                "value": float(sell.get("totalValue", 0) or 0),
+                                "percentage": 0.0,
+                                "holder_type": "insider_sell_aggregate",
+                                "date_reported": period,
+                                "source": "tmx_graphql_insiders",
+                                "transactions": int(sell_txns),
+                                "avg_price": float(sell.get("averagePrice", 0) or 0),
+                            })
+
+                    logger.info(
+                        "CA holders for %s: %d insider activity periods from TMX GraphQL",
+                        identifier, len(holders),
+                    )
+        except Exception as exc:
+            logger.debug("TMX GraphQL insider activity failed for %s: %s", identifier, exc)
+
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return ownership metrics from TMX insider activity data."""
+        try:
+            from datetime import date as _date
+            holders = self.get_holders(identifier)
+            if not holders:
+                return pd.DataFrame()
+
+            total_buy_value = sum(
+                h.get("value", 0) for h in holders if "buy" in h.get("holder_type", "")
+            )
+            total_sell_value = sum(
+                h.get("value", 0) for h in holders if "sell" in h.get("holder_type", "")
+            )
+            net_insider = total_buy_value - total_sell_value
+
+            return pd.DataFrame([{
+                "date_reported": pd.Timestamp(_date.today()),
+                "inst_ownership_pct": 0.0,
+                "inst_top5_concentration": 0.0,
+                "inst_holder_count": len(holders),
+                "insider_net_value": round(net_insider, 2),
+            }])
+        except Exception as exc:
+            logger.debug("CA holder history failed for %s: %s", identifier, exc)
+        return pd.DataFrame()
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch individual insider transactions from TMX GraphQL (SEDI data).
+
+        Uses the ``getInsiderTransactions`` GraphQL query which returns
+        structured SEDI (System for Electronic Disclosure by Insiders) data
+        including: registered holder name, transaction date, share count,
+        price, market value, security designation, and transaction type.
+
+        The ``monthDuration`` parameter controls the lookback window
+        (3 = 3 months, 6 = 6 months, 12 = 12 months).
+        """
+        transactions: list[dict[str, Any]] = []
+        import requests as _requests
+
+        try:
+            r = _requests.post(
+                _TMX_GRAPHQL_URL,
+                json={
+                    "query": (
+                        "query getInsiderTransactions($symbol: String!, $monthDuration: Int) {\n"
+                        "  getInsiderTransactions(symbol: $symbol, monthDuration: $monthDuration)\n"
+                        "}"
+                    ),
+                    "variables": {
+                        "symbol": identifier.upper(),
+                        "monthDuration": 12,
+                    },
+                },
+                headers={
+                    **_TMX_HEADERS,
+                    "Content-Type": "application/json",
+                    "locale": "en",
+                },
+                timeout=15,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                txn_list = data.get("data", {}).get("getInsiderTransactions", [])
+                if isinstance(txn_list, list):
+                    for txn in txn_list:
+                        if not isinstance(txn, dict):
+                            continue
+                        transactions.append({
+                            "insider_name": txn.get("registeredholder", ""),
+                            "position": txn.get("generalremarks", ""),
+                            "date": txn.get("date", ""),
+                            "transaction": txn.get("type", ""),
+                            "shares": int(txn.get("amount", 0) or 0),
+                            "value": float(txn.get("marketvalue", 0) or 0),
+                            "price": float(txn.get("pricefrom", 0) or 0),
+                            "security": txn.get("securitydesignation", ""),
+                            "filing_date": txn.get("filingdate", ""),
+                            "source": "tmx_graphql_sedi",
+                        })
+
+                if transactions:
+                    logger.info(
+                        "CA insider transactions for %s: %d from TMX GraphQL (SEDI)",
+                        identifier, len(transactions),
+                    )
+        except Exception as exc:
+            logger.debug("TMX GraphQL insider transactions failed for %s: %s", identifier, exc)
+
+        return transactions
