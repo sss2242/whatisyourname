@@ -1081,151 +1081,106 @@ class INBseClient:
             except Exception as exc:
                 logger.debug("BSE filing discoverer for shareholding failed for %s: %s", identifier, exc)
 
-        # FALLBACK: yfinance aggregate stats (only if native sources returned nothing)
-        if not holders:
-            try:
-                import yfinance as yf
-                yf_ticker = self._yf_ticker(identifier)
-                tick = yf.Ticker(yf_ticker)
-
-                mh = tick.major_holders
-                if mh is not None and not mh.empty:
-                    for idx, row in mh.iterrows():
-                        breakdown = (
-                            str(row.get("Breakdown", idx)).lower()
-                            if "Breakdown" in mh.columns
-                            else str(idx).lower()
-                        )
-                        val = (
-                            row.get("Value", row.iloc[-1])
-                            if "Value" in mh.columns
-                            else row.iloc[-1]
-                        )
-                        try:
-                            pct = float(val) * 100 if float(val) < 1 else float(val)
-                        except (ValueError, TypeError):
-                            continue
-
-                        if "insider" in breakdown:
-                            holders.append({
-                                "name": "Insiders / Promoters",
-                                "shares": 0,
-                                "percentage": round(pct, 2),
-                                "holder_type": "promoter",
-                                "date_reported": "",
-                                "source": "yfinance_major",
-                            })
-                        elif "institution" in breakdown and "percent" in breakdown:
-                            holders.append({
-                                "name": "Institutional Investors",
-                                "shares": 0,
-                                "percentage": round(pct, 2),
-                                "holder_type": "institutional",
-                                "date_reported": "",
-                                "source": "yfinance_major",
-                            })
-
-                if holders:
-                    logger.info("BSE holders fallback for %s: %d from yfinance", identifier, len(holders))
-            except Exception as exc:
-                logger.debug("yfinance holders fallback failed for BSE %s: %s", identifier, exc)
+        # No yfinance fallback -- native BSE SAST + fuzzy PDF extraction only.
+        # Probing confirmed: ShareHoldPat/w and InsiderTrading/w are blocked
+        # (redirect loops), shpSecurities.aspx is JS-rendered.  The SAST
+        # announcements via AnnSubCategoryGetData + fuzzy PDF extraction are
+        # the only working native paths for holder data.
 
         return holders
 
     def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
-        """Return institutional ownership metrics as a single-row snapshot.
+        """Return institutional ownership metrics from BSE native data.
 
-        Uses yfinance major_holders to extract aggregate ownership stats
-        for Indian companies.  yfinance provides a current-quarter snapshot.
-
-        Uses the same pattern as HKHkexClient.get_holder_history().
+        Derives aggregate metrics from get_holders() which uses BSE SAST
+        disclosures and fuzzy PDF extraction.  No yfinance dependency.
         """
         try:
-            import yfinance as yf
             from datetime import date as _date
-            yf_ticker = self._yf_ticker(identifier)
-            tick = yf.Ticker(yf_ticker)
-
-            mh = tick.major_holders
-            inst_pct = 0.0
-            inst_count = 0
-            if mh is not None and not mh.empty:
-                for idx, row in mh.iterrows():
-                    breakdown = (
-                        str(row.get("Breakdown", idx)).lower()
-                        if "Breakdown" in mh.columns
-                        else str(idx).lower()
-                    )
-                    val = (
-                        row.get("Value", row.iloc[-1])
-                        if "Value" in mh.columns
-                        else row.iloc[-1]
-                    )
-                    if (
-                        "institutionspercentheld" in breakdown
-                        or ("institutions" in breakdown and "percent" in breakdown)
-                    ):
-                        inst_pct = float(val) * 100 if float(val) < 1 else float(val)
-                    elif "institutionscount" in breakdown or "count" in breakdown:
-                        inst_count = int(float(val))
 
             holders = self.get_holders(identifier)
-            hhi = 0.0
-            if holders:
-                top5 = [h for h in holders if h.get("holder_type") != "category"][:5]
-                if not top5:
-                    top5 = holders[:5]
-                total_pct = sum(h.get("percentage", 0) for h in top5)
-                if total_pct > 0:
-                    hhi = sum(
-                        (h.get("percentage", 0) / total_pct) ** 2 for h in top5
-                    )
+            if not holders:
+                return pd.DataFrame()
 
-            if inst_pct > 0 or inst_count > 0 or holders:
-                return pd.DataFrame([{
-                    "date_reported": pd.Timestamp(_date.today()),
-                    "inst_ownership_pct": round(inst_pct, 2),
-                    "inst_top5_concentration": round(hhi, 4),
-                    "inst_holder_count": inst_count or len(holders),
-                }])
+            # Compute aggregate metrics from native holder data
+            inst_holders = [
+                h for h in holders
+                if h.get("holder_type") in ("institutional", "substantial")
+            ]
+            cat_holders = [h for h in holders if h.get("holder_type") == "category"]
+
+            inst_pct = sum(h.get("percentage", 0) for h in inst_holders)
+            # If we have category breakdowns (from SEBI shareholding pattern),
+            # use those for more accurate institutional percentage
+            for ch in cat_holders:
+                if "fii" in ch.get("name", "").lower() or "institutional" in ch.get("name", "").lower():
+                    inst_pct = max(inst_pct, ch.get("percentage", 0))
+
+            hhi = 0.0
+            top5 = [h for h in holders if h.get("holder_type") != "category"][:5]
+            if not top5:
+                top5 = holders[:5]
+            total_pct = sum(h.get("percentage", 0) for h in top5)
+            if total_pct > 0:
+                hhi = sum(
+                    (h.get("percentage", 0) / total_pct) ** 2 for h in top5
+                )
+
+            return pd.DataFrame([{
+                "date_reported": pd.Timestamp(_date.today()),
+                "inst_ownership_pct": round(inst_pct, 2),
+                "inst_top5_concentration": round(hhi, 4),
+                "inst_holder_count": len(inst_holders) or len(holders),
+            }])
         except Exception as exc:
             logger.debug("BSE holder history failed for %s: %s", identifier, exc)
         return pd.DataFrame()
 
     def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch insider transactions via yfinance for BSE/NSE-listed companies.
+        """Fetch insider transactions from BSE SAST announcements.
 
-        Uses the same pattern as HKHkexClient.get_insider_transactions().
-        yfinance returns SEBI SAST disclosure data for Indian companies.
+        Uses the BSE AnnSubCategoryGetData API with strCat='Insider Trading / SAST'
+        to discover SEBI Regulation 29/31 filings.  Each announcement contains
+        the insider name in the HEADLINE/NEWSSUB field and the transaction
+        date.  PDF attachments can be extracted for detailed share counts.
+
+        Probing confirmed: InsiderTrading/w endpoint is blocked (redirect loop).
+        The AnnSubCategoryGetData API is the only working path.
         """
         transactions: list[dict[str, Any]] = []
+        scrip_code = _resolve_scrip_code(identifier)
         try:
-            import yfinance as yf
-            yf_ticker = self._yf_ticker(identifier)
-            tick = yf.Ticker(yf_ticker)
-            insider = tick.insider_transactions
-            if insider is not None and not insider.empty:
-                for _, row in insider.iterrows():
-                    shares = 0
-                    try:
-                        shares = int(row.get("Shares", 0))
-                    except (ValueError, TypeError):
-                        pass
+            bse_session = _get_bse_session()
+            sast_filings = _fetch_bse_sast_disclosures(scrip_code, bse_session)
+            if sast_filings:
+                for filing in sast_filings[:20]:
+                    headline = filing.get("NEWSSUB", filing.get("HEADLINE", ""))
+                    date_str = filing.get("DT_TM", "")[:10]
+                    # Parse insider name from headline
+                    # SAST headlines: "Closure of Trading Window" or
+                    # "Acquisition of shares by [NAME]" or similar
+                    insider_name = headline[:60] if headline else "Unknown"
+                    txn_type = "SAST Disclosure"
+                    if "closure" in headline.lower():
+                        txn_type = "Trading Window Closure"
+                    elif "acquisition" in headline.lower():
+                        txn_type = "Acquisition"
+                    elif "disposal" in headline.lower() or "sale" in headline.lower():
+                        txn_type = "Disposal"
                     transactions.append({
-                        "insider_name": str(row.get("Insider", "")),
-                        "position": str(row.get("Position", "")),
-                        "date": str(row.get("Start Date", "")),
-                        "transaction": str(row.get("Transaction", "")),
-                        "shares": shares,
-                        "value": float(row.get("Value", 0) or 0),
+                        "insider_name": insider_name,
+                        "position": "",
+                        "date": date_str,
+                        "transaction": txn_type,
+                        "shares": 0,
+                        "value": 0.0,
+                        "source": "bse_sast_announcement",
                     })
-                logger.info(
-                    "BSE insider transactions for %s: %d (%s)",
-                    identifier, len(transactions), yf_ticker,
-                )
+                if transactions:
+                    logger.info(
+                        "BSE insider transactions for %s: %d from SAST announcements",
+                        identifier, len(transactions),
+                    )
         except Exception as exc:
-            logger.debug(
-                "yfinance insider transactions failed for BSE %s: %s",
-                identifier, exc,
-            )
+            logger.debug("BSE SAST insider transactions failed for %s: %s", identifier, exc)
         return transactions

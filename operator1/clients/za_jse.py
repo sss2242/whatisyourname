@@ -383,155 +383,137 @@ class ZAJseClient:
         return None
 
     def get_holders(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch institutional holders via yfinance + SENS shareholding announcements.
+        """Fetch holders from JSE SENS shareholding announcements.
 
-        Two-source strategy (mirrors the SGX/BSE pattern):
+        Uses the JSE WCF SENSService to find shareholding-related
+        announcements (Section 122 Companies Act disclosures, major
+        shareholder changes).  Parses headlines for shareholder names
+        and percentages using regex patterns.
 
-        1. **yfinance** (.JO suffix): provides institutional_holders and
-           mutualfund_holders tables for major JSE-listed companies.
+        Probing confirmed (2026-03-23):
+          - GetShareholdersForIssuer: 404 (doesn't exist)
+          - GetMajorShareholdersForIssuer: 404
+          - GetOwnershipForIssuer: 404
+          - GetDirectorsForIssuer: 404
+          - SENS announcements are the ONLY holder data source on JSE WCF
 
-        2. **SENS announcements**: filters for shareholding-related SENS
-           announcements (Section 122 disclosures, major shareholder changes)
-           via the JSE WCF SENSService.  Parses PDF announcements for
-           shareholder names and percentages.
-
-        Returns list of dicts with: name, shares, percentage, holder_type,
-        date_reported, source.
+        No yfinance dependency.
         """
         holders: list[dict[str, Any]] = []
+        import re as _re
 
-        # Primary: yfinance institutional + mutual fund holders
+        # Get SENS announcements and filter for shareholding disclosures
+        master_id = self._resolve_master_id(identifier)
+        if not master_id:
+            return holders
+
         try:
-            import yfinance as yf
-            tick = yf.Ticker(self._yf_ticker(identifier))
+            resp = requests.post(
+                f"{_JSE_PORTAL_BASE}/_vti_bin/JSE/SENSService.svc/"
+                "GetSensAnnouncementsByIssuerMasterId",
+                json={"issuerMasterId": master_id},
+                headers=_JSE_HEADERS,
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                return holders
 
-            # Institutional holders
-            inst = tick.institutional_holders
-            if inst is not None and not inst.empty:
-                for _, row in inst.iterrows():
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "institutional",
-                        "date_reported": str(row.get("Date Reported", "")),
-                        "source": "yfinance",
-                    })
+            data = resp.json()
+            announcements = data.get("GetSensAnnouncementsByIssuerMasterIdResult", [])
+            if not isinstance(announcements, list):
+                return holders
 
-            # Mutual fund holders
-            mf = tick.mutualfund_holders
-            if mf is not None and not mf.empty:
-                for _, row in mf.iterrows():
-                    pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                    if isinstance(pct, (int, float)) and 0 < pct < 1:
-                        pct = pct * 100
-                    holders.append({
-                        "name": str(row.get("Holder", "")),
-                        "shares": int(row.get("Shares", 0)),
-                        "value": float(row.get("Value", 0)),
-                        "percentage": round(float(pct), 2),
-                        "holder_type": "mutualfund",
-                        "date_reported": str(row.get("Date Reported", "")),
-                        "source": "yfinance",
-                    })
+            # Filter for shareholding/holder related announcements
+            holder_keywords = (
+                "shareholder", "beneficial", "section 122", "section 56",
+                "director", "interest in", "holding", "acquisition of",
+                "disposal of", "stake",
+            )
+            for ann in announcements:
+                headline = str(ann.get("Headline", "")).strip()
+                headline_lower = headline.lower()
+                if not any(kw in headline_lower for kw in holder_keywords):
+                    continue
 
-            # Major holders aggregate stats
-            major = tick.major_holders
-            if major is not None and not major.empty:
-                for idx, row in major.iterrows():
-                    breakdown = (
-                        str(row.get("Breakdown", idx)).lower()
-                        if "Breakdown" in major.columns
-                        else str(idx).lower()
-                    )
-                    val = (
-                        row.get("Value", row.iloc[-1])
-                        if "Value" in major.columns
-                        else row.iloc[-1]
-                    )
-                    try:
-                        pct = float(val) * 100 if float(val) < 1 else float(val)
-                    except (ValueError, TypeError):
-                        continue
+                date_str = ""
+                raw_date = ann.get("DateTimePublished", "")
+                if raw_date and "/Date(" in str(raw_date):
+                    ts_match = _re.search(r"/Date\((\d+)", str(raw_date))
+                    if ts_match:
+                        from datetime import datetime as _dt, timezone as _tz
+                        dt = _dt.fromtimestamp(int(ts_match.group(1)) / 1000, tz=_tz.utc)
+                        date_str = dt.strftime("%Y-%m-%d")
 
-                    if "insider" in breakdown:
-                        holders.append({
-                            "name": "Insiders / Directors",
-                            "shares": 0,
-                            "percentage": round(pct, 2),
-                            "holder_type": "insider_aggregate",
-                            "date_reported": "",
-                            "source": "yfinance_major",
-                        })
-                    elif "institution" in breakdown and "percent" in breakdown:
-                        holders.append({
-                            "name": "Institutional Investors",
-                            "shares": 0,
-                            "percentage": round(pct, 2),
-                            "holder_type": "institutional_aggregate",
-                            "date_reported": "",
-                            "source": "yfinance_major",
-                        })
+                # Try to extract shareholder name and percentage from headline
+                name = headline[:60]
+                pct = 0.0
+                pct_match = _re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", headline)
+                if pct_match:
+                    pct = float(pct_match.group(1))
+
+                # Classify holder type from headline
+                holder_type = "substantial"
+                if "director" in headline_lower:
+                    holder_type = "director"
+                elif "beneficial" in headline_lower:
+                    holder_type = "beneficial"
+
+                holders.append({
+                    "name": name,
+                    "shares": 0,
+                    "value": 0.0,
+                    "percentage": round(pct, 2),
+                    "holder_type": holder_type,
+                    "date_reported": date_str,
+                    "source": "jse_sens",
+                    "pdf_path": ann.get("PDFPath", ""),
+                })
 
             if holders:
                 logger.info(
-                    "JSE holders for %s: %d from yfinance (%s)",
-                    identifier, len(holders), self._yf_ticker(identifier),
+                    "JSE holders for %s: %d from SENS announcements",
+                    identifier, len(holders),
                 )
         except Exception as exc:
-            logger.debug("yfinance holders failed for JSE %s: %s", identifier, exc)
+            logger.debug("JSE SENS holder search failed for %s: %s", identifier, exc)
 
         return holders
 
     def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
-        """Return institutional ownership metrics as a single-row snapshot.
+        """Return institutional ownership metrics from JSE SENS data.
 
-        Uses yfinance major_holders for aggregate ownership percentages.
-        JSE does not expose historical holder data via its public APIs.
+        Derives aggregate metrics from get_holders() which uses JSE SENS
+        shareholding announcements.  No yfinance dependency.
+
+        Probing confirmed: GetShareholdersForIssuer, GetMajorShareholdersForIssuer,
+        GetOwnershipForIssuer, GetDirectorsForIssuer all return 404.
+        SENS announcements are the only holder data source on JSE WCF.
         """
         try:
-            import yfinance as yf
-            tick = yf.Ticker(self._yf_ticker(identifier))
+            from datetime import date as _date
 
-            major = tick.major_holders
-            if major is None or major.empty:
+            holders = self.get_holders(identifier)
+            if not holders:
                 return pd.DataFrame()
 
-            inst_pct = 0.0
-            holder_count = 0
-            for idx, row in major.iterrows():
-                breakdown = (
-                    str(row.get("Breakdown", idx)).lower()
-                    if "Breakdown" in major.columns
-                    else str(idx).lower()
-                )
-                val = (
-                    row.get("Value", row.iloc[-1])
-                    if "Value" in major.columns
-                    else row.iloc[-1]
-                )
-                try:
-                    fval = float(val)
-                except (ValueError, TypeError):
-                    continue
+            # Compute aggregate metrics from SENS holder data
+            substantial = [h for h in holders if h.get("percentage", 0) > 0]
+            inst_pct = sum(h.get("percentage", 0) for h in substantial)
 
-                if "institution" in breakdown and "percent" in breakdown:
-                    inst_pct = fval * 100 if fval < 1 else fval
-                elif "institution" in breakdown and "count" in breakdown:
-                    holder_count = int(fval)
+            hhi = 0.0
+            top5 = substantial[:5]
+            total_pct = sum(h.get("percentage", 0) for h in top5)
+            if total_pct > 0:
+                hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
 
             return pd.DataFrame([{
-                "date_reported": pd.Timestamp.now(),
+                "date_reported": pd.Timestamp(_date.today()),
                 "inst_ownership_pct": round(inst_pct, 2),
-                "inst_top5_concentration": 0.0,  # not available from yfinance
-                "inst_holder_count": holder_count,
+                "inst_top5_concentration": round(hhi, 4),
+                "inst_holder_count": len(substantial),
             }])
         except Exception as exc:
-            logger.debug("yfinance holder history failed for JSE %s: %s", identifier, exc)
+            logger.debug("JSE holder history failed for %s: %s", identifier, exc)
             return pd.DataFrame()
 
     def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
