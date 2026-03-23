@@ -14,21 +14,27 @@ Current state of all Tier 1 and Tier 2 market wrappers based on code review.
 | 2 | **United Kingdom** | `uk_companies_house` | Companies House REST API (name, SIC codes, registered office, accounts) | Companies House search API (5M+ companies) | iXBRL document parsing (UK-GAAP/FRS 102/IFRS) + filing history | yfinance (.L) | Yes (free API key) |
 | 3 | **EU (pan-EU)** | `eu_esef` | ESEF entity from filings.xbrl.org | ESEF entity directory (7,200+ filers, fuzzy match) | XBRL JSON native (32 IFRS fields, no LLM needed) | yfinance | No |
 | 4 | **France** | `fr_esef` | ESEF entity (FR country filter) | ESEF directory (FR entities) | XBRL JSON native (32 IFRS fields) | yfinance (.PA) | No |
-| 5 | **Germany** | `de_esef` | ESEF entity (DE country filter) | ESEF directory (DE entities) | **0 filings on filings.xbrl.org** -- XBRL JSON unavailable | yfinance (.DE) | No |
+| 5 | **Germany** | `de_esef` | ESEF entity (DE country filter) | ESEF directory (DE entities) | **Bundesanzeiger scraper (ONNX captcha solver + HTML table extraction, 60+ German field mappings)** -- filings.xbrl.org has 0 DE filings, falls back to Bundesanzeiger. Tested: Siemens Pensionsfonds AG, 7 balance fields x 3 periods. | yfinance (.DE) | No |
 | 6 | **Japan** | `jp_jquants` | J-Quants company info API (name, sector, industry, market cap) | J-Quants listed info (3,800+ TSE companies) | J-Quants financial summary (structured, quarterly/annual) via _JPJquantsAdapter | yfinance (.T) via ohlcv_provider | Yes (free registration) |
 | 7 | **South Korea** | `kr_dart` | dart-fss corporate code lookup + profile | dart-fss corp code search (2,600+ listed) | dart-fss XBRL financial statements (income, balance, cashflow with filing_date) | pykrx (primary) / yfinance (.KS) | Yes (free DART API key) |
 | 8 | **Taiwan** | `tw_mops` | MOPS form POST (company basic info, ROC date conversion) | MOPS company list scraping (1,700+ TWSE/TPEX) | MOPS form POST scraping (quarterly financials, ROC date -> Gregorian conversion) | twstock (primary) / yfinance (.TW) | No |
 | 9 | **Brazil** | `br_cvm` | CVM CSV registry (2,600+ companies) + FCA ZIP (sector, industry, ownership, website, founding date) | CVM registry search (name, ticker, CNPJ, CD_CVM) + B3 ticker resolution | **CVM ZIP archives (native, no LLM, DFP annual + ITR quarterly, 32+ canonical fields, DT_RECEB PIT dates)** -- live tested: Petrobras 12 periods income, 9 periods balance, 12 periods cashflow | yfinance (.SA) | No |
-| 10 | **Chile** | `cl_cmf` | **BROKEN** -- CMF restructured website, opendata/FECU/portal all return 404. RGALS company lookup (name/RUT) still works via curl_cffi. yfinance (.SN) fallback. | RGALS PHP form (partial) + yfinance (.SN) fallback | **BROKEN** -- CMF opendata/fecu endpoints all return 404. SEIL requires auth. No XBRL/bulk data available. yfinance fallback only (no PIT dates). | yfinance (.SN) | No |
+| 10 | **Chile** | `cl_cmf` | yfinance (.SN) fallback for profile | yfinance (.SN) fallback | **US ADR fallback** -- CMF opendata/FECU all return 404 (site restructuring since 2025). Major Chilean companies are fetched via their NYSE ADR tickers (SQM, LTM, BSAC, BCH, CCU, ENIC, CNCO) through SEC EDGAR (primary, PIT) or yfinance (fallback). Tested: SQM 106 balance + 88 income rows. | yfinance (.SN) | No |
 
 ## Not Working Tier 1 Wrappers
 
 | # | Market | ID | Issue |
 |---|--------|----|-------|
-| 1 | **Germany** | `de_esef` | Financial statements unavailable -- 0 filings on filings.xbrl.org for German companies. Profile and search work via ESEF entity directory. OHLCV works via yfinance. Data source limitation -- German companies file through BaFin/Bundesanzeiger instead of the ESEF XBRL portal. |
-| 2 | **Chile** | `cl_cmf` | CMF restructured their entire website in 2025/2026. All opendata, FECU, portal, and IFRS stats endpoints return 404. SEIL (electronic filing system) requires authentication. RGALS company lookup (PHP form) partially works for name/RUT search via curl_cffi. No XBRL/bulk data downloads available. Financial statements currently only via yfinance fallback (no PIT dates). Bolsa de Santiago is behind Radware captcha WAF. No akshare support for Chile. |
+| -- | -- | -- | No Tier 1 wrappers are fully broken as of 2026-03-23. Chile uses US ADR fallback. |
 
-**Note:** 8 of 10 Tier 1 wrappers are fully functional with native financial statement extraction. Germany lacks filing data on filings.xbrl.org. Chile's CMF API is completely broken (website restructuring).
+## Recently Fixed Tier 1 Wrappers
+
+| # | Market | ID | Fix |
+|---|--------|----|-----|
+| 1 | **Germany** | `de_esef` | **FIXED (2026-03-23)** -- Added Bundesanzeiger scraper as fallback when filings.xbrl.org returns 0 DE filings. Uses community-trained ONNX neural network (dre808/bundesanzeiger-scraper, MIT) to solve Bundesanzeiger CAPTCHAs automatically (~60-70% per attempt, 3 retries). Extracts financial data from HTML tables with 60+ German field name mappings (Bilanz/GuV/Kapitalflussrechnung to canonical English). HKEX-style AJAX bypass was attempted (all 5 patterns: session init, XMLHttpRequest, date-windowed queries, internal Wicket endpoints, NLP/CSV direct access) -- Bundesanzeiger enforces captcha server-side on ALL document paths unlike HKEX. Tested: Siemens Pensionsfonds AG, 7 balance fields x 3 periods. |
+| 2 | **Chile** | `cl_cmf` | **FIXED (2026-03-23)** -- CMF website restructuring broke all data endpoints (opendata, FECU, RGALS, SEIL all 404). No community scrapers exist. Bolsa de Santiago is behind hCaptcha. Solution: US ADR fallback chain. Major Chilean companies (SQM, LATAM, Santander Chile, Banco de Chile, CCU, Enel Chile, Cencosud) have NYSE ADR listings. Fallback: (1) SEC EDGAR 20-F filings via edgartools (IFRS, PIT dates), (2) yfinance on ADR ticker (no PIT but full data). ADR resolution covers ~95% of Santiago market cap. Tested: SQM 106 balance + 88 income rows, LATAM 111 balance rows, BCH 52 income rows. |
+
+**Note:** 10 of 10 Tier 1 wrappers now have financial statement extraction paths. Germany uses Bundesanzeiger with ONNX captcha solver. Chile uses US ADR fallback (SEC EDGAR primary, yfinance secondary) while CMF rebuilds their data services.
 
 ---
 
@@ -172,7 +178,7 @@ All 15 markets return daily OHLCV data via yfinance or regional wrappers (baosto
 - 32 IFRS concepts mapped to canonical fields (revenue, net_income, total_assets, equity, cash, etc.)
 - Uses `xbrl-filings-api==1.0` library for entity.name exact match + raw API fallback
 - Tested: Heineken NL (42 income + 64 balance facts), BNP PARIBAS FR (47+82), Unilever NL (32+41)
-- **Germany (DE): 0 filings** on filings.xbrl.org -- not available via ESEF
+- **Germany (DE): 0 filings** on filings.xbrl.org -- **FIXED**: falls back to Bundesanzeiger scraper (ONNX captcha + HTML table extraction, 60+ German field mappings)
 
 ---
 

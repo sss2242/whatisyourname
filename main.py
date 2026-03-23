@@ -2692,6 +2692,17 @@ Non-interactive examples:
                 ),
             }
 
+        # Walk-forward results
+        if walk_forward_result is not None:
+            profile["extended_models"]["walk_forward"] = {
+                "available": True,
+                "overall_mae": getattr(walk_forward_result, "overall_mae", None),
+                "overall_best_model": getattr(walk_forward_result, "overall_best_model", None),
+                "n_retrains": len(getattr(walk_forward_result, "retrain_dates", [])),
+                "mode_scores": getattr(walk_forward_result, "mode_scores", {}),
+                "best_model_by_mode": getattr(walk_forward_result, "best_model_by_mode", {}),
+            }
+
         # Burn-out results
         if burnout_result is not None:
             profile["extended_models"]["burnout"] = {
