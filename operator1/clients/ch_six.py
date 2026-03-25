@@ -783,21 +783,32 @@ class CHSixClient:
         return f"{code}.SW"
 
     def get_holders(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch institutional + mutual fund holders via yfinance (.SW suffix).
+        """Fetch institutional shareholders from MarketScreener (primary) or yfinance (fallback).
 
-        SIX does not expose shareholder data through its public APIs.
-        The Share Details API (sheldon) provides dividends, capital structure,
-        and corporate actions but not ownership data.  The Official Notices
-        API (349K+ notices) has a pagination bug that returns 0 items.
-        The Disclosure Office (Offenlegungsstelle) publishes significant
-        shareholding notifications as static HTML/PDF -- no structured API.
+        Primary: MarketScreener/Zonebourse -- scrapes institutional holder data
+        with names, shares, and percentages.  Covers major SIX-listed companies.
 
-        yfinance aggregates institutional ownership data from Yahoo Finance
-        for major SIX-listed companies (Nestle, Novartis, Roche, UBS, etc.).
+        Fallback: yfinance (.SW suffix) for companies not found on MarketScreener.
 
         Returns list of dicts with: name, shares, percentage, value,
         holder_type, date_reported, source.
         """
+        # --- Primary: MarketScreener ---
+        try:
+            from operator1.clients.marketscreener import fetch_shareholders
+            # Resolve company name from profile
+            company_name = identifier
+            cached = self._read_cache(identifier, "profile.json")
+            if cached and cached.get("name"):
+                company_name = cached["name"]
+            holders = fetch_shareholders(company_name)
+            if holders:
+                logger.info("SIX holders for %s: %d from MarketScreener", identifier, len(holders))
+                return holders
+        except Exception as exc:
+            logger.debug("MarketScreener holder lookup failed for SIX %s: %s", identifier, exc)
+
+        # --- Fallback: yfinance ---
         holders: list[dict[str, Any]] = []
         try:
             import yfinance as yf
