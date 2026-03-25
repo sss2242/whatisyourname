@@ -976,3 +976,53 @@ class EUEsefClient:
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
+
+    # -- Institutional / major holders ----------------------------------------
+    # ESEF does not provide shareholder/portfolio data.
+    # Corporate structure (parent/subsidiary) is handled separately by
+    # operator1/clients/gleif.py and injected into entity discovery in main.py.
+    # National regulator shareholder registers (AMF, BaFin, AFM, CNMV,
+    # CONSOB, FI) are not currently accessible programmatically.
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch institutional shareholders from MarketScreener/Zonebourse.
+
+        ESEF XBRL filings do not contain shareholder data. MarketScreener
+        (Zonebourse) provides institutional holder data for EU-listed
+        companies with holder names, share counts, and percentages.
+
+        Corporate ownership structure (parent/subsidiary) is handled
+        separately by the standalone GLEIF client in main.py Step 5e.1.
+        """
+        try:
+            from operator1.clients.marketscreener import fetch_shareholders
+
+            # Resolve company name from profile or search
+            company_name = identifier
+            matches = self.search_company(identifier)
+            if matches:
+                company_name = matches[0].get("name", identifier)
+
+            holders = fetch_shareholders(company_name)
+            if holders:
+                logger.info(
+                    "ESEF holders for %s: %d from MarketScreener",
+                    identifier, len(holders),
+                )
+                return holders
+        except Exception as exc:
+            logger.debug("MarketScreener holder lookup failed for %s: %s", identifier, exc)
+
+        return []
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """ESEF does not provide historical holder data."""
+        return pd.DataFrame()
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """ESEF does not provide insider transaction data.
+
+        Insider transactions are filed with national regulators (AMF, BaFin, etc.)
+        which are not currently accessible programmatically.
+        """
+        return []

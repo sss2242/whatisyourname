@@ -582,3 +582,95 @@ class CLCmfClient:
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
+
+    # -- Institutional / major holders (US EDGAR ADR fallback) ---------------
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch holders via US EDGAR using the ADR ticker fallback.
+
+        Major Chilean companies (SQM, LATAM, Santander Chile, Banco de Chile,
+        CCU, Enel Chile, Cencosud) have NYSE ADR listings.  SEC EDGAR SC 13D/13G
+        filings and DEF 14A proxies provide institutional holder data for these
+        ADR tickers.
+
+        Corporate ownership structure (parent/subsidiary) is handled separately
+        by the standalone GLEIF client (operator1/clients/gleif.py) and injected
+        into entity discovery in main.py Step 5e.1.
+        """
+        holders: list[dict[str, Any]] = []
+
+        # US EDGAR via ADR ticker (institutional shareholder data)
+        adr_ticker = _resolve_adr_ticker(identifier)
+        if adr_ticker and adr_ticker != identifier:
+            try:
+                from operator1.clients.us_edgar import USEdgarClient
+                edgar = USEdgarClient(
+                    user_agent="Operator1/1.0 (https://github.com/Abdu2024/OP-1)"
+                )
+                holders = edgar.get_holders(adr_ticker)
+                if holders:
+                    for h in holders:
+                        h["source"] = f"sec_edgar_adr ({adr_ticker})"
+                    logger.info(
+                        "CL holders for %s: %d from SEC EDGAR via ADR %s",
+                        identifier, len(holders), adr_ticker,
+                    )
+            except Exception as exc:
+                logger.debug("SEC EDGAR ADR holder lookup failed for %s -> %s: %s",
+                             identifier, adr_ticker, exc)
+
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return holder snapshot via US EDGAR ADR or GLEIF.
+
+        For ADR-listed companies, delegates to USEdgarClient.get_holder_history().
+        Otherwise returns a single-row snapshot from get_holders().
+        """
+        adr_ticker = _resolve_adr_ticker(identifier)
+        if adr_ticker and adr_ticker != identifier:
+            try:
+                from operator1.clients.us_edgar import USEdgarClient
+                edgar = USEdgarClient(
+                    user_agent="Operator1/1.0 (https://github.com/Abdu2024/OP-1)"
+                )
+                df = edgar.get_holder_history(adr_ticker, years=years)
+                if df is not None and not df.empty:
+                    return df
+            except Exception as exc:
+                logger.debug("SEC EDGAR ADR holder history failed for %s: %s", identifier, exc)
+
+        # Fallback: single snapshot from get_holders()
+        holders = self.get_holders(identifier)
+        if not holders:
+            return pd.DataFrame()
+
+        from datetime import datetime
+        return pd.DataFrame([{
+            "date_reported": datetime.now().strftime("%Y-%m-%d"),
+            "inst_ownership_pct": 0.0,
+            "inst_top5_concentration": 0.0,
+            "inst_holder_count": len(holders),
+        }])
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch insider transactions via US EDGAR ADR fallback.
+
+        For ADR-listed companies, SEC EDGAR Form 4 filings provide
+        insider buy/sell data.
+        """
+        adr_ticker = _resolve_adr_ticker(identifier)
+        if adr_ticker and adr_ticker != identifier:
+            try:
+                from operator1.clients.us_edgar import USEdgarClient
+                edgar = USEdgarClient(
+                    user_agent="Operator1/1.0 (https://github.com/Abdu2024/OP-1)"
+                )
+                txns = edgar.get_insider_transactions(adr_ticker)
+                if txns:
+                    for t in txns:
+                        t["source"] = f"sec_edgar_adr ({adr_ticker})"
+                    return txns
+            except Exception as exc:
+                logger.debug("SEC EDGAR ADR insider txns failed for %s: %s", identifier, exc)
+        return []

@@ -553,3 +553,266 @@ class CNSseClient:
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
+
+    # -- Institutional / major holders (akshare) -----------------------------
+
+    def _sina_code(self, identifier: str) -> str:
+        """Normalize to 6-digit stock code for akshare/Sina functions."""
+        code = identifier.split(".")[0].strip()
+        # Strip exchange prefixes (sh, sz, bj)
+        for prefix in ("sh", "sz", "bj", "SH", "SZ", "BJ"):
+            if code.startswith(prefix):
+                code = code[len(prefix):]
+        return code.zfill(6)
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch top shareholders from akshare (Sina Finance / EastMoney).
+
+        Uses ``akshare.stock_main_stock_holder`` (Sina Finance) for major
+        shareholders with name, shares, percentage, and announcement date.
+        Falls back to ``akshare.stock_circulate_stock_holder`` for
+        circulating (tradable) share holders.
+
+        Returns list of dicts with: name, shares, percentage, holder_type,
+        date_reported, source.
+        """
+        holders: list[dict[str, Any]] = []
+        code = self._sina_code(identifier)
+
+        # --- Path 1: Sina Finance major shareholders ---
+        try:
+            import akshare as ak
+
+            df = ak.stock_main_stock_holder(stock=code)
+            if df is not None and not df.empty:
+                for _, row in df.head(20).iterrows():
+                    name = str(row.get("股东名称", row.get("holder_name", "")))
+                    pct = 0.0
+                    try:
+                        pct_raw = row.get("持股比例", row.get("hold_ratio", 0))
+                        if pct_raw:
+                            pct_str = str(pct_raw).replace("%", "").strip()
+                            if pct_str:
+                                pct = float(pct_str)
+                                # Sina returns percentage as decimal (0.xx) or percent
+                                if 0 < pct < 1:
+                                    pct = pct * 100
+                    except (ValueError, TypeError):
+                        pass
+                    shares = 0
+                    try:
+                        shares_raw = row.get("持股数量", row.get("hold_num", 0))
+                        if shares_raw:
+                            shares = int(float(str(shares_raw).replace(",", "")))
+                    except (ValueError, TypeError):
+                        pass
+                    date_str = str(row.get("公告日期", row.get("截止日期", "")))
+                    holder_type = str(row.get("股东性质", "unknown"))
+                    # Map Chinese holder types to English
+                    if "基金" in holder_type:
+                        holder_type = "fund"
+                    elif "机构" in holder_type or "法人" in holder_type:
+                        holder_type = "institutional"
+                    elif "个人" in holder_type or "自然人" in holder_type:
+                        holder_type = "individual"
+                    else:
+                        holder_type = "institutional"
+
+                    if name and (pct > 0 or shares > 0):
+                        holders.append({
+                            "name": name,
+                            "shares": shares,
+                            "value": 0.0,
+                            "percentage": round(pct, 2),
+                            "holder_type": holder_type,
+                            "date_reported": date_str,
+                            "source": "akshare_sina",
+                        })
+
+            if holders:
+                logger.info("CN holders for %s: %d from akshare/Sina", identifier, len(holders))
+                return holders
+
+        except ImportError:
+            logger.debug("akshare not available for CN holder lookup")
+        except Exception as exc:
+            logger.debug("akshare Sina holder lookup failed for %s: %s", identifier, exc)
+
+        # --- Path 2: Circulating shareholders (fallback) ---
+        try:
+            import akshare as ak
+
+            df = ak.stock_circulate_stock_holder(stock=code)
+            if df is not None and not df.empty:
+                for _, row in df.head(20).iterrows():
+                    name = str(row.get("股东名称", ""))
+                    pct = 0.0
+                    try:
+                        pct_raw = row.get("持股比例", 0)
+                        if pct_raw:
+                            pct = float(str(pct_raw).replace("%", ""))
+                            if 0 < pct < 1:
+                                pct = pct * 100
+                    except (ValueError, TypeError):
+                        pass
+                    shares = 0
+                    try:
+                        shares_raw = row.get("持股数量", 0)
+                        if shares_raw:
+                            shares = int(float(str(shares_raw).replace(",", "")))
+                    except (ValueError, TypeError):
+                        pass
+                    date_str = str(row.get("截止日期", ""))
+
+                    if name and (pct > 0 or shares > 0):
+                        holders.append({
+                            "name": name,
+                            "shares": shares,
+                            "value": 0.0,
+                            "percentage": round(pct, 2),
+                            "holder_type": "institutional",
+                            "date_reported": date_str,
+                            "source": "akshare_sina_circulate",
+                        })
+
+            if holders:
+                logger.info("CN holders for %s: %d from akshare/Sina (circulating)", identifier, len(holders))
+        except Exception as exc:
+            logger.debug("akshare circulating holder lookup failed for %s: %s", identifier, exc)
+
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return shareholder count history from akshare/EastMoney.
+
+        Uses ``akshare.stock_zh_a_gdhs_detail_em`` which provides quarterly
+        shareholder count data (total holders, avg shares per holder, etc.).
+        This is useful for detecting institutional accumulation/distribution.
+
+        Returns DataFrame with columns: date_reported, inst_ownership_pct,
+        inst_top5_concentration, inst_holder_count.
+        """
+        code = self._sina_code(identifier)
+
+        try:
+            import akshare as ak
+
+            df = ak.stock_zh_a_gdhs_detail_em(symbol=code)
+            if df is None or df.empty:
+                return pd.DataFrame()
+
+            result_rows = []
+            for _, row in df.iterrows():
+                date_str = str(row.get("截止日期", row.get("record_date", "")))
+                holder_count = 0
+                try:
+                    holder_count = int(float(row.get("股东户数", row.get("holder_num", 0))))
+                except (ValueError, TypeError):
+                    pass
+
+                avg_shares = 0.0
+                try:
+                    avg_shares = float(row.get("户均持股数量", row.get("avg_hold_num", 0)))
+                except (ValueError, TypeError):
+                    pass
+
+                # Change ratio gives insight into accumulation/distribution
+                change_ratio = 0.0
+                try:
+                    cr_raw = row.get("股东户数-较上期变化", row.get("holder_num_change", 0))
+                    if cr_raw:
+                        change_ratio = float(str(cr_raw).replace("%", ""))
+                except (ValueError, TypeError):
+                    pass
+
+                if date_str and holder_count > 0:
+                    result_rows.append({
+                        "date_reported": date_str,
+                        "inst_holder_count": holder_count,
+                        # Proxy: declining holder count with stable float
+                        # implies institutional accumulation (fewer, larger holders)
+                        "inst_ownership_pct": 0.0,  # not directly available
+                        "inst_top5_concentration": 0.0,  # not directly available
+                        "holder_avg_shares": avg_shares,
+                        "holder_count_change_pct": change_ratio,
+                    })
+
+            if result_rows:
+                result_df = pd.DataFrame(result_rows)
+                result_df["date_reported"] = pd.to_datetime(result_df["date_reported"], errors="coerce")
+                result_df = result_df.dropna(subset=["date_reported"])
+                result_df = result_df.sort_values("date_reported")
+                logger.info("CN holder history for %s: %d periods from akshare/EastMoney", identifier, len(result_df))
+                return result_df
+
+        except ImportError:
+            logger.debug("akshare not available for CN holder history")
+        except Exception as exc:
+            logger.debug("akshare holder history failed for %s: %s", identifier, exc)
+
+        return pd.DataFrame()
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch insider/shareholder change notifications from akshare.
+
+        Uses ``akshare.stock_shareholder_change_ths`` (THS shareholder change
+        data) for insider buy/sell activity. Falls back gracefully if the
+        function is unavailable in the installed akshare version.
+
+        Returns list of dicts with: insider_name, position, date,
+        transaction, shares, value.
+        """
+        transactions: list[dict[str, Any]] = []
+        code = self._sina_code(identifier)
+
+        try:
+            import akshare as ak
+
+            # Try shareholder change data from THS (同花顺)
+            if hasattr(ak, "stock_shareholder_change_ths"):
+                df = ak.stock_shareholder_change_ths(symbol=code)
+                if df is not None and not df.empty:
+                    for _, row in df.head(30).iterrows():
+                        name = str(row.get("股东名称", row.get("shareholder_name", "")))
+                        change_type = str(row.get("变动方向", row.get("change_direction", "")))
+                        shares = 0
+                        try:
+                            shares = int(float(row.get("变动数量", row.get("change_num", 0))))
+                        except (ValueError, TypeError):
+                            pass
+                        date_str = str(row.get("变动日期", row.get("change_date", "")))
+                        pct_after = 0.0
+                        try:
+                            pct_after = float(row.get("变动后持股比例", row.get("hold_ratio_after", 0)))
+                        except (ValueError, TypeError):
+                            pass
+
+                        # Map Chinese transaction types
+                        if "增" in change_type or "买" in change_type:
+                            txn_type = "Purchase"
+                        elif "减" in change_type or "卖" in change_type:
+                            txn_type = "Sale"
+                        else:
+                            txn_type = change_type or "Unknown"
+
+                        if name and shares > 0:
+                            transactions.append({
+                                "insider_name": name,
+                                "position": "Shareholder",
+                                "date": date_str,
+                                "transaction": txn_type,
+                                "shares": shares,
+                                "value": 0.0,
+                                "percentage_after": round(pct_after, 2),
+                                "source": "akshare_ths",
+                            })
+
+            if transactions:
+                logger.info("CN insider transactions for %s: %d from akshare/THS", identifier, len(transactions))
+
+        except ImportError:
+            logger.debug("akshare not available for CN insider transactions")
+        except Exception as exc:
+            logger.debug("akshare insider transaction lookup failed for %s: %s", identifier, exc)
+
+        return transactions

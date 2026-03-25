@@ -531,20 +531,52 @@ def compute_graph_risk_metrics(
         pr_named = {nodes[i].name or nodes[i].isin: v for i, v in pr.items()}
 
         # Build node weight map from edge_weights (entity_id -> weight)
-        # Map entity ISINs to node indices for weighted contagion
+        # Map entity ISINs to node indices for weighted contagion.
+        # Corporate structure edges (parent/subsidiary) get higher default
+        # weights than business relationships -- controlling ownership is
+        # the strongest contagion channel.
+        _CORPORATE_STRUCTURE_WEIGHTS: dict[str, float] = {
+            "parent_companies": 2.8,   # parent distress strongly impacts subsidiary
+            "subsidiaries": 2.3,       # subsidiary distress moderately impacts parent
+        }
+        _DEFAULT_GROUP_WEIGHTS: dict[str, float] = {
+            "competitors": 1.0,
+            "suppliers": 1.2,
+            "customers": 1.1,
+            "financial_institutions": 1.3,
+            "logistics": 0.8,
+            "regulators": 0.5,
+        }
         node_weights: dict[int, float] = {}
         if edge_weights:
             for i, nd in enumerate(nodes):
                 w = edge_weights.get(nd.isin, edge_weights.get(nd.name, 1.0))
-                node_weights[i] = w
+                # Amplify with corporate structure weights
+                group_w = _CORPORATE_STRUCTURE_WEIGHTS.get(
+                    nd.relationship,
+                    _DEFAULT_GROUP_WEIGHTS.get(nd.relationship, 1.0),
+                )
+                node_weights[i] = w * group_w
+        else:
+            # Even without explicit edge_weights, apply corporate structure
+            # weights so parent/subsidiary contagion is stronger by default
+            for i, nd in enumerate(nodes):
+                group_w = _CORPORATE_STRUCTURE_WEIGHTS.get(
+                    nd.relationship,
+                    _DEFAULT_GROUP_WEIGHTS.get(nd.relationship, 1.0),
+                )
+                if group_w != 1.0:
+                    node_weights[i] = group_w
 
         # Contagion from each non-target node, measure impact on target
         # Pick the most connected non-target node as the seed
         non_target = [i for i in range(1, n)]
         if non_target:
             seed = max(non_target, key=lambda i: len(adjacency.get(i, [])))
-            if edge_weights and node_weights:
-                # Edge-weighted contagion (3.6)
+            if node_weights:
+                # Edge-weighted contagion: uses per-node weights from
+                # explicit edge_weights AND/OR corporate structure defaults
+                # (parent/subsidiary edges get 2.3-2.8x contagion multiplier)
                 exp_inf, max_inf, target_prob = _weighted_contagion_sim(
                     adjacency, n, seed,
                     base_prob=contagion_prob,

@@ -74,6 +74,12 @@ class FilingDiscovery:
     def quarterly_filings(self) -> list[FilingMetadata]:
         return [f for f in self.filings if f.filing_type in ("quarterly", "interim")]
 
+    def shareholding_filings(self) -> list[FilingMetadata]:
+        return [f for f in self.filings if f.filing_type == "shareholding"]
+
+    def insider_filings(self) -> list[FilingMetadata]:
+        return [f for f in self.filings if f.filing_type == "insider"]
+
 
 # ---------------------------------------------------------------------------
 # Protocol
@@ -186,19 +192,25 @@ def _classify_bse_filing_type(subject: str) -> str:
 
 
 class BSEFilingDiscoverer:
-    """Discovers financial result filings from BSE India API.
+    """Discovers financial result and shareholding filings from BSE India API.
 
     Uses the BSE corporate announcements API to find financial result
-    PDFs. Each result filing contains quarterly or annual financial
-    statements that can be extracted by the LLMFilingExtractor.
+    PDFs and shareholding pattern filings. Each result filing contains
+    quarterly or annual financial statements; shareholding filings contain
+    SEBI Regulation 31 shareholding pattern data.
     """
+
+    # BSE announcement categories for different filing types
+    _FINANCIAL_CATS = ["Result"]
+    _SHAREHOLDING_CATS = ["Shareholding", "Corp. Governance"]
 
     def discover_filings(
         self,
         ticker: str,
         years: int = 2,
+        categories: list[str] | None = None,
     ) -> FilingDiscovery:
-        """Discover financial result filings from BSE India.
+        """Discover filings from BSE India.
 
         Parameters
         ----------
@@ -206,39 +218,54 @@ class BSEFilingDiscoverer:
             BSE scrip code (e.g. '500325' for Reliance).
         years:
             Number of years to search back.
+        categories:
+            Filing categories to discover: ["financial"], ["shareholding"],
+            or ["financial", "shareholding"]. Default: ["financial"].
         """
+        if categories is None:
+            categories = ["financial"]
+
         result = FilingDiscovery(ticker=ticker, market_id="in_bse")
 
         today = date.today()
         from_date = today - timedelta(days=365 * years)
 
-        try:
-            resp = requests.get(
-                _BSE_ANN_URL,
-                params={
-                    "Ession": "",
-                    "strCat": "Result",
-                    "strPrevDate": from_date.strftime("%Y%m%d"),
-                    "strScrip": ticker,
-                    "strSearch": "P",
-                    "strToDate": today.strftime("%Y%m%d"),
-                    "strType": "C",
-                },
-                headers=_BSE_HEADERS,
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:
-            result.errors.append(f"BSE API request failed: {exc}")
-            return result
+        # Build list of BSE strCat values based on requested categories
+        str_cats = []
+        if "financial" in categories:
+            str_cats.extend(self._FINANCIAL_CATS)
+        if "shareholding" in categories:
+            str_cats.extend(self._SHAREHOLDING_CATS)
+        if not str_cats:
+            str_cats = self._FINANCIAL_CATS
 
-        table = data.get("Table", [])
-        if not table:
-            result.errors.append("No financial result filings found")
-            return result
+        for str_cat in str_cats:
+            try:
+                resp = requests.get(
+                    _BSE_ANN_URL,
+                    params={
+                        "Ession": "",
+                        "strCat": str_cat,
+                        "strPrevDate": from_date.strftime("%Y%m%d"),
+                        "strScrip": ticker,
+                        "strSearch": "P",
+                        "strToDate": today.strftime("%Y%m%d"),
+                        "strType": "C",
+                    },
+                    headers=_BSE_HEADERS,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                result.errors.append(f"BSE API request failed for {str_cat}: {exc}")
+                continue
 
-        for item in table:
+            table = data.get("Table", [])
+            if not table:
+                continue
+
+            for item in table:
             subject = item.get("NEWSSUB", "")
             attachment = item.get("ATTACHMENTNAME", "")
             news_dt = item.get("NEWS_DT", "")
@@ -255,7 +282,12 @@ class BSEFilingDiscoverer:
                     pass
 
             report_date = _parse_bse_report_date(subject)
-            filing_type = _classify_bse_filing_type(subject)
+            # Classify as shareholding if from a shareholding category
+            subject_lower = subject.lower()
+            if str_cat in self._SHAREHOLDING_CATS or "shareholding" in subject_lower:
+                filing_type = "shareholding"
+            else:
+                filing_type = _classify_bse_filing_type(subject)
 
             filing = FilingMetadata(
                 title=subject,
@@ -317,6 +349,11 @@ _ASX_FINANCIAL_TYPES = {
     "PERIODIC REPORTS",
     "ANNUAL REPORT",
     "HALF YEARLY REPORT",
+}
+_ASX_SHAREHOLDING_TYPES = {
+    "BECOMING A SUBSTANTIAL HOLDER",
+    "CEASING TO BE A SUBSTANTIAL HOLDER",
+    "CHANGE IN SUBSTANTIAL HOLDING",
 }
 
 
@@ -2521,3 +2558,101 @@ def _filter_by_statement_type(df: "pd.DataFrame", statement_type: str) -> "pd.Da
     mask = df["canonical_name"].isin(target_fields)
     filtered = df[mask].copy()
     return filtered
+
+
+# ---------------------------------------------------------------------------
+# Shareholding extraction pipeline
+# ---------------------------------------------------------------------------
+
+def try_shareholding_extraction(
+    ticker: str,
+    market_id: str,
+    max_filings: int = 3,
+) -> list[dict]:
+    """Discover shareholding filings and extract holder data from PDFs.
+
+    Uses the filing discoverer framework to find shareholding pattern
+    filings, download their PDFs, and extract holder data using the
+    fuzzy_pdf_parser's extract_shareholders_from_pdf().
+
+    Parameters
+    ----------
+    ticker:
+        Exchange ticker symbol.
+    market_id:
+        Market identifier (e.g. 'in_bse', 'sg_sgx').
+    max_filings:
+        Maximum number of shareholding filings to process.
+
+    Returns
+    -------
+    List of holder dicts with: name, shares, percentage, holder_type, source.
+    """
+    discoverer = _get_discoverer(market_id)
+    if discoverer is None:
+        return []
+
+    try:
+        # Discover shareholding filings
+        if hasattr(discoverer, 'discover_filings'):
+            import inspect
+            sig = inspect.signature(discoverer.discover_filings)
+            if 'categories' in sig.parameters:
+                discovery = discoverer.discover_filings(
+                    ticker, years=2, categories=["shareholding"],
+                )
+            else:
+                discovery = discoverer.discover_filings(ticker, years=2)
+        else:
+            return []
+
+        # Filter for shareholding filings
+        sh_filings = discovery.shareholding_filings()
+        if not sh_filings:
+            # Fallback: try annual filings (annual reports often contain
+            # shareholding sections)
+            sh_filings = discovery.annual_filings()[:2]
+
+        if not sh_filings:
+            return []
+
+        logger.info(
+            "Shareholding discovery for %s/%s: %d filings found",
+            market_id, ticker, len(sh_filings),
+        )
+
+        # Download and extract from each filing
+        from operator1.clients.fuzzy_pdf_parser import extract_shareholders_from_pdf
+
+        all_holders: list[dict] = []
+        for filing in sh_filings[:max_filings]:
+            try:
+                pdf_bytes = discoverer.download_filing(filing)
+                if not pdf_bytes:
+                    continue
+
+                holders = extract_shareholders_from_pdf(
+                    pdf_bytes,
+                    filing_date=filing.filing_date,
+                    market_id=market_id,
+                )
+                if holders:
+                    all_holders.extend(holders)
+                    logger.info(
+                        "Shareholding extraction from '%s': %d holders",
+                        filing.title[:40], len(holders),
+                    )
+                    break  # One successful extraction is enough
+            except Exception as exc:
+                logger.debug(
+                    "Shareholding extraction failed for %s: %s",
+                    filing.title[:40], exc,
+                )
+                continue
+
+        return all_holders
+
+    except Exception as exc:
+        logger.debug("Shareholding extraction pipeline failed for %s/%s: %s",
+                     market_id, ticker, exc)
+        return []

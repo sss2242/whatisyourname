@@ -222,6 +222,7 @@ def compute_fuzzy_protection(
     cache: pd.DataFrame,
     sector: str | None = None,
     gdp: float | None = None,
+    parent_sector: str | None = None,
 ) -> pd.DataFrame:
     """Compute daily fuzzy government protection scores.
 
@@ -233,6 +234,10 @@ def compute_fuzzy_protection(
         Target company sector (from verified profile).
     gdp:
         Country GDP in USD (from macro API data).
+    parent_sector:
+        Parent company's sector (from GLEIF corporate structure).
+        If provided, the target inherits 70% of the parent's sector
+        strategicness as a protection floor.
 
     Returns
     -------
@@ -243,6 +248,7 @@ def compute_fuzzy_protection(
         - ``fuzzy_policy_score``
         - ``fuzzy_protection_degree`` (0-1, replaces binary flag)
         - ``fuzzy_protection_label``
+        - ``fuzzy_parent_protection_floor`` (if parent_sector provided)
     """
     result = cache.copy()
 
@@ -346,6 +352,25 @@ def compute_fuzzy_protection(
         result["fuzzy_protection_degree"] = result[
             ["fuzzy_sector_score", "fuzzy_economic_score", "fuzzy_policy_score"]
         ].max(axis=1)
+
+    # Parent protection inheritance: if the target is a subsidiary of a
+    # strategically important parent, it inherits 70% of the parent's
+    # sector protection score as a floor.  A subsidiary of a defense
+    # contractor or systemically important bank inherits protection.
+    if parent_sector:
+        parent_protection = _sector_membership(parent_sector)
+        parent_floor = parent_protection * 0.7
+        if parent_floor > 0.1:
+            result["fuzzy_parent_protection_floor"] = parent_floor
+            # Apply floor: protection degree cannot be lower than parent floor
+            result["fuzzy_protection_degree"] = result["fuzzy_protection_degree"].clip(
+                lower=parent_floor
+            )
+            logger.info(
+                "Parent protection inheritance: parent_sector=%s, "
+                "parent_score=%.2f, floor=%.2f",
+                parent_sector, parent_protection, parent_floor,
+            )
 
     # Label
     result["fuzzy_protection_label"] = result["fuzzy_protection_degree"].apply(

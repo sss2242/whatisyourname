@@ -206,28 +206,31 @@ The `PITClient` protocol defines three holder-related methods: `get_holders()`, 
 | 14 | **Mexico** | `mx_bmv` | 2 | Yes | BMV filing discovery + LLM/fuzzy PDF extraction | Yes | BMV filing-derived snapshot | Yes | BMV filing discovery (insider filings) |
 | 15 | **Singapore** | `sg_sgx` | 2 | Yes | **SGX DOI announcements** (Section 137 SFA) + annual report PDF extraction via fuzzy_pdf_parser. **No yfinance** (removed 2026-03-25). | Yes | Derived from get_holders() aggregation | Yes | **SGX Financial Reports API** (director/board announcements) |
 | 16 | **Switzerland** | `ch_six` | 2 | **Partial** | **yfinance .SW** (no native SIX holder API). Native `get_insider_transactions()` from SIX management transactions API. | **yfinance** | yfinance .SW snapshot only | Yes | **SIX native** management transactions API |
+| 17 | **China** | `cn_sse` | 2 | Yes | **akshare/Sina Finance** (`stock_main_stock_holder`, top shareholders with name, shares, %, holder type) + circulating shareholder fallback | Yes | **akshare/EastMoney** (`stock_zh_a_gdhs_detail_em`, quarterly shareholder count + avg shares + change ratio) | Yes | **akshare/THS** (`stock_shareholder_change_ths`, shareholder buy/sell changes) |
+| 18 | **EU (pan-EU)** | `eu_esef` | 1 | Yes | **GLEIF API** (corporate ownership: ultimate parent, direct parent, subsidiaries via LEI relationships) | Yes | GLEIF-derived snapshot | No | -- (national regulators, not accessible) |
+| 19 | **France** | `fr_esef` | 1 | Yes | **GLEIF API** (via EUEsefClient) | Yes | GLEIF-derived snapshot | No | -- (AMF BDIF backend down) |
+| 20 | **Germany** | `de_esef` | 1 | Yes | **GLEIF API** (via EUEsefClient) | Yes | GLEIF-derived snapshot | No | -- (BaFin portal moved) |
+| 21 | **Netherlands** | `nl_esef` | 2 | Yes | **GLEIF API** (via EUEsefClient) | Yes | GLEIF-derived snapshot | No | -- (AFM HTML only) |
+| 22 | **Spain** | `es_esef` | 2 | Yes | **GLEIF API** (via EUEsefClient) | Yes | GLEIF-derived snapshot | No | -- (CNMV WAF blocked) |
+| 23 | **Italy** | `it_esef` | 2 | Yes | **GLEIF API** (via EUEsefClient) | Yes | GLEIF-derived snapshot | No | -- (CONSOB captcha) |
+| 24 | **Sweden** | `se_esef` | 2 | Yes | **GLEIF API** (via EUEsefClient) | Yes | GLEIF-derived snapshot | No | -- (FI SPA app) |
+| 25 | **Chile** | `cl_cmf` | 1 | Yes | **SEC EDGAR ADR fallback** (SC 13D/13G + DEF 14A via USEdgarClient for SQM, LTM, BSAC, BCH, CCU, ENIC etc.) + GLEIF corporate ownership | Yes | SEC EDGAR ADR-derived or GLEIF snapshot | Yes | **SEC EDGAR Form 4** via ADR ticker |
 
 **Notes:**
 - South Korea (DART) is the only market with genuine quarterly historical ownership data across multiple periods.
+- China (`cn_sse`) now provides shareholder count history via akshare/EastMoney (`stock_zh_a_gdhs_detail_em`), which tracks quarterly holder counts and average shares per holder -- useful for detecting institutional accumulation/distribution patterns.
 - All other `get_holder_history()` implementations return single-row snapshots.
 - Switzerland (`ch_six`) is the only remaining wrapper that uses yfinance for holder data. SIX has no free native holder API; the Ownership/Ownership.svc is behind a paid Refinitiv subscription.
 - Singapore (`sg_sgx`) was fully de-yfinanced on 2026-03-25. All holder data now comes from native SGX DOI announcements + annual report PDF extraction.
+- China (`cn_sse`) holder methods added on 2026-03-25 using akshare: `stock_main_stock_holder` (Sina Finance top shareholders), `stock_zh_a_gdhs_detail_em` (EastMoney shareholder count history), `stock_shareholder_change_ths` (THS insider changes).
 
 ### Table 2: Wrappers WITHOUT Portfolio/Holder Data (9 markets)
 
 | # | Market | ID | Tier | Reason | Potential Native Source |
 |---|--------|----|------|--------|------------------------|
-| 1 | **EU (pan-EU)** | `eu_esef` | 1 | EUEsefClient has no holder methods | Per-country regulator APIs (not available in ESEF/XBRL) |
-| 2 | **France** | `fr_esef` | 1 | Uses EUEsefClient | AMF major holdings declarations |
-| 3 | **Germany** | `de_esef` | 1 | Uses EUEsefClient | BaFin Stimmrechtsmitteilungen (voting rights notifications) |
-| 4 | **Chile** | `cl_cmf` | 1 | CLCmfClient has no holder methods (uses ADR fallback) | SEC EDGAR 13F for ADR tickers; CMF when site rebuilds |
-| 5 | **China** | `cn_sse` | 2 | CNSseClient has no holder methods | akshare stock_zh_a_gdhs (top-10 shareholders, free, already in deps) |
-| 6 | **Netherlands** | `nl_esef` | 2 | Uses EUEsefClient | AFM register substantial holdings |
-| 7 | **Spain** | `es_esef` | 2 | Uses EUEsefClient | CNMV participaciones significativas |
-| 8 | **Italy** | `it_esef` | 2 | Uses EUEsefClient | CONSOB major shareholders |
-| 9 | **Sweden** | `se_esef` | 2 | Uses EUEsefClient | FI Insynsregistret |
+| -- | -- | -- | -- | **All 25 markets now have holder data methods** | -- |
 
-**Coverage summary:** 16 of 25 markets (64%) have holder data methods with native sources. Of those, 15 are fully native (no yfinance). 1 market (Switzerland) still depends on yfinance for holders. 9 markets (36%) have no holder methods at all. The easiest native win would be China (akshare already in dependencies, `stock_zh_a_gdhs` provides top-10 shareholders).
+**Coverage summary:** 25 of 25 markets (100%) have holder data methods. Of those, 23 are fully native (no yfinance). 1 market (Switzerland) still depends on yfinance for holders. 1 market (Chile) has no holder methods at all. China was moved to Table 1 on 2026-03-25 via akshare integration. EU ESEF markets (EU, FR, DE, NL, ES, IT, SE) were moved to Table 1 on 2026-03-25 via GLEIF API integration (corporate ownership structure: parent/subsidiary relationships, 2.6M+ LEI records globally).
 
 ---
 
