@@ -1355,6 +1355,59 @@ Non-interactive examples:
         except Exception as exc:
             logger.warning("Entity discovery failed (continuing without): %s", exc)
 
+        # Step 5e.1: Enrich with GLEIF corporate structure (parent/subsidiary)
+        # GLEIF provides corporate control chains (who owns whom at the entity
+        # level) -- distinct from institutional shareholders (portfolio data).
+        # Parent-subsidiary edges are the strongest contagion channels.
+        try:
+            from operator1.clients.gleif import fetch_corporate_structure
+            _gleif_id = target_profile.get("lei") or target_profile.get("name") or company_name
+            _corp_struct = fetch_corporate_structure(_gleif_id)
+            if _corp_struct.available:
+                # Add parent companies as a new relationship group
+                _parent_entities = []
+                for _parent in [_corp_struct.ultimate_parent, _corp_struct.direct_parent]:
+                    if _parent:
+                        _parent_entities.append({
+                            "isin": "",
+                            "ticker": _parent.lei[:10] if _parent.lei else "",
+                            "name": _parent.name,
+                            "country": _parent.country,
+                            "sector": "",
+                            "relationship_group": "parent_companies",
+                            "match_score": 100,
+                            "lei": _parent.lei,
+                            "relationship": _parent.relationship,
+                        })
+                if _parent_entities:
+                    relationships["parent_companies"] = _parent_entities
+
+                # Add subsidiaries as a new relationship group
+                _sub_entities = []
+                for _sub in _corp_struct.subsidiaries[:15]:
+                    _sub_entities.append({
+                        "isin": "",
+                        "ticker": _sub.lei[:10] if _sub.lei else "",
+                        "name": _sub.name,
+                        "country": _sub.country,
+                        "sector": "",
+                        "relationship_group": "subsidiaries",
+                        "match_score": 100,
+                        "lei": _sub.lei,
+                        "relationship": "subsidiary",
+                    })
+                if _sub_entities:
+                    relationships["subsidiaries"] = _sub_entities
+
+                _n_parents = len(_parent_entities)
+                _n_subs = len(_sub_entities)
+                logger.info(
+                    "GLEIF corporate structure: %d parents, %d subsidiaries added to relationships",
+                    _n_parents, _n_subs,
+                )
+        except Exception as exc:
+            logger.debug("GLEIF corporate structure enrichment skipped: %s", exc)
+
         # Graph risk -- convert LinkedEntity dataclasses to dicts for .get() compat
         try:
             from dataclasses import asdict as _asdict

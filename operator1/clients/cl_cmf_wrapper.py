@@ -593,11 +593,13 @@ class CLCmfClient:
         filings and DEF 14A proxies provide institutional holder data for these
         ADR tickers.
 
-        Falls back to GLEIF corporate ownership structure if no ADR is available.
+        Corporate ownership structure (parent/subsidiary) is handled separately
+        by the standalone GLEIF client (operator1/clients/gleif.py) and injected
+        into entity discovery in main.py Step 5e.1.
         """
         holders: list[dict[str, Any]] = []
 
-        # --- Path 1: US EDGAR via ADR ticker ---
+        # US EDGAR via ADR ticker (institutional shareholder data)
         adr_ticker = _resolve_adr_ticker(identifier)
         if adr_ticker and adr_ticker != identifier:
             try:
@@ -607,80 +609,15 @@ class CLCmfClient:
                 )
                 holders = edgar.get_holders(adr_ticker)
                 if holders:
-                    # Tag source as ADR fallback
                     for h in holders:
                         h["source"] = f"sec_edgar_adr ({adr_ticker})"
                     logger.info(
                         "CL holders for %s: %d from SEC EDGAR via ADR %s",
                         identifier, len(holders), adr_ticker,
                     )
-                    return holders
             except Exception as exc:
                 logger.debug("SEC EDGAR ADR holder lookup failed for %s -> %s: %s",
                              identifier, adr_ticker, exc)
-
-        # --- Path 2: GLEIF corporate ownership (global fallback) ---
-        try:
-            import requests as _requests
-            _GLEIF_API = "https://api.gleif.org/api/v1/lei-records"
-            _GLEIF_H = {"User-Agent": "Operator1/1.0", "Accept": "application/json"}
-
-            # Search GLEIF by company name
-            search_name = identifier
-            # Try to get a better name from the ADR map or profile
-            for local_name, adr in _CHILE_ADR_MAP.items():
-                if identifier.lower() in local_name or local_name in identifier.lower():
-                    search_name = local_name
-                    break
-
-            resp = _requests.get(_GLEIF_API,
-                params={"filter[entity.legalName]": search_name, "page[size]": "1"},
-                headers=_GLEIF_H, timeout=15)
-            if resp.ok:
-                records = resp.json().get("data", [])
-                if records:
-                    lei = records[0]["attributes"]["lei"]
-                    # Get direct children
-                    r2 = _requests.get(f"{_GLEIF_API}/{lei}/direct-children",
-                        params={"page[size]": "20"}, headers=_GLEIF_H, timeout=15)
-                    if r2.ok:
-                        for child in r2.json().get("data", []):
-                            child_entity = child.get("attributes", {}).get("entity", {})
-                            child_name = child_entity.get("legalName", {}).get("name", "")
-                            if child_name:
-                                holders.append({
-                                    "name": child_name,
-                                    "shares": 0,
-                                    "value": 0.0,
-                                    "percentage": 0.0,
-                                    "holder_type": "subsidiary",
-                                    "date_reported": "",
-                                    "source": "gleif",
-                                    "relationship": "subsidiary",
-                                })
-                    # Get ultimate parent
-                    r3 = _requests.get(f"{_GLEIF_API}/{lei}/ultimate-parent",
-                        headers=_GLEIF_H, timeout=15)
-                    if r3.ok:
-                        parent = r3.json().get("data")
-                        if parent and isinstance(parent, dict):
-                            parent_name = parent.get("attributes", {}).get("entity", {}).get("legalName", {}).get("name", "")
-                            parent_lei = parent.get("attributes", {}).get("lei", "")
-                            if parent_name and parent_lei != lei:
-                                holders.insert(0, {
-                                    "name": parent_name,
-                                    "shares": 0,
-                                    "value": 0.0,
-                                    "percentage": 0.0,
-                                    "holder_type": "ultimate_parent",
-                                    "date_reported": "",
-                                    "source": "gleif",
-                                    "relationship": "ultimate_parent",
-                                })
-            if holders:
-                logger.info("CL holders for %s: %d from GLEIF", identifier, len(holders))
-        except Exception as exc:
-            logger.debug("GLEIF holder lookup failed for %s: %s", identifier, exc)
 
         return holders
 

@@ -977,199 +977,28 @@ class EUEsefClient:
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
 
-    # -- Institutional / major holders (GLEIF corporate ownership) -----------
-
-    _GLEIF_API = "https://api.gleif.org/api/v1/lei-records"
-    _GLEIF_HEADERS = {
-        "User-Agent": "Operator1/1.0 (financial-research)",
-        "Accept": "application/json",
-    }
-
-    def _resolve_lei(self, identifier: str) -> str:
-        """Resolve identifier to LEI.
-
-        If the identifier already looks like a LEI (20 alphanumeric chars),
-        return it directly.  Otherwise, search the local ESEF entity directory
-        or query GLEIF by name.
-        """
-        # LEIs are 20 chars, alphanumeric
-        clean = identifier.strip()
-        if len(clean) == 20 and clean.isalnum():
-            return clean
-
-        # Try local directory first
-        matches = self.search_company(clean)
-        if matches:
-            lei = matches[0].get("lei", "")
-            if lei and len(lei) == 20:
-                return lei
-
-        # Fallback: query GLEIF by name
-        try:
-            resp = requests.get(
-                self._GLEIF_API,
-                params={"filter[entity.legalName]": clean, "page[size]": "1"},
-                headers=self._GLEIF_HEADERS,
-                timeout=15,
-            )
-            if resp.ok:
-                records = resp.json().get("data", [])
-                if records:
-                    return records[0].get("attributes", {}).get("lei", "")
-        except Exception as exc:
-            logger.debug("GLEIF LEI resolution failed for %s: %s", identifier, exc)
-
-        return clean  # return as-is if resolution fails
+    # -- Institutional / major holders ----------------------------------------
+    # ESEF does not provide shareholder/portfolio data.
+    # Corporate structure (parent/subsidiary) is handled separately by
+    # operator1/clients/gleif.py and injected into entity discovery in main.py.
+    # National regulator shareholder registers (AMF, BaFin, AFM, CNMV,
+    # CONSOB, FI) are not currently accessible programmatically.
 
     def get_holders(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch corporate ownership structure from GLEIF API.
+        """ESEF does not provide shareholder data.
 
-        Uses the GLEIF LEI database to retrieve:
-        - Ultimate parent company (who owns this entity)
-        - Direct parent company
-        - Direct children / subsidiaries
-
-        GLEIF is free, requires no API key, and covers 2.6M+ legal entities
-        globally.  For EU ESEF markets, the LEI is the natural identifier.
-
-        Returns list of dicts with: name, shares (0), percentage (0),
-        holder_type, date_reported, source, lei, relationship.
+        Corporate ownership structure is handled by the standalone GLEIF
+        client (operator1/clients/gleif.py) and injected into entity
+        discovery in main.py Step 5e.1.
         """
-        holders: list[dict[str, Any]] = []
-        lei = self._resolve_lei(identifier)
-
-        if not lei or len(lei) != 20:
-            logger.debug("Cannot resolve LEI for %s, skipping GLEIF holder lookup", identifier)
-            return holders
-
-        # --- Ultimate parent ---
-        try:
-            resp = requests.get(
-                f"{self._GLEIF_API}/{lei}/ultimate-parent",
-                headers=self._GLEIF_HEADERS,
-                timeout=15,
-            )
-            if resp.ok:
-                parent_data = resp.json().get("data")
-                if parent_data and isinstance(parent_data, dict):
-                    parent_entity = parent_data.get("attributes", {}).get("entity", {})
-                    parent_name = parent_entity.get("legalName", {}).get("name", "")
-                    parent_lei = parent_data.get("attributes", {}).get("lei", "")
-                    parent_country = parent_entity.get("legalAddress", {}).get("country", "")
-                    if parent_name and parent_lei != lei:
-                        holders.append({
-                            "name": parent_name,
-                            "shares": 0,
-                            "value": 0.0,
-                            "percentage": 0.0,
-                            "holder_type": "ultimate_parent",
-                            "date_reported": "",
-                            "source": "gleif",
-                            "lei": parent_lei,
-                            "country": parent_country,
-                            "relationship": "ultimate_parent",
-                        })
-        except Exception as exc:
-            logger.debug("GLEIF ultimate parent lookup failed for %s: %s", lei, exc)
-
-        # --- Direct parent ---
-        try:
-            resp = requests.get(
-                f"{self._GLEIF_API}/{lei}/direct-parent",
-                headers=self._GLEIF_HEADERS,
-                timeout=15,
-            )
-            if resp.ok:
-                parent_data = resp.json().get("data")
-                if parent_data and isinstance(parent_data, dict):
-                    parent_entity = parent_data.get("attributes", {}).get("entity", {})
-                    parent_name = parent_entity.get("legalName", {}).get("name", "")
-                    parent_lei = parent_data.get("attributes", {}).get("lei", "")
-                    parent_country = parent_entity.get("legalAddress", {}).get("country", "")
-                    # Avoid duplicate with ultimate parent
-                    existing_leis = {h["lei"] for h in holders if h.get("lei")}
-                    if parent_name and parent_lei not in existing_leis and parent_lei != lei:
-                        holders.append({
-                            "name": parent_name,
-                            "shares": 0,
-                            "value": 0.0,
-                            "percentage": 0.0,
-                            "holder_type": "direct_parent",
-                            "date_reported": "",
-                            "source": "gleif",
-                            "lei": parent_lei,
-                            "country": parent_country,
-                            "relationship": "direct_parent",
-                        })
-        except Exception as exc:
-            logger.debug("GLEIF direct parent lookup failed for %s: %s", lei, exc)
-
-        # --- Direct children (subsidiaries) ---
-        try:
-            resp = requests.get(
-                f"{self._GLEIF_API}/{lei}/direct-children",
-                params={"page[size]": "50"},
-                headers=self._GLEIF_HEADERS,
-                timeout=15,
-            )
-            if resp.ok:
-                children = resp.json().get("data", [])
-                for child in children[:30]:
-                    child_entity = child.get("attributes", {}).get("entity", {})
-                    child_name = child_entity.get("legalName", {}).get("name", "")
-                    child_lei = child.get("attributes", {}).get("lei", "")
-                    child_country = child_entity.get("legalAddress", {}).get("country", "")
-                    if child_name:
-                        holders.append({
-                            "name": child_name,
-                            "shares": 0,
-                            "value": 0.0,
-                            "percentage": 0.0,
-                            "holder_type": "subsidiary",
-                            "date_reported": "",
-                            "source": "gleif",
-                            "lei": child_lei,
-                            "country": child_country,
-                            "relationship": "subsidiary",
-                        })
-        except Exception as exc:
-            logger.debug("GLEIF children lookup failed for %s: %s", lei, exc)
-
-        if holders:
-            logger.info(
-                "ESEF holders for %s: %d from GLEIF (%d parents, %d subsidiaries)",
-                identifier, len(holders),
-                sum(1 for h in holders if "parent" in h.get("relationship", "")),
-                sum(1 for h in holders if h.get("relationship") == "subsidiary"),
-            )
-
-        return holders
+        return []
 
     def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
-        """Return holder snapshot from GLEIF.
-
-        GLEIF does not provide historical ownership changes, so this returns
-        a single-row snapshot derived from the current get_holders() data.
-        """
-        holders = self.get_holders(identifier)
-        if not holders:
-            return pd.DataFrame()
-
-        from datetime import datetime
-        n_parents = sum(1 for h in holders if "parent" in h.get("relationship", ""))
-        n_subs = sum(1 for h in holders if h.get("relationship") == "subsidiary")
-
-        return pd.DataFrame([{
-            "date_reported": datetime.now().strftime("%Y-%m-%d"),
-            "inst_ownership_pct": 0.0,
-            "inst_top5_concentration": 0.0,
-            "inst_holder_count": len(holders),
-            "n_parent_entities": n_parents,
-            "n_subsidiaries": n_subs,
-        }])
+        """ESEF does not provide historical holder data."""
+        return pd.DataFrame()
 
     def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
-        """ESEF/GLEIF does not provide insider transaction data.
+        """ESEF does not provide insider transaction data.
 
         Insider transactions are filed with national regulators (AMF, BaFin, etc.)
         which are not currently accessible programmatically.
