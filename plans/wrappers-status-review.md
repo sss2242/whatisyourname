@@ -182,52 +182,52 @@ All 15 markets return daily OHLCV data via yfinance or regional wrappers (baosto
 
 ---
 
-## Portfolio / Holder Data Coverage
+## Portfolio / Holder Data Coverage (updated 2026-03-25)
 
-The `PITClient` protocol defines three holder-related methods: `get_holders()`, `get_holder_history()`, and `get_insider_transactions()`. Not all wrappers implement them.
+The `PITClient` protocol defines three holder-related methods: `get_holders()`, `get_holder_history()`, and `get_insider_transactions()`. All 25 wrappers now implement these methods, with varying levels of native vs stub coverage.
 
-### Table 1: Wrappers WITH Portfolio/Holder Data
+### Table 1: Wrappers WITH Native Portfolio/Holder Data (16 markets)
 
-| # | Market | ID | `get_holders()` | Source | `get_holder_history()` | Source | `get_insider_transactions()` | Source |
-|---|--------|----|-----------------|--------|------------------------|--------|------------------------------|--------|
-| 1 | **United States** | `us_sec_edgar` | Yes | yfinance (13F institutional + mutual fund) | Yes | yfinance snapshot (inst_ownership_pct, top5 HHI, count) | Yes | yfinance (insider buys/sells) |
-| 2 | **United Kingdom** | `uk_companies_house` | Yes | **Native PSC API** (>25% control, name, natures_of_control) + yfinance fallback | Yes | yfinance snapshot | No | -- |
-| 3 | **South Korea** | `kr_dart` | Yes | **Native DART API** (hyslr_sttus, >5% shareholders, trmend_posesn_stock_qota_rt) | Yes | **Native DART quarterly** (up to 8 quarters, per-period HHI, inst_ownership_pct) | No | -- |
-| 4 | **Japan** | `jp_jquants` | Yes | yfinance (.T suffix, institutional + mutual fund) | Yes | yfinance snapshot | Yes | yfinance |
-| 5 | **Brazil** | `br_cvm` | Yes | yfinance (.SA suffix, institutional + mutual fund) | Yes | yfinance snapshot | Yes | yfinance (.SA) |
-| 6 | **India** | `in_bse` | Yes | yfinance (.NS major_holders aggregate) + **BSE BoardMeetings PDF scraping** (SEBI shareholding patterns: Promoter, FII, DII, MF) | Yes | yfinance snapshot | Yes | yfinance (.NS) |
-| 7 | **Hong Kong** | `hk_hkex` | Yes | yfinance (.HK suffix, institutional + mutual fund) | Yes | yfinance snapshot | Yes | yfinance (.HK) |
-| 8 | **Singapore** | `sg_sgx` | Yes | yfinance (.SI) + **SGX Disclosure of Interest announcements** (Section 137 SFA, shareholder names + %) | Yes | yfinance snapshot | Yes | yfinance (.SI) |
-| 9 | **Mexico** | `mx_bmv` | Yes | yfinance (.MX suffix, institutional + mutual fund) | Yes | yfinance snapshot | Yes | yfinance (.MX) |
+| # | Market | ID | Tier | `get_holders()` | Native Source | `get_holder_history()` | Native Source | `get_insider_transactions()` | Native Source |
+|---|--------|----|------|-----------------|---------------|------------------------|---------------|------------------------------|---------------|
+| 1 | **United States** | `us_sec_edgar` | 1 | Yes | SEC EDGAR SC 13D/13G filings (>5% beneficial owners) + DEF 14A proxy via LLM/fuzzy PDF | Yes | SEC EDGAR filing-derived snapshot | Yes | SEC EDGAR Form 4 filings |
+| 2 | **United Kingdom** | `uk_companies_house` | 1 | Yes | **Native PSC API** (>25% control, name, natures_of_control) | Yes | PSC-derived snapshot | No | -- |
+| 3 | **South Korea** | `kr_dart` | 1 | Yes | **Native DART API** (hyslr_sttus, >5% shareholders) | Yes | **Native DART quarterly** (up to 8 quarters, per-period HHI) | No | -- |
+| 4 | **Japan** | `jp_jquants` | 1 | Yes | J-Quants financial summary (major shareholder data) | Yes | J-Quants / filing-derived snapshot | Yes | J-Quants / filing discovery |
+| 5 | **Taiwan** | `tw_mops` | 1 | Yes | **TWSE OpenAPI** (director/supervisor shareholding, major shareholders) | Yes | TWSE director shareholding data | Yes | **TWSE OpenAPI t187ap12_L** (insider transfer notifications) |
+| 6 | **Brazil** | `br_cvm` | 1 | Yes | **CVM FRE archives** (posicao_acionaria CSV -- name, shares, %, controlling flag) | Yes | CVM FRE-derived snapshot | Yes | CVM FRE archives (insider transactions) |
+| 7 | **India** | `in_bse` | 2 | Yes | **BSE SAST disclosures** (Reg. 29/31) + BSE BoardMeetings PDF scraping (SEBI shareholding patterns) | Yes | BSE SAST-derived snapshot | Yes | BSE SAST announcements |
+| 8 | **Hong Kong** | `hk_hkex` | 2 | Yes | **akshare/EastMoney** (stock_hk_holders_em, structured) | Yes | akshare/EastMoney-derived snapshot | Yes | HKEX disclosure filings |
+| 9 | **Australia** | `au_asx` | 2 | Yes | ASX substantial holder notices via filing discovery + LLM/fuzzy PDF | Yes | ASX filing-derived snapshot | Yes | ASX director dealings announcements |
+| 10 | **Canada** | `ca_sedar` | 2 | Yes | **TMX GraphQL API** (insider activity summary, SEDI data) | Yes | TMX insider activity-derived snapshot | Yes | TMX GraphQL individual insider transactions |
+| 11 | **Saudi Arabia** | `sa_tadawul` | 2 | Yes | **Tadawul native HTML** (foreign ownership table, 411 companies) via curl_cffi | Yes | Tadawul foreign ownership-derived snapshot | Yes | Tadawul statementsTabData type=5 (board reports) |
+| 12 | **South Africa** | `za_jse` | 2 | Yes | **JSE SENS** shareholding announcements | Yes | JSE SENS-derived snapshot | Yes | JSE SENS director dealings |
+| 13 | **UAE** | `ae_dfm` | 2 | Yes | **DFM eFsah API** (holder-related disclosures) | Yes | DFM eFsah-derived snapshot | Yes | DFM eFsah BOD meeting results |
+| 14 | **Mexico** | `mx_bmv` | 2 | Yes | BMV filing discovery + LLM/fuzzy PDF extraction | Yes | BMV filing-derived snapshot | Yes | BMV filing discovery (insider filings) |
+| 15 | **Singapore** | `sg_sgx` | 2 | Yes | **SGX DOI announcements** (Section 137 SFA) + annual report PDF extraction via fuzzy_pdf_parser. **No yfinance** (removed 2026-03-25). | Yes | Derived from get_holders() aggregation | Yes | **SGX Financial Reports API** (director/board announcements) |
+| 16 | **Switzerland** | `ch_six` | 2 | **Partial** | **yfinance .SW** (no native SIX holder API). Native `get_insider_transactions()` from SIX management transactions API. | **yfinance** | yfinance .SW snapshot only | Yes | **SIX native** management transactions API |
 
 **Notes:**
-- Only **UK (PSC API)** and **South Korea (DART hyslr_sttus)** provide holder data from native government APIs.
-- **India (BSE)** and **Singapore (SGX)** supplement yfinance with exchange-specific disclosure scraping.
-- All other implementations rely on yfinance as the sole holder data source.
-- `get_holder_history()` returns a **single-row snapshot** (not true time-series) for all yfinance-backed implementations. Only **South Korea (DART)** provides genuine quarterly historical ownership data across multiple periods.
+- South Korea (DART) is the only market with genuine quarterly historical ownership data across multiple periods.
+- All other `get_holder_history()` implementations return single-row snapshots.
+- Switzerland (`ch_six`) is the only remaining wrapper that uses yfinance for holder data. SIX has no free native holder API; the Ownership/Ownership.svc is behind a paid Refinitiv subscription.
+- Singapore (`sg_sgx`) was fully de-yfinanced on 2026-03-25. All holder data now comes from native SGX DOI announcements + annual report PDF extraction.
 
-### Table 2: Wrappers WITHOUT Portfolio/Holder Data
+### Table 2: Wrappers WITHOUT Portfolio/Holder Data (9 markets)
 
-| # | Market | ID | Tier | Reason | Potential Source |
-|---|--------|----|------|--------|-----------------|
-| 1 | **EU (pan-EU)** | `eu_esef` | 1 | EUEsefClient has no holder methods | ESEF filings don't include ownership; would need per-country regulator APIs |
-| 2 | **France** | `fr_esef` | 1 | Uses EUEsefClient (no holder methods) | AMF major holdings declarations (free, no API) |
-| 3 | **Germany** | `de_esef` | 1 | Uses EUEsefClient (no holder methods) | BaFin Stimmrechtsmitteilungen (voting rights notifications) |
-| 4 | **Taiwan** | `tw_mops` | 1 | TWMopsClient has no holder methods | TWSE/MOPS director/supervisor shareholding reports |
-| 5 | **Chile** | `cl_cmf` | 1 | CLCmfClient has no holder methods (uses ADR fallback) | CMF website restructuring; ADR tickers could use yfinance |
-| 6 | **Australia** | `au_asx` | 2 | AUAsxClient has no holder methods | ASX substantial holder notices; yfinance (.AX) |
-| 7 | **Canada** | `ca_sedar` | 2 | CASedarClient has no holder methods | SEDI insider reports; yfinance (.TO) |
-| 8 | **China** | `cn_sse` | 2 | CNSseClient has no holder methods | akshare top-10 shareholder API (stock_zh_a_gdhs); yfinance |
-| 9 | **Switzerland** | `ch_six` | 2 | CHSixClient has no holder methods | SIX significant shareholders register; yfinance (.SW) |
-| 10 | **South Africa** | `za_jse` | 2 | ZAJseClient has no holder methods | JSE SENS shareholder announcements; yfinance (.JO) |
-| 11 | **Saudi Arabia** | `sa_tadawul` | 2 | SATadawulClient has no holder methods | Tadawul ownership disclosure API; yfinance (.SR) |
-| 12 | **UAE** | `ae_dfm` | 2 | AEDfmClient has no holder methods | DFM/ADX disclosure filings; yfinance (.AE) |
-| 13 | **Netherlands** | `nl_esef` | 2 | Uses EUEsefClient (no holder methods) | AFM register substantial holdings; yfinance (.AS) |
-| 14 | **Spain** | `es_esef` | 2 | Uses EUEsefClient (no holder methods) | CNMV participaciones significativas; yfinance (.MC) |
-| 15 | **Italy** | `it_esef` | 2 | Uses EUEsefClient (no holder methods) | CONSOB major shareholders; yfinance (.MI) |
-| 16 | **Sweden** | `se_esef` | 2 | Uses EUEsefClient (no holder methods) | FI Insynsregistret; yfinance (.ST) |
+| # | Market | ID | Tier | Reason | Potential Native Source |
+|---|--------|----|------|--------|------------------------|
+| 1 | **EU (pan-EU)** | `eu_esef` | 1 | EUEsefClient has no holder methods | Per-country regulator APIs (not available in ESEF/XBRL) |
+| 2 | **France** | `fr_esef` | 1 | Uses EUEsefClient | AMF major holdings declarations |
+| 3 | **Germany** | `de_esef` | 1 | Uses EUEsefClient | BaFin Stimmrechtsmitteilungen (voting rights notifications) |
+| 4 | **Chile** | `cl_cmf` | 1 | CLCmfClient has no holder methods (uses ADR fallback) | SEC EDGAR 13F for ADR tickers; CMF when site rebuilds |
+| 5 | **China** | `cn_sse` | 2 | CNSseClient has no holder methods | akshare stock_zh_a_gdhs (top-10 shareholders, free, already in deps) |
+| 6 | **Netherlands** | `nl_esef` | 2 | Uses EUEsefClient | AFM register substantial holdings |
+| 7 | **Spain** | `es_esef` | 2 | Uses EUEsefClient | CNMV participaciones significativas |
+| 8 | **Italy** | `it_esef` | 2 | Uses EUEsefClient | CONSOB major shareholders |
+| 9 | **Sweden** | `se_esef` | 2 | Uses EUEsefClient | FI Insynsregistret |
 
-**Coverage summary:** 9 of 25 markets (36%) have holder data methods implemented. 16 markets (64%) have no holder data. The easiest wins would be adding yfinance-backed `get_holders()` to the 16 missing wrappers (same pattern used by US, JP, BR, HK, MX) since yfinance covers most exchanges globally.
+**Coverage summary:** 16 of 25 markets (64%) have holder data methods with native sources. Of those, 15 are fully native (no yfinance). 1 market (Switzerland) still depends on yfinance for holders. 9 markets (36%) have no holder methods at all. The easiest native win would be China (akshare already in dependencies, `stock_zh_a_gdhs` provides top-10 shareholders).
 
 ---
 
