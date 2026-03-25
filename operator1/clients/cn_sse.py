@@ -702,24 +702,30 @@ class CNSseClient:
 
             result_rows = []
             for _, row in df.iterrows():
-                date_str = str(row.get("截止日期", row.get("record_date", "")))
+                # Column names from akshare stock_zh_a_gdhs_detail_em:
+                # 股东户数统计截止日, 股东户数-本次, 股东户数-增减比例, 户均持股数量, 总股本
+                date_str = str(row.get("股东户数统计截止日", row.get("截止日期", "")))
                 holder_count = 0
                 try:
-                    holder_count = int(float(row.get("股东户数", row.get("holder_num", 0))))
+                    hc_raw = row.get("股东户数-本次", row.get("股东户数", 0))
+                    if hc_raw is not None:
+                        holder_count = int(float(str(hc_raw)))
                 except (ValueError, TypeError):
                     pass
 
                 avg_shares = 0.0
                 try:
-                    avg_shares = float(row.get("户均持股数量", row.get("avg_hold_num", 0)))
+                    avg_raw = row.get("户均持股数量", row.get("avg_hold_num", 0))
+                    if avg_raw is not None:
+                        avg_shares = float(str(avg_raw))
                 except (ValueError, TypeError):
                     pass
 
                 # Change ratio gives insight into accumulation/distribution
                 change_ratio = 0.0
                 try:
-                    cr_raw = row.get("股东户数-较上期变化", row.get("holder_num_change", 0))
-                    if cr_raw:
+                    cr_raw = row.get("股东户数-增减比例", row.get("股东户数-较上期变化", 0))
+                    if cr_raw is not None:
                         change_ratio = float(str(cr_raw).replace("%", ""))
                 except (ValueError, TypeError):
                     pass
