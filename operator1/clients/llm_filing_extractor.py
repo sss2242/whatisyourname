@@ -469,8 +469,8 @@ Filing text excerpt:
 
 
 @dataclass
-class ExtractionResult:
-    """Result of financial data extraction."""
+class FilingFilingExtractionResult:
+    """Result of financial data extraction from a single filing."""
 
     success: bool = False
     data: dict[str, Any] = field(default_factory=dict)
@@ -605,13 +605,13 @@ class LLMFilingExtractor:
         self,
         ixbrl_text: str,
         market_id: str = "",
-    ) -> ExtractionResult:
+    ) -> FilingExtractionResult:
         """Extract financials from iXBRL-tagged HTML.
 
         Uses the ixbrl-parse library (already installed) for structured
         extraction. No LLM call needed.
         """
-        result = ExtractionResult(source_format="ixbrl")
+        result = FilingExtractionResult(source_format="ixbrl")
 
         try:
             from ixbrl_parse import IXBRL
@@ -656,9 +656,9 @@ class LLMFilingExtractor:
         self,
         html_text: str,
         market_id: str = "",
-    ) -> ExtractionResult:
+    ) -> FilingExtractionResult:
         """Extract financials from HTML filing (with tables)."""
-        result = ExtractionResult(source_format="html")
+        result = FilingExtractionResult(source_format="html")
 
         try:
             from bs4 import BeautifulSoup
@@ -703,9 +703,9 @@ class LLMFilingExtractor:
         self,
         pdf_bytes: bytes,
         market_id: str = "",
-    ) -> ExtractionResult:
+    ) -> FilingExtractionResult:
         """Extract financials from a PDF filing."""
-        result = ExtractionResult(source_format="pdf")
+        result = FilingExtractionResult(source_format="pdf")
 
         try:
             import pdfplumber
@@ -770,9 +770,9 @@ class LLMFilingExtractor:
         text: str,
         market_id: str,
         source_format: str,
-    ) -> ExtractionResult:
+    ) -> FilingExtractionResult:
         """Send text to LLM for structured extraction."""
-        result = ExtractionResult(source_format=source_format)
+        result = FilingExtractionResult(source_format=source_format)
 
         if self._llm is None:
             result.error = "No LLM client available for extraction"
@@ -821,13 +821,13 @@ class LLMFilingExtractor:
         data: dict[str, Any],
         filing_text: str = "",
         market_id: str = "",
-    ) -> ExtractionResult:
+    ) -> FilingExtractionResult:
         """Validate/cross-check existing extracted data using LLM.
 
         Can be used on data from any source (yfinance, EDGAR, etc.)
         to verify against the original filing text.
         """
-        result = ExtractionResult(source_format="validation")
+        result = FilingExtractionResult(source_format="validation")
 
         if self._llm is None:
             # No LLM -- just do accounting identity check
@@ -1005,7 +1005,7 @@ class LLMFilingExtractor:
 
     def to_canonical_dataframe(
         self,
-        extraction: ExtractionResult,
+        extraction: FilingExtractionResult,
         market_id: str = "",
     ) -> pd.DataFrame:
         """Convert extraction result to canonical long-format DataFrame.

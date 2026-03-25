@@ -1257,6 +1257,17 @@ Non-interactive examples:
     except Exception as exc:
         logger.warning("Survival mode detection failed: %s", exc)
 
+    # Step 5e variables: initialized early so fuzzy protection (Step 5b)
+    # can safely access relationships.get("parent_companies") for
+    # protection inheritance from GLEIF corporate structure.
+    relationships = {}
+    graph_risk_result = None
+    game_theory_result = None
+    linked_caches: dict[str, pd.DataFrame] = {}
+    linked_agg_df: pd.DataFrame | None = None
+    contagion_result = None
+    _ownership_edge_weights: dict[str, float] = {}
+
     # Step 5b: Fuzzy Logic government protection
     fuzzy_result = None
     try:
@@ -1347,13 +1358,9 @@ Non-interactive examples:
     # before estimation). No need to re-compute here.
 
     # Step 5e: Linked entity discovery via Gemini (optional)
-    relationships = {}
-    graph_risk_result = None
-    game_theory_result = None
-    linked_caches: dict[str, pd.DataFrame] = {}
-    linked_agg_df: pd.DataFrame | None = None
-    contagion_result = None
-    _ownership_edge_weights: dict[str, float] = {}
+    # NOTE: relationships, graph_risk_result, game_theory_result, linked_caches,
+    # linked_agg_df, contagion_result, _ownership_edge_weights are initialized
+    # before Step 5b (fuzzy protection) so they can be safely accessed there.
 
     # Build the LLM client once for the whole pipeline
     from operator1.clients.llm_factory import create_llm_client
@@ -1438,10 +1445,10 @@ Non-interactive examples:
             logger.debug("GLEIF corporate structure enrichment skipped: %s", exc)
 
         # Graph risk -- convert LinkedEntity dataclasses to dicts for .get() compat
+        _rel_dicts = {}
         try:
             from dataclasses import asdict as _asdict
             from operator1.models.graph_risk import compute_graph_risk_metrics
-            _rel_dicts = {}
             for _grp, _ents in relationships.items():
                 if isinstance(_ents, list):
                     _rel_dicts[_grp] = [
@@ -1642,18 +1649,19 @@ Non-interactive examples:
                             from operator1.models.graph_risk import compute_graph_risk_metrics as _grc
                             _enhanced_gr = _grc(
                                 target_isin=target_profile.get("isin", ticker),
-                                relationships=_rel_dicts if "_rel_dicts" in dir() else {},
+                                relationships=_rel_dicts,
                                 edge_weights=_ownership_edge_weights,
                                 target_cache=cache,
                                 linked_caches=linked_caches if linked_caches else None,
                             )
                             if _enhanced_gr.available:
+                                _old_contagion = graph_risk_result.contagion_target_infection_prob
                                 graph_risk_result = _enhanced_gr
                                 logger.info(
                                     "Graph risk re-computed with ownership edge weights: "
                                     "contagion=%.3f (was %.3f)",
                                     _enhanced_gr.contagion_target_infection_prob,
-                                    graph_risk_result.contagion_target_infection_prob,
+                                    _old_contagion,
                                 )
                         except Exception as _gr_exc:
                             logger.debug("Graph risk re-computation skipped: %s", _gr_exc)
@@ -1972,6 +1980,7 @@ Non-interactive examples:
             logger.warning("Dual regime classification failed: %s", exc)
 
         # Granger causality
+        _gc_vars = []
         try:
             from operator1.models.granger_causality import (
                 compute_granger_causality,
@@ -2171,6 +2180,14 @@ Non-interactive examples:
         except Exception as exc:
             logger.debug("Mode error aggregation / Fixed Share failed: %s", exc)
 
+        # Derive mode_weights from Fixed Share for prediction aggregator
+        _mode_weights = None
+        if _fixed_share is not None:
+            try:
+                _mode_weights = {"global": _fixed_share.get_weights()}
+            except Exception:
+                pass
+
         # Monte Carlo
         # In private mode, use equity_change_rate instead of return_1d.
         try:
@@ -2250,19 +2267,18 @@ Non-interactive examples:
                         calibrator.update(r)
                 # build_conformal_result expects nested dict:
                 # {variable: {horizon_label: point_forecast}}
+                # Use forecast_result.forecasts (available now) instead of
+                # pred_result.predictions (set later by run_prediction_aggregation).
                 _nested_forecasts: dict[str, dict[str, float]] = {}
-                if hasattr(pred_result, "predictions"):
-                    for var, horizons_dict in pred_result.predictions.items():
-                        if isinstance(horizons_dict, dict):
+                if forecast_result is not None and hasattr(forecast_result, "forecasts"):
+                    for var, var_forecasts in forecast_result.forecasts.items():
+                        if isinstance(var_forecasts, dict):
                             _nested_forecasts[var] = {}
-                            for h, hp in horizons_dict.items():
-                                pf = getattr(hp, "point_forecast", None)
-                                if pf is not None:
-                                    try:
-                                        _nested_forecasts[var][h] = float(pf)
-                                    except (TypeError, ValueError):
-                                        pass
-                            # Remove empty variable entries
+                            for h, val in var_forecasts.items():
+                                try:
+                                    _nested_forecasts[var][h] = float(val)
+                                except (TypeError, ValueError):
+                                    pass
                             if not _nested_forecasts[var]:
                                 del _nested_forecasts[var]
                 conformal_result = build_conformal_result(
@@ -2295,6 +2311,7 @@ Non-interactive examples:
             try:
                 pred_result = run_prediction_aggregation(
                     cache, forecast_result, mc_result,
+                    mode_weights=_mode_weights,
                     conformal_result=conformal_result,
                     dual_regime_result=dual_regime_result,
                     copula_result=copula_result,
@@ -2364,7 +2381,7 @@ Non-interactive examples:
         _tv_granger_result = None
         try:
             from operator1.models.granger_causality import compute_time_varying_granger
-            _tv_granger_result = compute_time_varying_granger(cache, variables=_gc_vars[:15] if '_gc_vars' in dir() else None)
+            _tv_granger_result = compute_time_varying_granger(cache, variables=_gc_vars[:15] if _gc_vars else None)
             if _tv_granger_result and _tv_granger_result.get("emerging_pairs"):
                 logger.info(
                     "Time-varying Granger: %d windows, %d emerging, %d disappearing",
@@ -2504,6 +2521,16 @@ Non-interactive examples:
         except Exception:
             pass
 
+    # Run data quality audit (feeds into profile data_quality section)
+    _quality_path = None
+    try:
+        from operator1.quality.data_quality import run_quality_checks, save_quality_report
+        _qr = run_quality_checks(cache, entity_id=ticker or "target")
+        _quality_path = str(Path(args.output_dir) / "data_quality_report.json")
+        save_quality_report({"target": _qr}, output_path=_quality_path)
+    except Exception as exc:
+        logger.debug("Quality audit skipped: %s", exc)
+
     try:
         profile = build_company_profile(
             verified_target=target_profile,
@@ -2513,6 +2540,7 @@ Non-interactive examples:
             forecast_result=forecast_result,
             mc_result=mc_result,
             prediction_result=pred_result,
+            quality_report_path=_quality_path,
             estimation_coverage_path=str(Path(args.output_dir) / "estimation_coverage.json"),
             graph_risk_result=_available_dict(graph_risk_result),
             game_theory_result=_available_dict(game_theory_result),

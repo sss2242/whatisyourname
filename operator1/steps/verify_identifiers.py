@@ -13,29 +13,9 @@ from typing import Any
 
 from operator1.clients.pit_base import PITClientError
 from operator1.clients.equity_provider import EquityProvider
+from operator1.types import VerifiedTarget  # canonical definition in types.py
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class VerifiedTarget:
-    """Container for a successfully verified target company.
-
-    All fields are populated during the verification step and
-    remain immutable for the rest of the pipeline.
-    """
-
-    isin: str
-    ticker: str
-    name: str
-    country: str          # ISO-2 from PIT provider profile
-    sector: str
-    industry: str
-    sub_industry: str | None
-    fmp_symbol: str       # kept for backward compat; same as ticker in new arch
-    currency: str
-    exchange: str
-    raw_profile: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 class VerificationError(Exception):

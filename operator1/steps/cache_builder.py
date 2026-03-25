@@ -26,27 +26,9 @@ import pandas as pd
 
 from operator1.constants import CACHE_DIR, DATE_START, DATE_END
 from operator1.config_loader import get_global_config
-from operator1.types import EntityData, ExtractionResult
+from operator1.types import EntityData, ExtractionResult, LookAheadError
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-
-class LookAheadError(Exception):
-    """Raised when a financial statement leaks future data into a past day."""
-
-    def __init__(self, entity: str, statement: str, day: str, report_date: str) -> None:
-        self.entity = entity
-        self.statement = statement
-        self.day = day
-        self.report_date = report_date
-        super().__init__(
-            f"Look-ahead violation for {entity}: {statement} report_date "
-            f"{report_date} applied to day {day}"
-        )
 
 
 # ---------------------------------------------------------------------------

@@ -401,10 +401,10 @@ class HKHkexClient:
                         pct = 0.0
                         try:
                             pct_raw = row.get("持股比例", row.get("hold_ratio", 0))
-                            if pct_raw:
-                                pct = float(str(pct_raw).replace("%", ""))
-                                if 0 < pct < 1:
-                                    pct = pct * 100
+                            if pct_raw is not None and str(pct_raw).strip() and str(pct_raw).strip() != "nan":
+                                pct = float(str(pct_raw).replace("%", "").strip())
+                                # akshare/EastMoney returns 持股比例 already as
+                                # percentage (5.73 = 5.73%). Do NOT multiply by 100.
                         except (ValueError, TypeError):
                             pass
                         shares = 0
