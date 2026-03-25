@@ -862,7 +862,7 @@ def _extract_number_from_text(line: str) -> float | None:
 # Shareholder / ownership data extraction from PDFs
 # ---------------------------------------------------------------------------
 
-# Keywords that identify pages containing shareholder data
+# Keywords that identify pages containing shareholder data (English base)
 _SHAREHOLDER_KEYWORDS = [
     "shareholding pattern", "major shareholders", "ownership structure",
     "substantial shareholders", "top shareholders", "significant shareholders",
@@ -874,6 +874,101 @@ _SHAREHOLDER_KEYWORDS = [
     "percentage of holding", "% of total",
     "directors and key managerial personnel",
 ]
+
+# Per-region shareholder keywords (added to base keywords when market_id provided)
+_SHAREHOLDER_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
+    "in_bse": [
+        # SEBI format (Regulation 31)
+        "shareholding of promoter", "public shareholding",
+        "shares held by custodians", "non-institutions",
+        "central government", "state government",
+        "mutual funds", "financial institutions",
+        "foreign institutional investors", "foreign portfolio",
+        "bodies corporate", "individuals", "nri",
+        "statement showing shareholding pattern",
+    ],
+    "jp_jquants": [
+        # Japanese
+        "大株主の状況", "所有者別状況", "株式の状況",
+        "major shareholders", "status of shareholders",
+    ],
+    "kr_dart": [
+        # Korean
+        "주주현황", "최대주주", "주요주주", "소액주주",
+        "지분율", "보유주식수",
+        "shareholder status", "largest shareholder",
+    ],
+    "tw_mops": [
+        # Chinese (Traditional)
+        "股東名簿", "持股比例", "大股東", "股權結構",
+        "主要股東", "股東持股",
+    ],
+    "br_cvm": [
+        # Portuguese
+        "composição acionária", "ações detidas", "participação acionária",
+        "acionistas", "controlador", "free float",
+        "posição acionária", "quadro societário",
+    ],
+    "cl_cmf": [
+        # Spanish
+        "composición accionaria", "principales accionistas",
+        "estructura de propiedad", "participación accionaria",
+    ],
+    "fr_esef": [
+        # French
+        "répartition du capital", "actionnariat",
+        "principaux actionnaires", "structure du capital",
+        "droits de vote", "capital social",
+    ],
+    "de_esef": [
+        # German
+        "aktionärsstruktur", "stimmrechte", "anteilseigner",
+        "hauptaktionäre", "aktienbesitz", "grundkapital",
+        "stimmrechtsmitteilung",
+    ],
+    "sa_tadawul": [
+        # Arabic + English
+        "هيكل الملكية", "المساهمون الرئيسيون",
+        "نسبة الملكية", "الأسهم المملوكة",
+        "ownership structure", "major shareholders",
+    ],
+    "sg_sgx": [
+        "substantial shareholders", "directors interests",
+        "statistics of shareholdings", "distribution of shareholdings",
+    ],
+    "au_asx": [
+        "substantial shareholders", "top 20 shareholders",
+        "distribution of equity securities", "voting rights",
+    ],
+    "ca_sedar": [
+        "principal shareholders", "voting securities",
+        "ownership of securities", "control persons",
+    ],
+    "za_jse": [
+        "shareholder spread", "major shareholders",
+        "beneficial shareholders", "fund managers",
+    ],
+    "hk_hkex": [
+        # Chinese (Simplified) + English
+        "股东", "持股", "主要股东", "股权结构",
+        "substantial shareholders", "disclosure of interests",
+    ],
+    "cn_sse": [
+        # Chinese (Simplified)
+        "股东", "持股", "十大股东", "前十大股东",
+        "股权结构", "流通股股东", "实际控制人",
+    ],
+    "ae_dfm": [
+        # Arabic + English
+        "المساهمون", "هيكل الملكية",
+        "shareholders", "ownership",
+    ],
+    "mx_bmv": [
+        # Spanish
+        "estructura accionaria", "principales accionistas",
+        "tenencia accionaria", "capital social",
+    ],
+}
 
 # Keywords that indicate a row is a holder name (not a section header)
 _HOLDER_ROW_INDICATORS = [
@@ -918,13 +1013,20 @@ def extract_shareholders_from_pdf(
         logger.debug("pdfplumber not installed, cannot extract shareholders from PDF")
         return holders
 
+    # Build keyword list: base + market-specific
+    keywords = list(_SHAREHOLDER_KEYWORDS)
+    market_kw = _SHAREHOLDER_KEYWORDS_BY_MARKET.get(market_id, [])
+    if market_kw:
+        keywords = market_kw + keywords
+        logger.debug("Shareholder parser: added %d market hints for %s", len(market_kw), market_id)
+
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
             # Find pages with shareholder content
             sh_pages = []
             for i, page in enumerate(doc.pages):
                 text = (page.extract_text() or "").lower()
-                score = sum(1 for kw in _SHAREHOLDER_KEYWORDS if kw in text)
+                score = sum(1 for kw in keywords if kw in text)
                 if score >= 2:
                     sh_pages.append((i, score))
 
