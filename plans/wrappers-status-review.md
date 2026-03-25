@@ -214,6 +214,7 @@ The `PITClient` protocol defines three holder-related methods: `get_holders()`, 
 | 22 | **Spain** | `es_esef` | 2 | Yes | **GLEIF API** (via EUEsefClient) | Yes | GLEIF-derived snapshot | No | -- (CNMV WAF blocked) |
 | 23 | **Italy** | `it_esef` | 2 | Yes | **GLEIF API** (via EUEsefClient) | Yes | GLEIF-derived snapshot | No | -- (CONSOB captcha) |
 | 24 | **Sweden** | `se_esef` | 2 | Yes | **GLEIF API** (via EUEsefClient) | Yes | GLEIF-derived snapshot | No | -- (FI SPA app) |
+| 25 | **Chile** | `cl_cmf` | 1 | Yes | **SEC EDGAR ADR fallback** (SC 13D/13G + DEF 14A via USEdgarClient for SQM, LTM, BSAC, BCH, CCU, ENIC etc.) + GLEIF corporate ownership | Yes | SEC EDGAR ADR-derived or GLEIF snapshot | Yes | **SEC EDGAR Form 4** via ADR ticker |
 
 **Notes:**
 - South Korea (DART) is the only market with genuine quarterly historical ownership data across multiple periods.
@@ -227,9 +228,9 @@ The `PITClient` protocol defines three holder-related methods: `get_holders()`, 
 
 | # | Market | ID | Tier | Reason | Potential Native Source |
 |---|--------|----|------|--------|------------------------|
-| 1 | **Chile** | `cl_cmf` | 1 | CLCmfClient has no holder methods (uses ADR fallback) | SEC EDGAR 13F for ADR tickers; CMF when site rebuilds |
+| -- | -- | -- | -- | **All 25 markets now have holder data methods** | -- |
 
-**Coverage summary:** 24 of 25 markets (96%) have holder data methods with native sources. Of those, 23 are fully native (no yfinance). 1 market (Switzerland) still depends on yfinance for holders. 1 market (Chile) has no holder methods at all. China was moved to Table 1 on 2026-03-25 via akshare integration. EU ESEF markets (EU, FR, DE, NL, ES, IT, SE) were moved to Table 1 on 2026-03-25 via GLEIF API integration (corporate ownership structure: parent/subsidiary relationships, 2.6M+ LEI records globally).
+**Coverage summary:** 25 of 25 markets (100%) have holder data methods. Of those, 23 are fully native (no yfinance). 1 market (Switzerland) still depends on yfinance for holders. 1 market (Chile) has no holder methods at all. China was moved to Table 1 on 2026-03-25 via akshare integration. EU ESEF markets (EU, FR, DE, NL, ES, IT, SE) were moved to Table 1 on 2026-03-25 via GLEIF API integration (corporate ownership structure: parent/subsidiary relationships, 2.6M+ LEI records globally).
 
 ---
 

@@ -582,3 +582,158 @@ class CLCmfClient:
 
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
+
+    # -- Institutional / major holders (US EDGAR ADR fallback) ---------------
+
+    def get_holders(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch holders via US EDGAR using the ADR ticker fallback.
+
+        Major Chilean companies (SQM, LATAM, Santander Chile, Banco de Chile,
+        CCU, Enel Chile, Cencosud) have NYSE ADR listings.  SEC EDGAR SC 13D/13G
+        filings and DEF 14A proxies provide institutional holder data for these
+        ADR tickers.
+
+        Falls back to GLEIF corporate ownership structure if no ADR is available.
+        """
+        holders: list[dict[str, Any]] = []
+
+        # --- Path 1: US EDGAR via ADR ticker ---
+        adr_ticker = _resolve_adr_ticker(identifier)
+        if adr_ticker and adr_ticker != identifier:
+            try:
+                from operator1.clients.us_edgar import USEdgarClient
+                edgar = USEdgarClient(
+                    user_agent="Operator1/1.0 (https://github.com/Abdu2024/OP-1)"
+                )
+                holders = edgar.get_holders(adr_ticker)
+                if holders:
+                    # Tag source as ADR fallback
+                    for h in holders:
+                        h["source"] = f"sec_edgar_adr ({adr_ticker})"
+                    logger.info(
+                        "CL holders for %s: %d from SEC EDGAR via ADR %s",
+                        identifier, len(holders), adr_ticker,
+                    )
+                    return holders
+            except Exception as exc:
+                logger.debug("SEC EDGAR ADR holder lookup failed for %s -> %s: %s",
+                             identifier, adr_ticker, exc)
+
+        # --- Path 2: GLEIF corporate ownership (global fallback) ---
+        try:
+            import requests as _requests
+            _GLEIF_API = "https://api.gleif.org/api/v1/lei-records"
+            _GLEIF_H = {"User-Agent": "Operator1/1.0", "Accept": "application/json"}
+
+            # Search GLEIF by company name
+            search_name = identifier
+            # Try to get a better name from the ADR map or profile
+            for local_name, adr in _CHILE_ADR_MAP.items():
+                if identifier.lower() in local_name or local_name in identifier.lower():
+                    search_name = local_name
+                    break
+
+            resp = _requests.get(_GLEIF_API,
+                params={"filter[entity.legalName]": search_name, "page[size]": "1"},
+                headers=_GLEIF_H, timeout=15)
+            if resp.ok:
+                records = resp.json().get("data", [])
+                if records:
+                    lei = records[0]["attributes"]["lei"]
+                    # Get direct children
+                    r2 = _requests.get(f"{_GLEIF_API}/{lei}/direct-children",
+                        params={"page[size]": "20"}, headers=_GLEIF_H, timeout=15)
+                    if r2.ok:
+                        for child in r2.json().get("data", []):
+                            child_entity = child.get("attributes", {}).get("entity", {})
+                            child_name = child_entity.get("legalName", {}).get("name", "")
+                            if child_name:
+                                holders.append({
+                                    "name": child_name,
+                                    "shares": 0,
+                                    "value": 0.0,
+                                    "percentage": 0.0,
+                                    "holder_type": "subsidiary",
+                                    "date_reported": "",
+                                    "source": "gleif",
+                                    "relationship": "subsidiary",
+                                })
+                    # Get ultimate parent
+                    r3 = _requests.get(f"{_GLEIF_API}/{lei}/ultimate-parent",
+                        headers=_GLEIF_H, timeout=15)
+                    if r3.ok:
+                        parent = r3.json().get("data")
+                        if parent and isinstance(parent, dict):
+                            parent_name = parent.get("attributes", {}).get("entity", {}).get("legalName", {}).get("name", "")
+                            parent_lei = parent.get("attributes", {}).get("lei", "")
+                            if parent_name and parent_lei != lei:
+                                holders.insert(0, {
+                                    "name": parent_name,
+                                    "shares": 0,
+                                    "value": 0.0,
+                                    "percentage": 0.0,
+                                    "holder_type": "ultimate_parent",
+                                    "date_reported": "",
+                                    "source": "gleif",
+                                    "relationship": "ultimate_parent",
+                                })
+            if holders:
+                logger.info("CL holders for %s: %d from GLEIF", identifier, len(holders))
+        except Exception as exc:
+            logger.debug("GLEIF holder lookup failed for %s: %s", identifier, exc)
+
+        return holders
+
+    def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
+        """Return holder snapshot via US EDGAR ADR or GLEIF.
+
+        For ADR-listed companies, delegates to USEdgarClient.get_holder_history().
+        Otherwise returns a single-row snapshot from get_holders().
+        """
+        adr_ticker = _resolve_adr_ticker(identifier)
+        if adr_ticker and adr_ticker != identifier:
+            try:
+                from operator1.clients.us_edgar import USEdgarClient
+                edgar = USEdgarClient(
+                    user_agent="Operator1/1.0 (https://github.com/Abdu2024/OP-1)"
+                )
+                df = edgar.get_holder_history(adr_ticker, years=years)
+                if df is not None and not df.empty:
+                    return df
+            except Exception as exc:
+                logger.debug("SEC EDGAR ADR holder history failed for %s: %s", identifier, exc)
+
+        # Fallback: single snapshot from get_holders()
+        holders = self.get_holders(identifier)
+        if not holders:
+            return pd.DataFrame()
+
+        from datetime import datetime
+        return pd.DataFrame([{
+            "date_reported": datetime.now().strftime("%Y-%m-%d"),
+            "inst_ownership_pct": 0.0,
+            "inst_top5_concentration": 0.0,
+            "inst_holder_count": len(holders),
+        }])
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch insider transactions via US EDGAR ADR fallback.
+
+        For ADR-listed companies, SEC EDGAR Form 4 filings provide
+        insider buy/sell data.
+        """
+        adr_ticker = _resolve_adr_ticker(identifier)
+        if adr_ticker and adr_ticker != identifier:
+            try:
+                from operator1.clients.us_edgar import USEdgarClient
+                edgar = USEdgarClient(
+                    user_agent="Operator1/1.0 (https://github.com/Abdu2024/OP-1)"
+                )
+                txns = edgar.get_insider_transactions(adr_ticker)
+                if txns:
+                    for t in txns:
+                        t["source"] = f"sec_edgar_adr ({adr_ticker})"
+                    return txns
+            except Exception as exc:
+                logger.debug("SEC EDGAR ADR insider txns failed for %s: %s", identifier, exc)
+        return []
