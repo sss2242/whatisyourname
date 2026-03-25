@@ -12,15 +12,14 @@ Primary financials: SGX Financial Reports API (api.sgx.com/financialreports/v1.0
   - Document pages contain PDF download links
   - Works globally without authentication
 
-Holder data: yfinance (.SI suffix) + SGX disclosure announcement scraping
-  - yfinance provides institutional + mutual fund holders for major SGX stocks
+Holder data: SGX disclosure announcement scraping (native, no yfinance)
   - SGX Financial Reports API searched for Disclosure of Interest filings
-  - Uses the HKEX scraper pattern: persistent session, date-windowed queries,
+  - Announcement pages scraped for shareholder names and percentages
+  - Annual report PDFs parsed via fuzzy_pdf_parser for shareholding sections
+  - Uses the HKEX scraper pattern: persistent session, paginated queries,
     client-side filtering by company name
 
-Fallback profile: yfinance (.SI suffix)
-
-OHLCV: handled separately via ohlcv_provider.py (yfinance .SI)
+OHLCV: handled separately via ohlcv_provider.py
 
 Coverage: ~700+ listed companies on SGX, ~$0.6T market cap.
 """
@@ -667,12 +666,8 @@ class SGSgxClient:
             if matches:
                 return _securities_to_company_list(matches, self.market_id)
 
-        # Fallback to yfinance search
-        try:
-            from operator1.clients.yfinance_backed import yf_search
-            return yf_search(query, self.market_id, "SG", "SGX", yf_suffix=".SI")
-        except Exception:
-            return []
+        # No fallback -- SGX Securities API covers all listed stocks
+        return []
 
     def search_company(self, name: str) -> list[dict[str, Any]]:
         return self.list_companies(query=name)
@@ -683,7 +678,7 @@ class SGSgxClient:
         """Fetch company profile from SGX Securities API.
 
         Looks up the ticker in the securities directory for name, currency,
-        and board. Falls back to yfinance for sector/industry enrichment.
+        and board. Falls back to OpenFIGI for sector/industry enrichment.
         """
         cached = self._read_cache(identifier, "profile.json")
         if cached:
@@ -713,20 +708,21 @@ class SGSgxClient:
                 if item.get("m"):
                     raw["board"] = item["m"]
 
-        # Supplement with yfinance for sector/industry (SGX API doesn't provide these)
+        # Supplement with OpenFIGI for sector/industry (SGX API doesn't provide these)
         if not raw.get("sector"):
             try:
-                from operator1.clients.yfinance_backed import yf_get_profile
-                yf_profile = yf_get_profile(
-                    identifier, self.market_id, "Singapore", "SG", "SGX", "SGD",
-                    yf_suffix=".SI",
+                from operator1.clients.supplement import enrich_profile
+                enriched = enrich_profile(
+                    market_id=self.market_id,
+                    ticker=identifier,
+                    existing_profile=raw,
                 )
                 # Only take fields that SGX didn't provide
-                for field in ("sector", "industry", "name", "market_cap"):
-                    if yf_profile.get(field) and not raw.get(field):
-                        raw[field] = yf_profile[field]
+                for field in ("sector", "industry", "name", "market_cap", "isin"):
+                    if enriched.get(field) and not raw.get(field):
+                        raw[field] = enriched[field]
             except Exception as exc:
-                logger.debug("yfinance profile supplement failed for %s: %s", identifier, exc)
+                logger.debug("OpenFIGI profile supplement failed for %s: %s", identifier, exc)
 
         profile = translate_profile(raw, self.market_id)
         self._write_cache(identifier, "profile.json", profile)
@@ -780,24 +776,23 @@ class SGSgxClient:
     def get_executives(self, identifier: str) -> list[dict[str, Any]]:
         return []
 
-    # -- Institutional holders (yfinance + SGX announcement scraping) --------
-
-    def _yf_ticker(self, identifier: str) -> str:
-        """Convert SGX ticker code to yfinance format (e.g. 'D05' -> 'D05.SI')."""
-        code = identifier.split(".")[0].strip().upper()
-        return f"{code}.SI"
+    # -- Institutional holders (SGX native -- DOI announcements + PDF) --------
 
     def get_holders(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch institutional + mutual fund holders via yfinance, supplemented
-        by SGX disclosure-of-interest announcements.
+        """Fetch substantial shareholders from SGX native disclosure data.
 
         SGX's substantial shareholding data (Section 137 of the Securities
         and Futures Act) is published as announcement PDFs via the financial
-        reports API.  yfinance provides aggregated institutional holder data
-        from Yahoo Finance for major SGX-listed companies.
+        reports API.  No yfinance dependency.
+
+        Two-source native strategy:
+        1. SGX Financial Reports API -> find Disclosure of Interest filings
+           -> scrape announcement pages for shareholder names + percentages
+        2. Annual report PDFs -> fuzzy_pdf_parser for "Statistics of
+           Shareholdings" sections with substantial shareholder tables
 
         Uses the same session-based pattern as the HKEX scraper: persistent
-        session for cookie reuse, paginated date-windowed queries.
+        session for cookie reuse, paginated queries.
         """
         holders: list[dict[str, Any]] = []
 
@@ -875,141 +870,108 @@ class SGSgxClient:
             except Exception as exc:
                 logger.debug("SGX filing discoverer for shareholding failed for %s: %s", identifier, exc)
 
-        # FALLBACK: yfinance (only if native sources returned nothing)
-        if not holders:
-            try:
-                import yfinance as yf
-                tick = yf.Ticker(self._yf_ticker(identifier))
-
-                inst = tick.institutional_holders
-                if inst is not None and not inst.empty:
-                    for _, row in inst.iterrows():
-                        pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                        if isinstance(pct, (int, float)) and 0 < pct < 1:
-                            pct = pct * 100
-                        holders.append({
-                            "name": str(row.get("Holder", "")),
-                            "shares": int(row.get("Shares", 0)),
-                            "value": float(row.get("Value", 0)),
-                            "percentage": round(float(pct), 2),
-                            "holder_type": "institutional",
-                            "date_reported": str(row.get("Date Reported", "")),
-                            "source": "yfinance",
-                        })
-
-                mf = tick.mutualfund_holders
-                if mf is not None and not mf.empty:
-                    for _, row in mf.iterrows():
-                        pct = row.get("pctHeld", 0) or row.get("% Out", 0) or 0
-                        if isinstance(pct, (int, float)) and 0 < pct < 1:
-                            pct = pct * 100
-                        holders.append({
-                            "name": str(row.get("Holder", "")),
-                            "shares": int(row.get("Shares", 0)),
-                            "value": float(row.get("Value", 0)),
-                            "percentage": round(float(pct), 2),
-                            "holder_type": "mutualfund",
-                            "date_reported": str(row.get("Date Reported", "")),
-                            "source": "yfinance",
-                        })
-
-                if holders:
-                    logger.info("SGX holders fallback for %s: %d from yfinance", identifier, len(holders))
-            except Exception as exc:
-                logger.debug("yfinance holders fallback failed for SGX %s: %s", identifier, exc)
-
+        # No yfinance fallback -- native SGX sources only
         return holders
 
     def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
-        """Return institutional ownership metrics as a single-row snapshot.
+        """Return institutional ownership metrics from native SGX data.
 
-        SGX does not expose historical shareholding data via free APIs.
-        yfinance provides a current-quarter snapshot of aggregate
-        institutional ownership statistics.
+        Derives aggregate metrics from get_holders() which uses SGX DOI
+        announcements and annual report PDF extraction.  No yfinance dependency.
 
-        Uses the same pattern as HKHkexClient.get_holder_history().
+        Returns a single-row snapshot (same pattern as HKHkexClient).
         """
         try:
-            import yfinance as yf
             from datetime import date as _date
-            tick = yf.Ticker(self._yf_ticker(identifier))
-
-            mh = tick.major_holders
-            inst_pct = 0.0
-            inst_count = 0
-            if mh is not None and not mh.empty:
-                for idx, row in mh.iterrows():
-                    breakdown = (
-                        str(row.get("Breakdown", idx)).lower()
-                        if "Breakdown" in mh.columns
-                        else str(idx).lower()
-                    )
-                    val = (
-                        row.get("Value", row.iloc[-1])
-                        if "Value" in mh.columns
-                        else row.iloc[-1]
-                    )
-                    if (
-                        "institutionspercentheld" in breakdown
-                        or ("institutions" in breakdown and "percent" in breakdown)
-                    ):
-                        inst_pct = float(val) * 100 if float(val) < 1 else float(val)
-                    elif "institutionscount" in breakdown or "count" in breakdown:
-                        inst_count = int(float(val))
 
             holders = self.get_holders(identifier)
-            hhi = 0.0
-            if holders:
-                top5 = holders[:5]
-                total_pct = sum(h.get("percentage", 0) for h in top5)
-                if total_pct > 0:
-                    hhi = sum(
-                        (h.get("percentage", 0) / total_pct) ** 2 for h in top5
-                    )
+            if not holders:
+                return pd.DataFrame()
 
-            if inst_pct > 0 or inst_count > 0 or holders:
-                return pd.DataFrame([{
-                    "date_reported": pd.Timestamp(_date.today()),
-                    "inst_ownership_pct": round(inst_pct, 2),
-                    "inst_top5_concentration": round(hhi, 4),
-                    "inst_holder_count": inst_count or len(holders),
-                }])
+            inst_holders = [h for h in holders if h.get("holder_type") in ("substantial", "institutional")]
+            inst_pct = sum(h.get("percentage", 0) for h in inst_holders)
+
+            hhi = 0.0
+            top5 = inst_holders[:5]
+            total_pct = sum(h.get("percentage", 0) for h in top5)
+            if total_pct > 0:
+                hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
+
+            return pd.DataFrame([{
+                "date_reported": pd.Timestamp(_date.today()),
+                "inst_ownership_pct": round(inst_pct, 2),
+                "inst_top5_concentration": round(hhi, 4),
+                "inst_holder_count": len(inst_holders),
+            }])
         except Exception as exc:
             logger.debug("SGX holder history failed for %s: %s", identifier, exc)
         return pd.DataFrame()
 
     def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch insider transactions via yfinance for SGX-listed companies.
+        """Fetch director/board announcements from SGX Financial Reports API.
 
-        Uses the same pattern as HKHkexClient.get_insider_transactions().
+        Uses the SGX Financial Reports API to find board-related
+        announcements (director appointments, resignations, dealings).
+        Returns basic filing metadata; detailed extraction requires LLM.
+
+        No yfinance dependency.
         """
         transactions: list[dict[str, Any]] = []
         try:
-            import yfinance as yf
-            tick = yf.Ticker(self._yf_ticker(identifier))
-            insider = tick.insider_transactions
-            if insider is not None and not insider.empty:
-                for _, row in insider.iterrows():
-                    shares = 0
-                    try:
-                        shares = int(row.get("Shares", 0))
-                    except (ValueError, TypeError):
-                        pass
-                    transactions.append({
-                        "insider_name": str(row.get("Insider", "")),
-                        "position": str(row.get("Position", "")),
-                        "date": str(row.get("Start Date", "")),
-                        "transaction": str(row.get("Transaction", "")),
-                        "shares": shares,
-                        "value": float(row.get("Value", 0) or 0),
-                    })
+            session = _get_sgx_session()
+            company_name = _resolve_company_name(identifier)
+
+            # Search for director-related reports via financial reports API
+            resp = session.get(
+                f"{_SGX_BASE}/financialreports/v1.0",
+                params={
+                    "pagestart": "0",
+                    "pagesize": "50",
+                    "companyname": company_name,
+                },
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                return transactions
+
+            data = resp.json()
+            reports = data.get("data", [])
+
+            _INSIDER_KEYWORDS = (
+                "director", "appointment", "resignation", "cessation",
+                "change of", "dealings", "interested person",
+            )
+
+            for report in reports:
+                title = (report.get("title") or "").lower()
+                if not any(kw in title for kw in _INSIDER_KEYWORDS):
+                    continue
+
+                doc_date_ms = report.get("documentDate", 0)
+                if isinstance(doc_date_ms, (int, float)) and doc_date_ms > 0:
+                    doc_date_str = date.fromtimestamp(doc_date_ms / 1000).isoformat()
+                else:
+                    doc_date_str = ""
+
+                transactions.append({
+                    "insider_name": report.get("title", "Unknown"),
+                    "position": "",
+                    "date": doc_date_str,
+                    "transaction": "Disclosure",
+                    "shares": 0,
+                    "value": 0.0,
+                    "source": "sgx_financial_reports",
+                    "announcement_url": report.get("url", ""),
+                })
+
+            if transactions:
                 logger.info(
-                    "SGX insider transactions for %s: %d",
+                    "SGX insider/director announcements for %s: %d from native API",
                     identifier, len(transactions),
                 )
         except Exception as exc:
             logger.debug(
-                "yfinance insider transactions failed for SGX %s: %s",
+                "SGX insider transaction search failed for %s: %s",
                 identifier, exc,
             )
         return transactions
