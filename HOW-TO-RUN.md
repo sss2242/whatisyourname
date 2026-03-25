@@ -235,7 +235,28 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 ### Step 3: Install dependencies
 
-**Staged install (recommended -- avoids timeouts):**
+**Option A: Use the install script (recommended)**
+
+```cmd
+install.bat
+```
+
+This creates a virtual environment and installs all 4 stages. If any stage fails (e.g. slow connection), re-run just that stage:
+
+```cmd
+install.bat 1   &REM Stage 1: Core libraries (~30s)
+install.bat 2   &REM Stage 2: ML and statistics (~1-2min)
+install.bat 3   &REM Stage 3: Deep learning + Bayesian (~5-8min, PyTorch is ~2 GB)
+install.bat 4   &REM Stage 4: Data source wrappers (~1-2min)
+```
+
+After install.bat finishes, activate the virtual environment:
+
+```cmd
+venv\Scripts\activate
+```
+
+**Option B: Manual staged install**
 
 ```cmd
 pip install --timeout 300 -r requirements\stage1-core.txt
@@ -246,13 +267,13 @@ pip install --timeout 300 -r requirements\stage4-wrappers.txt
 
 If any stage fails, just re-run that one command. Stage 3 is the largest (~2 GB for PyTorch).
 
-**All at once** (may timeout on slow connections):
+**Option C: All at once** (may timeout on slow connections):
 
 ```cmd
 pip install --timeout 300 --retries 5 -r requirements.txt
 ```
 
-**Lighter install** -- skip deep learning for faster setup:
+**Option D: Lighter install** -- skip deep learning for faster setup:
 
 ```cmd
 pip install --timeout 300 -r requirements\stage1-core.txt
