@@ -590,13 +590,14 @@ class CNSseClient:
                     pct = 0.0
                     try:
                         pct_raw = row.get("持股比例", row.get("hold_ratio", 0))
-                        if pct_raw:
+                        if pct_raw is not None and str(pct_raw).strip():
                             pct_str = str(pct_raw).replace("%", "").strip()
-                            if pct_str:
+                            if pct_str and pct_str != "nan":
                                 pct = float(pct_str)
-                                # Sina returns percentage as decimal (0.xx) or percent
-                                if 0 < pct < 1:
-                                    pct = pct * 100
+                                # Sina returns 持股比例 already as percentage
+                                # (e.g. 4.55 = 4.55%, NOT 0.0455).
+                                # Only convert if clearly a decimal > 1 (e.g. 45.5)
+                                # which would mean the raw value is a true percentage.
                     except (ValueError, TypeError):
                         pass
                     shares = 0
@@ -649,10 +650,8 @@ class CNSseClient:
                     pct = 0.0
                     try:
                         pct_raw = row.get("持股比例", 0)
-                        if pct_raw:
-                            pct = float(str(pct_raw).replace("%", ""))
-                            if 0 < pct < 1:
-                                pct = pct * 100
+                        if pct_raw is not None and str(pct_raw).strip() and str(pct_raw).strip() != "nan":
+                            pct = float(str(pct_raw).replace("%", "").strip())
                     except (ValueError, TypeError):
                         pass
                     shares = 0
