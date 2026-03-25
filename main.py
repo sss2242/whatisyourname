@@ -2311,7 +2311,7 @@ Non-interactive examples:
             try:
                 pred_result = run_prediction_aggregation(
                     cache, forecast_result, mc_result,
-                    mode_weights=_mode_weights if '_mode_weights' in dir() else None,
+                    mode_weights=_mode_weights,
                     conformal_result=conformal_result,
                     dual_regime_result=dual_regime_result,
                     copula_result=copula_result,
@@ -2524,9 +2524,10 @@ Non-interactive examples:
     # Run data quality audit (feeds into profile data_quality section)
     _quality_path = None
     try:
-        from operator1.quality.data_quality import run_quality_audit
-        _qr = run_quality_audit(cache, entity_id=ticker or "target")
+        from operator1.quality.data_quality import run_quality_checks, save_quality_report
+        _qr = run_quality_checks(cache, entity_id=ticker or "target")
         _quality_path = str(Path(args.output_dir) / "data_quality_report.json")
+        save_quality_report({"target": _qr}, output_path=_quality_path)
     except Exception as exc:
         logger.debug("Quality audit skipped: %s", exc)
 

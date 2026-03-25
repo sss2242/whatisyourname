@@ -1076,7 +1076,6 @@ def build_company_profile(
     prediction_result: dict[str, Any] | None = None,
     quality_report_path: str | Path | None = None,
     estimation_coverage_path: str | Path | None = None,
-    output_path: str | Path | None = None,
     # Advanced modules
     graph_risk_result: dict[str, Any] | None = None,
     game_theory_result: dict[str, Any] | None = None,
@@ -1113,15 +1112,12 @@ def build_company_profile(
         Path to ``data_quality_report.json`` (default: ``cache/``).
     estimation_coverage_path:
         Path to ``estimation_coverage.json`` (default: ``cache/``).
-    output_path:
-        Where to write ``company_profile.json``.  Defaults to
-        ``cache/company_profile.json``.
 
     Returns
     -------
     dict
         The complete company profile as a Python dict.
-        Also persisted to *output_path* as JSON.
+        The caller (main.py) is responsible for persisting to disk.
     """
     logger.info("Building company profile JSON...")
 
