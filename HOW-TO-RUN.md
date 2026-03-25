@@ -8,7 +8,7 @@ Step-by-step instructions for running Operator 1 on Linux Mint and Windows.
 
 ### Prerequisites
 
-You need Python 3.12 or newer and git. Linux Mint ships with Python, but you may need to install `pip` and `venv`.
+You need Python 3.12 or newer and git. Linux Mint ships with Python, but the version may be older than 3.12.
 
 Open a terminal (Ctrl+Alt+T) and run:
 
@@ -16,17 +16,23 @@ Open a terminal (Ctrl+Alt+T) and run:
 # Check your Python version (need 3.12+)
 python3 --version
 
-# Install pip and venv if not already present
+# Install pip, venv, and build tools
 sudo apt update
-sudo apt install python3-pip python3-venv git -y
+sudo apt install python3-pip python3-venv python3-dev build-essential git -y
+
+# If your Python is older than 3.12, add the deadsnakes PPA:
+sudo apt install software-properties-common -y
+sudo add-apt-repository ppa:deadsnakes/ppa -y
+sudo apt update
+sudo apt install python3.12 python3.12-venv python3.12-dev -y
 ```
 
 ### Step 1: Clone the repository
 
 ```bash
 cd ~
-git clone https://github.com/oso0240/githubu-isu-meanu.git
-cd githubu-isu-meanu
+git clone https://github.com/oos24/whatisyourname.git
+cd whatisyourname
 ```
 
 ### Step 2: Create a virtual environment
@@ -34,11 +40,14 @@ cd githubu-isu-meanu
 A virtual environment keeps Operator 1's dependencies isolated from your system Python.
 
 ```bash
-python3 -m venv venv
+# Use python3.12 if you installed it via deadsnakes PPA, otherwise python3
+python3.12 -m venv venv   # or: python3 -m venv venv (if your python3 is 3.12+)
 source venv/bin/activate
 ```
 
 You should see `(venv)` at the beginning of your terminal prompt. Every time you open a new terminal to run Operator 1, you need to activate it again with `source venv/bin/activate`.
+
+> **Note**: The `install.sh` script handles virtual environment creation automatically. If you use `./install.sh`, you can skip this step.
 
 ### Step 3: Install dependencies
 
@@ -205,8 +214,8 @@ You need Python 3.12 or newer and git.
 
 ```cmd
 cd %USERPROFILE%
-git clone https://github.com/oso0240/githubu-isu-meanu.git
-cd githubu-isu-meanu
+git clone https://github.com/oos24/whatisyourname.git
+cd whatisyourname
 ```
 
 ### Step 2: Create a virtual environment
@@ -340,7 +349,10 @@ deactivate
 ## Troubleshooting
 
 ### "No module named operator1"
-Make sure you are running the command from inside the `githubu-isu-meanu` directory and that your virtual environment is activated.
+Make sure you are running the command from inside the `whatisyourname` directory and that your virtual environment is activated.
+
+### install.sh fails with "dnf: command not found" (Linux Mint / Ubuntu)
+The old install.sh was written for Amazon Linux. The updated version auto-detects your OS and uses the correct package manager (`apt` for Debian/Ubuntu/Mint, `dnf` for Fedora/RHEL). Make sure you have the latest `install.sh`.
 
 ### "pip: command not found" (Linux)
 Run `sudo apt install python3-pip -y`.
