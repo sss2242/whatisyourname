@@ -674,6 +674,23 @@ class TWMopsClient:
         holders: list[dict[str, Any]] = []
         code = identifier.strip()
 
+        # Fetch total outstanding shares from TWSE t187ap03_L (native, no yfinance)
+        _total_shares = 0
+        try:
+            from curl_cffi import requests as _cf
+            _s = _cf.Session(impersonate="chrome")
+            _r = _s.get("https://openapi.twse.com.tw/v1/opendata/t187ap03_L", timeout=20)
+            if _r.status_code == 200:
+                _d = _r.json()
+                if isinstance(_d, list):
+                    for _row in _d:
+                        if _row.get("公司代號", "").strip() == code:
+                            _raw = _row.get("已發行普通股數或TDR原股發行股數", "0")
+                            _total_shares = int(str(_raw).replace(",", "").strip() or 0)
+                            break
+        except Exception:
+            pass
+
         # --- Path 1: TWSE t187ap11_L -- director/officer shareholdings ---
         try:
             from curl_cffi import requests as cf_requests
@@ -711,11 +728,12 @@ class TWMopsClient:
                         report_date = row.get("出表日期", "")
 
                         if name and current_shares > 0:
+                            pct = round(current_shares / _total_shares * 100, 4) if _total_shares > 0 else 0.0
                             holders.append({
                                 "name": name,
                                 "shares": current_shares,
                                 "value": 0.0,
-                                "percentage": 0.0,
+                                "percentage": pct,
                                 "holder_type": "director" if "董事" in position else "officer",
                                 "position": position,
                                 "pledged_shares": pledged,
@@ -780,10 +798,38 @@ class TWMopsClient:
             total_shares = sum(h.get("shares", 0) for h in directors)
             total_pledged = sum(h.get("pledged_shares", 0) for h in directors)
 
+            # Compute ownership percentage from total outstanding shares
+            ownership_pct = 0.0
+            top5_hhi = 0.0
+            # Get total outstanding from the first holder's context or re-fetch
+            _outstanding = 0
+            try:
+                from curl_cffi import requests as _cf
+                _s = _cf.Session(impersonate="chrome")
+                _r = _s.get("https://openapi.twse.com.tw/v1/opendata/t187ap03_L", timeout=20)
+                if _r.status_code == 200:
+                    _d = _r.json()
+                    if isinstance(_d, list):
+                        for _row in _d:
+                            if _row.get("公司代號", "").strip() == identifier.strip():
+                                _raw = _row.get("已發行普通股數或TDR原股發行股數", "0")
+                                _outstanding = int(str(_raw).replace(",", "").strip() or 0)
+                                break
+            except Exception:
+                pass
+
+            if _outstanding > 0:
+                ownership_pct = round(total_shares / _outstanding * 100, 4)
+                # HHI of top 5 holders (sum of squared share fractions)
+                top5 = sorted(directors, key=lambda h: h.get("shares", 0), reverse=True)[:5]
+                if top5 and total_shares > 0:
+                    top5_hhi = sum((h.get("shares", 0) / _outstanding) ** 2 for h in top5)
+                    top5_hhi = round(top5_hhi, 6)
+
             return pd.DataFrame([{
                 "date_reported": pd.Timestamp(date.today()),
-                "inst_ownership_pct": 0.0,
-                "inst_top5_concentration": 0.0,
+                "inst_ownership_pct": ownership_pct,
+                "inst_top5_concentration": top5_hhi,
                 "inst_holder_count": len(directors),
                 "director_total_shares": total_shares,
                 "director_pledged_shares": total_pledged,
