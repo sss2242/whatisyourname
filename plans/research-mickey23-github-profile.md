@@ -107,4 +107,8 @@ The only repo with original code contributions from Mickey is **TWStockHighLowVi
 4. **Fork-heavy profile:** 14 out of 15 repos are forks with zero stars and zero additional forks. Most appear to be personal reference copies rather than active contributions.
 5. **Active project:** TWStockHighLowViewer is the only fork with meaningful original commits -- a Streamlit-based quantitative scanner for Taiwan stocks.
 6. **AI/LLM interest:** Recent forks (March 2026) show growing interest in AI-driven stock analysis tools, including multi-agent LLM trading frameworks and AI hedge fund simulations.
-7. **The githubu-isu-meanu repo** appears to be connected to this project (Operator 1 / whatisyourname) based on its commit history containing Roo Code contributions about native holder data APIs.
+7. **Bulk forking pattern:** Forked 8 TWStock repos in a single day (Feb 27), suggesting automated or rapid collection of stock-related projects rather than deliberate study.
+
+## Note on githubu-isu-meanu
+
+The `githubu-isu-meanu` repo is **not Mickey23's original work**. It is a fork of this project (Operator 1 / whatisyourname) that was originally hosted under a different account (oso2424242442). Mickey23 discovered and forked the repo while it was still public and in-progress. The original owner has since deleted the old account's repos and consolidated everything into the current `oso24422442/whatisyourname` repository. Mickey23's fork contains no additional modifications -- it's a straight copy of the work-in-progress state at the time of forking.
