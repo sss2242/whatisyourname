@@ -1269,10 +1269,39 @@ Non-interactive examples:
             if not _gdp_series.empty:
                 _gdp_val = float(_gdp_series.dropna().iloc[-1])
 
+        # Extract parent sector from GLEIF corporate structure (if available)
+        # for protection inheritance.  The parent_companies group was added
+        # in Step 5e.1 from GLEIF data.
+        _parent_sector = None
+        _parent_entities = relationships.get("parent_companies", [])
+        if _parent_entities:
+            # Use the first parent's name to infer sector
+            _p = _parent_entities[0]
+            _parent_name = _p.get("name", "") if isinstance(_p, dict) else getattr(_p, "name", "")
+            # Infer sector from parent name heuristics
+            _pn = _parent_name.lower()
+            if any(w in _pn for w in ["energy", "oil", "gas", "petrol"]):
+                _parent_sector = "energy"
+            elif any(w in _pn for w in ["bank", "financ", "credit", "invest"]):
+                _parent_sector = "banking"
+            elif any(w in _pn for w in ["defense", "defence", "aerospace", "military"]):
+                _parent_sector = "defense"
+            elif any(w in _pn for w in ["telecom", "communic"]):
+                _parent_sector = "telecommunications"
+            elif any(w in _pn for w in ["pharma", "health", "medical"]):
+                _parent_sector = "healthcare"
+            elif any(w in _pn for w in ["utilit", "electric", "power"]):
+                _parent_sector = "utilities"
+            elif any(w in _pn for w in ["insur"]):
+                _parent_sector = "insurance"
+            elif any(w in _pn for w in ["technolog", "software", "digital"]):
+                _parent_sector = "technology"
+
         cache = compute_fuzzy_protection(
             cache,
             sector=target_profile.get("sector"),
             gdp=_gdp_val,
+            parent_sector=_parent_sector,
         )
         fuzzy_result = {
             "mean_degree": float(cache["fuzzy_protection_degree"].mean()),
@@ -2591,6 +2620,43 @@ Non-interactive examples:
         # Inject reconciliation report
         if reconciliation_report:
             profile["meta"]["reconciliation"] = reconciliation_report
+
+        # Inject GLEIF corporate structure into profile
+        _parent_list = relationships.get("parent_companies", [])
+        _sub_list = relationships.get("subsidiaries", [])
+        if _parent_list or _sub_list:
+            _parent_dicts = []
+            for _p in _parent_list:
+                if isinstance(_p, dict):
+                    _parent_dicts.append({
+                        "name": _p.get("name", ""),
+                        "lei": _p.get("lei", ""),
+                        "country": _p.get("country", ""),
+                        "relationship": _p.get("relationship", "parent"),
+                    })
+            _sub_dicts = []
+            _sub_countries = set()
+            for _s in _sub_list:
+                if isinstance(_s, dict):
+                    _sub_dicts.append({
+                        "name": _s.get("name", ""),
+                        "lei": _s.get("lei", ""),
+                        "country": _s.get("country", ""),
+                    })
+                    if _s.get("country"):
+                        _sub_countries.add(_s["country"])
+            profile["corporate_structure"] = {
+                "available": True,
+                "source": "gleif",
+                "parent_companies": _parent_dicts,
+                "n_parents": len(_parent_dicts),
+                "subsidiaries": _sub_dicts[:10],
+                "n_subsidiaries": len(_sub_dicts),
+                "subsidiaries_countries": sorted(_sub_countries),
+                "cross_border": len(_sub_countries) > 1,
+            }
+        else:
+            profile["corporate_structure"] = {"available": False}
 
         # Inject institutional/major holders
         if target_holders:
