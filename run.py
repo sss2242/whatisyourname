@@ -133,14 +133,15 @@ def _yes_no(msg: str, default: bool = True) -> bool:
 
 def check_python_version() -> bool:
     v = sys.version_info
-    if v.major >= 3 and v.minor >= 10:
+    if v.major >= 3 and v.minor >= 12:
         _ok(f"Python {v.major}.{v.minor}.{v.micro}")
         return True
-    elif v.major >= 3 and v.minor >= 8:
-        _warn(f"Python {v.major}.{v.minor}.{v.micro} (3.10+ recommended)")
+    elif v.major >= 3 and v.minor >= 10:
+        _warn(f"Python {v.major}.{v.minor}.{v.micro} (3.12+ required, some features may fail)")
         return True
     else:
-        _err(f"Python {v.major}.{v.minor}.{v.micro} -- need 3.8+")
+        _err(f"Python {v.major}.{v.minor}.{v.micro} -- need 3.12+")
+        _info("Download from: https://www.python.org/downloads/")
         return False
 
 
@@ -938,8 +939,9 @@ def main() -> int:
         _info("Key files:")
         for key_file in [
             "cache/company_profile.json",
-            "cache/report/analysis_report.md",
-            "cache/report/analysis_report.pdf",
+            "cache/report/premium_report.md",
+            "cache/report/pro_report.md",
+            "cache/report/basic_report.md",
         ]:
             p = Path(key_file)
             if p.exists():

@@ -26,38 +26,9 @@ from operator1.clients.canonical_translator import (
 )
 from operator1.config_loader import get_global_config
 from operator1.constants import CACHE_DIR, RAW_CACHE_DIR, DATE_START, DATE_END
-from operator1.types import VerifiedTarget
+from operator1.types import VerifiedTarget, EntityData, ExtractionResult
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class EntityData:
-    """Raw data container for a single entity."""
-
-    isin: str
-    profile: dict[str, Any] = field(default_factory=dict)
-    quotes: pd.DataFrame = field(default_factory=pd.DataFrame)
-    income_statement: pd.DataFrame = field(default_factory=pd.DataFrame)
-    balance_sheet: pd.DataFrame = field(default_factory=pd.DataFrame)
-    cashflow_statement: pd.DataFrame = field(default_factory=pd.DataFrame)
-
-    # Target-only extras
-    peers: list[str] = field(default_factory=list)
-    supply_chain: list[dict[str, Any]] = field(default_factory=list)
-    executives: list[dict[str, Any]] = field(default_factory=list)
-
-    # OHLCV price data (from PIT provider)
-    ohlcv: pd.DataFrame = field(default_factory=pd.DataFrame)
-
-
-@dataclass
-class ExtractionResult:
-    """Container for all extracted data."""
-
-    target: EntityData = field(default_factory=lambda: EntityData(isin=""))
-    linked: dict[str, EntityData] = field(default_factory=dict)  # isin -> EntityData
-    errors: list[dict[str, str]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

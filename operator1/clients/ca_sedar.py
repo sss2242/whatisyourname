@@ -476,6 +476,16 @@ class CASedarClient:
         except Exception as exc:
             logger.debug("TMX GraphQL insider activity failed for %s: %s", identifier, exc)
 
+        # Fallback: extract shareholders from filing PDFs
+        if not holders:
+            try:
+                from operator1.clients.filing_discoverer import try_shareholding_extraction
+                holders = try_shareholding_extraction(identifier, market_id=self.market_id)
+                if holders:
+                    logger.info("SEDAR holders from PDF shareholding extraction: %d", len(holders))
+            except Exception as exc:
+                logger.debug("SEDAR PDF shareholding fallback failed: %s", exc)
+
         return holders
 
     def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:

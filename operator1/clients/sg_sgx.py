@@ -870,7 +870,16 @@ class SGSgxClient:
             except Exception as exc:
                 logger.debug("SGX filing discoverer for shareholding failed for %s: %s", identifier, exc)
 
-        # No yfinance fallback -- native SGX sources only
+        # Fallback: extract shareholders from filing PDFs
+        if not holders:
+            try:
+                from operator1.clients.filing_discoverer import try_shareholding_extraction
+                holders = try_shareholding_extraction(identifier, market_id=self.market_id)
+                if holders:
+                    logger.info("SGX holders from PDF shareholding extraction: %d", len(holders))
+            except Exception as exc:
+                logger.debug("SGX PDF shareholding fallback failed: %s", exc)
+
         return holders
 
     def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:

@@ -366,12 +366,20 @@ class ASXFilingDiscoverer:
     identify filing dates even when the PDF is not directly downloadable.
     """
 
+    # Shareholding headline keywords
+    _SHAREHOLDING_KEYWORDS = [
+        "substantial holder", "substantial shareholder",
+        "ceasing to be a substantial", "becoming a substantial",
+        "appendix 3y", "director interest", "change of director",
+    ]
+
     def discover_filings(
         self,
         ticker: str,
         years: int = 2,
+        categories: list[str] | None = None,
     ) -> FilingDiscovery:
-        """Discover financial announcements from ASX MarkitDigital API.
+        """Discover financial and/or shareholding announcements from ASX.
 
         Parameters
         ----------
@@ -379,7 +387,13 @@ class ASXFilingDiscoverer:
             ASX ticker symbol (e.g. 'BHP', 'CBA').
         years:
             Number of years to search back.
+        categories:
+            Filing categories: ["financial"], ["shareholding"], or both.
+            Default: ["financial"].
         """
+        if categories is None:
+            categories = ["financial"]
+
         result = FilingDiscovery(ticker=ticker, market_id="au_asx")
 
         try:
@@ -402,20 +416,36 @@ class ASXFilingDiscoverer:
 
         cutoff = date.today() - timedelta(days=365 * years)
 
+        want_financial = "financial" in categories
+        want_shareholding = "shareholding" in categories
+
         for item in items:
             headline = item.get("headline", "")
             ann_type = item.get("announcementType", "")
             ann_date = item.get("date", "")
             doc_key = item.get("documentKey", "")
+            lower_headline = headline.lower()
 
-            # Filter to financial filings
-            if ann_type not in _ASX_FINANCIAL_TYPES:
-                # Also check headline keywords
-                lower_headline = headline.lower()
-                if not any(kw in lower_headline for kw in
-                           ["annual report", "half year", "financial result",
-                            "preliminary final", "appendix 4d", "appendix 4e"]):
-                    continue
+            # Check if this is a shareholding filing
+            is_shareholding = any(
+                kw in lower_headline for kw in self._SHAREHOLDING_KEYWORDS
+            )
+
+            # Check if this is a financial filing
+            is_financial = (
+                ann_type in _ASX_FINANCIAL_TYPES
+                or any(kw in lower_headline for kw in
+                       ["annual report", "half year", "financial result",
+                        "preliminary final", "appendix 4d", "appendix 4e"])
+            )
+
+            # Filter based on requested categories
+            if is_shareholding and want_shareholding:
+                pass  # include
+            elif is_financial and want_financial:
+                pass  # include
+            else:
+                continue
 
             # Parse date
             filing_date = ""
@@ -429,10 +459,11 @@ class ASXFilingDiscoverer:
                 continue
 
             # Classify filing type
-            lower = headline.lower()
-            if "annual" in lower or "appendix 4e" in lower:
+            if is_shareholding:
+                filing_type = "shareholding"
+            elif "annual" in lower_headline or "appendix 4e" in lower_headline:
                 filing_type = "annual"
-            elif "half year" in lower or "appendix 4d" in lower or lower.startswith("hy"):
+            elif "half year" in lower_headline or "appendix 4d" in lower_headline or lower_headline.startswith("hy"):
                 filing_type = "interim"
             else:
                 filing_type = "quarterly"

@@ -1266,14 +1266,10 @@ def build_company_profile(
     # Make JSON-safe
     profile = _json_serialisable(profile)
 
-    # Persist to disk
-    if output_path is None:
-        output_path = Path(CACHE_DIR) / "company_profile.json"
-    out = Path(output_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
+    # NOTE: File persistence is handled by the caller (main.py) after
+    # injecting additional sections (enriched_survival_timeline,
+    # filing_calendar, extended_models, etc.).  Removed the write here
+    # to avoid writing an incomplete profile.
 
-    with open(out, "w", encoding="utf-8") as fh:
-        json.dump(profile, fh, indent=2, default=str)
-
-    logger.info("Company profile written to %s", out)
+    logger.info("Company profile built: %d top-level sections", len(profile))
     return profile
