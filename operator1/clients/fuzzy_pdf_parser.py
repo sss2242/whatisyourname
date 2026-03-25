@@ -858,6 +858,204 @@ def _extract_number_from_text(line: str) -> float | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Shareholder / ownership data extraction from PDFs
+# ---------------------------------------------------------------------------
+
+# Keywords that identify pages containing shareholder data
+_SHAREHOLDER_KEYWORDS = [
+    "shareholding pattern", "major shareholders", "ownership structure",
+    "substantial shareholders", "top shareholders", "significant shareholders",
+    "beneficial owners", "institutional holders", "holder name",
+    "persons with significant control", "register of members",
+    "shareholding of promoters", "category of shareholders",
+    "public shareholding", "promoter and promoter group",
+    "holding of specified securities", "shares held",
+    "percentage of holding", "% of total",
+    "directors and key managerial personnel",
+]
+
+# Keywords that indicate a row is a holder name (not a section header)
+_HOLDER_ROW_INDICATORS = [
+    "ltd", "limited", "inc", "corp", "llc", "plc", "nv", "ag", "sa", "sas",
+    "gmbh", "fund", "trust", "bank", "capital", "asset", "management",
+    "investment", "insurance", "pension", "securities", "holdings",
+    "group", "partners", "advisors", "state", "government", "mutual",
+    "fidelity", "vanguard", "blackrock", "jpmorgan", "goldman",
+    "amundi", "ubs", "hsbc", "citibank", "nomura", "dws",
+]
+
+
+def extract_shareholders_from_pdf(
+    pdf_bytes: bytes,
+    filing_date: str = "",
+    market_id: str = "",
+) -> list[dict[str, Any]]:
+    """Extract shareholder/ownership data from a PDF.
+
+    Finds pages with shareholding pattern tables and extracts holder
+    names with share counts and percentages.  Works with SEBI
+    (India), IFRS annual reports, and other standard formats.
+
+    Parameters
+    ----------
+    pdf_bytes:
+        Raw PDF file content.
+    filing_date:
+        ISO date string of when the filing was published.
+    market_id:
+        Market identifier for logging.
+
+    Returns
+    -------
+    List of dicts with: name, shares, percentage, holder_type, source.
+    """
+    holders: list[dict[str, Any]] = []
+
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.debug("pdfplumber not installed, cannot extract shareholders from PDF")
+        return holders
+
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+            # Find pages with shareholder content
+            sh_pages = []
+            for i, page in enumerate(doc.pages):
+                text = (page.extract_text() or "").lower()
+                score = sum(1 for kw in _SHAREHOLDER_KEYWORDS if kw in text)
+                if score >= 2:
+                    sh_pages.append((i, score))
+
+            sh_pages.sort(key=lambda x: -x[1])
+            if not sh_pages:
+                return holders
+
+            logger.debug("Shareholder pages found: %d", len(sh_pages))
+
+            seen_names: set[str] = set()
+
+            for page_idx, _ in sh_pages[:5]:
+                page = doc.pages[page_idx]
+                tables = page.extract_tables()
+
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+
+                    # Try to identify columns: look for header row with
+                    # "name", "shares", "%", "holding" keywords
+                    header = table[0] if table[0] else []
+                    header_lower = [str(h).lower().strip() if h else "" for h in header]
+
+                    name_col = -1
+                    shares_col = -1
+                    pct_col = -1
+
+                    for ci, h in enumerate(header_lower):
+                        if any(w in h for w in ["name", "shareholder", "holder", "category"]):
+                            name_col = ci
+                        elif any(w in h for w in ["shares", "number", "quantity", "nos"]):
+                            shares_col = ci
+                        elif any(w in h for w in ["%", "percent", "holding", "proportion"]):
+                            pct_col = ci
+
+                    # If no clear header, assume col 0 = name, last cols = numbers
+                    if name_col < 0:
+                        name_col = 0
+
+                    # Extract rows
+                    for row in table[1:]:
+                        if not row or not row[name_col]:
+                            continue
+
+                        name = str(row[name_col]).strip()
+                        if not name or len(name) < 3:
+                            continue
+
+                        # Skip section headers and totals
+                        name_lower = name.lower()
+                        if any(w in name_lower for w in [
+                            "total", "grand total", "sub-total", "subtotal",
+                            "category", "particulars", "description",
+                            "sl. no", "sr. no", "s.no",
+                        ]):
+                            continue
+
+                        # Check if this looks like a holder name
+                        is_holder = any(w in name_lower for w in _HOLDER_ROW_INDICATORS)
+                        # Also accept if the row has numeric values
+                        has_numbers = any(
+                            _parse_indian_number(str(c).strip()) is not None
+                            for c in row[1:] if c
+                        )
+
+                        if not is_holder and not has_numbers:
+                            continue
+
+                        if name in seen_names:
+                            continue
+                        seen_names.add(name)
+
+                        # Extract shares and percentage
+                        shares = 0
+                        pct = 0.0
+
+                        if shares_col >= 0 and shares_col < len(row) and row[shares_col]:
+                            val = _parse_indian_number(str(row[shares_col]).strip())
+                            if val is not None:
+                                shares = int(val)
+
+                        if pct_col >= 0 and pct_col < len(row) and row[pct_col]:
+                            val = _parse_indian_number(str(row[pct_col]).strip())
+                            if val is not None:
+                                pct = round(val, 4)
+
+                        # If no identified columns, try extracting from any cell
+                        if shares == 0 and pct == 0.0:
+                            for c in row[1:]:
+                                if c is None:
+                                    continue
+                                val = _parse_indian_number(str(c).strip())
+                                if val is not None:
+                                    if val > 100:
+                                        shares = int(val)
+                                    elif 0 < val <= 100:
+                                        pct = round(val, 4)
+
+                        if shares > 0 or pct > 0:
+                            # Determine holder type from name
+                            holder_type = "institutional"
+                            if any(w in name_lower for w in ["promoter", "director", "founder", "family"]):
+                                holder_type = "promoter"
+                            elif any(w in name_lower for w in ["public", "individual", "retail"]):
+                                holder_type = "retail"
+                            elif any(w in name_lower for w in ["fund", "mutual", "pension", "insurance"]):
+                                holder_type = "fund"
+
+                            holders.append({
+                                "name": name,
+                                "shares": shares,
+                                "value": 0.0,
+                                "percentage": pct,
+                                "holder_type": holder_type,
+                                "date_reported": filing_date,
+                                "source": f"fuzzy_pdf_{market_id}" if market_id else "fuzzy_pdf",
+                            })
+
+        if holders:
+            logger.info(
+                "Fuzzy PDF shareholder extraction: %d holders from %d pages",
+                len(holders), len(sh_pages),
+            )
+
+    except Exception as exc:
+        logger.debug("Fuzzy PDF shareholder extraction failed: %s", exc)
+
+    return holders
+
+
 def _parse_indian_number(text: str) -> float | None:
     """Parse a number string handling Indian conventions.
 
