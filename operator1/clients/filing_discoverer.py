@@ -266,40 +266,40 @@ class BSEFilingDiscoverer:
                 continue
 
             for item in table:
-            subject = item.get("NEWSSUB", "")
-            attachment = item.get("ATTACHMENTNAME", "")
-            news_dt = item.get("NEWS_DT", "")
+                subject = item.get("NEWSSUB", "")
+                attachment = item.get("ATTACHMENTNAME", "")
+                news_dt = item.get("NEWS_DT", "")
 
-            if not attachment:
-                continue
+                if not attachment:
+                    continue
 
-            # Parse filing date from NEWS_DT (ISO timestamp)
-            filing_date = ""
-            if news_dt:
-                try:
-                    filing_date = news_dt[:10]  # "2026-01-16T19:07:13" -> "2026-01-16"
-                except Exception:
-                    pass
+                # Parse filing date from NEWS_DT (ISO timestamp)
+                filing_date = ""
+                if news_dt:
+                    try:
+                        filing_date = news_dt[:10]  # "2026-01-16T19:07:13" -> "2026-01-16"
+                    except Exception:
+                        pass
 
-            report_date = _parse_bse_report_date(subject)
-            # Classify as shareholding if from a shareholding category
-            subject_lower = subject.lower()
-            if str_cat in self._SHAREHOLDING_CATS or "shareholding" in subject_lower:
-                filing_type = "shareholding"
-            else:
-                filing_type = _classify_bse_filing_type(subject)
+                report_date = _parse_bse_report_date(subject)
+                # Classify as shareholding if from a shareholding category
+                subject_lower = subject.lower()
+                if str_cat in self._SHAREHOLDING_CATS or "shareholding" in subject_lower:
+                    filing_type = "shareholding"
+                else:
+                    filing_type = _classify_bse_filing_type(subject)
 
-            filing = FilingMetadata(
-                title=subject,
-                filing_date=filing_date,
-                report_date=report_date,
-                document_url=f"{_BSE_PDF_BASE}/{attachment}",
-                document_format="pdf",
-                filing_type=filing_type,
-                market_id="in_bse",
-                attachment_id=attachment,
-            )
-            result.filings.append(filing)
+                filing = FilingMetadata(
+                    title=subject,
+                    filing_date=filing_date,
+                    report_date=report_date,
+                    document_url=f"{_BSE_PDF_BASE}/{attachment}",
+                    document_format="pdf",
+                    filing_type=filing_type,
+                    market_id="in_bse",
+                    attachment_id=attachment,
+                )
+                result.filings.append(filing)
 
         logger.info(
             "BSE discovery for %s: found %d filings (%d annual, %d quarterly)",
