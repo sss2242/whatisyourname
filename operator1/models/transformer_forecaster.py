@@ -63,6 +63,7 @@ class TransformerResult:
     n_epochs_trained: int = 0
     fitted: bool = False
     error: str | None = None
+    available: bool = True
 
 
 # ---------------------------------------------------------------------------

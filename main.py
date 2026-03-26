@@ -1783,6 +1783,54 @@ Non-interactive examples:
         logger.warning("News sentiment scoring failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 5j: Adaptive threshold calibration
+    # ------------------------------------------------------------------
+    # Replaces fixed textbook survival thresholds with peer-calibrated,
+    # data-derived values.  Must run AFTER linked entity data (Step 5f)
+    # and peer ranking (Step 5h) so peer distributions are available.
+    # Recalibrates survival flags computed earlier in Step 5 with
+    # sector-aware thresholds.
+    _adaptive_thresholds = None
+    try:
+        from operator1.analysis.adaptive_thresholds import (
+            compute_adaptive_thresholds,
+            threshold_set_to_survival_dict,
+            threshold_set_to_mc_dict,
+        )
+        _adaptive_thresholds = compute_adaptive_thresholds(
+            cache,
+            linked_caches=linked_caches if linked_caches else None,
+            regime_detector=None,  # HMM not yet fitted; will be used in Step 6
+            fh_composite_scores=(
+                cache["fh_composite_score"]
+                if "fh_composite_score" in cache.columns
+                else None
+            ),
+        )
+        if _adaptive_thresholds.adapted:
+            # Recalibrate survival flags with adaptive thresholds
+            _adapted_survival_dict = threshold_set_to_survival_dict(_adaptive_thresholds)
+            cache["company_survival_mode_flag"] = compute_company_survival_flag(
+                cache, thresholds=_adapted_survival_dict,
+            )
+            cache["survival_probability"] = compute_survival_probability(
+                cache, thresholds=_adapted_survival_dict,
+            )
+            # Re-run hierarchy weights with updated survival flags
+            cache = compute_hierarchy_weights(cache)
+            for i in range(1, 6):
+                col = f"hierarchy_tier{i}_weight"
+                if col in cache.columns:
+                    weights[f"tier{i}"] = float(cache[col].iloc[-1])
+            logger.info(
+                "Adaptive thresholds applied: %d days flagged (was %d before recalibration)",
+                cache["company_survival_mode_flag"].sum(),
+                cache["company_survival_mode_flag"].sum(),  # logged for comparison
+            )
+    except Exception as exc:
+        logger.warning("Adaptive threshold calibration failed (using defaults): %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 5.5: Enriched survival timeline (bridge: rule-based + HMM)
     # ------------------------------------------------------------------
     # Runs early regime detection (HMM/GMM/PELT/BCP) and combines it
@@ -1893,6 +1941,120 @@ Non-interactive examples:
             logger.warning("Step 5.5 (enriched survival timeline) failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 5k: Adaptive model parameters (Tier 2)
+    # ------------------------------------------------------------------
+    # Compute data-derived model parameters from pipeline outputs.
+    # Must run after Step 5.5 (regime detector available) and before
+    # Step 6 (temporal models consume these parameters).
+    _adaptive_model_params = None
+    try:
+        from operator1.analysis.adaptive_model_params import (
+            compute_blend_weights,
+            compute_regime_risk_multiplier,
+            compute_garman_klass_factor,
+            compute_transition_halflife,
+            compute_adaptive_mc_params,
+            compute_adaptive_participation_rate,
+            AdaptiveModelParams,
+        )
+        _adaptive_model_params = AdaptiveModelParams()
+
+        # Cox/sigmoid blend recalibration (inverse-variance, Cochrane 1954)
+        if "survival_probability" in cache.columns and "cox_survival_score" in cache.columns:
+            _sig = cache.get("survival_probability")
+            _cox = cache.get("cox_survival_score")
+            _actual = cache.get("company_survival_mode_flag", pd.Series(0, index=cache.index))
+            if _sig is not None and _cox is not None:
+                w_sig, w_cox = compute_blend_weights(_sig, _cox, _actual)
+                _adaptive_model_params.blend_w_sig = w_sig
+                _adaptive_model_params.blend_w_cox = w_cox
+                # Re-blend with data-driven weights
+                cache["survival_probability"] = w_sig * _sig + w_cox * _cox.fillna(_sig)
+                _adaptive_model_params.methods_used["blend"] = f"inverse_variance(sig={w_sig:.3f},cox={w_cox:.3f})"
+                logger.info("Adaptive blend: w_sig=%.3f, w_cox=%.3f", w_sig, w_cox)
+
+        # Regime risk multiplier (HMM volatility ratio)
+        _adaptive_model_params.survival_risk_multiplier = compute_regime_risk_multiplier(
+            regime_detector, cache,
+        )
+        # Garman-Klass intraday factor
+        _adaptive_model_params.intraday_low_factor = compute_garman_klass_factor(cache)
+        # Transition half-life from enriched timeline
+        _adaptive_model_params.transition_halflife = compute_transition_halflife(
+            enriched_timeline_result,
+        )
+        # Participation rate (Amihud)
+        _adaptive_model_params.participation_rate = compute_adaptive_participation_rate(cache)
+        # MC parameters (precision-targeted)
+        _adaptive_model_params.mc_n_paths, _adaptive_model_params.mc_is_tilt = (
+            compute_adaptive_mc_params(cache)
+        )
+        _adaptive_model_params.adapted = True
+        logger.info(
+            "Adaptive model params: risk_mult=%.2f, gk_factor=%.2f, "
+            "transition_hl=%d, mc_paths=%d, mc_tilt=%.2f, participation=%.3f",
+            _adaptive_model_params.survival_risk_multiplier,
+            _adaptive_model_params.intraday_low_factor,
+            _adaptive_model_params.transition_halflife,
+            _adaptive_model_params.mc_n_paths,
+            _adaptive_model_params.mc_is_tilt,
+            _adaptive_model_params.participation_rate,
+        )
+    except Exception as exc:
+        logger.warning("Adaptive model params failed (using defaults): %s", exc)
+
+    # Step 5k.2: Tier 3 adaptive parameters (windows, NN, noise, patterns)
+    _adaptive_tier3 = None
+    try:
+        from operator1.analysis.adaptive_windows import (
+            compute_adaptive_windows,
+            compute_nn_hyperparams,
+            compute_pattern_thresholds,
+            compute_stale_threshold,
+            AdaptiveTier3Params,
+        )
+        from operator1.analysis.adaptive_model_params import compute_effective_sample_size
+
+        _detected_freq = (
+            filing_calendar_result.detected_frequency
+            if filing_calendar_result is not None
+            else "quarterly"
+        )
+        _adaptive_tier3 = AdaptiveTier3Params()
+        _adaptive_tier3.windows = compute_adaptive_windows(_detected_freq)
+        _adaptive_tier3.stale_threshold_days = compute_stale_threshold(_detected_freq)
+
+        # NN hyperparams from effective sample size
+        _n_eff_close = compute_effective_sample_size(cache, "close")
+        _n_feat = sum(
+            1 for c in cache.columns
+            if cache[c].dtype in ("float64", "float32") and cache[c].notna().sum() > 10
+        )
+        _adaptive_tier3.nn_params = compute_nn_hyperparams(
+            n_eff=_n_eff_close, n_features=min(_n_feat, 30),
+        )
+
+        # Pattern thresholds
+        _adaptive_tier3.pattern_body_threshold, _adaptive_tier3.pattern_doji_threshold = (
+            compute_pattern_thresholds(cache, lookback=_adaptive_tier3.windows.medium)
+        )
+
+        _adaptive_tier3.adapted = True
+        logger.info(
+            "Tier 3 adaptive: freq=%s, windows=%d/%d/%d/%d, nn_d=%d/h=%d/drop=%.2f, "
+            "pattern=%.2f/%.2f, stale=%dd",
+            _detected_freq,
+            _adaptive_tier3.windows.short, _adaptive_tier3.windows.medium,
+            _adaptive_tier3.windows.long, _adaptive_tier3.windows.trend,
+            _adaptive_tier3.nn_params.d_model, _adaptive_tier3.nn_params.hidden_dim,
+            _adaptive_tier3.nn_params.dropout,
+            _adaptive_tier3.pattern_body_threshold, _adaptive_tier3.pattern_doji_threshold,
+            _adaptive_tier3.stale_threshold_days,
+        )
+    except Exception as exc:
+        logger.warning("Tier 3 adaptive params failed (using defaults): %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 6: Temporal modeling (optional)
     # ------------------------------------------------------------------
     forecast_result = None
@@ -1973,7 +2135,15 @@ Non-interactive examples:
         # Dual regime classification
         try:
             from operator1.models.regime_mixer import compute_dual_regimes
-            dual_regime_result = compute_dual_regimes(cache)
+            from operator1.analysis.adaptive_thresholds import threshold_set_to_regime_dict
+            _regime_thresholds = (
+                threshold_set_to_regime_dict(_adaptive_thresholds)
+                if _adaptive_thresholds is not None and _adaptive_thresholds.adapted
+                else None
+            )
+            dual_regime_result = compute_dual_regimes(
+                cache, thresholds=_regime_thresholds,
+            )
             if dual_regime_result and dual_regime_result.fitted:
                 logger.info("Dual regime classification complete")
         except Exception as exc:
@@ -2124,7 +2294,26 @@ Non-interactive examples:
                 if hasattr(_wf_timeline_result, "timeline")
                 else _wf_timeline_result
             )
-            walk_forward_result = run_walk_forward(cache, _wf_timeline_df)
+            # Extract individual Series for survival_modes and switch_points.
+            # run_walk_forward expects pd.Series (not a DataFrame) for these
+            # parameters -- passing the full DataFrame would produce garbage
+            # mode labels (str(row) instead of str(value)) and break
+            # mode-conditioned scoring.
+            _wf_modes = (
+                _wf_timeline_df["survival_mode"]
+                if isinstance(_wf_timeline_df, pd.DataFrame)
+                and "survival_mode" in _wf_timeline_df.columns
+                else None
+            )
+            _wf_switches = (
+                _wf_timeline_df["switch_point"]
+                if isinstance(_wf_timeline_df, pd.DataFrame)
+                and "switch_point" in _wf_timeline_df.columns
+                else None
+            )
+            walk_forward_result = run_walk_forward(
+                cache, _wf_modes, _wf_switches,
+            )
             if walk_forward_result and walk_forward_result.fitted:
                 logger.info(
                     "Walk-forward: %d days evaluated, best=%s (MAE=%.6f)",
@@ -2192,7 +2381,27 @@ Non-interactive examples:
         # In private mode, use equity_change_rate instead of return_1d.
         try:
             _mc_returns = "equity_change_rate" if _is_private else "return_1d"
-            mc_result = run_monte_carlo(cache, returns_col=_mc_returns)
+            _mc_thresholds = (
+                threshold_set_to_mc_dict(_adaptive_thresholds)
+                if _adaptive_thresholds is not None and _adaptive_thresholds.adapted
+                else None
+            )
+            _mc_n = (
+                _adaptive_model_params.mc_n_paths
+                if _adaptive_model_params is not None and _adaptive_model_params.adapted
+                else 10_000
+            )
+            _mc_tilt = (
+                _adaptive_model_params.mc_is_tilt
+                if _adaptive_model_params is not None and _adaptive_model_params.adapted
+                else 1.5
+            )
+            mc_result = run_monte_carlo(
+                cache, returns_col=_mc_returns,
+                n_paths=_mc_n,
+                importance_tilt=_mc_tilt,
+                survival_thresholds=_mc_thresholds,
+            )
             logger.info("Monte Carlo simulation complete")
         except Exception as exc:
             logger.warning("Monte Carlo failed: %s", exc)
@@ -2449,6 +2658,49 @@ Non-interactive examples:
     else:
         logger.info("Step 6: Skipped (--skip-models)")
         # regime_detector may have been set in Step 5.5; keep it if so.
+
+    # ------------------------------------------------------------------
+    # Step 6.5: Retroactive calibration (Category D)
+    # ------------------------------------------------------------------
+    # After all temporal models have run, use their outputs to calibrate
+    # model weight matrices that were initially set to fixed defaults.
+    # Empirical Bayes: use first-pass data to set second-pass priors.
+    _retro_params = None
+    if not args.skip_models:
+        try:
+            from operator1.analysis.retroactive_calibration import run_retroactive_calibration
+
+            _entity_groups_for_retro = {}
+            if relationships:
+                for grp, ents in relationships.items():
+                    if isinstance(ents, list):
+                        ids = []
+                        for e in ents:
+                            eid = ""
+                            if isinstance(e, dict):
+                                eid = e.get("isin", "") or e.get("ticker", "")
+                            elif hasattr(e, "isin"):
+                                eid = e.isin or getattr(e, "ticker", "")
+                            if eid:
+                                ids.append(eid)
+                        _entity_groups_for_retro[grp] = ids
+
+            _retro_params = run_retroactive_calibration(
+                cache=cache,
+                linked_caches=linked_caches if linked_caches else None,
+                entity_groups=_entity_groups_for_retro if _entity_groups_for_retro else None,
+                walk_forward_result=walk_forward_result,
+                forecast_result=forecast_result,
+                sobol_result=sobol_result,
+                target_profile=target_profile,
+            )
+            if _retro_params.n_calibrated > 0:
+                logger.info(
+                    "Step 6.5: Retroactive calibration complete (%d groups calibrated)",
+                    _retro_params.n_calibrated,
+                )
+        except Exception as exc:
+            logger.warning("Retroactive calibration failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Step 7: Build company profile
