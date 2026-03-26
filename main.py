@@ -2003,6 +2003,57 @@ Non-interactive examples:
     except Exception as exc:
         logger.warning("Adaptive model params failed (using defaults): %s", exc)
 
+    # Step 5k.2: Tier 3 adaptive parameters (windows, NN, noise, patterns)
+    _adaptive_tier3 = None
+    try:
+        from operator1.analysis.adaptive_windows import (
+            compute_adaptive_windows,
+            compute_nn_hyperparams,
+            compute_pattern_thresholds,
+            compute_stale_threshold,
+            AdaptiveTier3Params,
+        )
+        from operator1.analysis.adaptive_model_params import compute_effective_sample_size
+
+        _detected_freq = (
+            filing_calendar_result.detected_frequency
+            if filing_calendar_result is not None
+            else "quarterly"
+        )
+        _adaptive_tier3 = AdaptiveTier3Params()
+        _adaptive_tier3.windows = compute_adaptive_windows(_detected_freq)
+        _adaptive_tier3.stale_threshold_days = compute_stale_threshold(_detected_freq)
+
+        # NN hyperparams from effective sample size
+        _n_eff_close = compute_effective_sample_size(cache, "close")
+        _n_feat = sum(
+            1 for c in cache.columns
+            if cache[c].dtype in ("float64", "float32") and cache[c].notna().sum() > 10
+        )
+        _adaptive_tier3.nn_params = compute_nn_hyperparams(
+            n_eff=_n_eff_close, n_features=min(_n_feat, 30),
+        )
+
+        # Pattern thresholds
+        _adaptive_tier3.pattern_body_threshold, _adaptive_tier3.pattern_doji_threshold = (
+            compute_pattern_thresholds(cache, lookback=_adaptive_tier3.windows.medium)
+        )
+
+        _adaptive_tier3.adapted = True
+        logger.info(
+            "Tier 3 adaptive: freq=%s, windows=%d/%d/%d/%d, nn_d=%d/h=%d/drop=%.2f, "
+            "pattern=%.2f/%.2f, stale=%dd",
+            _detected_freq,
+            _adaptive_tier3.windows.short, _adaptive_tier3.windows.medium,
+            _adaptive_tier3.windows.long, _adaptive_tier3.windows.trend,
+            _adaptive_tier3.nn_params.d_model, _adaptive_tier3.nn_params.hidden_dim,
+            _adaptive_tier3.nn_params.dropout,
+            _adaptive_tier3.pattern_body_threshold, _adaptive_tier3.pattern_doji_threshold,
+            _adaptive_tier3.stale_threshold_days,
+        )
+    except Exception as exc:
+        logger.warning("Tier 3 adaptive params failed (using defaults): %s", exc)
+
     # ------------------------------------------------------------------
     # Step 6: Temporal modeling (optional)
     # ------------------------------------------------------------------
