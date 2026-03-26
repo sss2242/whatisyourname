@@ -107,7 +107,7 @@ report generation, with expected vs actual inputs, outputs, and operations.
 |---|----------|--------|--------|
 | **Input** | cache, `hierarchy_weights` dict | Same | OK |
 | **Output** | cache + `fh_liquidity_score`, `fh_solvency_score`, `fh_stability_score`, `fh_profitability_score`, `fh_growth_score`, `fh_composite_score`, `fh_composite_label`, `fh_altman_z_score`, `fh_altman_z_zone`, `fh_beneish_m_score`, `fh_beneish_flag`, `fh_runway_months`; `fh_result` (FinancialHealthResult) | Same | OK |
-| **Operation** | 1. Per-tier scoring (expanding percentile rank normalization). 2. Weighted composite (uses hierarchy_weights). 3. Altman Z-Score (5 coefficients from 1968 paper). 4. Beneish M-Score (8 coefficients from 1999 paper). 5. Liquidity runway (cash / monthly burn rate). | Same | OK |
+| **Operation** | 1. Per-tier scoring (expanding percentile rank normalization). 2. Weighted composite (uses hierarchy_weights). 3. Altman Z-Score (5 coefficients from 1968 paper). 4. Beneish M-Score (8 coefficients from 1999 paper). 5. Liquidity runway (cash / monthly burn rate). 6. **Adaptive PE/EV caps** (Log-Normal P99.5 + Tukey Extreme Fence + MAD consensus, replacing fixed 200/100 caps). | Same | **ENHANCED** |
 
 ### C6. Entity Discovery -- `discover_linked_entities()`
 
@@ -198,6 +198,43 @@ report generation, with expected vs actual inputs, outputs, and operations.
 | **Output** | Augmented cache with per-variable columns: `{var}_observed`, `{var}_estimated`, `{var}_final`, `{var}_source`, `{var}_confidence`, `{var}_missingness_type`, `{var}_estimation_method`, `{var}_sensitivity_lower/upper`; `EstimationCoverage` result | Same | OK |
 | **Operation** | **Phase 1:** Deterministic accounting identity fill (total_assets = total_liabilities + total_equity, etc., 5 iterations max). **Phase 2:** Classify NaN as MAR or MNAR. **Phase 3a (MAR):** **miceforest LightGBM MICE** (preferred, non-linear) or sklearn BayesianRidge MICE (fallback) + Gaussian Process + Matrix Completion ensemble. **Phase 3b (MNAR):** Heckman Selection + Pattern-Mixture + GAIN ensemble. Observed values are NEVER overwritten. | Same -- all 3 phases implemented | **ENHANCED** |
 | **Note** | PerformanceWarning during in-loop column insertion is now suppressed (P1 fix). DataFrame defragmented via `.copy()` before return. | FIXED | OK |
+
+---
+
+## Phase D-extra: Adaptive Parameter Calibration
+
+Three modules that replace fixed constants across the pipeline with data-derived values. Wired in main.py Steps 5j, 5k, and 5k.2 -- after peer data is available but before temporal models consume parameters.
+
+### Dx1. Adaptive Thresholds -- `compute_adaptive_thresholds()` (Tier 1)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `cache`, `linked_caches` (peer data from Step 5f), `regime_detector` (from Step 5.5), `fh_composite_scores` | Same | OK |
+| **Output** | `ThresholdSet` with calibrated survival thresholds, regime mixer thresholds, vanity thresholds, FH label breakpoints | Same | OK |
+| **Location** | `operator1/analysis/adaptive_thresholds.py` (837 lines) | | |
+| **Operation** | 5 methods: (A) **Peer Percentile** (Huber 1981) -- survival triggers at P10/P90 of sector peer distribution, MAD-based fallback for small groups. (D) **BOCPD Deterioration Tightening** (Adams & MacKay 2007) -- when own-history shows structural downward shift, thresholds tighten by 20%. (E) **Sector Z-Score** (Iglewicz & Hoaglin 1993) -- vanity metrics flagged at 2 modified-Z-scores from sector median. (H) **Jenks Natural Breaks** (Fisher 1958) -- FH composite labels from optimal class boundaries via DP. (J) **HMM Emission Crossover** (Rabiner 1989) -- regime mixer thresholds from HMM Gaussian crossover point. | Same | OK |
+| **Downstream** | Consumed by `compute_company_survival_flag()` (recalibrated), `compute_survival_probability()` (recalibrated), `compute_hierarchy_weights()` (re-run), `run_monte_carlo()` (via `threshold_set_to_mc_dict()`), `compute_dual_regimes()` (via `threshold_set_to_regime_dict()`) | Same | OK |
+| **Fallback** | All thresholds have textbook defaults; adapted only when sufficient peer data or HMM results are available. Absolute floors prevent over-adaptation. | Same | OK |
+
+### Dx2. Adaptive Model Parameters -- Tier 2 constants
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `cache`, `regime_detector`, `enriched_timeline_result`, Cox/sigmoid series | Same | OK |
+| **Output** | `AdaptiveModelParams` with: blend weights, risk multiplier, GK factor, transition halflife, MC params, participation rate, PID gains, contagion probs, train splits, confidence bounds | Same | OK |
+| **Location** | `operator1/analysis/adaptive_model_params.py` (1186 lines) | | |
+| **Operation** | 10+ methods: (5) **Kish Effective Sample Size** (Kish 1965) -- true information content from interpolation weights. (6) **Inverse-Variance Blending** (Cochrane 1954) -- Cox/sigmoid blend from prediction variance. (7) **Lambda PID Tuning** (Dahlin 1968) -- PID gains from error ACF half-life. (8a) **Copula Tail Contagion** (Joe 2014) -- edge-specific contagion from tail dependence. (8b) **Amihud Participation Rate** (Amihud 2002) -- liquidation rate from illiquidity. (9a) **Regime Risk Multiplier** -- HMM volatility ratio. (9b) **Garman-Klass Factor** (1980) -- intraday low from OHLC volatility. (9c) **Transition Half-Life** -- from enriched timeline switch durations. (10) **Precision-Targeted MC** (Glasserman 2003) -- path count for target SE. Also includes Category A (train splits, confidence bounds, percentile scoring) and Category C (conflict scoring, OHLC noise, Hurst exponent, bootstrap spread). | Same | OK |
+| **Downstream** | Consumed by `survival_probability` (re-blended), `run_monte_carlo()` (n_paths, is_tilt), `run_forward_pass()` (PID gains), graph_risk (contagion probs), ownership_contagion (participation rate) | Same | OK |
+
+### Dx3. Adaptive Windows & Hyperparameters -- Tier 3 constants
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `filing_calendar_result.detected_frequency`, `cache`, Kish n_eff | Same | OK |
+| **Output** | `AdaptiveTier3Params` with: filing-anchored windows, NN hyperparams, particle noise, pattern thresholds, stale threshold, entity scoring weights | Same | OK |
+| **Location** | `operator1/analysis/adaptive_windows.py` (553 lines) | | |
+| **Operation** | 7 methods: (11) **Filing-Frequency-Anchored Windows** (Nyquist-Shannon) -- all rolling windows are integer multiples of filing period (short=base/3, medium=base, long=2*base, trend=4*base). (12) **Scaling-Law NN Architecture** (Kaplan 2020) -- d_model/hidden_dim proportional to n_eff. (13) **Innovation-Based Particle Noise** (Mehra 1970) -- state/obs noise from difference series std. (14) **Distribution-Based Pattern Thresholds** (Bulkowski 2008) -- doji=P10, body=P50 of body/range ratio. (16) **Confidence Decay Half-Life** -- proportional to filing period. (18) **Filing-Frequency Staleness** -- 2x filing period. (19) **Market-Specific Entity Scoring** -- CJK markets get higher ticker weight, lower name weight. | Same | OK |
+| **Downstream** | Windows consumed by derived_variables, forecasting, forward_pass, burnout. NN params consumed by transformer_forecaster. Pattern thresholds consumed by pattern_detector. Staleness consumed by filing_calendar. | Same | OK |
 
 ---
 
@@ -590,3 +627,11 @@ report generation, with expected vs actual inputs, outputs, and operations.
 | S14 | forecasting.py:1682 | Conformal calibrator receives synthetic `+/-RMSE` pairs (~12-14 points) instead of actual validation residuals (hundreds) | **FIXED** -- Added `test_residuals` field to `ModelMetrics`; Kalman, LSTM, tree, and baseline wrappers now store actual residuals; collection logic prefers real residuals with synthetic fallback |
 | S15 | news_sentiment.py:1 | Docstring says "Fetches stock news from FMP (1 API call)" but FMP was removed. Actual source is GNews/RSS. `_fetch_news_alpha_vantage()` at line 190 is dead code (redirects to gnews). | **FIXED** -- docstring updated |
 | S16 | constants.py:8-9 | `DATE_END = date.today()` and `DATE_START` computed at import time, not at call time. In a long-running process or multi-day library use, the date window is stale. | **FIXED** -- added `get_date_window()` function; module-level constants kept for backward compatibility |
+| B3 | financial_health.py:379,383 | PE ratio capped at fixed 200, EV/EBITDA capped at fixed 100 regardless of sector/distribution | **FIXED** -- adaptive caps via 3-method consensus: Log-Normal P99.5 (Aitchison & Brown 1957), Tukey Extreme Fence (Tukey 1977), MAD-Based Cap (Iglewicz & Hoaglin 1993). Floor/ceiling bounds preserved. |
+| R1 | report_generator.py:2214-2353 | 140 lines of unreachable dead code after `return` in `_build_economic_position()`, duplicating `_build_appendix()` methodology | **FIXED** -- dead code deleted, file reduced from 4151 to 4034 lines |
+| R2 | report_generator.py:2932 | `_build_economic_position()` existed but was not wired in `_section_builders` -- economic plane data invisible in reports | **FIXED** -- added as section 75 ("Economic Position & Industry Classification") in PRO and PREMIUM tiers |
+| R3 | report_generator.py:4049 | LLM validation logged "Attempting to append missing section" but never actually appended -- complete no-op | **FIXED** -- implemented auto-patching: missing sections now appended from fallback template builders with keyword matching |
+| R4 | report_generator.py:1141,1159,1190 | Section 9 (Predictions) used wrong profile keys for conformal (`conformal_intervals` vs `extended_models.conformal_prediction`), SHAP, and DTW analogs -- all always empty | **FIXED** -- changed to read from `extended_models` sub-dict where data actually lives |
+| R5 | report_generator.py:2577 | Stale `geopolitical_risk` fallback key never produced by any module | **FIXED** -- removed dead fallback |
+| R6 | profile_builder.py:675 | `_build_historical_section()` crashes on `cache=None` (None guard placed after `.columns` access) | **FIXED** -- moved None guard before `.columns` access |
+| R7 | test_phase7_report.py:222,679,708 | 17 tests failing due to obsolete `output_path` parameter and stale file existence assertions | **FIXED** -- removed `output_path`, updated assertions to test returned dict directly (34/34 pass) |

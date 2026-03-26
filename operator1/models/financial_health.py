@@ -51,6 +51,24 @@ logger = logging.getLogger(__name__)
 
 _EPS = 1e-10  # avoid division by zero
 
+# ---------------------------------------------------------------------------
+# Adaptive valuation caps (replaces fixed PE=200, EV/EBITDA=100)
+# ---------------------------------------------------------------------------
+
+# Absolute floor caps: never clip below these values, even with sparse data.
+# These are the minimum "extreme" thresholds that preserve enough range for
+# the expanding percentile rank normalization to produce meaningful scores.
+_PE_CAP_FLOOR: float = 50.0
+_EV_CAP_FLOOR: float = 30.0
+
+# Absolute ceiling caps: sanity bounds beyond which values are economically
+# meaningless (negative earnings approaching zero produce PE -> infinity).
+_PE_CAP_CEILING: float = 500.0
+_EV_CAP_CEILING: float = 200.0
+
+# Minimum observations before switching from textbook defaults to adaptive
+_MIN_OBS_ADAPTIVE: int = 20
+
 # Default equal weights across 5 tiers (matches normal regime)
 _DEFAULT_WEIGHTS: dict[str, float] = {
     "tier1": 0.20,
@@ -96,6 +114,128 @@ _M_COEFFS = {
     "LVGI": -0.327,
 }
 _M_THRESHOLD = -1.78
+
+
+def _compute_adaptive_valuation_cap(
+    series: pd.Series,
+    *,
+    floor: float,
+    ceiling: float,
+    textbook_default: float,
+    percentile: float = 0.995,
+) -> float:
+    """Compute a data-driven upper clip for valuation ratios (PE, EV/EBITDA).
+
+    Replaces fixed caps (PE=200, EV/EBITDA=100) with an adaptive threshold
+    derived from the company's own expanding distribution.  Three methods
+    are tried in order; the final cap is the consensus of whichever succeed.
+
+    **Method 1 -- Log-Normal P99.5 (Aitchison & Brown 1957; Limpert 2001):**
+    PE and EV/EBITDA distributions are well-known to be approximately
+    log-normal (positively skewed, bounded below by zero).  Fit mu and
+    sigma in log-space, then cap at exp(mu + z * sigma) where z is the
+    normal quantile for the target percentile.
+
+    **Method 2 -- Tukey Extreme Fence (Tukey 1977):**
+    Upper fence = Q3 + 3 * IQR.  Non-parametric, makes no distributional
+    assumptions.  The k=3 multiplier identifies extreme outliers (vs k=1.5
+    for mild).
+
+    **Method 3 -- MAD-Based Cap (Iglewicz & Hoaglin 1993):**
+    Cap = median + 3.5 * MAD * 1.4826.  Uses the Median Absolute Deviation
+    scaled by 1.4826 to be comparable to standard deviation under normality.
+    The 3.5 threshold is the standard recommendation from the NIST
+    Engineering Statistics Handbook.
+
+    The final cap is the *median* of the three method outputs (robust to
+    any single method failing or producing an outlier estimate), clamped
+    to [floor, ceiling].
+
+    Parameters
+    ----------
+    series:
+        Raw positive-valued ratio series (e.g., pe_ratio_calc). NaN and
+        non-positive values are excluded before computation.
+    floor:
+        Minimum cap (prevents over-capping with sparse data).
+    ceiling:
+        Maximum cap (absolute sanity bound).
+    textbook_default:
+        Fallback cap when insufficient data for adaptive methods.
+    percentile:
+        Target percentile for the log-normal method (default 0.995).
+
+    Returns
+    -------
+    float
+        The adaptive upper clip value, in [floor, ceiling].
+    """
+    from scipy.stats import norm as _norm
+
+    # Filter to positive, finite values only
+    clean = series.dropna()
+    clean = clean[(clean > 0) & np.isfinite(clean)]
+
+    if len(clean) < _MIN_OBS_ADAPTIVE:
+        return min(max(textbook_default, floor), ceiling)
+
+    candidates: list[float] = []
+
+    # --- Method 1: Log-Normal P99.5 (Aitchison & Brown 1957) ---
+    # PE/EV distributions are approximately log-normal: log(PE) ~ N(mu, sigma^2).
+    # The percentile in the original space is exp(mu + z * sigma).
+    try:
+        log_vals = np.log(clean.values)
+        mu_ln = float(np.mean(log_vals))
+        sigma_ln = float(np.std(log_vals, ddof=1))
+        if sigma_ln > 1e-8:
+            z_score = float(_norm.ppf(percentile))
+            lognormal_cap = float(np.exp(mu_ln + z_score * sigma_ln))
+            candidates.append(lognormal_cap)
+    except Exception:
+        pass
+
+    # --- Method 2: Tukey Extreme Fence (Tukey 1977) ---
+    # Upper fence = Q3 + k * IQR, with k=3 for extreme outliers.
+    try:
+        q1 = float(np.percentile(clean.values, 25))
+        q3 = float(np.percentile(clean.values, 75))
+        iqr = q3 - q1
+        if iqr > 1e-8:
+            tukey_cap = q3 + 3.0 * iqr
+            candidates.append(tukey_cap)
+    except Exception:
+        pass
+
+    # --- Method 3: MAD-Based Cap (Iglewicz & Hoaglin 1993) ---
+    # Cap = median + 3.5 * MAD * 1.4826 (scaled MAD approximates std
+    # under normality; 3.5 is the NIST recommendation for outlier flagging).
+    try:
+        median_val = float(np.median(clean.values))
+        mad = float(np.median(np.abs(clean.values - median_val))) * 1.4826
+        if mad > 1e-8:
+            mad_cap = median_val + 3.5 * mad
+            candidates.append(mad_cap)
+    except Exception:
+        pass
+
+    if not candidates:
+        return min(max(textbook_default, floor), ceiling)
+
+    # Consensus: take the median of available method outputs.
+    # This is robust to any single method producing an extreme estimate.
+    consensus = float(np.median(candidates))
+
+    # Clamp to [floor, ceiling]
+    cap = min(max(consensus, floor), ceiling)
+
+    logger.debug(
+        "Adaptive valuation cap: methods=%s, consensus=%.1f, final=%.1f "
+        "(floor=%.1f, ceiling=%.1f, n=%d)",
+        [round(c, 1) for c in candidates], consensus, cap, floor, ceiling, len(clean),
+    )
+
+    return cap
 
 
 # ---------------------------------------------------------------------------
@@ -375,12 +515,29 @@ def _score_growth(cache: pd.DataFrame) -> pd.Series:
         components.append(_normalize_series(rev_growth))
 
     if "pe_ratio_calc" in cache.columns:
-        # Low PE -> potentially undervalued -> higher score
-        pe = cache["pe_ratio_calc"].clip(lower=0, upper=200)
+        # Low PE -> potentially undervalued -> higher score.
+        # Adaptive cap replaces the fixed 200 using three expert methods:
+        # log-normal P99.5 (Aitchison & Brown 1957), Tukey extreme fence
+        # (Tukey 1977), MAD-based cap (Iglewicz & Hoaglin 1993).
+        pe_cap = _compute_adaptive_valuation_cap(
+            cache["pe_ratio_calc"],
+            floor=_PE_CAP_FLOOR,
+            ceiling=_PE_CAP_CEILING,
+            textbook_default=200.0,
+        )
+        pe = cache["pe_ratio_calc"].clip(lower=0, upper=pe_cap)
         components.append(_normalize_series(pe, invert=True))
 
     if "ev_to_ebitda" in cache.columns:
-        ev = cache["ev_to_ebitda"].clip(lower=0, upper=100)
+        # Low EV/EBITDA -> potentially undervalued -> higher score.
+        # Same adaptive cap logic as PE above.
+        ev_cap = _compute_adaptive_valuation_cap(
+            cache["ev_to_ebitda"],
+            floor=_EV_CAP_FLOOR,
+            ceiling=_EV_CAP_CEILING,
+            textbook_default=100.0,
+        )
+        ev = cache["ev_to_ebitda"].clip(lower=0, upper=ev_cap)
         components.append(_normalize_series(ev, invert=True))
 
     if not components:

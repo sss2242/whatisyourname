@@ -1,6 +1,6 @@
 # Analysis Models Map (2026-03-22, updated)
 
-Complete map of all 42 analytical modules in operator1/analysis/, operator1/features/, and operator1/models/. Each module's purpose, inputs, outputs, wiring status in main.py, profile/report integration, and enhancement status.
+Complete map of all 45 analytical modules in operator1/analysis/, operator1/features/, and operator1/models/. Each module's purpose, inputs, outputs, wiring status in main.py, profile/report integration, and enhancement status.
 
 **Enhancement legend:**
 - NEW = new capability added in this PR
@@ -28,9 +28,9 @@ These transform the daily cache into model-ready features.
 
 ---
 
-## Layer 2: Analysis Modules (operator1/analysis/) -- 7 modules
+## Layer 2: Analysis Modules (operator1/analysis/) -- 10 modules
 
-Rule-based and fuzzy-logic analysis that produces survival flags and regime classifications.
+Rule-based and fuzzy-logic analysis that produces survival flags, regime classifications, and adaptive parameter calibration.
 
 | # | Module | Lines | Input | Output | main.py Step | Profile Section | Enhancement |
 |---|--------|-------|-------|--------|-------------|----------------|-------------|
@@ -41,6 +41,9 @@ Rule-based and fuzzy-logic analysis that produces survival flags and regime clas
 | 15 | `ethical_filters.py` | 355 | Cache | 4 filter results: Purchasing Power, Solvency, Gharar, Cash is King | Called inside profile_builder | `filters` | OK |
 | 16 | `economic_planes.py` | 135 | Sector, industry strings | Primary plane (1 of 5), secondary planes list | Step 6 (pre-forecast) | `economic_plane` | OK |
 | 17 | `vanity.py` | 636 | Cache with derived vars, fh_* scores | `vanity_score` (0-100), `vanity_label`, `vanity_trend`, 5 component columns | Step 5d | `vanity` | OK |
+| 18a | `adaptive_thresholds.py` | 837 | Cache, `linked_caches`, `regime_detector`, `fh_composite_scores` | `ThresholdSet` with peer-calibrated survival thresholds (5 methods: Peer Percentile, BOCPD Tightening, Sector Z-Score, Jenks Breaks, HMM Crossover) | Step 5j | Consumed by survival_mode, monte_carlo, regime_mixer | OK |
+| 18b | `adaptive_model_params.py` | 1,186 | Cache, `regime_detector`, `enriched_timeline_result`, Cox/sigmoid series | `AdaptiveModelParams` with 10+ calibrated params: Kish n_eff, inverse-variance blend, Lambda PID, copula contagion, Amihud participation, GK factor, MC precision, Hurst exponent | Step 5k | Consumed by survival_probability, monte_carlo, forward_pass, graph_risk | OK |
+| 18c | `adaptive_windows.py` | 553 | `filing_frequency`, Kish n_eff, cache OHLC | `AdaptiveTier3Params` with filing-anchored windows (Nyquist), scaling-law NN hyperparams (Kaplan 2020), particle noise (Mehra 1970), pattern thresholds (Bulkowski 2008), stale threshold | Step 5k.2 | Consumed by derived_variables, forecasting, transformer, pattern_detector | OK |
 
 ---
 
@@ -106,7 +109,7 @@ Statistical and ML models that consume the enriched daily cache.
 
 | # | Module | Lines | Input | Output | main.py Step | Profile Section | Enhancement |
 |---|--------|-------|-------|--------|-------------|----------------|-------------|
-| 37 | `financial_health.py` | 831 | Cache, hierarchy weights | 5 tier scores, composite score, Altman Z, Beneish M, liquidity runway | Step 5d | `financial_health` | OK |
+| 37 | `financial_health.py` | 992 | Cache, hierarchy weights | 5 tier scores, composite score, Altman Z, Beneish M, liquidity runway, **adaptive PE/EV caps** | Step 5d | `financial_health` | **UPGRADED**: Growth tier uses adaptive valuation caps via Log-Normal P99.5 (Aitchison & Brown 1957), Tukey Extreme Fence (Tukey 1977), MAD-Based Cap (Iglewicz & Hoaglin 1993) consensus -- replaces fixed PE=200/EV=100 |
 | 38 | `graph_risk.py` | 622 | Target ISIN, relationships dict, **target_cache**, **linked_caches** | `GraphRiskResult` (network centrality, contagion probability, supply chain concentration, **CoVaR**, **SRISK**) | Step 5e | `graph_risk` | **NEW**: CoVaR and SRISK systemic risk measures. Edge-weighted contagion using revenue/supply exposure |
 | 39 | `game_theory.py` | 460 | Target cache, competitor caches | `GameTheoryResult` (Cournot/Stackelberg, competitive pressure, market structure) | Step 5e | `game_theory` | OK |
 
@@ -149,7 +152,11 @@ Step 5f:  Linked entity data fetch (parallel)
 Step 5g:  linked_aggregates
 Step 5h:  peer_ranking
 Step 5i:  news_sentiment [VADER]
+Step 5j:  adaptive_thresholds [Peer Percentile, BOCPD, Sector Z-Score, Jenks, HMM Crossover]
+          -> recalibrate survival_mode + hierarchy_weights with adapted thresholds
 Step 5.5: regime_detector (early) [+ChangeFinder online] -> survival_timeline (enriched)
+Step 5k:  adaptive_model_params [Kish n_eff, Cochrane blend, Dahlin PID, Amihud, GK, Glasserman MC]
+Step 5k.2: adaptive_windows [Nyquist windows, Kaplan NN, Mehra noise, Bulkowski patterns]
 Step 6:   [TEMPORAL MODELS -- all skip if --skip-models]
   6a: regime_detector (if not already run)
   6b: regime_mixer (dual regimes)
@@ -210,8 +217,8 @@ Step 8:   report_generator.generate_all_reports()
 | Layer | Modules | Lines | Description | Enhancements |
 |-------|---------|-------|-------------|-------------|
 | Features | 11 | ~8,500 | Raw cache -> enriched features (ratios, conflict, sentiment, peers, macro) | VADER sentiment, ta technical indicators |
-| Analysis | 7 | ~3,040 | Rule-based survival flags, hierarchy weights, ethical filters, vanity | Cox PH survival, scikit-fuzzy Mamdani, Sobol feedback |
+| Analysis | 10 | ~5,616 | Rule-based survival flags, hierarchy weights, ethical filters, vanity, **adaptive parameter calibration (3 tiers)** | Cox PH survival, scikit-fuzzy Mamdani, Sobol feedback, Peer Percentile/BOCPD/Jenks/HMM thresholds, Kish n_eff, Cochrane blend, Dahlin PID, Amihud, Nyquist windows, Kaplan NN scaling |
 | Temporal Models | 24 | ~15,800 | Statistical + ML models | PCMCI causality, EMD cycles, stumpy patterns, Student-t/Clayton copulas, Conformal PID + Mondrian, Fixed Share + MCS, multivariate MC, ChangeFinder, Optuna TPE, AutoARIMA, DFM, CoVaR/SRISK, edge-weighted graph, cross-company DTW |
-| **Total** | **42** | **~27,340** | | **28 enhancements across 18 modules** |
+| **Total** | **45** | **~29,916** | | **29 enhancements across 19 modules** |
 
-All 42 modules wired in main.py. All results stored in profile_builder. All sections rendered in report_generator.
+All 45 modules wired in main.py. All results stored in profile_builder. All sections rendered in report_generator.
