@@ -855,7 +855,7 @@ def render_health():
 
 
 def _health_card(market_id: str, data: dict):
-    """Single market health card."""
+    """Single market health card with deep probe details."""
     status = data.get("status", "unknown")
     colors = {"healthy": "bg-green-800", "degraded": "bg-yellow-800",
               "critical": "bg-red-800", "unknown": "bg-gray-700"}
@@ -864,12 +864,64 @@ def _health_card(market_id: str, data: dict):
     latency = data.get("latency_ms", 0)
     short_id = market_id.split("_")[0].upper()
 
-    with ui.card().classes(f"p-3 min-w-28 {color}"):
-        ui.label(short_id).classes("font-bold text-white")
-        ui.label(f"{level} {latency}ms").classes("text-xs text-gray-300")
-        icons = {"healthy": "check_circle", "degraded": "warning",
-                 "critical": "error", "unknown": "help"}
-        ui.icon(icons.get(status, "help")).classes("text-white")
+    # Extract deep probe info if available
+    probes = data.get("probes", [])
+    deep_probe = None
+    for p in probes:
+        if isinstance(p, dict) and p.get("level") == "L4_deep":
+            deep_probe = p
+            break
+
+    with ui.expansion(text="").classes(f"min-w-32 {color} rounded"):
+        with ui.row().classes("items-center gap-2"):
+            icons = {"healthy": "check_circle", "degraded": "warning",
+                     "critical": "error", "unknown": "help"}
+            ui.icon(icons.get(status, "help")).classes("text-white")
+            ui.label(short_id).classes("font-bold text-white")
+            ui.label(f"{level} {latency}ms").classes("text-xs text-gray-300")
+
+            # Pattern badge (from deep probe)
+            if deep_probe:
+                pattern = deep_probe.get("pattern", "")
+                pattern_colors = {
+                    "waf": "red", "session": "orange", "referer": "yellow",
+                    "free_api": "green", "api_key": "blue",
+                }
+                if pattern:
+                    ui.badge(pattern.upper(), color=pattern_colors.get(pattern, "gray")).classes("text-xs")
+
+                # Schema drift indicator
+                if deep_probe.get("schema_drift"):
+                    ui.badge("DRIFT", color="orange").classes("text-xs")
+
+                # Deep probe status
+                dp_status = deep_probe.get("status", "")
+                dp_colors = {
+                    "working": "green", "restructured": "orange",
+                    "down": "red", "waf_blocked": "red",
+                    "geo_blocked": "yellow", "partial": "orange",
+                }
+                if dp_status and dp_status != status:
+                    ui.badge(dp_status, color=dp_colors.get(dp_status, "gray")).classes("text-xs")
+
+        # Expandable detail section
+        if deep_probe and deep_probe.get("steps"):
+            ui.separator()
+            ui.label("Deep Probe Steps").classes("text-xs text-gray-400 mt-1")
+            for step in deep_probe["steps"]:
+                if isinstance(step, dict):
+                    icon = "check" if step.get("passed") else "close"
+                    icon_color = "text-green-400" if step.get("passed") else "text-red-400"
+                    step_name = step.get("step_name", "?")
+                    method = step.get("method", "")
+                    detail = step.get("detail", step.get("error", ""))
+                    ms = step.get("latency_ms", 0)
+                    with ui.row().classes("items-center gap-1"):
+                        ui.icon(icon).classes(f"text-sm {icon_color}")
+                        ui.label(f"{step_name}").classes("text-xs text-gray-300")
+                        ui.label(f"({method}) {ms}ms").classes("text-xs text-gray-500")
+                    if detail:
+                        ui.label(f"  {detail[:80]}").classes("text-xs text-gray-500 ml-4")
 
 
 async def _run_health_check():

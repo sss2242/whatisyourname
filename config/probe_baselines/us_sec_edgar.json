@@ -1,0 +1,5 @@
+{
+  "cik_str": "int",
+  "ticker": "str",
+  "title": "str"
+}

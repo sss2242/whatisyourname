@@ -454,6 +454,31 @@ def run_health_check(
             icon, market_id, health.status, health.level_passed, health.latency_ms,
         )
 
+    # Run deep probes (L4: per-wrapper pattern-specific probes)
+    try:
+        from operator1.monitoring.wrapper_probes import run_deep_probes
+        deep_results = run_deep_probes(markets)
+        # Attach deep probe results to each market health entry
+        for mid, probe_result in deep_results.items():
+            if mid in report.markets:
+                report.markets[mid].probes.append({
+                    "level": "L4_deep",
+                    "status": probe_result.status,
+                    "pattern": probe_result.pattern,
+                    "total_latency_ms": probe_result.total_latency_ms,
+                    "schema_drift": probe_result.schema_drift,
+                    "steps": probe_result.steps,
+                })
+                # Upgrade degraded to restructured if schema drift detected
+                if probe_result.schema_drift and report.markets[mid].status == "healthy":
+                    report.markets[mid].status = "degraded"
+                    report.markets[mid].degraded_reason = (
+                        f"API schema drift detected: {', '.join(probe_result.schema_diff_fields[:3])}"
+                    )
+        logger.info("Deep probes complete: %d markets probed", len(deep_results))
+    except Exception as exc:
+        logger.warning("Deep probes failed (non-fatal): %s", exc)
+
     # Detect status changes and alert
     _detect_and_alert(report, previous_report)
 

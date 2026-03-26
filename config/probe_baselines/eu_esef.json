@@ -1,0 +1,7 @@
+{
+  "type": "str",
+  "attributes": "dict",
+  "relationships": "dict",
+  "id": "str",
+  "links": "dict"
+}
