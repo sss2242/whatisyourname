@@ -921,3 +921,265 @@ def compute_confidence_bounds(
     lower = lower_map.get(method_type, 0.05)
 
     return round(lower, 3), round(upper, 3)
+
+
+# =========================================================================
+# Category C: Edge-case adaptive parameters
+# =========================================================================
+
+
+# ---------------------------------------------------------------------------
+# C1. Country-Relative Conflict Event Scoring (Gleditsch 2002, Poisson Z)
+# ---------------------------------------------------------------------------
+
+
+def compute_conflict_event_score(
+    events_30d: int,
+    baseline_monthly_events: float = 0.0,
+) -> float:
+    """Score conflict events relative to the country's baseline rate.
+
+    Uses a Poisson Z-score: z = (observed - expected) / sqrt(expected).
+    Then applies sigmoid to map to [0, 1].
+
+    Parameters
+    ----------
+    events_30d:
+        Number of conflict events in the last 30 days.
+    baseline_monthly_events:
+        Country's typical monthly event count (from UCDP history).
+        If 0 or unknown, falls back to absolute scoring.
+
+    Returns
+    -------
+    float in [0, 1]. Higher = more concerning.
+    """
+    if events_30d == 0:
+        return 0.0
+
+    if baseline_monthly_events > 1.0:
+        # Poisson Z-score
+        z = (events_30d - baseline_monthly_events) / max(math.sqrt(baseline_monthly_events), 1.0)
+        # Sigmoid mapping: z=0 -> 0.5, z=2 -> 0.88, z=-2 -> 0.12
+        score = 1.0 / (1.0 + math.exp(-z))
+    else:
+        # No baseline: absolute log-scaling (current-style fallback)
+        score = min(math.log10(events_30d + 1) / 2.0, 1.0)
+
+    return round(max(0.0, min(1.0, score)), 4)
+
+
+# ---------------------------------------------------------------------------
+# C3. Parkinson/Yang-Zhang OHLC Noise Decomposition (1980/2000)
+# ---------------------------------------------------------------------------
+
+
+def compute_ohlc_noise_factors(
+    cache: pd.DataFrame,
+    lookback: int = 63,
+) -> dict[str, float]:
+    """Decompose price noise into overnight gap and intraday components.
+
+    Uses Parkinson (1980) for intraday and Yang-Zhang (2000) for
+    overnight gap variance decomposition.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache with open, high, low, close columns.
+    lookback:
+        Days of recent data.
+
+    Returns
+    -------
+    Dict with keys: gap_factor, high_low_factor, horizon_growth_rate.
+    Defaults: gap_factor=0.3, high_low_factor=0.5, horizon_growth=0.02.
+    """
+    defaults = {"gap_factor": 0.3, "high_low_factor": 0.5, "horizon_growth_rate": 0.02}
+
+    required = ["open", "high", "low", "close"]
+    if not all(c in cache.columns for c in required):
+        return defaults
+
+    ohlc = cache[required].dropna().tail(lookback)
+    if len(ohlc) < 20:
+        return defaults
+
+    o, h, l, c = ohlc["open"], ohlc["high"], ohlc["low"], ohlc["close"]
+    prev_c = c.shift(1).dropna()
+
+    if len(prev_c) < 15:
+        return defaults
+
+    # Align
+    o_a = o.iloc[1:]
+    h_a = h.iloc[1:]
+    l_a = l.iloc[1:]
+    c_a = c.iloc[1:]
+    pc = prev_c
+
+    # Close-to-close volatility
+    cc_ret = np.log(c_a.values / pc.values)
+    sigma_cc = max(float(np.std(cc_ret)), 1e-8)
+
+    # Overnight (gap) volatility: var(log(open / prev_close))
+    gap_ret = np.log(o_a.values / pc.values)
+    sigma_overnight = max(float(np.std(gap_ret)), 1e-10)
+
+    # Parkinson intraday volatility: var(log(high/low)) / (4*ln2)
+    hl_ratio = np.log(h_a.values / np.maximum(l_a.values, 1e-10))
+    sigma_parkinson = max(float(np.sqrt(np.mean(hl_ratio ** 2) / (4 * math.log(2)))), 1e-10)
+
+    gap_factor = round(sigma_overnight / sigma_cc, 4)
+    high_low_factor = round(sigma_parkinson / sigma_cc * 0.5, 4)
+
+    # Hurst exponent for horizon noise scaling (R/S analysis)
+    horizon_growth = _compute_hurst_growth_rate(cc_ret)
+
+    # Clamp to reasonable ranges
+    gap_factor = max(0.05, min(1.0, gap_factor))
+    high_low_factor = max(0.1, min(1.5, high_low_factor))
+    horizon_growth = max(0.0, min(0.10, horizon_growth))
+
+    return {
+        "gap_factor": gap_factor,
+        "high_low_factor": high_low_factor,
+        "horizon_growth_rate": horizon_growth,
+    }
+
+
+# ---------------------------------------------------------------------------
+# C6. Hurst Exponent Noise Scaling (Hurst 1951, Lo 1991)
+# ---------------------------------------------------------------------------
+
+
+def _compute_hurst_growth_rate(
+    returns: np.ndarray,
+    max_lag: int = 50,
+) -> float:
+    """Compute per-day noise growth rate from Hurst exponent.
+
+    Uses R/S (rescaled range) analysis. H > 0.5 = trending (noise grows),
+    H < 0.5 = mean-reverting (noise shrinks), H = 0.5 = random walk.
+
+    Returns the per-day growth rate: (2*H - 1) / 252.
+    """
+    returns = returns[~np.isnan(returns)]
+    n = len(returns)
+    if n < 20:
+        return 0.02  # default
+
+    # R/S analysis across multiple lag windows
+    lags = range(10, min(max_lag, n // 2))
+    if len(list(lags)) < 3:
+        return 0.02
+
+    log_rs = []
+    log_n = []
+
+    for lag in lags:
+        rs_vals = []
+        for start in range(0, n - lag, lag):
+            window = returns[start:start + lag]
+            if len(window) < lag:
+                continue
+            mean_r = np.mean(window)
+            cumdev = np.cumsum(window - mean_r)
+            R = np.max(cumdev) - np.min(cumdev)
+            S = max(np.std(window, ddof=1), 1e-10)
+            rs_vals.append(R / S)
+        if rs_vals:
+            log_rs.append(math.log(float(np.mean(rs_vals))))
+            log_n.append(math.log(lag))
+
+    if len(log_rs) < 3:
+        return 0.02
+
+    # Linear regression: log(R/S) = H * log(n) + c
+    log_rs_arr = np.array(log_rs)
+    log_n_arr = np.array(log_n)
+    try:
+        H = float(np.polyfit(log_n_arr, log_rs_arr, 1)[0])
+    except Exception:
+        return 0.02
+
+    H = max(0.2, min(0.8, H))
+
+    # Per-day growth rate: positive if trending, negative if mean-reverting
+    growth = (2 * H - 1.0) / 252.0
+    return round(growth, 6)
+
+
+def compute_hurst_exponent(
+    cache: pd.DataFrame,
+    column: str = "return_1d",
+) -> float:
+    """Compute the Hurst exponent for a cache column.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache DataFrame.
+    column:
+        Column to analyze (typically return_1d).
+
+    Returns
+    -------
+    Hurst exponent in [0.2, 0.8]. 0.5 = random walk.
+    """
+    if column not in cache.columns:
+        return 0.5
+
+    returns = cache[column].dropna().values
+    if len(returns) < 20:
+        return 0.5
+
+    growth = _compute_hurst_growth_rate(returns)
+    H = (growth * 252 + 1.0) / 2.0
+    return round(max(0.2, min(0.8, H)), 3)
+
+
+# ---------------------------------------------------------------------------
+# C4. Bootstrap Prediction Spread (Efron 1979)
+# ---------------------------------------------------------------------------
+
+
+def compute_bootstrap_spread(
+    model_predictions: dict[str, float],
+    default_spread_pct: float = 0.10,
+) -> float:
+    """Compute prediction interval spread from model ensemble disagreement.
+
+    Instead of a fixed percentage, uses the actual spread between
+    model predictions as the uncertainty measure.
+
+    Parameters
+    ----------
+    model_predictions:
+        Dict of {model_name: point_forecast}.
+    default_spread_pct:
+        Fallback spread as fraction of forecast.
+
+    Returns
+    -------
+    float: half-width of the prediction spread.
+    """
+    if not model_predictions or len(model_predictions) < 2:
+        # Can't compute spread from 0-1 models
+        vals = list(model_predictions.values()) if model_predictions else [0.0]
+        return abs(vals[0]) * default_spread_pct if vals else 0.0
+
+    vals = [v for v in model_predictions.values() if not math.isnan(v)]
+    if len(vals) < 2:
+        return abs(vals[0]) * default_spread_pct if vals else 0.0
+
+    arr = np.array(vals)
+    # IQR of model predictions (robust to outlier models)
+    q25 = float(np.percentile(arr, 25))
+    q75 = float(np.percentile(arr, 75))
+    iqr = q75 - q25
+
+    # Scale to 90% CI: 1.35 * IQR ~= 1 sigma, then * 1.645
+    spread = 1.35 * iqr * 1.645 / 2.0
+
+    return max(spread, abs(float(np.mean(arr))) * 0.001)
