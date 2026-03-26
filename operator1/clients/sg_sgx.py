@@ -554,57 +554,162 @@ def _parse_sgx_shareholding_text(
     - Shareholding distribution by size
     - Top 20 shareholders list
 
-    Uses regex patterns similar to BSE's _parse_shareholding_text().
+    IMPORTANT: This function first isolates the relevant shareholding
+    section(s) before applying regex extraction.  Without section
+    isolation, the loose regex patterns match random text throughout
+    the 100+ page annual report (e.g. funding breakdowns, executive
+    bios) producing garbage "holders" like "Wholesale funding 16%".
     """
     import re as _re
 
-    # Pattern 1: Substantial shareholder lines
-    # "Name of Substantial Shareholder ... Direct Interest ... Deemed Interest"
-    # "Temasek Holdings ... 1,234,567 ... 28.18%"
-    sub_patterns = [
-        _re.compile(
-            r"([A-Z][A-Za-z\s&.,()'-]+?)\s+"
-            r"([\d,]+)\s+"           # direct shares
-            r"([\d.]+)\s*%",         # percentage
-            _re.MULTILINE,
-        ),
-        _re.compile(
-            r"([A-Z][A-Za-z\s&.,()'-]{5,}?)\s+"
-            r".*?"
-            r"([\d.]+)\s*%\s*$",
-            _re.MULTILINE,
-        ),
+    # ------------------------------------------------------------------
+    # Step 1: Isolate the shareholding section(s) from the full text.
+    # We look for known section headings and extract a bounded window
+    # of text (~3000 chars) after each heading.  This prevents the
+    # regex from matching random percentages in unrelated sections.
+    # ------------------------------------------------------------------
+    section_headings = [
+        r"substantial\s+shareholder",
+        r"statistics\s+of\s+shareholding",
+        r"analysis\s+of\s+shareholding",
+        r"twenty\s+largest\s+shareholder",
+        r"top\s+20\s+shareholder",
     ]
 
-    for pat in sub_patterns:
-        for m in pat.finditer(text):
-            name = m.group(1).strip()
-            # Skip table headers and labels
-            if any(skip in name.lower() for skip in [
-                "name", "shareholder", "interest", "total", "percentage",
-                "direct", "deemed", "number", "class",
-            ]):
-                continue
-            try:
-                pct = float(m.groups()[-1])
-            except (ValueError, IndexError):
-                continue
-            if 0.1 < pct < 100 and len(name) > 3:
-                try:
-                    shares_str = m.group(2).replace(",", "") if len(m.groups()) >= 3 else "0"
-                    shares = int(shares_str)
-                except (ValueError, IndexError):
-                    shares = 0
+    sections: list[str] = []
+    for heading in section_headings:
+        for m in _re.finditer(heading, text, _re.IGNORECASE):
+            start = m.start()
+            # Extract up to 3000 chars after the heading -- enough for
+            # the substantial shareholder table but not so much that we
+            # bleed into the next unrelated section.
+            end = min(start + 3000, len(text))
+            sections.append(text[start:end])
 
-                if not any(h["name"].lower() == name.lower() for h in holders):
-                    holders.append({
-                        "name": name,
-                        "shares": shares,
-                        "percentage": round(pct, 2),
-                        "holder_type": "substantial",
-                        "date_reported": date_reported,
-                        "source": "sgx_filing_pdf",
-                    })
+    if not sections:
+        # No recognised section headings found -- skip entirely rather
+        # than matching against the full document (which produces garbage).
+        logger.debug("SGX PDF: no shareholding section headings found")
+        return
+
+    section_text = "\n".join(sections)
+
+    # ------------------------------------------------------------------
+    # Step 2: Extract substantial shareholder data from isolated sections.
+    # Patterns are tuned for SGX annual report format:
+    #   "Maju Holdings Pte. Ltd.  484,789,855  –  484,789,855  17.08"
+    #   "Temasek Holdings  312,559,831  490,413,019  802,972,850  28.30"
+    # ------------------------------------------------------------------
+
+    # Skip words that indicate table headers, labels, or non-name text
+    _SKIP_WORDS = {
+        "name", "shareholder", "interest", "total", "percentage",
+        "direct", "deemed", "number", "class", "shares", "ordinary",
+        "size", "shareholdings", "location", "singapore", "malaysia",
+        "overseas", "voting", "rights", "treasury", "issued",
+        "excluding", "based", "calculated", "pursuant", "section",
+        "subsidiary", "wholly", "owned", "note", "the", "and",
+        "for", "with", "from", "this", "that", "which", "are",
+        "was", "were", "has", "have", "not", "but", "all",
+    }
+
+    def _is_valid_name(name: str) -> bool:
+        """Check if extracted text looks like a company/person name."""
+        name_stripped = name.strip()
+        if len(name_stripped) < 4:
+            return False
+        # Must contain at least one uppercase letter
+        if not any(c.isupper() for c in name_stripped):
+            return False
+        # First word should not be a skip word
+        first_word = name_stripped.split()[0].lower().rstrip(".,;:()")
+        if first_word in _SKIP_WORDS:
+            return False
+        # Should look like an entity name (contains letters, not just numbers)
+        alpha_count = sum(1 for c in name_stripped if c.isalpha())
+        if alpha_count < 3:
+            return False
+        return True
+
+    # Pattern: Name followed by share numbers and percentage
+    # Matches lines like: "Maju Holdings Pte. Ltd. 484,789,855 – 484,789,855 17.08"
+    pat_shares_pct = _re.compile(
+        r"^([A-Z][A-Za-z\s&.,()'\-/]+?)"  # company name (starts with uppercase)
+        r"\s+"
+        r"([\d,]+(?:\s+[\d,–\-]+)*)"       # one or more share number columns
+        r"\s+"
+        r"(\d{1,3}\.\d{1,2})"              # percentage (e.g. 17.08, 28.30)
+        r"\s*$",
+        _re.MULTILINE,
+    )
+
+    for m in pat_shares_pct.finditer(section_text):
+        name = m.group(1).strip().rstrip(".,;:")
+        pct_str = m.group(3)
+        try:
+            pct = float(pct_str)
+        except ValueError:
+            continue
+        if not (0.5 < pct < 100):
+            continue
+        if not _is_valid_name(name):
+            continue
+        # Try to extract the last (total) share count
+        shares = 0
+        shares_parts = m.group(2).replace("–", "").replace("-", "").split()
+        for sp in reversed(shares_parts):
+            sp_clean = sp.replace(",", "").strip()
+            if sp_clean.isdigit():
+                shares = int(sp_clean)
+                break
+        if not any(h["name"].lower() == name.lower() for h in holders):
+            holders.append({
+                "name": name,
+                "shares": shares,
+                "percentage": round(pct, 2),
+                "holder_type": "substantial",
+                "date_reported": date_reported,
+                "source": "sgx_filing_pdf",
+            })
+
+    # Pattern for "Twenty largest shareholders" section
+    # Format: "1 CITIBANK NOMINEES SINGAPORE  1,234,567  12.34"
+    pat_top20 = _re.compile(
+        r"^\s*(\d{1,2})\s+"                # rank number
+        r"([A-Z][A-Za-z\s&.,()'\-/]+?)"    # shareholder name
+        r"\s+"
+        r"([\d,]+)"                         # shares
+        r"\s+"
+        r"(\d{1,3}\.\d{1,2})"              # percentage
+        r"\s*$",
+        _re.MULTILINE,
+    )
+
+    for m in pat_top20.finditer(section_text):
+        rank = int(m.group(1))
+        name = m.group(2).strip().rstrip(".,;:")
+        shares_str = m.group(3).replace(",", "")
+        pct_str = m.group(4)
+        if rank > 20:
+            continue
+        try:
+            pct = float(pct_str)
+            shares = int(shares_str)
+        except ValueError:
+            continue
+        if not (0.01 < pct < 100):
+            continue
+        if not _is_valid_name(name):
+            continue
+        if not any(h["name"].lower() == name.lower() for h in holders):
+            holders.append({
+                "name": name,
+                "shares": shares,
+                "percentage": round(pct, 2),
+                "holder_type": "top20",
+                "date_reported": date_reported,
+                "source": "sgx_filing_pdf",
+            })
 
 
 class SGSgxClient:
@@ -815,11 +920,15 @@ class SGSgxClient:
         except Exception as exc:
             logger.debug("SGX DOI scraping failed for %s: %s", identifier, exc)
 
-        # SECONDARY: SGX filing discoverer + fuzzy_pdf_parser for shareholding
-        # data from annual report / disclosure PDFs.  Uses the existing
-        # fuzzy_pdf_parser module (camelot-py + fuzzy string matching) for
-        # table extraction, then _parse_sgx_shareholding_text for
-        # substantial shareholder pattern matching.
+        # SECONDARY: SGX filing discoverer -- two-stage PDF extraction.
+        # Stage 1: Run fuzzy_pdf_parser for financial statement extraction
+        #          (income, balance, cashflow -- same as before).
+        # Stage 2: Extract shareholding data from pages that contain
+        #          shareholding keywords (page-level isolation).
+        #
+        # Stage 2 avoids feeding the entire 100+ page annual report to the
+        # shareholding regex, which previously produced garbage matches from
+        # unrelated sections (e.g. "Wholesale funding 16%").
         if not holders:
             try:
                 from operator1.clients.filing_discoverer import SGXFilingDiscoverer
@@ -834,34 +943,50 @@ class SGSgxClient:
                             if not pdf_bytes or pdf_bytes[:4] != b"%PDF":
                                 continue
 
-                            # Use fuzzy parser for structured extraction
-                            rows = extract_financials_from_pdf(
-                                pdf_bytes,
-                                filing_date=filing.filing_date or "",
-                                report_date=filing.report_date or "",
-                                statement_type="balance",
-                            )
-
-                            # Also extract raw text for shareholding patterns
+                            # --- Stage 1: Financial statement extraction ---
+                            # Run the fuzzy PDF parser for structured financial
+                            # data (income, balance, cashflow).  This is the
+                            # same extraction that _fetch_financials() uses.
                             try:
-                                from operator1.clients.fuzzy_pdf_parser import _extract_tables_text
-                                text = _extract_tables_text(pdf_bytes)
-                            except (ImportError, AttributeError):
-                                import pdfplumber as _pdfp, io as _io
-                                with _pdfp.open(_io.BytesIO(pdf_bytes)) as pdf:
-                                    text = "\n".join(
-                                        (p.extract_text() or "") for p in pdf.pages
-                                    )
+                                extract_financials_from_pdf(
+                                    pdf_bytes,
+                                    filing_date=filing.filing_date or "",
+                                    report_date=filing.report_date or "",
+                                    statement_type="balance",
+                                )
+                            except Exception as exc:
+                                logger.debug("SGX financial extraction from PDF failed: %s", exc)
 
-                            if text and ("substantial shareholder" in text.lower() or
-                                         "statistics of shareholding" in text.lower() or
-                                         "analysis of shareholding" in text.lower()):
-                                _parse_sgx_shareholding_text(text, holders, filing.filing_date or "")
+                            # --- Stage 2: Shareholding extraction ---
+                            # Extract text ONLY from pages containing
+                            # shareholding keywords (page-level isolation).
+                            import pdfplumber as _pdfp, io as _io
+                            _SH_KEYWORDS = (
+                                "substantial shareholder",
+                                "statistics of shareholding",
+                                "analysis of shareholding",
+                                "twenty largest shareholder",
+                                "top 20 shareholder",
+                            )
+                            relevant_pages: list[str] = []
+                            with _pdfp.open(_io.BytesIO(pdf_bytes)) as pdf:
+                                for page in pdf.pages:
+                                    page_text = page.extract_text() or ""
+                                    page_lower = page_text.lower()
+                                    if any(kw in page_lower for kw in _SH_KEYWORDS):
+                                        relevant_pages.append(page_text)
+
+                            if relevant_pages:
+                                text = "\n".join(relevant_pages)
+                                _parse_sgx_shareholding_text(
+                                    text, holders, filing.filing_date or "",
+                                )
 
                             if holders:
                                 logger.info(
-                                    "SGX shareholding for %s: extracted via fuzzy parser (%s)",
-                                    identifier, filing.filing_date,
+                                    "SGX shareholding for %s: %d holders from %d relevant pages (%s)",
+                                    identifier, len(holders), len(relevant_pages),
+                                    filing.filing_date,
                                 )
                                 break
                         except Exception as exc:
@@ -897,7 +1022,7 @@ class SGSgxClient:
             if not holders:
                 return pd.DataFrame()
 
-            inst_holders = [h for h in holders if h.get("holder_type") in ("substantial", "institutional")]
+            inst_holders = [h for h in holders if h.get("holder_type") in ("substantial", "institutional", "top20")]
             inst_pct = sum(h.get("percentage", 0) for h in inst_holders)
 
             hhi = 0.0
