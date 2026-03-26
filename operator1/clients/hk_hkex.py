@@ -481,6 +481,28 @@ class HKHkexClient:
         except Exception as exc:
             logger.debug("HKEX disclosure search failed for %s: %s", identifier, exc)
 
+
+        # --- MarketScreener fallback (global institutional shareholder data) ---
+        if not holders:
+            try:
+                from operator1.clients.marketscreener import fetch_shareholders
+                company_name = ""
+                if hasattr(self, '_read_cache'):
+                    profile = self._read_cache(identifier, "profile.json")
+                    if profile:
+                        company_name = profile.get("name", "")
+                if not company_name:
+                    company_name = identifier
+                ms_holders = fetch_shareholders(company_name)
+                if ms_holders:
+                    holders.extend(ms_holders)
+                    logger.info(
+                        "%s holders for %s: %d from MarketScreener (fallback)",
+                        self.market_id, identifier, len(ms_holders),
+                    )
+            except Exception as exc:
+                logger.debug("MarketScreener fallback failed for %s: %s", identifier, exc)
+
         return holders
 
     def get_holder_history(self, identifier: str, years: int = 2) -> "pd.DataFrame":
