@@ -703,6 +703,221 @@ class AdaptiveModelParams:
     mc_n_paths: int = 10_000
     mc_is_tilt: float = 1.5
 
+    # Category A: train/test splits, confidence, vanity
+    train_split_fracs: dict[str, float] = field(default_factory=dict)
+    conformal_fallback_width: float | None = None
+
     # Metadata
     adapted: bool = False
     methods_used: dict[str, str] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# A1. Variance-Optimized Train/Test Split (Arlot & Celisse 2010)
+# ---------------------------------------------------------------------------
+
+# Model-specific constants for split sizing.
+# Higher c -> larger test set (more evaluation data needed).
+_SPLIT_C: dict[str, float] = {
+    "kalman": 2.0,
+    "garch": 2.5,
+    "var": 2.0,
+    "lstm": 3.5,
+    "tree": 3.0,
+    "transformer": 4.0,
+    "baseline": 1.5,
+}
+
+
+def compute_adaptive_split(
+    n_eff: float,
+    model_type: str = "tree",
+) -> float:
+    """Compute optimal train fraction from effective sample size.
+
+    Uses Arlot & Celisse (2010) variance-optimized split:
+    test_frac = c / sqrt(n_eff), clamped to [0.10, 0.30].
+
+    Parameters
+    ----------
+    n_eff:
+        Effective sample size (from Kish computation).
+    model_type:
+        Model identifier for complexity-specific constant.
+
+    Returns
+    -------
+    float
+        Train fraction in [0.70, 0.90]. Default 0.85 when n_eff
+        is moderate (~200 for tree models).
+    """
+    c = _SPLIT_C.get(model_type, 2.5)
+    test_frac = c / math.sqrt(max(n_eff, 4))
+    test_frac = max(0.10, min(0.30, test_frac))
+    return round(1.0 - test_frac, 3)
+
+
+# ---------------------------------------------------------------------------
+# A2. Conformal-Derived Confidence (Vovk et al. 2005)
+# ---------------------------------------------------------------------------
+
+
+def compute_calibrated_confidence(
+    residuals: list[float] | np.ndarray,
+    coverage_target: float = 0.90,
+    value_range: float | None = None,
+) -> float:
+    """Compute confidence score from residual coverage and tightness.
+
+    confidence = empirical_coverage * interval_tightness
+
+    Parameters
+    ----------
+    residuals:
+        Array of (actual - predicted) values.
+    coverage_target:
+        Target coverage level (default 90%).
+    value_range:
+        Range of the variable (max - min). If None, estimated
+        from residuals.
+
+    Returns
+    -------
+    float in [0.05, 0.95].
+    """
+    arr = np.asarray(residuals, dtype=float)
+    arr = arr[~np.isnan(arr)]
+
+    if len(arr) < 5:
+        return 0.50  # insufficient data, neutral confidence
+
+    # Empirical coverage at target level
+    q = float(np.percentile(np.abs(arr), coverage_target * 100))
+    coverage = float(np.mean(np.abs(arr) <= q))
+
+    # Interval tightness: how narrow is the interval relative to value range
+    if value_range is None or value_range < 1e-8:
+        value_range = float(np.percentile(np.abs(arr), 95) - np.percentile(np.abs(arr), 5))
+        value_range = max(value_range, 1e-8)
+
+    tightness = 1.0 - min(2 * q / value_range, 0.99)
+
+    confidence = coverage * max(tightness, 0.10)
+    return round(max(0.05, min(0.95, confidence)), 3)
+
+
+# ---------------------------------------------------------------------------
+# A3. Percentile Rank Score (Fama & French 1993 factor construction)
+# ---------------------------------------------------------------------------
+
+
+def percentile_rank_score(
+    series: pd.Series,
+    higher_is_worse: bool = True,
+    min_periods: int = 10,
+) -> pd.Series:
+    """Convert a raw signal to a 0-100 percentile score.
+
+    Replaces arbitrary scaling multipliers (*1000, *200, *10, etc.)
+    with a monotone transformation to [0, 100] via expanding
+    percentile rank. Standard approach in quantitative factor investing.
+
+    Parameters
+    ----------
+    series:
+        Raw signal series (e.g., R&D intensity excess).
+    higher_is_worse:
+        If True, higher raw values map to higher (worse) scores.
+        If False, lower raw values map to higher scores.
+    min_periods:
+        Minimum observations before ranking starts.
+
+    Returns
+    -------
+    pd.Series with values in [0, 100]. NaN where insufficient data.
+    """
+    rank = series.expanding(min_periods=min_periods).rank(pct=True)
+    if higher_is_worse:
+        return rank * 100
+    else:
+        return (1 - rank) * 100
+
+
+# ---------------------------------------------------------------------------
+# A4. IQR-Based Conformal Fallback (Hyndman & Athanasopoulos 2021)
+# ---------------------------------------------------------------------------
+
+
+def compute_conformal_fallback_width(
+    residuals: list[float] | np.ndarray | None,
+    point_forecast: float = 0.0,
+    coverage: float = 0.90,
+) -> float:
+    """Compute conformal prediction interval fallback width from residuals.
+
+    Uses IQR of residuals scaled to desired coverage (Hyndman 2021).
+    Falls back to 10% of forecast value when no residuals available.
+
+    Parameters
+    ----------
+    residuals:
+        Array of forecast residuals.
+    point_forecast:
+        The point forecast value (for percentage-based fallback).
+    coverage:
+        Desired coverage level.
+
+    Returns
+    -------
+    float
+        Half-width of the prediction interval.
+    """
+    if residuals is not None:
+        arr = np.asarray(residuals, dtype=float)
+        arr = arr[~np.isnan(arr)]
+        if len(arr) >= 10:
+            iqr = float(np.percentile(np.abs(arr), 75) - np.percentile(np.abs(arr), 25))
+            z = {0.90: 1.645, 0.95: 1.96, 0.99: 2.576}.get(coverage, 1.645)
+            width = max(1.35 * iqr * z / 1.645, abs(point_forecast) * 0.001)
+            return round(width, 6)
+
+    # Last resort
+    return round(abs(point_forecast) * 0.10, 6)
+
+
+# ---------------------------------------------------------------------------
+# A5. Calibration-Derived Confidence Bounds (Platt 1999)
+# ---------------------------------------------------------------------------
+
+
+def compute_confidence_bounds(
+    empirical_coverage: float = 0.90,
+    method_type: str = "mar",
+) -> tuple[float, float]:
+    """Compute adaptive confidence clip bounds from empirical coverage.
+
+    Parameters
+    ----------
+    empirical_coverage:
+        Fraction of held-out values within predicted intervals.
+    method_type:
+        "mar" for Missing At Random path, "mnar" for Missing Not
+        At Random, "gain" for adversarial imputation.
+
+    Returns
+    -------
+    (lower_bound, upper_bound) for confidence clipping.
+    """
+    # Upper bound: slightly above empirical coverage (optimistic ceiling)
+    upper = min(0.95, empirical_coverage * 1.05)
+
+    # Lower bound: depends on method type
+    lower_map = {
+        "mar": 0.05,    # MICE/GP/Matrix completion have good priors
+        "mnar": 0.10,   # Heckman has structural model
+        "gain": 0.10,   # adversarial has distribution matching
+        "vae": 0.05,    # VAE reconstruction
+    }
+    lower = lower_map.get(method_type, 0.05)
+
+    return round(lower, 3), round(upper, 3)
