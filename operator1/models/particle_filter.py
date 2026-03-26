@@ -62,6 +62,7 @@ class ParticleFilterResult:
     # Distribution outputs
     percentiles: dict[str, np.ndarray] = field(default_factory=dict)
     # {"p5": array, "p50": array, "p95": array} for each state
+    available: bool = True
 
 
 # ---------------------------------------------------------------------------

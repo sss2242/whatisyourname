@@ -2124,7 +2124,26 @@ Non-interactive examples:
                 if hasattr(_wf_timeline_result, "timeline")
                 else _wf_timeline_result
             )
-            walk_forward_result = run_walk_forward(cache, _wf_timeline_df)
+            # Extract individual Series for survival_modes and switch_points.
+            # run_walk_forward expects pd.Series (not a DataFrame) for these
+            # parameters -- passing the full DataFrame would produce garbage
+            # mode labels (str(row) instead of str(value)) and break
+            # mode-conditioned scoring.
+            _wf_modes = (
+                _wf_timeline_df["survival_mode"]
+                if isinstance(_wf_timeline_df, pd.DataFrame)
+                and "survival_mode" in _wf_timeline_df.columns
+                else None
+            )
+            _wf_switches = (
+                _wf_timeline_df["switch_point"]
+                if isinstance(_wf_timeline_df, pd.DataFrame)
+                and "switch_point" in _wf_timeline_df.columns
+                else None
+            )
+            walk_forward_result = run_walk_forward(
+                cache, _wf_modes, _wf_switches,
+            )
             if walk_forward_result and walk_forward_result.fitted:
                 logger.info(
                     "Walk-forward: %d days evaluated, best=%s (MAE=%.6f)",

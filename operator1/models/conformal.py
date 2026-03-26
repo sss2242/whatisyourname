@@ -76,6 +76,7 @@ class ConformalResult:
     calibration_scores_count: int = 0
     coverage_level: float = DEFAULT_COVERAGE
     method: str = "split_conformal"
+    available: bool = True
 
 
 # ---------------------------------------------------------------------------
