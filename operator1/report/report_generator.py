@@ -88,8 +88,8 @@ class ReportMode(str, Enum):
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20},
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 7, 11, 14, 16, 17, 18, 195, 196, 197, 198, 20},
-    ReportTier.PREMIUM: set(range(1, 23)) | {195, 196, 197, 198},  # all 22 sections + geopolitical + SIX + holders + ownership deep
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 20},
+    ReportTier.PREMIUM: set(range(1, 23)) | {75, 195, 196, 197, 198},  # all 22 sections + economic position + geopolitical + SIX + holders + ownership deep
 }
 
 
@@ -1138,7 +1138,7 @@ def _build_predictions_forecasts(profile: dict[str, Any]) -> str:
         lines.append(f"- Upside (95th percentile): {_fmt(mc.get('p95'))}")
 
     # Conformal prediction intervals
-    conformal = profile.get("conformal_intervals", {})
+    conformal = profile.get("extended_models", {}).get("conformal_prediction", {})
     if conformal:
         lines.append("")
         lines.append("### Conformal Prediction Intervals")
@@ -1156,7 +1156,7 @@ def _build_predictions_forecasts(profile: dict[str, Any]) -> str:
                         )
 
     # SHAP explanations
-    shap_data = profile.get("shap_explanations", {})
+    shap_data = profile.get("extended_models", {}).get("shap_explanations", {})
     if shap_data.get("available"):
         lines.append("")
         lines.append("### What Drove These Predictions")
@@ -1187,7 +1187,7 @@ def _build_predictions_forecasts(profile: dict[str, Any]) -> str:
                 lines.append(f"- {feat}: average influence {_fmt(importance, '.4f')}")
 
     # Historical analogs (DTW)
-    analogs = profile.get("historical_analogs", {})
+    analogs = profile.get("extended_models", {}).get("dtw_analogs", {})
     if analogs.get("available"):
         lines.append("")
         lines.append("### Historical Analogs (DTW Pattern Matching)")
@@ -2210,147 +2210,6 @@ def _build_economic_position(profile: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-
-    lines: list[str] = []
-
-    lines.append("### Methodology Summary")
-    lines.append("")
-    lines.append("This analysis uses **25+ mathematical modules** across 9 categories:")
-    lines.append("")
-    lines.append("| Category | Modules |")
-    lines.append("|----------|---------|")
-    lines.append("| Regime Detection | HMM (Hidden Markov Model), GMM (Gaussian Mixture), PELT, Bayesian Change Point |")
-    lines.append("| Forecasting | Adaptive Kalman Filter, GARCH, VAR, LSTM with MC Dropout, **Temporal Fusion Transformer (TFT)** |")
-    lines.append("| Tree Ensembles | Random Forest, XGBoost, Gradient Boosting |")
-    lines.append("| Causality | Granger Causality, Transfer Entropy, Copula Models |")
-    lines.append("| Uncertainty | **Conformal Prediction** (distribution-free intervals), **MC Dropout** (epistemic uncertainty), Regime-Aware Monte Carlo, Importance Sampling |")
-    lines.append("| Explainability | **SHAP** (per-prediction feature attribution), Sobol Global Sensitivity |")
-    lines.append("| Historical Analogs | **Dynamic Time Warping (DTW)** for finding similar past periods |")
-    lines.append("| Optimisation | Genetic Algorithm (ensemble weight tuning) |")
-    lines.append("| Pattern Recognition | Candlestick Detector, Wavelet/Fourier Decomposition |")
-    lines.append("")
-
-    lines.append("### Conformal Prediction")
-    lines.append("")
-    lines.append("Traditional financial models assume returns are normally distributed "
-                 "and compute confidence intervals as RMSE x z-score x sqrt(horizon). "
-                 "**This assumption is wrong** -- financial returns have fat tails and "
-                 "regime switches that break Gaussian models.")
-    lines.append("")
-    lines.append("Conformal Prediction provides **distribution-free** intervals with "
-                 "**guaranteed** finite-sample coverage. If we target 90% coverage, the "
-                 "intervals will contain the true value at least 90% of the time -- regardless "
-                 "of the underlying distribution.")
-    lines.append("")
-    lines.append("We use **Adaptive Conformal Inference (ACI)** which adjusts the interval "
-                 "width online as the data distribution shifts (e.g., during regime changes).")
-    lines.append("")
-
-    lines.append("### SHAP Feature Attribution")
-    lines.append("")
-    lines.append("SHAP (SHapley Additive exPlanations) answers the question: *Why did "
-                 "the model make this specific prediction?*")
-    lines.append("")
-    lines.append("For each predicted variable, SHAP decomposes the prediction into "
-                 "contributions from individual features. For example: \"debt-to-equity "
-                 "is predicted to rise 8% primarily because: +3.2% from rising long-term "
-                 "debt, +2.1% from declining equity, -0.8% from strong cash position.\"")
-    lines.append("")
-
-    lines.append("### Temporal Fusion Transformer (TFT)")
-    lines.append("")
-    lines.append("TFT is a deep learning architecture purpose-built for mixed-frequency "
-                 "time series. Unlike LSTM which treats all inputs equally, TFT uses:")
-    lines.append("- **Variable selection gates** to learn which features matter")
-    lines.append("- **Multi-head self-attention** to focus on relevant historical days")
-    lines.append("- **Gated Residual Networks** for stable, deep learning")
-    lines.append("")
-    lines.append("This is particularly valuable for our data which mixes daily prices, "
-                 "quarterly financial statements, and annual macro indicators.")
-    lines.append("")
-
-    lines.append("### Dynamic Time Warping (DTW) Historical Analogs")
-    lines.append("")
-    lines.append("DTW finds past periods where the company showed a similar "
-                 "multi-variable pattern to the present. Instead of just matching "
-                 "by regime label, DTW considers the *shape* of the trajectory "
-                 "across multiple variables simultaneously (price, volatility, "
-                 "debt, margins, macro conditions).")
-    lines.append("")
-    lines.append("The outcomes from those historical analog periods serve as "
-                 "empirical priors: if 4 out of 5 analogs showed a 10% decline "
-                 "in the following month, that is a strong signal regardless of "
-                 "what the regression models predict.")
-    lines.append("")
-
-    lines.append("### MC Dropout (Epistemic Uncertainty)")
-    lines.append("")
-    lines.append("Standard neural networks give a single point prediction with "
-                 "no indication of how *confident* the model is. MC Dropout fixes "
-                 "this by running 100 forward passes through the LSTM with dropout "
-                 "enabled at inference time. The spread of those 100 predictions "
-                 "measures **epistemic uncertainty** -- how much the model itself "
-                 "is unsure.")
-    lines.append("")
-    lines.append("This is different from **aleatoric uncertainty** (inherent "
-                 "randomness in the data). A prediction with low epistemic but "
-                 "high aleatoric uncertainty means: *the model is confident in "
-                 "its estimate, but the variable is inherently noisy.* A prediction "
-                 "with high epistemic uncertainty means: *the model does not have "
-                 "enough information to make a reliable prediction.*")
-    lines.append("")
-
-    lines.append("### Forward Pass & Burn-Out Process")
-    lines.append("")
-    lines.append("The temporal engine uses a **day-by-day forward pass**: for each of "
-                 "~500 trading days, it predicts the next day, compares with actual data, "
-                 "and updates model parameters online. This is followed by a "
-                 "**convergence-based burn-out** phase: intensive re-training on the most "
-                 "recent 6 months with up to 10 iterations and patience-based early stopping.")
-    lines.append("")
-
-    lines.append("### Variable Tier Definitions")
-    lines.append("")
-    lines.append("| Tier | Category | Variables | Normal Weight |")
-    lines.append("|------|----------|-----------|---------------|")
-    lines.append("| 1 | Liquidity & Cash | cash_ratio, FCF, operating CF | 20% |")
-    lines.append("| 2 | Solvency & Debt | debt_to_equity, net_debt_to_EBITDA | 20% |")
-    lines.append("| 3 | Market Stability | volatility, drawdown, volume | 20% |")
-    lines.append("| 4 | Profitability | margins, ROE, ROA | 20% |")
-    lines.append("| 5 | Growth & Valuation | P/E, EV/EBITDA, revenue growth | 20% |")
-    lines.append("")
-
-    lines.append("### Data Sources")
-    lines.append("")
-    _meta_app = profile.get("meta", {})
-    _provider_label_app = _meta_app.get("data_provider_label", _meta_app.get("data_provider", "Unknown"))
-    _macro_source_app = _meta_app.get("macro_source", "")
-    _macro_country_app = _meta_app.get("macro_country", "")
-
-    lines.append(f"- **{_provider_label_app}:** Point-in-time financial data "
-                 "(company profile, financial statements with filing dates, OHLCV prices)")
-    if _macro_source_app:
-        lines.append(f"- **{_macro_source_app} ({_macro_country_app}):** "
-                     "Macroeconomic indicators (GDP, inflation, interest rates, unemployment, exchange rates)")
-    lines.append("- **Gemini API:** Report narrative generation (optional)")
-    lines.append("")
-
-    meta = profile.get("meta", {})
-    lines.append("### Data Timestamps")
-    lines.append("")
-    lines.append(f"- Report generated: {meta.get('generated_at', 'N/A')}")
-    lines.append(f"- Cache date range: {meta.get('cache_start', 'N/A')} to {meta.get('cache_end', 'N/A')}")
-    lines.append("")
-
-    lines.append("### Disclaimer")
-    lines.append("")
-    lines.append("This report is generated algorithmically and is for informational purposes only. "
-                 "It does not constitute financial advice. Past performance does not guarantee "
-                 "future results. All predictions carry inherent uncertainty.")
-
-    return "\n".join(lines)
-
-
 def _build_key_indicators_table(profile: dict[str, Any], mode: ReportMode = ReportMode.RESULTS) -> str:
     """Build a Key Financial Indicators summary table.
 
@@ -2574,7 +2433,7 @@ def _build_geopolitical_risk_section(profile: dict[str, Any]) -> str:
     """Build Geopolitical & Conflict Risk section from conflict_risk data."""
     lines: list[str] = []
 
-    conflict = profile.get("conflict_risk", profile.get("geopolitical_risk", {}))
+    conflict = profile.get("conflict_risk", {})
     if not conflict or not isinstance(conflict, dict):
         lines.append("No geopolitical risk data available for this market.")
         lines.append("")
@@ -2939,6 +2798,7 @@ def _build_fallback_report(
         5: ("5. Financial Health Scoring", _build_financial_health(profile)),
         6: ("6. Survival Mode Analysis", _build_survival_analysis(profile)),
         7: ("7. Linked Variables & Market Context", _build_linked_entities_section(profile)),
+        75: ("7.5. Economic Position & Industry Classification", _build_economic_position(profile)),
         8: ("8. Temporal Analysis & Model Insights", _build_regime_analysis(profile)),
         9: ("9. Predictions & Forecasts", _build_predictions_forecasts(profile)),
         10: ("10. Technical Patterns & Chart Analysis", _build_technical_patterns(profile)),
@@ -4046,10 +3906,34 @@ def generate_report(
                 "appending missing sections from fallback template.",
                 len(validation_issues),
             )
+            # Auto-patch: append missing sections from fallback template
+            _patch_builders: dict[str, str] = {
+                "executive summary": _build_executive_summary(profile),
+                "company overview": _build_company_overview(profile),
+                "historical performance": _build_historical_performance(profile),
+                "financial health": _build_financial_health(profile),
+                "survival": _build_survival_analysis(profile),
+                "linked variables": _build_linked_entities_section(profile),
+                "temporal analysis": _build_regime_analysis(profile),
+                "predictions": _build_predictions_forecasts(profile),
+                "technical patterns": _build_technical_patterns(profile),
+                "ethical filter": _build_ethical_filters_section(profile),
+                "supply chain": _build_graph_risk_section(profile),
+                "competitive": _build_game_theory_section(profile),
+                "risk factors": _build_risk_assessment(profile),
+                "limitations": _build_limitations(profile),
+                "investment recommendation": _build_investment_recommendation(profile),
+                "appendix": _build_appendix(profile),
+            }
             for issue in validation_issues:
                 if issue.startswith("Missing section:"):
                     section_name = issue.replace("Missing section: '", "").rstrip("'")
-                    logger.info("Attempting to append missing section: %s", section_name)
+                    content = _patch_builders.get(section_name.lower())
+                    if content:
+                        markdown += f"\n\n---\n\n## {section_name.title()}\n\n{content}\n"
+                        logger.info("Auto-patched missing section: %s", section_name)
+                    else:
+                        logger.info("Missing section '%s' -- no matching fallback builder", section_name)
 
     # Step 2: Save markdown
     md_path = out / tier.filename
