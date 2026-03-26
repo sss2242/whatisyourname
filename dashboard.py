@@ -595,7 +595,6 @@ def render_report():
         report_dir / "premium_report.md",
         report_dir / "pro_report.md",
         report_dir / "basic_report.md",
-        report_dir / "analysis_report.md",
     ]:
         if candidate.exists():
             report_path = candidate
