@@ -208,19 +208,55 @@ class AUAsxClient:
     # -- Institutional holders (ASX filing discovery) -------------------------
 
     def get_holders(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch holders from ASX substantial holder notices via filing discovery.
+        """Fetch holders from MarketScreener (primary) + ASX announcements (fallback).
 
-        ASX requires substantial holder notices (>5% ownership) to be filed
-        as announcements.  Uses the ASX MarkitDigital announcements API to
-        find these filings, then extracts holder data via LLM/fuzzy PDF
-        parsing.
+        Three-stage approach:
+
+        1. **MarketScreener** (primary): Global institutional shareholder
+           data scraped from marketscreener.com / zonebourse.com. Returns
+           institutional holder names, share counts, and percentages.
+           No API key needed (DuckDuckGo slug resolution + curl_cffi).
+
+        2. **ASX MarkitDigital announcements** (fallback): Searches for
+           substantial holder notices (>5% ownership).  Known API limitation:
+           returns max 5 items regardless of params (probed 2026-03-26).
+
+        3. **Filing discovery + PDF extraction** (last resort): Downloads
+           annual reports and extracts shareholder pages.
+
+        No yfinance dependency.
 
         Returns list of dicts with: name, shares, percentage, holder_type,
         date_reported, source.
         """
         holders: list[dict[str, Any]] = []
 
-        # --- ASX substantial holder notices via announcements API ---
+        # --- Path 1: MarketScreener institutional shareholders ---
+        try:
+            from operator1.clients.marketscreener import fetch_shareholders
+
+            # Get company name for slug resolution
+            profile = self._read_cache(identifier, "profile.json")
+            company_name = ""
+            if profile:
+                company_name = profile.get("name", "")
+            if not company_name:
+                company_name = identifier  # fallback to ticker
+
+            ms_holders = fetch_shareholders(company_name)
+            if ms_holders:
+                holders.extend(ms_holders)
+                logger.info(
+                    "ASX holders for %s: %d from MarketScreener",
+                    identifier, len(ms_holders),
+                )
+        except Exception as exc:
+            logger.debug("MarketScreener holder lookup failed for %s: %s", identifier, exc)
+
+        if holders:
+            return holders
+
+        # --- Path 2: ASX substantial holder notices via announcements API ---
         try:
             import re
             ticker = identifier.upper().strip()
@@ -323,11 +359,12 @@ class AUAsxClient:
             if not holders:
                 return pd.DataFrame()
 
-            substantial = [h for h in holders if h.get("holder_type") == "substantial"]
-            inst_pct = sum(h.get("percentage", 0) for h in substantial)
+            # Count both "substantial" (ASX announcements) and "institutional" (MarketScreener)
+            with_pct = [h for h in holders if h.get("percentage", 0) > 0]
+            inst_pct = sum(h.get("percentage", 0) for h in with_pct)
 
             hhi = 0.0
-            top5 = substantial[:5]
+            top5 = sorted(with_pct, key=lambda h: h.get("percentage", 0), reverse=True)[:5]
             total_pct = sum(h.get("percentage", 0) for h in top5)
             if total_pct > 0:
                 hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
@@ -336,7 +373,7 @@ class AUAsxClient:
                 "date_reported": pd.Timestamp(_date.today()),
                 "inst_ownership_pct": round(inst_pct, 2),
                 "inst_top5_concentration": round(hhi, 4),
-                "inst_holder_count": len(substantial),
+                "inst_holder_count": len(with_pct),
             }])
         except Exception as exc:
             logger.debug("ASX holder history failed for %s: %s", identifier, exc)
