@@ -958,50 +958,29 @@ class SGSgxClient:
                                 logger.debug("SGX financial extraction from PDF failed: %s", exc)
 
                             # --- Stage 2: Shareholding extraction ---
-                            # Primary: fuzzy parser's extract_shareholders_from_pdf
-                            # (camelot table extraction + page scoring + column ID).
-                            # Fallback: SGX-specific regex parser for formats the
-                            # generic table parser may miss (substantial shareholder
-                            # tables + top-20 lists in SGX annual reports).
-                            try:
-                                from operator1.clients.fuzzy_pdf_parser import extract_shareholders_from_pdf
-                                _fuzzy_holders = extract_shareholders_from_pdf(
-                                    pdf_bytes,
-                                    filing_date=filing.filing_date or "",
-                                    market_id="sg_sgx",
+                            # Extract text ONLY from pages containing
+                            # shareholding keywords (page-level isolation).
+                            import pdfplumber as _pdfp, io as _io
+                            _SH_KEYWORDS = (
+                                "substantial shareholder",
+                                "statistics of shareholding",
+                                "analysis of shareholding",
+                                "twenty largest shareholder",
+                                "top 20 shareholder",
+                            )
+                            relevant_pages: list[str] = []
+                            with _pdfp.open(_io.BytesIO(pdf_bytes)) as pdf:
+                                for page in pdf.pages:
+                                    page_text = page.extract_text() or ""
+                                    page_lower = page_text.lower()
+                                    if any(kw in page_lower for kw in _SH_KEYWORDS):
+                                        relevant_pages.append(page_text)
+
+                            if relevant_pages:
+                                text = "\n".join(relevant_pages)
+                                _parse_sgx_shareholding_text(
+                                    text, holders, filing.filing_date or "",
                                 )
-                                for fh in _fuzzy_holders:
-                                    holders.append(fh)
-                            except Exception as _fpe:
-                                logger.debug("SGX fuzzy shareholder extraction failed: %s", _fpe)
-
-                            # Fallback: SGX custom regex parser if fuzzy parser
-                            # found nothing (handles SGX-specific text layouts).
-                            if not holders:
-                                try:
-                                    import pdfplumber as _pdfp, io as _io
-                                    _SH_KEYWORDS = (
-                                        "substantial shareholder",
-                                        "statistics of shareholding",
-                                        "analysis of shareholding",
-                                        "twenty largest shareholder",
-                                        "top 20 shareholder",
-                                    )
-                                    relevant_pages: list[str] = []
-                                    with _pdfp.open(_io.BytesIO(pdf_bytes)) as pdf:
-                                        for page in pdf.pages:
-                                            page_text = page.extract_text() or ""
-                                            page_lower = page_text.lower()
-                                            if any(kw in page_lower for kw in _SH_KEYWORDS):
-                                                relevant_pages.append(page_text)
-
-                                    if relevant_pages:
-                                        text = "\n".join(relevant_pages)
-                                        _parse_sgx_shareholding_text(
-                                            text, holders, filing.filing_date or "",
-                                        )
-                                except Exception as _regex_exc:
-                                    logger.debug("SGX regex shareholding fallback failed: %s", _regex_exc)
 
                             if holders:
                                 logger.info(
