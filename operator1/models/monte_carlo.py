@@ -833,6 +833,7 @@ def run_monte_carlo(
     variable_sensitivities: dict[str, float] | None = None,
     regime_col: str = "regime_label",
     returns_col: str = "return_1d",
+    burnout_distributions: dict[str, dict[str, float]] | None = None,
 ) -> MonteCarloResult:
     """Run the full Monte Carlo simulation pipeline.
 
@@ -919,6 +920,35 @@ def run_monte_carlo(
     distributions = estimate_regime_distributions(
         returns, regime_labels, unique_regimes,
     )
+
+    # Override with burn-out calibrated distributions when available.
+    # Burn-out distributions are model-weighted (incorporating ensemble
+    # quality) rather than raw sample statistics, producing more realistic
+    # tail behavior for survival probability estimation.
+    if burnout_distributions:
+        _n_overrides = 0
+        for regime, params in burnout_distributions.items():
+            if regime in distributions and params.get("n_obs", 0) >= 10:
+                old = distributions[regime]
+                distributions[regime] = RegimeDistribution(
+                    regime_label=regime,
+                    mean=params["mean"],
+                    std=params["std"],
+                    n_obs=params["n_obs"],
+                )
+                _n_overrides += 1
+                logger.info(
+                    "MC: burn-out override for regime '%s': "
+                    "mean %.6f->%.6f, std %.6f->%.6f",
+                    regime, old.mean, params["mean"],
+                    old.std, params["std"],
+                )
+        if _n_overrides > 0:
+            logger.info(
+                "MC: %d/%d regime distributions overridden by burn-out calibration",
+                _n_overrides, len(distributions),
+            )
+
     result.regime_distributions = distributions
 
     transition_matrix, regime_order = estimate_transition_matrix(
