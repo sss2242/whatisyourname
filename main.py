@@ -2660,6 +2660,49 @@ Non-interactive examples:
         # regime_detector may have been set in Step 5.5; keep it if so.
 
     # ------------------------------------------------------------------
+    # Step 6.5: Retroactive calibration (Category D)
+    # ------------------------------------------------------------------
+    # After all temporal models have run, use their outputs to calibrate
+    # model weight matrices that were initially set to fixed defaults.
+    # Empirical Bayes: use first-pass data to set second-pass priors.
+    _retro_params = None
+    if not args.skip_models:
+        try:
+            from operator1.analysis.retroactive_calibration import run_retroactive_calibration
+
+            _entity_groups_for_retro = {}
+            if relationships:
+                for grp, ents in relationships.items():
+                    if isinstance(ents, list):
+                        ids = []
+                        for e in ents:
+                            eid = ""
+                            if isinstance(e, dict):
+                                eid = e.get("isin", "") or e.get("ticker", "")
+                            elif hasattr(e, "isin"):
+                                eid = e.isin or getattr(e, "ticker", "")
+                            if eid:
+                                ids.append(eid)
+                        _entity_groups_for_retro[grp] = ids
+
+            _retro_params = run_retroactive_calibration(
+                cache=cache,
+                linked_caches=linked_caches if linked_caches else None,
+                entity_groups=_entity_groups_for_retro if _entity_groups_for_retro else None,
+                walk_forward_result=walk_forward_result,
+                forecast_result=forecast_result,
+                sobol_result=sobol_result,
+                target_profile=target_profile,
+            )
+            if _retro_params.n_calibrated > 0:
+                logger.info(
+                    "Step 6.5: Retroactive calibration complete (%d groups calibrated)",
+                    _retro_params.n_calibrated,
+                )
+        except Exception as exc:
+            logger.warning("Retroactive calibration failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 7: Build company profile
     # ------------------------------------------------------------------
     # Item 5: When --skip-models is used, the following variables are None:
