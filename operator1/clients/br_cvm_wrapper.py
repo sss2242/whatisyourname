@@ -469,13 +469,27 @@ class BRCvmClient:
         return df
 
     def _resolve_cd_cvm(self, identifier: str) -> str:
-        """Resolve any identifier (ticker, name, CVM code) to a CD_CVM code."""
+        """Resolve any identifier (ticker, name, CVM code) to a CD_CVM code.
+
+        Handles B3 ticker format (e.g. PETR4, VALE3, ITUB4) by stripping
+        the trailing share class digit(s) and searching by the base name.
+        """
         # If identifier looks like a CVM code (all digits), use directly
         if identifier.strip().isdigit():
             return identifier.strip()
 
         # Otherwise search the registry
         matches = self.list_companies(query=identifier)
+
+        # B3 tickers use a 4-letter base + share class digit(s).
+        # CVM registry doesn't store B3 tickers, so strip trailing
+        # digits and retry as a name search.
+        if not matches and identifier.strip() and identifier[-1].isdigit():
+            import re
+            base = re.sub(r"\d+$", "", identifier).strip()
+            if len(base) >= 3:
+                matches = self.list_companies(query=base)
+
         if matches:
             cd_cvm = matches[0].get("cik", "")
             if cd_cvm:
@@ -516,23 +530,29 @@ class BRCvmClient:
                 logger.debug("BR holders: could not resolve CD_CVM for %s", identifier)
                 return holders
 
-            import zipfile
-            from io import BytesIO
             from datetime import date as _date
+            import re as _re
+
+            # Resolve CNPJ for this company (FRE uses CNPJ as key).
+            # B3 tickers like PETR4 need digit stripping to match
+            # the CVM registry which doesn't store B3 tickers.
+            matches = self.list_companies(query=identifier)
+            if not matches and identifier.strip() and identifier[-1].isdigit():
+                base = _re.sub(r"\d+$", "", identifier).strip()
+                if len(base) >= 3:
+                    matches = self.list_companies(query=base)
+            cnpj = matches[0].get("cnpj", "") if matches else ""
+            company_name = matches[0].get("name", "") if matches else ""
 
             # CVM FRE master ZIP contains posicao_acionaria CSV with
-            # structured shareholder data (name, shares, percentage,
-            # controlling flag, nationality).  The correct URL is the
-            # master ZIP: fre_cia_aberta_{year}.zip which contains
-            # fre_cia_aberta_posicao_acionaria_{year}.csv inside it.
+            # structured shareholder data.  Start with previous year
+            # (current year ZIP only has filings submitted so far, which
+            # may be empty for most companies early in the year).
             current_year = _date.today().year
-            for year in range(current_year, current_year - 3, -1):
+            for year in range(current_year - 1, current_year - 4, -1):
                 url = f"{_CVM_DATASET_BASE}/DOC/FRE/DADOS/fre_cia_aberta_{year}.zip"
                 try:
-                    resp = requests.get(url, timeout=120)
-                    if resp.status_code != 200:
-                        continue
-                    z = zipfile.ZipFile(BytesIO(resp.content))
+                    z = self._download_zip(url)
 
                     # Find the posicao_acionaria CSV inside the master ZIP
                     target_csv = f"fre_cia_aberta_posicao_acionaria_{year}.csv"
@@ -555,28 +575,30 @@ class BRCvmClient:
                         except Exception:
                             continue
 
-                    # Filter for this company by CNPJ or Nome_Companhia
-                    # First try matching by company name from CVM registry
-                    matches = self.list_companies(query=identifier)
-                    company_name = matches[0].get("name", "") if matches else ""
-                    cnpj = matches[0].get("cnpj", "") if matches else ""
-
+                    # Filter for this company by CNPJ or company name.
+                    # CNPJ and company_name resolved once before the loop.
                     company_rows = pd.DataFrame()
                     if cnpj and "CNPJ_Companhia" in df.columns:
                         company_rows = df[df["CNPJ_Companhia"] == cnpj]
                     if company_rows.empty and company_name and "Nome_Companhia" in df.columns:
-                        company_rows = df[
-                            df["Nome_Companhia"].str.contains(
-                                company_name.split()[0], case=False, na=False,
-                            )
-                        ]
+                        # Use first word of company name for fuzzy match
+                        first_word = company_name.split()[0] if company_name else ""
+                        if first_word and len(first_word) >= 3:
+                            company_rows = df[
+                                df["Nome_Companhia"].str.contains(
+                                    first_word, case=False, na=False,
+                                )
+                            ]
                     if company_rows.empty:
                         continue
 
                     # Extract holder data from CVM FRE posicao_acionaria columns
                     for _, row in company_rows.iterrows():
                         holder_name = str(row.get("Acionista", "")).strip()
-                        if not holder_name or holder_name.lower() in ("outros", "acoes tesouraria"):
+                        if not holder_name or holder_name.lower() in (
+                            "outros", "acoes tesouraria", "ações tesouraria",
+                            "ações em tesouraria", "acoes em tesouraria",
+                        ):
                             continue
 
                         pct = 0.0
@@ -674,10 +696,11 @@ class BRCvmClient:
             from datetime import date as _date
 
             current_year = _date.today().year
-            for year in range(current_year, current_year - 2, -1):
+            for year in range(current_year - 1, current_year - 3, -1):
                 url = f"{_CVM_DATASET_BASE}/DOC/FRE/DADOS/fre_cia_aberta_valor_mobiliario_negociado_{year}.zip"
                 try:
-                    resp = requests.get(url, timeout=60)
+                    import requests as _req
+                    resp = _req.get(url, timeout=60, headers=self._headers)
                     if resp.status_code != 200:
                         continue
                     z = zipfile.ZipFile(BytesIO(resp.content))

@@ -382,8 +382,11 @@ def _extract_holders_from_sast(
         news_dt = (filing.get("NEWS_DT") or "")[:10]
         attachment = filing.get("ATTACHMENTNAME", "")
 
-        # Skip Closure of Trading Window (no shareholder data)
-        if "closure" in subcatname.lower():
+        # Skip Closure of Trading Window (no shareholder data).
+        # IMPORTANT: check for "closure of trading" not just "closure"
+        # because "Disclosures under Reg. 29(2)" contains "closure" as
+        # a substring of "Disclosures" and must NOT be skipped.
+        if "closure of trading" in subcatname.lower():
             continue
 
         # Strategy 1: Extract shareholder name from HEADLINE field
