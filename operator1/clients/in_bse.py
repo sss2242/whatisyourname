@@ -440,24 +440,43 @@ def _extract_holders_from_sast(
                     if resp.status_code != 200 or resp.content[:4] != b"%PDF":
                         continue
 
-                    # Parse SAST PDF for shareholding data
+                    # Parse SAST PDF for shareholding data.
+                    # Primary: fuzzy parser's extract_shareholders_from_pdf
+                    # (camelot table extraction + page scoring).
+                    # Fallback: raw text extraction + SAST regex parser.
                     try:
-                        import pdfplumber
-                        import io
+                        from operator1.clients.fuzzy_pdf_parser import extract_shareholders_from_pdf
+                        _fuzzy_holders = extract_shareholders_from_pdf(
+                            resp.content,
+                            filing_date=news_dt,
+                            market_id="in_bse",
+                        )
+                        for fh in _fuzzy_holders:
+                            if fh.get("name") and fh["name"].lower() not in seen_names:
+                                holders.append(fh)
+                                seen_names.add(fh["name"].lower())
+                    except Exception as _fpe:
+                        logger.debug("BSE fuzzy shareholder extraction from SAST PDF failed: %s", _fpe)
 
-                        with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
-                            text = ""
-                            for page in pdf.pages[:5]:
-                                text += (page.extract_text() or "") + "\n"
+                    # Fallback: raw text + SAST-specific regex parser
+                    if not any(h.get("source") == "fuzzy_pdf" for h in holders):
+                        try:
+                            import pdfplumber
+                            import io
 
-                        if text.strip():
-                            _parse_sast_pdf_text(
-                                text, holders, shareholder_name, news_dt,
-                            )
-                    except ImportError:
-                        pass
-                    except Exception as exc:
-                        logger.debug("SAST PDF parse failed: %s", exc)
+                            with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
+                                text = ""
+                                for page in pdf.pages[:5]:
+                                    text += (page.extract_text() or "") + "\n"
+
+                            if text.strip():
+                                _parse_sast_pdf_text(
+                                    text, holders, shareholder_name, news_dt,
+                                )
+                        except ImportError:
+                            pass
+                        except Exception as exc:
+                            logger.debug("SAST PDF text parse failed: %s", exc)
 
                     time.sleep(_BSE_REQUEST_DELAY_S)
                     break  # Found the PDF, don't try other base URLs
