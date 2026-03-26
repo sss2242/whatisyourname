@@ -393,32 +393,20 @@ class CASedarClient:
         import requests as _requests
 
         try:
-            # getCompanyInsidersActivities returns aggregated insider activity
+            # PRIMARY: getInsiderTransactions returns individual SEDI
+            # transaction data with registeredholder names, amounts, and
+            # market values.  We aggregate by unique holder name to produce
+            # a holder list.  This is more reliable than
+            # getCompanyInsidersActivities (whose schema changed in 2025+,
+            # removing numberOfTransactions/averagePrice/totalValue fields).
             r = _requests.post(
                 _TMX_GRAPHQL_URL,
                 json={
                     "query": (
-                        "query getCompanyInsidersActivities($symbol: String) {\n"
-                        "  getCompanyInsidersActivities(symbol: $symbol) {\n"
-                        "    insiderActivities {\n"
-                        "      periodkey\n"
-                        "      buy {\n"
-                        "        numberOfTransactions\n"
-                        "        shares\n"
-                        "        averagePrice\n"
-                        "        totalValue\n"
-                        "      }\n"
-                        "      sell {\n"
-                        "        numberOfTransactions\n"
-                        "        shares\n"
-                        "        averagePrice\n"
-                        "        totalValue\n"
-                        "      }\n"
-                        "    }\n"
-                        "  }\n"
-                        "}"
+                        '{getInsiderTransactions(symbol:"'
+                        + identifier.upper()
+                        + '",monthDuration:12)}'
                     ),
-                    "variables": {"symbol": identifier.upper()},
                 },
                 headers={
                     **_TMX_HEADERS,
@@ -429,49 +417,53 @@ class CASedarClient:
             )
             if r.status_code == 200:
                 data = r.json()
-                activities = (
-                    data.get("data", {})
-                    .get("getCompanyInsidersActivities", {})
-                    .get("insiderActivities", [])
-                )
-                if activities:
-                    for act in activities:
-                        period = act.get("periodkey", "")
-                        buy = act.get("buy", {}) or {}
-                        sell = act.get("sell", {}) or {}
-                        buy_txns = buy.get("numberOfTransactions", 0) or 0
-                        sell_txns = sell.get("numberOfTransactions", 0) or 0
-                        buy_shares = buy.get("shares", 0) or 0
-                        sell_shares = sell.get("shares", 0) or 0
+                txn_list = data.get("data", {}).get("getInsiderTransactions", [])
+                if isinstance(txn_list, list) and txn_list:
+                    # Aggregate by unique holder name
+                    holder_agg: dict[str, dict[str, Any]] = {}
+                    for txn in txn_list:
+                        if not isinstance(txn, dict):
+                            continue
+                        name = (txn.get("registeredholder") or "").strip()
+                        if not name:
+                            name = (txn.get("filer") or "").strip()
+                        if not name or len(name) < 3:
+                            continue
+                        if name not in holder_agg:
+                            holder_agg[name] = {
+                                "shares": 0,
+                                "value": 0.0,
+                                "last_date": "",
+                                "txn_count": 0,
+                                "relationship": txn.get("relationship", ""),
+                            }
+                        agg = holder_agg[name]
+                        agg["shares"] += int(txn.get("amount", 0) or 0)
+                        agg["value"] += float(txn.get("marketvalue", 0) or 0)
+                        agg["txn_count"] += 1
+                        txn_date = txn.get("date", "")
+                        if txn_date > agg["last_date"]:
+                            agg["last_date"] = txn_date
 
-                        if buy_txns > 0:
-                            holders.append({
-                                "name": f"Insider Buys ({period})",
-                                "shares": int(buy_shares),
-                                "value": float(buy.get("totalValue", 0) or 0),
-                                "percentage": 0.0,
-                                "holder_type": "insider_buy_aggregate",
-                                "date_reported": period,
-                                "source": "tmx_graphql_insiders",
-                                "transactions": int(buy_txns),
-                                "avg_price": float(buy.get("averagePrice", 0) or 0),
-                            })
-                        if sell_txns > 0:
-                            holders.append({
-                                "name": f"Insider Sells ({period})",
-                                "shares": int(sell_shares),
-                                "value": float(sell.get("totalValue", 0) or 0),
-                                "percentage": 0.0,
-                                "holder_type": "insider_sell_aggregate",
-                                "date_reported": period,
-                                "source": "tmx_graphql_insiders",
-                                "transactions": int(sell_txns),
-                                "avg_price": float(sell.get("averagePrice", 0) or 0),
-                            })
+                    for name, agg in holder_agg.items():
+                        holders.append({
+                            "name": name,
+                            "shares": agg["shares"],
+                            "value": round(agg["value"], 2),
+                            "percentage": 0.0,
+                            "holder_type": "insider",
+                            "date_reported": agg["last_date"],
+                            "source": "tmx_graphql_sedi",
+                            "transactions": agg["txn_count"],
+                            "relationship": agg["relationship"],
+                        })
+
+                    # Sort by absolute value (most active insiders first)
+                    holders.sort(key=lambda h: abs(h.get("value", 0)), reverse=True)
 
                     logger.info(
-                        "CA holders for %s: %d insider activity periods from TMX GraphQL",
-                        identifier, len(holders),
+                        "CA holders for %s: %d unique insiders from %d TMX SEDI transactions",
+                        identifier, len(holders), len(txn_list),
                     )
         except Exception as exc:
             logger.debug("TMX GraphQL insider activity failed for %s: %s", identifier, exc)
