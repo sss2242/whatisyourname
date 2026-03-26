@@ -202,6 +202,15 @@ def fetch_shareholders(
             name = name_match.group(1).strip()
             if not name or len(name) < 3:
                 continue
+            # Reject CSS selectors, HTML fragments, and other garbage
+            if any(c in name for c in ('{', '}', '<', '>', 'not(', '.c-')):
+                continue
+            # Reject strings that start with special chars
+            if name[0] in '.(#[':
+                continue
+            # Reject French/English labels that aren't holder names
+            if name.lower().startswith(("liste des", "list of", "shareholders of")):
+                continue
 
             # Extract numbers (shares counts)
             numbers = re.findall(r'>\s*([\d\u00a0\u202f\u2009\s,.]+)\s*<', chunk)
