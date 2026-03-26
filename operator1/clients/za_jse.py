@@ -142,6 +142,43 @@ def _parse_issuer(issuer: dict) -> dict[str, Any]:
     }
 
 
+def _parse_wcf_date(raw: str) -> str:
+    """Parse a WCF /Date(timestamp+offset)/ string to ISO date."""
+    if not raw or "/Date(" not in str(raw):
+        return ""
+    import re as _re
+    ts_match = _re.search(r"/Date\((\d+)", str(raw))
+    if ts_match:
+        dt = datetime.fromtimestamp(int(ts_match.group(1)) / 1000, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d")
+    return ""
+
+
+def _extract_pdf_text(pdf_bytes: bytes, max_pages: int = 4) -> str:
+    """Extract text from a PDF for classification (shareholding vs dealing).
+
+    Uses pdfplumber for quick text extraction.  For actual shareholder
+    table parsing, use ``fuzzy_pdf_parser.extract_shareholders_from_pdf``
+    instead -- it handles page scoring, table extraction, and column
+    identification automatically.
+    """
+    try:
+        import pdfplumber
+        import io
+        full_text = ""
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages[:max_pages]:
+                text = page.extract_text() or ""
+                full_text += text + "\n"
+        return full_text
+    except ImportError:
+        logger.debug("pdfplumber not installed -- cannot parse PDFs")
+        return ""
+    except Exception as exc:
+        logger.debug("PDF text extraction failed: %s", exc)
+        return ""
+
+
 class ZAJseClient:
     """PIT client for South African JSE equities.
 
@@ -383,19 +420,29 @@ class ZAJseClient:
         return None
 
     def get_holders(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch holders from JSE SENS shareholding announcements.
+        """Fetch holders from JSE SENS shareholding announcements + PDF extraction.
 
-        Uses the JSE WCF SENSService to find shareholding-related
-        announcements (Section 122 Companies Act disclosures, major
-        shareholder changes).  Parses headlines for shareholder names
-        and percentages using regex patterns.
+        Three-stage approach (no yfinance):
 
-        Probing confirmed (2026-03-23):
-          - GetShareholdersForIssuer: 404 (doesn't exist)
-          - GetMajorShareholdersForIssuer: 404
-          - GetOwnershipForIssuer: 404
-          - GetDirectorsForIssuer: 404
-          - SENS announcements are the ONLY holder data source on JSE WCF
+        1. **SENS headline parsing**: Filter the 15 most recent SENS
+           announcements for shareholding/director dealing keywords.
+           Extract holder name and percentage from headlines.  Download
+           and parse SENS PDFs for structured data.
+
+        2. **SENS PDF deep parse**: For shareholding-related SENS PDFs,
+           extract structured holder data (name, shares, percentage)
+           using pdfplumber + regex.
+
+        3. **Filing discovery PDF fallback**: Use the annual report filing
+           discovery path to find and parse shareholder pages from annual
+           reports (two-stage: page scoring + table extraction).
+
+        Probing confirmed (2026-03-26):
+          - GetSensAnnouncementsByIssuerMasterId returns max 15 recent items
+          - API field is ``FlashHeadline`` (not ``Headline``)
+          - API date field is ``AcknowledgeDateTime`` (not ``DateTimePublished``)
+          - No dedicated shareholder WCF endpoints exist (all return 404)
+          - SENS announcements + filing PDFs are the ONLY native holder sources
 
         No yfinance dependency.
         """
@@ -405,7 +452,9 @@ class ZAJseClient:
         # Get SENS announcements and filter for shareholding disclosures
         master_id = self._resolve_master_id(identifier)
         if not master_id:
-            return holders
+            logger.debug("JSE: could not resolve MasterID for %s", identifier)
+            # Skip to filing discovery fallback
+            return self._holders_from_filing_pdfs(identifier)
 
         try:
             resp = requests.post(
@@ -416,111 +465,237 @@ class ZAJseClient:
                 timeout=15,
             )
             if resp.status_code != 200:
-                return holders
+                logger.debug("JSE SENS returned %d for MasterID %s", resp.status_code, master_id)
+                return self._holders_from_filing_pdfs(identifier)
 
             data = resp.json()
             announcements = data.get("GetSensAnnouncementsByIssuerMasterIdResult", [])
             if not isinstance(announcements, list):
-                return holders
+                return self._holders_from_filing_pdfs(identifier)
 
-            # Filter for shareholding/holder related announcements
+            # Filter for shareholding/holder related announcements.
+            # BUG FIX: API returns FlashHeadline, not Headline.
             holder_keywords = (
                 "shareholder", "beneficial", "section 122", "section 56",
-                "director", "interest in", "holding", "acquisition of",
+                "interest in", "holding", "acquisition of",
                 "disposal of", "stake",
             )
+            dealing_keywords = (
+                "dealing in securities", "dealings in securities",
+                "director dealing", "directors dealing",
+            )
+
+            seen_holders: dict[str, dict] = {}  # deduplicate by name
+            holder_pdfs: list[str] = []
+
             for ann in announcements:
-                headline = str(ann.get("Headline", "")).strip()
+                # BUG FIX: use FlashHeadline (the actual API field)
+                headline = str(ann.get("FlashHeadline", "")).strip()
                 headline_lower = headline.lower()
-                if not any(kw in headline_lower for kw in holder_keywords):
+
+                is_holder = any(kw in headline_lower for kw in holder_keywords)
+                is_dealing = any(kw in headline_lower for kw in dealing_keywords)
+
+                if not is_holder and not is_dealing:
                     continue
 
-                date_str = ""
-                raw_date = ann.get("DateTimePublished", "")
-                if raw_date and "/Date(" in str(raw_date):
-                    ts_match = _re.search(r"/Date\((\d+)", str(raw_date))
-                    if ts_match:
-                        from datetime import datetime as _dt, timezone as _tz
-                        dt = _dt.fromtimestamp(int(ts_match.group(1)) / 1000, tz=_tz.utc)
-                        date_str = dt.strftime("%Y-%m-%d")
+                # BUG FIX: use AcknowledgeDateTime (the actual API field)
+                date_str = _parse_wcf_date(ann.get("AcknowledgeDateTime", ""))
 
-                # Try to extract shareholder name and percentage from headline
-                name = headline[:60]
-                pct = 0.0
-                pct_match = _re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", headline)
-                if pct_match:
-                    pct = float(pct_match.group(1))
+                pdf_path = ann.get("PDFPath", "")
 
-                # Classify holder type from headline
-                holder_type = "substantial"
-                if "director" in headline_lower:
-                    holder_type = "director"
-                elif "beneficial" in headline_lower:
-                    holder_type = "beneficial"
+                if is_holder:
+                    # Try to extract shareholder name and percentage from headline
+                    name = headline[:80]
+                    pct = 0.0
+                    pct_match = _re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", headline)
+                    if pct_match:
+                        pct = float(pct_match.group(1))
 
-                holders.append({
-                    "name": name,
-                    "shares": 0,
-                    "value": 0.0,
-                    "percentage": round(pct, 2),
-                    "holder_type": holder_type,
-                    "date_reported": date_str,
-                    "source": "jse_sens",
-                    "pdf_path": ann.get("PDFPath", ""),
-                })
+                    holder_type = "substantial"
+                    if "beneficial" in headline_lower:
+                        holder_type = "beneficial"
+
+                    if name not in seen_holders or pct > seen_holders[name].get("percentage", 0):
+                        seen_holders[name] = {
+                            "name": name,
+                            "shares": 0,
+                            "value": 0.0,
+                            "percentage": round(pct, 2),
+                            "holder_type": holder_type,
+                            "date_reported": date_str,
+                            "source": "jse_sens",
+                            "pdf_path": pdf_path,
+                        }
+                    if pdf_path:
+                        holder_pdfs.append(pdf_path)
+
+                elif is_dealing and pdf_path:
+                    # Director dealings -- download PDF for structured data
+                    holder_pdfs.append(pdf_path)
+
+            holders = list(seen_holders.values())
+
+            # Stage 2: Download and parse SENS PDFs for structured holder data
+            _parsed_from_pdfs = self._parse_sens_holder_pdfs(holder_pdfs[:5])
+            if _parsed_from_pdfs:
+                # Merge PDF-parsed holders (deduplicate by name)
+                for ph in _parsed_from_pdfs:
+                    ph_name = ph.get("name", "")
+                    if ph_name and ph_name not in seen_holders:
+                        holders.append(ph)
+                        seen_holders[ph_name] = ph
 
             if holders:
                 logger.info(
-                    "JSE holders for %s: %d from SENS announcements",
+                    "JSE holders for %s: %d from SENS announcements + PDFs",
                     identifier, len(holders),
                 )
         except Exception as exc:
             logger.debug("JSE SENS holder search failed for %s: %s", identifier, exc)
 
-        # Fallback: extract shareholders from filing PDFs
+        # Stage 3: Filing discovery PDF fallback (annual report shareholder pages)
         if not holders:
-            try:
-                from operator1.clients.filing_discoverer import try_shareholding_extraction
-                holders = try_shareholding_extraction(identifier, market_id=self.market_id)
-                if holders:
-                    logger.info("JSE holders from PDF shareholding extraction: %d", len(holders))
-            except Exception as exc:
-                logger.debug("JSE PDF shareholding fallback failed: %s", exc)
+            holders = self._holders_from_filing_pdfs(identifier)
 
         return holders
+
+    def _parse_sens_holder_pdfs(
+        self, pdf_urls: list[str],
+    ) -> list[dict[str, Any]]:
+        """Download and parse SENS PDFs for structured holder/dealing data.
+
+        Handles two JSE-mandated PDF formats:
+        1. Shareholding disclosure (Section 122): name, shares, percentage
+        2. Director dealing (para 6.77-6.85): name, shares, value, date
+        """
+        import re as _re
+
+        holders: list[dict[str, Any]] = []
+
+        for pdf_url in pdf_urls:
+            if not pdf_url:
+                continue
+            try:
+                resp = requests.get(
+                    pdf_url,
+                    headers={"User-Agent": _JSE_HEADERS["User-Agent"]},
+                    timeout=15,
+                )
+                if resp.status_code != 200 or resp.content[:4] != b"%PDF":
+                    continue
+
+                text = _extract_pdf_text(resp.content, max_pages=4)
+                if not text:
+                    continue
+
+                text_lower = text.lower()
+
+                # Check if this is a shareholding disclosure
+                if any(kw in text_lower for kw in (
+                    "shareholder", "beneficial owner", "section 122",
+                    "section 56", "shareholding",
+                )):
+                    # Use the fuzzy PDF parser's shareholding extractor
+                    # (page scoring + table extraction + column identification)
+                    try:
+                        from operator1.clients.fuzzy_pdf_parser import extract_shareholders_from_pdf
+                        parsed_holders = extract_shareholders_from_pdf(
+                            resp.content,
+                            filing_date="",
+                            market_id="za_jse",
+                        )
+                        for ph in parsed_holders:
+                            ph["source"] = "jse_sens_pdf"
+                            ph["pdf_path"] = pdf_url
+                            holders.append(ph)
+                    except ImportError:
+                        logger.debug("fuzzy_pdf_parser not available for shareholding extraction")
+
+                # Check if this is a director dealing
+                elif any(kw in text_lower for kw in (
+                    "dealing in securities", "paragraph 6.77",
+                    "paragraph 6.83", "director",
+                )):
+                    parsed = _parse_director_dealings_pdf(resp.content, "")
+                    for tx in parsed:
+                        name = tx.get("insider_name", "")
+                        if name:
+                            holders.append({
+                                "name": name,
+                                "shares": tx.get("shares", 0),
+                                "value": tx.get("value", 0.0),
+                                "percentage": 0.0,
+                                "holder_type": "director",
+                                "date_reported": tx.get("date", ""),
+                                "source": "jse_sens_pdf",
+                                "pdf_path": pdf_url,
+                            })
+
+                time.sleep(0.5)  # rate limit between PDFs
+            except Exception as exc:
+                logger.debug("JSE SENS PDF parse failed for %s: %s", pdf_url, exc)
+
+        return holders
+
+    def _holders_from_filing_pdfs(self, identifier: str) -> list[dict[str, Any]]:
+        """Extract shareholders from annual report PDFs via filing discovery.
+
+        Uses the two-stage PDF extraction pipeline:
+        1. Filing discovery finds annual report PDFs
+        2. Page-level shareholding extraction isolates shareholder pages
+        3. Table extraction + regex parsing extracts holder data
+
+        No yfinance dependency.
+        """
+        try:
+            from operator1.clients.filing_discoverer import try_shareholding_extraction
+            holders = try_shareholding_extraction(identifier, market_id=self.market_id)
+            if holders:
+                logger.info("JSE holders from PDF shareholding extraction: %d", len(holders))
+                return holders
+        except Exception as exc:
+            logger.debug("JSE PDF shareholding fallback failed: %s", exc)
+        return []
 
     def get_holder_history(self, identifier: str, years: int = 2) -> pd.DataFrame:
         """Return institutional ownership metrics from JSE SENS data.
 
         Derives aggregate metrics from get_holders() which uses JSE SENS
-        shareholding announcements.  No yfinance dependency.
+        shareholding announcements and filing PDF extraction.
 
-        Probing confirmed: GetShareholdersForIssuer, GetMajorShareholdersForIssuer,
-        GetOwnershipForIssuer, GetDirectorsForIssuer all return 404.
-        SENS announcements are the only holder data source on JSE WCF.
+        No yfinance dependency.  Returns empty DataFrame when no native
+        holder data is available (same as AU ASX).
+
+        Probing confirmed (2026-03-26): No dedicated shareholder WCF
+        endpoints exist.  SENS + filing PDFs are the only native sources.
         """
         try:
-            from datetime import date as _date
-
             holders = self.get_holders(identifier)
             if not holders:
                 return pd.DataFrame()
 
-            # Compute aggregate metrics from SENS holder data
+            # Compute aggregate metrics from holder data
             substantial = [h for h in holders if h.get("percentage", 0) > 0]
+            directors = [h for h in holders if h.get("holder_type") == "director"]
             inst_pct = sum(h.get("percentage", 0) for h in substantial)
 
             hhi = 0.0
-            top5 = substantial[:5]
+            top5 = sorted(substantial, key=lambda h: h.get("percentage", 0), reverse=True)[:5]
             total_pct = sum(h.get("percentage", 0) for h in top5)
             if total_pct > 0:
                 hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
 
+            # Use the most recent date_reported from holders, or today
+            report_dates = [h.get("date_reported", "") for h in holders if h.get("date_reported")]
+            report_date = max(report_dates) if report_dates else date.today().isoformat()
+
             return pd.DataFrame([{
-                "date_reported": pd.Timestamp(_date.today()),
+                "date_reported": pd.Timestamp(report_date),
                 "inst_ownership_pct": round(inst_pct, 2),
                 "inst_top5_concentration": round(hhi, 4),
                 "inst_holder_count": len(substantial),
+                "director_count": len(directors),
             }])
         except Exception as exc:
             logger.debug("JSE holder history failed for %s: %s", identifier, exc)
@@ -678,36 +853,51 @@ def _parse_director_dealings_pdf(
     import re as _re
 
     # Strategy 1: Key-value format (most common for single-transaction PDFs)
-    # Look for patterns like "Director: John Smith" and "Number of shares: 10,000"
+    # Handles two JSE sub-formats:
+    #   SOL style:  "Director: V D Kahla", "Transaction date: 26 February 2026"
+    #   SBK style:  "Prescribed Officer Ms. FZ Montjane", "Date of Transaction 2025-11-18"
     director_patterns = [
-        # "Director: Jacobus Petrus Bekker" -- must start with a capital letter name, not "In compliance..."
+        # "Director: Jacobus Petrus Bekker" -- must start with a capital letter name
         _re.compile(r"^Director[:\s]+([A-Z][a-zA-Z\s,.'()-]+?)(?:\n|$)", _re.IGNORECASE | _re.MULTILINE),
         _re.compile(r"Name of director[^:]*[:\s]+([A-Z][a-zA-Z\s,.'()-]+?)(?:\n|$)", _re.IGNORECASE),
         _re.compile(r"Name of associate[:\s]+([A-Z][a-zA-Z\s,.'()-]+?)(?:\n|$)", _re.IGNORECASE),
+        # SBK style: "Prescribed Officer Ms. FZ Montjane" or "Prescribed Officer Mr AB Smith"
+        _re.compile(r"Prescribed Officer\s+(?:Ms\.?|Mr\.?|Mrs\.?|Dr\.?|Adv\.?)?\s*([A-Z][a-zA-Z\s,.'()-]+?)(?:\n|$)", _re.IGNORECASE),
         # "Surname and initials" column header followed by name line
         _re.compile(r"Surname\s+.*?\n\s*(?:and initials.*?\n\s*)?([A-Z][a-z]+ [A-Z](?:\s[A-Z])?)", _re.IGNORECASE),
     ]
     date_patterns = [
         _re.compile(r"Transaction date[:\s]+(\d{1,2}\s+\w+\s+\d{4})", _re.IGNORECASE),
         _re.compile(r"Transaction date[:\s]+(\d{4}-\d{2}-\d{2})", _re.IGNORECASE),
-        _re.compile(r"Transaction date[:\s]+(\d{1,2}\s+\w+\s+\d{4})", _re.IGNORECASE),
+        # SBK style: "Date of Transaction 2025-11-18" (no colon)
+        _re.compile(r"Date of Transaction\s+(\d{4}-\d{2}-\d{2})", _re.IGNORECASE),
+        _re.compile(r"Date of Transaction\s+(\d{1,2}\s+\w+\s+\d{4})", _re.IGNORECASE),
     ]
     shares_patterns = [
         _re.compile(r"Number of (?:shares|securities)[:\s]+([\d,\s]+)", _re.IGNORECASE),
+        # SBK style: "sale of 7,000 Standard Bank" -> extract number
+        _re.compile(r"(?:sale|purchase|acquisition|disposal)\s+of\s+([\d,\s]+)\s+\w+", _re.IGNORECASE),
     ]
     value_patterns = [
         _re.compile(r"Total value[:\s]+[rR]?\s?([\d,.\s]+)", _re.IGNORECASE),
         _re.compile(r"Total value of (?:the )?transaction[:\s]+[rR]?\s?([\d,.\s]+)", _re.IGNORECASE),
+        # SBK: "Total Value of Transaction R1,913,595.60"
+        _re.compile(r"Total Value of Transaction\s+[rR]?\s?([\d,.\s]+)", _re.IGNORECASE),
     ]
     nature_patterns = [
+        _re.compile(r"Nature of Transaction\s+(.+?)(?:\n|$)", _re.IGNORECASE),
         _re.compile(r"Nature of transaction[:\s]+(.+?)(?:\n|$)", _re.IGNORECASE),
     ]
     interest_patterns = [
         _re.compile(r"Nature (?:and extent )?of (?:director.s )?interest[:\s]+(.+?)(?:\n|$)", _re.IGNORECASE),
+        # SBK: "Nature of Interest Direct Beneficial"
+        _re.compile(r"Nature of Interest\s+(.+?)(?:\n|$)", _re.IGNORECASE),
     ]
     price_patterns = [
         _re.compile(r"(?:Average weighted |Volume weighted average\s+)price per share[:\s]+[rR]?\s?([\d,.\s]+)", _re.IGNORECASE),
         _re.compile(r"Price per (?:share|security)[:\s]+[rR]?\s?([\d,.\s]+)", _re.IGNORECASE),
+        # SBK: "Price per share R273.3708" (no colon)
+        _re.compile(r"Price per share\s+[rR]?\s?([\d,.\s]+)", _re.IGNORECASE),
     ]
 
     def _extract_first(patterns: list, text: str) -> str:
@@ -749,8 +939,10 @@ def _parse_director_dealings_pdf(
         return s
 
     # Check for multi-transaction blocks (Naspers style: repeated "Transaction date" lines)
+    # Handles both "Transaction date: 26 February 2026" (SOL) and
+    # "Date of Transaction 2025-11-18" (SBK) formats.
     tx_date_matches = list(_re.finditer(
-        r"Transaction date[:\s]+(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2})",
+        r"(?:Transaction date|Date of Transaction)[:\s]+(\d{1,2}\s+\w+\s+\d{4}|\d{4}-\d{2}-\d{2})",
         full_text, _re.IGNORECASE,
     ))
 
