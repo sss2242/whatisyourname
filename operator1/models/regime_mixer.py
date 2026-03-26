@@ -62,6 +62,7 @@ class DualRegimeResult:
 
 def classify_fundamental_regime(
     cache: pd.DataFrame,
+    thresholds: dict[str, dict[str, float]] | None = None,
 ) -> tuple[pd.Series, pd.DataFrame]:
     """Classify each day into a fundamental regime based on financial ratios.
 
@@ -70,6 +71,15 @@ def classify_fundamental_regime(
     - ``stressed``: at least one ratio in warning zone
     - ``distress``: at least one ratio in critical zone (survival mode)
 
+    Parameters
+    ----------
+    cache:
+        Daily cache DataFrame with derived financial ratios.
+    thresholds:
+        Optional adaptive thresholds dict with "distress" and "stressed"
+        sub-dicts. If None, uses the module-level ``_FUND_THRESHOLDS``.
+        Format: ``{"distress": {"current_ratio": 0.8, ...}, "stressed": {...}}``
+
     Returns
     -------
     (labels, probabilities)
@@ -77,6 +87,8 @@ def classify_fundamental_regime(
         ``probabilities`` is a DataFrame with columns
         [healthy, stressed, distress], each in [0, 1].
     """
+    t = thresholds if thresholds is not None else _FUND_THRESHOLDS
+
     n = len(cache)
     labels = pd.Series("healthy", index=cache.index, dtype="object")
     probs = pd.DataFrame(
@@ -92,10 +104,10 @@ def classify_fundamental_regime(
     # Current ratio
     if "current_ratio" in cache.columns:
         cr = cache["current_ratio"]
-        distress_score += (cr < _FUND_THRESHOLDS["distress"]["current_ratio"]).astype(float)
+        distress_score += (cr < t["distress"]["current_ratio"]).astype(float)
         stress_score += (
-            (cr >= _FUND_THRESHOLDS["distress"]["current_ratio"])
-            & (cr < _FUND_THRESHOLDS["stressed"]["current_ratio"])
+            (cr >= t["distress"]["current_ratio"])
+            & (cr < t["stressed"]["current_ratio"])
         ).astype(float) * 0.5
         n_indicators += 1
 
@@ -103,10 +115,10 @@ def classify_fundamental_regime(
     for de_col in ("debt_to_equity_abs", "debt_to_equity"):
         if de_col in cache.columns:
             de = cache[de_col].abs()
-            distress_score += (de > _FUND_THRESHOLDS["distress"]["debt_to_equity"]).astype(float)
+            distress_score += (de > t["distress"]["debt_to_equity"]).astype(float)
             stress_score += (
-                (de > _FUND_THRESHOLDS["stressed"]["debt_to_equity"])
-                & (de <= _FUND_THRESHOLDS["distress"]["debt_to_equity"])
+                (de > t["stressed"]["debt_to_equity"])
+                & (de <= t["distress"]["debt_to_equity"])
             ).astype(float) * 0.5
             n_indicators += 1
             break
@@ -114,10 +126,10 @@ def classify_fundamental_regime(
     # Drawdown (uses equity_drawdown proxy when resolved via private company mode)
     if "drawdown_252d" in cache.columns:
         dd = cache["drawdown_252d"]
-        distress_score += (dd < _FUND_THRESHOLDS["distress"]["drawdown_252d"]).astype(float)
+        distress_score += (dd < t["distress"]["drawdown_252d"]).astype(float)
         stress_score += (
-            (dd >= _FUND_THRESHOLDS["distress"]["drawdown_252d"])
-            & (dd < _FUND_THRESHOLDS["stressed"]["drawdown_252d"])
+            (dd >= t["distress"]["drawdown_252d"])
+            & (dd < t["stressed"]["drawdown_252d"])
         ).astype(float) * 0.5
         n_indicators += 1
 
@@ -128,9 +140,11 @@ def classify_fundamental_regime(
 
     # Cash ratio
     if "cash_ratio" in cache.columns:
-        distress_score += (cache["cash_ratio"] < 0.1).astype(float) * 0.5
+        _cr_distress = t.get("distress", {}).get("cash_ratio", 0.1)
+        _cr_stressed = t.get("stressed", {}).get("cash_ratio", 0.3)
+        distress_score += (cache["cash_ratio"] < _cr_distress).astype(float) * 0.5
         stress_score += (
-            (cache["cash_ratio"] >= 0.1) & (cache["cash_ratio"] < 0.3)
+            (cache["cash_ratio"] >= _cr_distress) & (cache["cash_ratio"] < _cr_stressed)
         ).astype(float) * 0.3
         n_indicators += 1
 
@@ -157,12 +171,23 @@ def classify_fundamental_regime(
 
 def compute_dual_regimes(
     cache: pd.DataFrame,
+    thresholds: dict[str, dict[str, float]] | None = None,
 ) -> DualRegimeResult:
     """Compute dual regime layers (market + fundamental).
 
     The market regime comes from existing ``regime_hmm`` or
     ``regime_label`` columns in the cache (set by the regime detector).
     The fundamental regime is computed here from financial ratios.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache DataFrame with derived financial ratios and
+        regime columns from the regime detector.
+    thresholds:
+        Optional adaptive thresholds for fundamental regime
+        classification. Format: ``{"distress": {...}, "stressed": {...}}``.
+        If None, uses module-level defaults.
 
     Returns
     -------
@@ -197,7 +222,7 @@ def compute_dual_regimes(
 
         # Fundamental regime
         result.fund_regime_labels, result.fund_regime_probs = (
-            classify_fundamental_regime(cache)
+            classify_fundamental_regime(cache, thresholds=thresholds)
         )
 
         # Store in cache for downstream use

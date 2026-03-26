@@ -1783,6 +1783,54 @@ Non-interactive examples:
         logger.warning("News sentiment scoring failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 5j: Adaptive threshold calibration
+    # ------------------------------------------------------------------
+    # Replaces fixed textbook survival thresholds with peer-calibrated,
+    # data-derived values.  Must run AFTER linked entity data (Step 5f)
+    # and peer ranking (Step 5h) so peer distributions are available.
+    # Recalibrates survival flags computed earlier in Step 5 with
+    # sector-aware thresholds.
+    _adaptive_thresholds = None
+    try:
+        from operator1.analysis.adaptive_thresholds import (
+            compute_adaptive_thresholds,
+            threshold_set_to_survival_dict,
+            threshold_set_to_mc_dict,
+        )
+        _adaptive_thresholds = compute_adaptive_thresholds(
+            cache,
+            linked_caches=linked_caches if linked_caches else None,
+            regime_detector=None,  # HMM not yet fitted; will be used in Step 6
+            fh_composite_scores=(
+                cache["fh_composite_score"]
+                if "fh_composite_score" in cache.columns
+                else None
+            ),
+        )
+        if _adaptive_thresholds.adapted:
+            # Recalibrate survival flags with adaptive thresholds
+            _adapted_survival_dict = threshold_set_to_survival_dict(_adaptive_thresholds)
+            cache["company_survival_mode_flag"] = compute_company_survival_flag(
+                cache, thresholds=_adapted_survival_dict,
+            )
+            cache["survival_probability"] = compute_survival_probability(
+                cache, thresholds=_adapted_survival_dict,
+            )
+            # Re-run hierarchy weights with updated survival flags
+            cache = compute_hierarchy_weights(cache)
+            for i in range(1, 6):
+                col = f"hierarchy_tier{i}_weight"
+                if col in cache.columns:
+                    weights[f"tier{i}"] = float(cache[col].iloc[-1])
+            logger.info(
+                "Adaptive thresholds applied: %d days flagged (was %d before recalibration)",
+                cache["company_survival_mode_flag"].sum(),
+                cache["company_survival_mode_flag"].sum(),  # logged for comparison
+            )
+    except Exception as exc:
+        logger.warning("Adaptive threshold calibration failed (using defaults): %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 5.5: Enriched survival timeline (bridge: rule-based + HMM)
     # ------------------------------------------------------------------
     # Runs early regime detection (HMM/GMM/PELT/BCP) and combines it
@@ -1973,7 +2021,15 @@ Non-interactive examples:
         # Dual regime classification
         try:
             from operator1.models.regime_mixer import compute_dual_regimes
-            dual_regime_result = compute_dual_regimes(cache)
+            from operator1.analysis.adaptive_thresholds import threshold_set_to_regime_dict
+            _regime_thresholds = (
+                threshold_set_to_regime_dict(_adaptive_thresholds)
+                if _adaptive_thresholds is not None and _adaptive_thresholds.adapted
+                else None
+            )
+            dual_regime_result = compute_dual_regimes(
+                cache, thresholds=_regime_thresholds,
+            )
             if dual_regime_result and dual_regime_result.fitted:
                 logger.info("Dual regime classification complete")
         except Exception as exc:
@@ -2211,7 +2267,15 @@ Non-interactive examples:
         # In private mode, use equity_change_rate instead of return_1d.
         try:
             _mc_returns = "equity_change_rate" if _is_private else "return_1d"
-            mc_result = run_monte_carlo(cache, returns_col=_mc_returns)
+            _mc_thresholds = (
+                threshold_set_to_mc_dict(_adaptive_thresholds)
+                if _adaptive_thresholds is not None and _adaptive_thresholds.adapted
+                else None
+            )
+            mc_result = run_monte_carlo(
+                cache, returns_col=_mc_returns,
+                survival_thresholds=_mc_thresholds,
+            )
             logger.info("Monte Carlo simulation complete")
         except Exception as exc:
             logger.warning("Monte Carlo failed: %s", exc)
