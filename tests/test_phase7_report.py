@@ -219,18 +219,16 @@ class TestProfileBuilder(unittest.TestCase):
             "forecast_result": self.forecast,
             "mc_result": self.mc,
             "prediction_result": self.prediction,
-            "output_path": Path(self.tmpdir) / "profile.json",
         }
         defaults.update(kwargs)
         return build_company_profile(**defaults)
 
     def test_profile_is_valid_json(self) -> None:
         profile = self._build()
-        out = Path(self.tmpdir) / "profile.json"
-        self.assertTrue(out.exists())
-
-        with open(out) as f:
-            loaded = json.load(f)
+        # build_company_profile returns a dict; verify it's JSON-serialisable
+        self.assertIsInstance(profile, dict)
+        text = json.dumps(profile, default=str)
+        loaded = json.loads(text)
         self.assertIsInstance(loaded, dict)
 
     def test_all_sections_present(self) -> None:
@@ -330,8 +328,7 @@ class TestProfileBuilder(unittest.TestCase):
     def test_no_nan_in_json(self) -> None:
         """Verify serialised JSON contains no NaN values."""
         profile = self._build()
-        out = Path(self.tmpdir) / "profile.json"
-        text = out.read_text()
+        text = json.dumps(profile, default=str)
         self.assertNotIn("NaN", text)
         self.assertNotIn("Infinity", text)
 
@@ -677,7 +674,6 @@ class TestProfileToReport(unittest.TestCase):
             forecast_result=_make_forecast_result(),
             mc_result=_make_mc_result(),
             prediction_result=_make_prediction_result(),
-            output_path=Path(self.tmpdir) / "profile.json",
         )
 
         result = generate_report(
@@ -687,8 +683,8 @@ class TestProfileToReport(unittest.TestCase):
             generate_chart_images=False,
         )
 
-        # Verify profile JSON exists
-        self.assertTrue((Path(self.tmpdir) / "profile.json").exists())
+        # Verify profile is a valid dict
+        self.assertIsInstance(profile, dict)
 
         # Verify report markdown exists
         self.assertTrue(Path(result["markdown_path"]).exists())
@@ -706,7 +702,6 @@ class TestProfileToReport(unittest.TestCase):
 
         profile = build_company_profile(
             verified_target=_make_verified_target(),
-            output_path=Path(self.tmpdir) / "profile.json",
         )
 
         result = generate_report(
