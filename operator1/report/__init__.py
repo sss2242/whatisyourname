@@ -10,9 +10,11 @@ Public API:
 
 from operator1.report.profile_builder import build_company_profile
 from operator1.report.report_generator import generate_charts, generate_report
+from operator1.report.enhanced_outputs import generate_enhanced_outputs
 
 __all__ = [
     "build_company_profile",
     "generate_charts",
     "generate_report",
+    "generate_enhanced_outputs",
 ]
