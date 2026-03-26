@@ -15,9 +15,9 @@ rate_limit_burst: 5                # max burst size before throttling
 # Disk cache TTL for HTTP responses (hours)
 http_cache_ttl_hours: 24
 
-# Entity discovery budgets
-search_budget_per_group: 10   # max search calls per relationship group
-search_budget_global: 50      # max total search calls across all groups
+# Entity discovery budgets (increased for 3-call LLM strategy)
+search_budget_per_group: 15   # max search calls per relationship group
+search_budget_global: 80      # max total search calls across all groups
 
 # Cache rebuild control
 # Set to true to force re-fetching all data even when caches exist.

@@ -2266,19 +2266,28 @@ Non-interactive examples:
             import traceback as _tb
             logger.warning("Forward pass failed: %s\n%s", exc, _tb.format_exc())
 
-        # Burn-out
+        # Burn-out (weight calibration via exponential gradient learning)
         try:
             burnout_result = run_burnout(
                 cache,
                 hierarchy_weights=weights,
                 regime_labels=regime_labels,
                 extra_variables=_extra_vars,
+                forward_pass_result=forward_pass_result,
             )
             logger.info(
-                "Burn-out complete: %d iterations, converged=%s",
+                "Burn-out complete: %d iterations, converged=%s, calibrated=%s",
                 burnout_result.iterations_completed,
                 burnout_result.converged,
+                getattr(burnout_result, "calibrated", False),
             )
+            if getattr(burnout_result, "regime_weights", None):
+                for regime, wts in burnout_result.regime_weights.items():
+                    logger.info(
+                        "  Regime '%s' weights: %s",
+                        regime,
+                        {k: f"{v:.3f}" for k, v in wts.items()},
+                    )
         except Exception as exc:
             logger.warning("Burn-out failed: %s", exc)
 
@@ -2396,11 +2405,18 @@ Non-interactive examples:
                 if _adaptive_model_params is not None and _adaptive_model_params.adapted
                 else 1.5
             )
+            # Pass burn-out calibrated distributions when available
+            _burnout_dists = (
+                burnout_result.regime_distributions
+                if burnout_result is not None and getattr(burnout_result, "calibrated", False)
+                else None
+            )
             mc_result = run_monte_carlo(
                 cache, returns_col=_mc_returns,
                 n_paths=_mc_n,
                 importance_tilt=_mc_tilt,
                 survival_thresholds=_mc_thresholds,
+                burnout_distributions=_burnout_dists,
             )
             logger.info("Monte Carlo simulation complete")
         except Exception as exc:
@@ -2516,6 +2532,22 @@ Non-interactive examples:
             logger.warning("DTW historical analogs failed: %s", exc)
 
         # Prediction aggregation (now receives conformal + DTW results)
+        # Merge burn-out regime weights into mode_weights (primary source)
+        if (
+            burnout_result is not None
+            and getattr(burnout_result, "calibrated", False)
+            and burnout_result.regime_weights
+        ):
+            if _mode_weights is None:
+                _mode_weights = {}
+            # Burn-out regime weights override FixedShare per-regime weights
+            for regime, model_weights in burnout_result.regime_weights.items():
+                _mode_weights[regime] = model_weights
+            logger.info(
+                "Prediction aggregator: using burn-out calibrated weights for %d regimes",
+                len(burnout_result.regime_weights),
+            )
+
         if forecast_result is not None:
             try:
                 pred_result = run_prediction_aggregation(
@@ -3108,6 +3140,11 @@ Non-interactive examples:
                 "available": True,
                 "iterations_completed": burnout_result.iterations_completed,
                 "converged": burnout_result.converged,
+                "calibrated": getattr(burnout_result, "calibrated", False),
+                "weight_stability": getattr(burnout_result, "weight_stability", None),
+                "calibration_steps": getattr(burnout_result, "calibration_steps", 0),
+                "regime_weights": getattr(burnout_result, "regime_weights", {}),
+                "regime_distributions": getattr(burnout_result, "regime_distributions", {}),
             }
 
         # GA optimization

@@ -3963,6 +3963,34 @@ def generate_report(
     if generate_pdf:
         pdf_path = _generate_pdf(md_path, out / f"{tier.value}_report.pdf")
 
+    # Step 6: Enhanced outputs (Premium tier only)
+    # Generates fpdf2 PDF, mplfinance charts, quantstats tearsheet,
+    # and plotly interactive dashboard as supplementary outputs.
+    enhanced: dict[str, Any] = {}
+    if tier == ReportTier.PREMIUM:
+        try:
+            from operator1.report.enhanced_outputs import generate_enhanced_outputs
+            enhanced = generate_enhanced_outputs(
+                markdown=markdown,
+                cache=cache,
+                profile=profile,
+                chart_paths=chart_paths,
+                output_dir=out,
+                generate_pdf=True,
+                generate_tearsheet=True,
+                generate_interactive=True,
+                generate_enhanced_charts=True,
+            )
+            logger.info(
+                "Enhanced outputs: pdf=%s, tearsheet=%s, dashboard=%s, charts=%d",
+                bool(enhanced.get("fpdf2_pdf_path")),
+                bool(enhanced.get("tearsheet_path")),
+                bool(enhanced.get("interactive_path")),
+                len(enhanced.get("enhanced_chart_paths", [])),
+            )
+        except Exception as exc:
+            logger.warning("Enhanced outputs failed (non-fatal): %s", exc)
+
     return {
         "markdown": markdown,
         "markdown_path": str(md_path),
@@ -3971,6 +3999,10 @@ def generate_report(
         "pdf_path": pdf_path,
         "tier": tier.value,
         "mode": mode.value,
+        "enhanced_pdf_path": enhanced.get("fpdf2_pdf_path"),
+        "tearsheet_path": enhanced.get("tearsheet_path"),
+        "interactive_dashboard_path": enhanced.get("interactive_path"),
+        "enhanced_chart_paths": enhanced.get("enhanced_chart_paths", []),
     }
 
 

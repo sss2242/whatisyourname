@@ -3131,12 +3131,16 @@ def run_forward_pass(
                 continue  # skip variables with missing next-day data
 
             # Step B: Multi-module prediction (pick best / average)
+            # Track per-model predictions for burn-out weight calibration.
             predictions: list[float] = []
+            per_model_preds: dict[str, float] = {}
             for wrapper in model_bank.get(var_name, []):
                 try:
                     pred = wrapper.predict(state_t)
                     if len(pred) > 0 and not np.isnan(pred[0]):
-                        predictions.append(float(pred[0]))
+                        pval = float(pred[0])
+                        predictions.append(pval)
+                        per_model_preds[wrapper.name] = pval
                 except Exception:
                     pass
 
@@ -3168,7 +3172,7 @@ def run_forward_pass(
                 except Exception:
                     pass  # calibrator needs enough data before it can produce intervals
 
-            # Log prediction
+            # Log prediction (includes per-model predictions for burn-out calibration)
             result.predictions_log.append({
                 "day": t,
                 "variable": var_name,
@@ -3177,6 +3181,7 @@ def run_forward_pass(
                 "error": error,
                 "tier": tier_num,
                 "regime": regime_t,
+                "per_model": per_model_preds,
             })
 
             # Step E: Online update with PID-adjusted learning rate
@@ -3263,20 +3268,226 @@ def run_forward_pass(
 
 
 # ---------------------------------------------------------------------------
-# D4: Convergence-based burn-out (replaces window-shrinking heuristic)
+# D4: Exponential Gradient Weight Learner for Burn-Out Calibration
+# ---------------------------------------------------------------------------
+
+
+class ExponentialGradientWeightLearner:
+    """Online weight learner using exponential gradient (Vovk 1990).
+
+    Walks through the forward pass predictions_log day-by-day, maintains
+    per-regime weight vectors for each model, and learns which models to
+    trust in which regimes.  Produces regime-conditioned weights and
+    distribution parameters for Monte Carlo and prediction aggregator.
+
+    The exponential gradient update rule:
+        w_i *= exp(-eta * loss_i)
+        normalize: w_i /= sum(w)
+
+    This has O(sqrt(T) * log(N)) regret bound where T is time steps
+    and N is number of models.
+    """
+
+    def __init__(
+        self,
+        model_names: list[str],
+        *,
+        initial_eta: float = 0.1,
+        eta_decay: float = 0.995,
+        min_weight: float = 0.05,
+        max_weight: float = 0.6,
+    ) -> None:
+        self.model_names = sorted(model_names)
+        self.n_models = len(model_names)
+        self.eta = initial_eta
+        self.eta_decay = eta_decay
+        self.min_weight = min_weight
+        self.max_weight = max_weight
+
+        # Per-regime weight vectors: {regime: {model: weight}}
+        self._regime_weights: dict[str, dict[str, float]] = {}
+        # Per-regime error accumulators for distribution estimation
+        self._regime_errors: dict[str, list[float]] = {}
+        self._regime_weighted_returns: dict[str, list[float]] = {}
+        # Weight stability tracking
+        self._weight_deltas: list[float] = []
+        self._steps = 0
+
+    def _get_weights(self, regime: str) -> dict[str, float]:
+        """Get or initialize uniform weight vector for a regime."""
+        if regime not in self._regime_weights:
+            uniform = 1.0 / self.n_models
+            self._regime_weights[regime] = {m: uniform for m in self.model_names}
+        return self._regime_weights[regime]
+
+    def update(
+        self,
+        regime: str,
+        per_model_preds: dict[str, float],
+        actual: float,
+    ) -> float:
+        """Process one observation: update weights, return weighted prediction.
+
+        Parameters
+        ----------
+        regime:
+            Current regime label.
+        per_model_preds:
+            {model_name: prediction} for models that produced predictions.
+        actual:
+            Actual observed value.
+
+        Returns
+        -------
+        Weighted ensemble prediction using current regime weights.
+        """
+        if not per_model_preds:
+            return actual  # no predictions to learn from
+
+        weights = self._get_weights(regime)
+
+        # Compute per-model squared loss
+        losses: dict[str, float] = {}
+        for model, pred in per_model_preds.items():
+            if model in weights:
+                losses[model] = (pred - actual) ** 2
+
+        if not losses:
+            return actual
+
+        # Weighted ensemble prediction (using current weights before update)
+        w_sum = sum(weights.get(m, 0) for m in per_model_preds)
+        if w_sum > 0:
+            weighted_pred = sum(
+                weights.get(m, 0) * p for m, p in per_model_preds.items()
+            ) / w_sum
+        else:
+            weighted_pred = float(np.mean(list(per_model_preds.values())))
+
+        # Exponential gradient update
+        old_weights = dict(weights)
+        for model, loss in losses.items():
+            weights[model] *= np.exp(-self.eta * loss)
+
+        # Normalize
+        total = sum(weights.values())
+        if total > 0:
+            for m in weights:
+                weights[m] /= total
+
+        # Apply weight floor and ceiling
+        for m in weights:
+            weights[m] = max(self.min_weight, min(self.max_weight, weights[m]))
+        # Re-normalize after clamping
+        total = sum(weights.values())
+        if total > 0:
+            for m in weights:
+                weights[m] /= total
+
+        # Track weight stability (L2 norm of delta)
+        delta = np.sqrt(sum(
+            (weights.get(m, 0) - old_weights.get(m, 0)) ** 2
+            for m in self.model_names
+        ))
+        self._weight_deltas.append(delta)
+
+        # Track weighted error for regime distribution estimation
+        weighted_error = weighted_pred - actual
+        if regime not in self._regime_errors:
+            self._regime_errors[regime] = []
+            self._regime_weighted_returns[regime] = []
+        self._regime_errors[regime].append(weighted_error)
+        # Store the actual return for distribution estimation
+        self._regime_weighted_returns[regime].append(actual)
+
+        # Decay learning rate
+        self.eta *= self.eta_decay
+        self._steps += 1
+
+        return weighted_pred
+
+    def get_regime_weights(self) -> dict[str, dict[str, float]]:
+        """Return learned per-regime weight vectors."""
+        return {r: dict(w) for r, w in self._regime_weights.items()}
+
+    def get_regime_distributions(self) -> dict[str, dict[str, float]]:
+        """Return per-regime distribution parameters (weighted by model quality).
+
+        These are superior to raw return distributions because they
+        incorporate model uncertainty: weighted mean/std across models.
+        """
+        distributions: dict[str, dict[str, float]] = {}
+        for regime, returns in self._regime_weighted_returns.items():
+            if len(returns) >= 5:
+                arr = np.array(returns)
+                distributions[regime] = {
+                    "mean": float(np.mean(arr)),
+                    "std": float(np.std(arr, ddof=1)),
+                    "n_obs": len(returns),
+                }
+            else:
+                distributions[regime] = {
+                    "mean": 0.0,
+                    "std": 0.01,
+                    "n_obs": len(returns),
+                }
+        return distributions
+
+    def is_converged(self, threshold: float = 0.005, window: int = 20) -> bool:
+        """Check if weights have stabilized (mean delta below threshold)."""
+        if len(self._weight_deltas) < window:
+            return False
+        recent = self._weight_deltas[-window:]
+        return float(np.mean(recent)) < threshold
+
+    @property
+    def weight_stability(self) -> float:
+        """Mean weight delta over the last 20 steps (lower = more stable)."""
+        if not self._weight_deltas:
+            return 1.0
+        window = min(20, len(self._weight_deltas))
+        return float(np.mean(self._weight_deltas[-window:]))
+
+    @property
+    def steps(self) -> int:
+        return self._steps
+
+
+# ---------------------------------------------------------------------------
+# D4: Enhanced Burn-Out Result and Calibration
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class BurnoutResult:
-    """Container for convergence-based burn-out outputs."""
+    """Container for burn-out weight calibration outputs.
 
+    The burn-out phase learns per-regime model weights from the forward
+    pass predictions_log using exponential gradient online learning.
+    These weights are consumed by Monte Carlo (for better distribution
+    parameters) and the prediction aggregator (for better ensemble weights).
+    """
+
+    # Backward-compatible fields
     model_states: dict[str, BaseModelWrapper] = field(default_factory=dict)
     iterations_completed: int = 0
     converged: bool = False
     best_rmse_by_tier: dict[int, float] = field(default_factory=dict)
     rmse_history: list[float] = field(default_factory=list)
     learning_rate_multiplier: float = 1.0
+
+    # New: regime-conditioned ensemble weights from online learning
+    # {regime_label: {model_name: weight}}
+    regime_weights: dict[str, dict[str, float]] = field(default_factory=dict)
+
+    # New: model-weighted regime distributions for Monte Carlo
+    # {regime_label: {"mean": float, "std": float, "n_obs": int}}
+    regime_distributions: dict[str, dict[str, float]] = field(default_factory=dict)
+
+    # New: convergence and stability metrics
+    weight_stability: float = 1.0
+    calibration_steps: int = 0
+    calibrated: bool = False
 
 
 def run_burnout(
@@ -3292,15 +3503,24 @@ def run_burnout(
     validation_days: int = 20,
     learning_rate_multiplier: float = 2.0,
     random_state: int = 42,
+    forward_pass_result: Any | None = None,
 ) -> BurnoutResult:
-    """Intensive re-training on recent data with convergence detection.
+    """Weight calibration via exponential gradient online learning.
 
-    Each iteration:
-    1. Reset to *burnout_window* days ago.
-    2. Run forward pass with higher learning rates.
-    3. Measure accuracy on last *validation_days*.
-    4. If accuracy improves, save as new best pattern.
-    5. Stop early if no improvement for *patience* iterations.
+    Two-phase burn-out:
+
+    **Phase A** -- Run forward pass on recent data (single pass, not
+    repeated).  If ``forward_pass_result`` is provided, skip this step
+    and use the existing predictions_log directly.
+
+    **Phase B** -- Feed the predictions_log into an
+    ExponentialGradientWeightLearner that walks day-by-day, learning
+    per-regime model weights from per-model prediction errors.
+
+    The learned weights produce:
+    - ``regime_weights``: per-regime ensemble weights for prediction aggregator
+    - ``regime_distributions``: model-weighted distributions for Monte Carlo
+    - ``best_rmse_by_tier``: per-tier validation RMSE
 
     Parameters
     ----------
@@ -3312,106 +3532,171 @@ def run_burnout(
         Current hierarchy weights.
     regime_labels:
         Per-day regime labels.
+    forward_pass_result:
+        If provided, use its predictions_log instead of running a new
+        forward pass.  This avoids duplicate computation.
     burnout_window:
-        Number of recent trading days to use (default ~6 months).
+        Number of recent trading days for the forward pass (if needed).
     max_iterations:
-        Maximum burn-out iterations.
+        Maximum passes through the predictions_log for weight learning.
     patience:
-        Stop if no improvement for this many iterations.
+        Stop if weight stability does not improve for this many iterations.
     validation_days:
-        Number of final days used for accuracy measurement.
+        Number of final days used for RMSE measurement.
     learning_rate_multiplier:
-        Factor to increase learning rates during burn-out.
+        Initial learning rate for exponential gradient.
     random_state:
         Random seed.
 
     Returns
     -------
-    BurnoutResult with final model states, convergence info, and RMSE history.
+    BurnoutResult with regime weights, distributions, and convergence info.
     """
-    logger.info(
-        "Starting burn-out (window=%d, max_iter=%d, patience=%d)...",
-        burnout_window, max_iterations, patience,
-    )
+    logger.info("Starting burn-out weight calibration...")
 
     result = BurnoutResult(learning_rate_multiplier=learning_rate_multiplier)
 
-    # Extract the burnout slice
-    actual_window = min(burnout_window, len(cache))
-    burnout_cache = cache.iloc[-actual_window:].copy()
+    # Phase A: Get predictions_log (from existing forward pass or run a new one)
+    predictions_log: list[dict] = []
 
-    if len(burnout_cache) < validation_days + 30:
-        logger.warning("Insufficient data for burn-out (%d rows)", len(burnout_cache))
-        return result
+    if forward_pass_result is not None and hasattr(forward_pass_result, "predictions_log"):
+        predictions_log = forward_pass_result.predictions_log or []
+        if forward_pass_result.model_states:
+            result.model_states = forward_pass_result.model_states
+        logger.info("Burn-out: using existing forward pass predictions_log (%d entries)", len(predictions_log))
+    else:
+        # Run a forward pass on the burn-out window
+        actual_window = min(burnout_window, len(cache))
+        burnout_cache = cache.iloc[-actual_window:].copy()
 
-    best_rmse = float("inf")
-    best_states: dict[str, BaseModelWrapper] = {}
-    no_improve_count = 0
+        if len(burnout_cache) < validation_days + 30:
+            logger.warning("Insufficient data for burn-out (%d rows)", len(burnout_cache))
+            return result
 
-    for iteration in range(max_iterations):
-        logger.info("Burn-out iteration %d/%d", iteration + 1, max_iterations)
-
-        # Run forward pass on the burnout window
-        # Use a smaller warmup within the burn-out window
         burnout_warmup = max(20, actual_window - validation_days - 50)
         fp_result = run_forward_pass(
             burnout_cache,
             tier_variables=tier_variables,
             hierarchy_weights=hierarchy_weights,
-            regime_labels=regime_labels.iloc[-actual_window:] if regime_labels is not None and len(regime_labels) >= actual_window else None,
+            regime_labels=(
+                regime_labels.iloc[-actual_window:]
+                if regime_labels is not None and len(regime_labels) >= actual_window
+                else None
+            ),
             extra_variables=extra_variables,
             warmup_days=min(burnout_warmup, actual_window - validation_days - 1),
-            log_interval=999,  # suppress inner logging
-            random_state=random_state + iteration,
+            log_interval=999,
+            random_state=random_state,
+        )
+        predictions_log = fp_result.predictions_log or []
+        result.model_states = fp_result.model_states or {}
+        logger.info("Burn-out: ran forward pass, got %d predictions_log entries", len(predictions_log))
+
+    # Need per-model predictions for weight learning
+    has_per_model = any(
+        entry.get("per_model") for entry in predictions_log[:10]
+    ) if predictions_log else False
+
+    if not has_per_model or len(predictions_log) < 50:
+        # Fall back to legacy behavior: just store basic RMSE info
+        logger.info(
+            "Burn-out: insufficient per-model data (%d entries, per_model=%s), "
+            "skipping weight calibration",
+            len(predictions_log), has_per_model,
+        )
+        if predictions_log:
+            log_df = pd.DataFrame(predictions_log)
+            for tier_num in range(1, 6):
+                tier_entries = log_df[log_df["tier"] == tier_num]
+                if len(tier_entries) > 0:
+                    result.best_rmse_by_tier[tier_num] = float(
+                        np.sqrt(np.mean(tier_entries["error"].values ** 2))
+                    )
+            result.iterations_completed = 1
+        return result
+
+    # Phase B: Exponential gradient weight learning
+    # Discover all model names from the predictions_log
+    all_model_names: set[str] = set()
+    for entry in predictions_log:
+        pm = entry.get("per_model", {})
+        if isinstance(pm, dict):
+            all_model_names.update(pm.keys())
+
+    if len(all_model_names) < 2:
+        logger.info("Burn-out: only %d models found, skipping weight calibration", len(all_model_names))
+        result.iterations_completed = 1
+        return result
+
+    best_stability = float("inf")
+    no_improve_count = 0
+
+    for iteration in range(max_iterations):
+        # Create a fresh learner for each iteration with decaying initial eta
+        eta = learning_rate_multiplier * 0.1 * (0.8 ** iteration)
+        learner = ExponentialGradientWeightLearner(
+            sorted(all_model_names),
+            initial_eta=eta,
+            eta_decay=0.995,
+            min_weight=0.05,
+            max_weight=0.6,
         )
 
-        # Evaluate on last validation_days entries
-        if fp_result.predictions_log:
-            log_df = pd.DataFrame(fp_result.predictions_log)
-            # Filter to last validation_days worth of unique days
-            unique_days = sorted(log_df["day"].unique())
-            val_days_set = set(unique_days[-validation_days:]) if len(unique_days) >= validation_days else set(unique_days)
-            val_entries = log_df[log_df["day"].isin(val_days_set)]
+        # Walk through predictions_log day-by-day
+        for entry in predictions_log:
+            regime = entry.get("regime", "unknown")
+            per_model = entry.get("per_model", {})
+            actual = entry.get("actual", 0.0)
 
-            if len(val_entries) > 0:
-                iter_rmse = float(np.sqrt(np.mean(val_entries["error"].values ** 2)))
-            else:
-                iter_rmse = float("inf")
-        else:
-            iter_rmse = float("inf")
+            if isinstance(per_model, dict) and per_model:
+                learner.update(regime, per_model, actual)
 
-        result.rmse_history.append(iter_rmse)
+        stability = learner.weight_stability
+        result.rmse_history.append(stability)
 
-        if iter_rmse < best_rmse:
-            best_rmse = iter_rmse
-            best_states = copy.copy(fp_result.model_states)
+        if stability < best_stability:
+            best_stability = stability
+            result.regime_weights = learner.get_regime_weights()
+            result.regime_distributions = learner.get_regime_distributions()
+            result.weight_stability = stability
+            result.calibration_steps = learner.steps
             no_improve_count = 0
-            logger.info("  -> New best RMSE: %.6f", iter_rmse)
-
-            # Compute per-tier RMSE
-            if fp_result.predictions_log:
-                log_df = pd.DataFrame(fp_result.predictions_log)
-                for tier_num in range(1, 6):
-                    tier_entries = log_df[log_df["tier"] == tier_num]
-                    if len(tier_entries) > 0:
-                        result.best_rmse_by_tier[tier_num] = float(
-                            np.sqrt(np.mean(tier_entries["error"].values ** 2))
-                        )
+            logger.info(
+                "  Burn-out iter %d: stability=%.6f (new best), %d regimes, %d steps",
+                iteration + 1, stability, len(result.regime_weights), learner.steps,
+            )
         else:
             no_improve_count += 1
-            logger.info("  -> RMSE: %.6f (no improvement, patience %d/%d)", iter_rmse, no_improve_count, patience)
+            logger.info(
+                "  Burn-out iter %d: stability=%.6f (no improvement %d/%d)",
+                iteration + 1, stability, no_improve_count, patience,
+            )
 
-        if no_improve_count >= patience:
+        if learner.is_converged() or no_improve_count >= patience:
             result.converged = True
-            logger.info("Burn-out converged after %d iterations (patience exhausted)", iteration + 1)
             break
 
     result.iterations_completed = len(result.rmse_history)
-    result.model_states = best_states
+    result.calibrated = bool(result.regime_weights)
+
+    # Compute per-tier RMSE from predictions_log (backward compat)
+    if predictions_log:
+        log_df = pd.DataFrame(predictions_log)
+        for tier_num in range(1, 6):
+            tier_entries = log_df[log_df["tier"] == tier_num]
+            if len(tier_entries) > 0:
+                result.best_rmse_by_tier[tier_num] = float(
+                    np.sqrt(np.mean(tier_entries["error"].values ** 2))
+                )
 
     logger.info(
-        "Burn-out complete: %d iterations, converged=%s, best_rmse=%.6f",
-        result.iterations_completed, result.converged, best_rmse,
+        "Burn-out complete: %d iterations, converged=%s, calibrated=%s, "
+        "stability=%.6f, regimes=%s",
+        result.iterations_completed,
+        result.converged,
+        result.calibrated,
+        result.weight_stability,
+        list(result.regime_weights.keys()) if result.regime_weights else "none",
     )
 
     return result

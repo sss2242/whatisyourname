@@ -446,21 +446,39 @@ def discover_linked_entities(
             logger.debug("Cross-region client build failed: %s", exc)
 
     # ------------------------------------------------------------------
-    # 1. Get Gemini proposals (names only -- no financial data)
+    # 1. Get LLM proposals (names only -- no financial data)
+    # Uses 3-call strategy (international + local + gap-fill) for
+    # thicker entity caches, with single-call fallback.
     # ------------------------------------------------------------------
     proposals: dict[str, list[str]] = {}
     if llm_client is not None:
         sector_hints = f"{target_sector}, country={target_country}"
-        proposals = llm_client.propose_linked_entities(
-            target_profile, sector_hints=sector_hints,
-        )
+
+        # Try 3-call discovery first (produces 25-40 entities vs 10-15)
+        _used_3call = False
+        if hasattr(llm_client, "propose_linked_entities_3call"):
+            try:
+                proposals = llm_client.propose_linked_entities_3call(
+                    target_profile, sector_hints=sector_hints,
+                )
+                _used_3call = bool(proposals)
+            except Exception as exc:
+                logger.warning("3-call entity discovery failed: %s; falling back to single call", exc)
+
+        # Fall back to single-call if 3-call is unavailable or failed
+        if not _used_3call:
+            proposals = llm_client.propose_linked_entities(
+                target_profile, sector_hints=sector_hints,
+            )
+
         logger.info(
-            "Gemini proposed entities for %d groups: %s",
+            "LLM proposed entities for %d groups (%s): %s",
             len(proposals),
+            "3-call" if _used_3call else "single-call",
             {g: len(v) for g, v in proposals.items()},
         )
     else:
-        logger.info("No Gemini client -- skipping LLM entity proposals")
+        logger.info("No LLM client -- skipping entity proposals")
 
     # ------------------------------------------------------------------
     # 2. Resolve each proposal via PIT provider search
