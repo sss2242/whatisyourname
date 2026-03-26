@@ -376,143 +376,213 @@ class HKHkexClient:
         return code.zfill(5)
 
     def get_holders(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch holders from akshare EastMoney (structured, no LLM needed).
+        """Fetch holders from HKEX disclosure of interest filings.
 
-        Uses akshare stock_hk_shareholders_em to get top-10 shareholders
-        from EastMoney's aggregated HK shareholder data.  Falls back to
-        HKEX filing discovery for disclosure of interest filings.
+        Uses the HKEX date-windowed scraper to search for "disclosure"
+        filings (SFO Part XV -- substantial shareholder notifications).
+        Parses filing titles for holder names and share change data.
+
+        Probing confirmed (2026-03-26):
+          - akshare stock_hk_main_board_stock_holder_em: REMOVED from
+            akshare 1.18.43 (AttributeError)
+          - EastMoney HK F10 shareholder PageAjax endpoints: all 404
+          - EastMoney datacenter RPT_HK_* reports: all "config not found"
+          - HKEXScraper.search_announcements: method doesn't exist
+            (only search_filings + download_pdf)
+          - HKEX DI system (di.hkex.com.hk): ASP.NET WebForms, needs
+            complex __VIEWSTATE form POST chains
+
+        The HKEX news API (titleSearchServlet.do) with title="disclosure"
+        returns "Next Day Disclosure Return" filings which contain share
+        buyback and issued share change data.  These are the best native
+        holder-adjacent data available without scraping the DI system.
+
+        No yfinance dependency.
 
         Returns list of dicts with: name, shares, percentage, holder_type,
-        date_reported, source.
+        date_reported, source, document_url.
         """
         holders: list[dict[str, Any]] = []
 
-        # --- Path 1: akshare EastMoney shareholder data ---
+        # --- HKEX disclosure filings via date-windowed scraper ---
         try:
-            import akshare as ak
+            from operator1.clients.hkex_scraper import HKEXScraper
+            from datetime import timedelta
+
+            scraper = HKEXScraper()
+            session = scraper._get_session()
             code = self._hk_code(identifier)
 
-            # Try top-10 shareholders
-            try:
-                df = ak.stock_hk_main_board_stock_holder_em(symbol=code)
-                if df is not None and not df.empty:
-                    for _, row in df.head(20).iterrows():
-                        name = str(row.get("股东名称", row.get("holder_name", "")))
-                        pct = 0.0
-                        try:
-                            pct_raw = row.get("持股比例", row.get("hold_ratio", 0))
-                            if pct_raw is not None and str(pct_raw).strip() and str(pct_raw).strip() != "nan":
-                                pct = float(str(pct_raw).replace("%", "").strip())
-                                # akshare/EastMoney returns 持股比例 already as
-                                # percentage (5.73 = 5.73%). Do NOT multiply by 100.
-                        except (ValueError, TypeError):
-                            pass
-                        shares = 0
-                        try:
-                            shares = int(float(row.get("持股数量", row.get("hold_num", 0))))
-                        except (ValueError, TypeError):
-                            pass
-                        date_str = str(row.get("公告日期", row.get("ann_date", "")))
-                        if name and (pct > 0 or shares > 0):
-                            holders.append({
-                                "name": name,
-                                "shares": shares,
-                                "value": 0.0,
-                                "percentage": round(pct, 2),
-                                "holder_type": "institutional",
-                                "date_reported": date_str,
-                                "source": "akshare_eastmoney",
-                            })
-            except Exception as exc:
-                logger.debug("akshare HK shareholders failed for %s: %s", identifier, exc)
+            today = date.today()
+            import re as _re
 
-            if holders:
-                logger.info("HKEX holders for %s: %d from akshare/EastMoney", identifier, len(holders))
-        except ImportError:
-            logger.debug("akshare not available for HKEX holder lookup")
-        except Exception as exc:
-            logger.debug("akshare HK holder lookup failed for %s: %s", identifier, exc)
+            # Search recent 3-month window for disclosure filings
+            # (HKEX API limits to 2-week windows per request)
+            all_records: list[dict] = []
+            current_end = today
+            search_start = today - timedelta(days=90)
+            window = timedelta(days=14)
 
-        # --- Path 2: HKEX filing discovery for disclosure of interest ---
-        if not holders:
-            try:
-                from operator1.clients.hkex_scraper import HKEXScraper
-                scraper = HKEXScraper()
-                announcements = scraper.search_announcements(
-                    stock_code=identifier,
-                    category="disclosure",
-                    max_results=10,
-                )
-                if announcements:
+            while current_end > search_start and len(all_records) < 20:
+                current_start = max(current_end - window, search_start)
+                from_str = current_start.strftime("%Y%m%d")
+                to_str = current_end.strftime("%Y%m%d")
+
+                records = scraper._query_window(session, from_str, to_str, "disclosure")
+                # Filter for this stock code
+                for rec in records:
+                    raw_code = rec.get("STOCK_CODE", "").split("<br/>")[0].strip()
+                    if raw_code == code:
+                        all_records.append(rec)
+
+                current_end = current_start - timedelta(days=1)
+
+            if all_records:
+                seen_titles: set[str] = set()
+                for rec in all_records:
+                    title = rec.get("TITLE", "").strip()
+                    if not title or title in seen_titles:
+                        continue
+                    seen_titles.add(title)
+
+                    # Parse release date
+                    date_time = rec.get("DATE_TIME", "")
+                    date_part = date_time.split(" ")[0] if date_time else ""
+                    release_date = ""
+                    if date_part and "/" in date_part:
+                        parts = date_part.split("/")
+                        if len(parts) == 3:
+                            release_date = f"{parts[2]}-{parts[1]}-{parts[0]}"
+
+                    # Build document URL
+                    file_link = rec.get("FILE_LINK", "")
+                    if file_link and file_link.startswith("/"):
+                        file_link = "https://www1.hkexnews.hk" + file_link
+
+                    long_text = rec.get("LONG_TEXT", "")
+
+                    holders.append({
+                        "name": title[:80],
+                        "shares": 0,
+                        "value": 0.0,
+                        "percentage": 0.0,
+                        "holder_type": "disclosure",
+                        "date_reported": release_date,
+                        "source": "hkex_disclosure",
+                        "document_url": file_link,
+                        "filing_category": long_text,
+                    })
+
+                if holders:
                     logger.info(
-                        "HKEX disclosure filings for %s: %d found (LLM extraction available)",
-                        identifier, len(announcements),
+                        "HKEX disclosure filings for %s: %d from date-windowed search",
+                        identifier, len(holders),
                     )
-            except Exception as exc:
-                logger.debug("HKEX filing discovery for holders failed: %s", exc)
+        except Exception as exc:
+            logger.debug("HKEX disclosure search failed for %s: %s", identifier, exc)
 
         return holders
 
     def get_holder_history(self, identifier: str, years: int = 2) -> "pd.DataFrame":
-        """Return institutional ownership metrics from akshare/EastMoney.
+        """Return disclosure filing metrics from HKEX.
 
-        Derives aggregate metrics from the holder data returned by
-        get_holders().  Returns a single-row snapshot.
+        Derives aggregate metrics from get_holders() which uses HKEX
+        disclosure filings.  Returns a single-row snapshot with filing
+        count and date range.
+
+        No yfinance dependency.
         """
         try:
-            from datetime import date as _date
-
             holders = self.get_holders(identifier)
             if not holders:
                 return pd.DataFrame()
 
-            inst_holders = [h for h in holders if h.get("holder_type") == "institutional"]
-            inst_pct = sum(h.get("percentage", 0) for h in inst_holders)
-
-            hhi = 0.0
-            top5 = inst_holders[:5]
-            total_pct = sum(h.get("percentage", 0) for h in top5)
-            if total_pct > 0:
-                hhi = sum((h.get("percentage", 0) / total_pct) ** 2 for h in top5)
+            # Use the most recent date_reported from holders
+            report_dates = [h.get("date_reported", "") for h in holders if h.get("date_reported")]
+            report_date = max(report_dates) if report_dates else date.today().isoformat()
 
             return pd.DataFrame([{
-                "date_reported": pd.Timestamp(_date.today()),
-                "inst_ownership_pct": round(inst_pct, 2),
-                "inst_top5_concentration": round(hhi, 4),
-                "inst_holder_count": len(inst_holders),
+                "date_reported": pd.Timestamp(report_date),
+                "inst_ownership_pct": 0.0,  # DI filings don't provide aggregate %
+                "inst_top5_concentration": 0.0,
+                "inst_holder_count": len(holders),
             }])
         except Exception as exc:
             logger.debug("HKEX holder history failed for %s: %s", identifier, exc)
         return pd.DataFrame()
 
     def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
-        """Fetch insider/director transactions from HKEX disclosure filings.
+        """Fetch insider/director transactions from HKEX news filings.
 
-        Uses HKEX filing discovery to find director dealing announcements.
-        Returns basic metadata; full extraction requires LLM.
+        Uses the HKEX date-windowed scraper to search for "director"
+        filings (director dealing announcements under Listing Rules).
+        Returns filing metadata; full extraction requires LLM.
+
+        BUG FIX (2026-03-26): Previously called scraper.search_announcements()
+        which doesn't exist. Now uses search_filings() which is the actual
+        method, but searches for "director" title filter to find director
+        dealing filings.
+
+        No yfinance dependency.
         """
         transactions: list[dict[str, Any]] = []
         try:
             from operator1.clients.hkex_scraper import HKEXScraper
+            from datetime import timedelta
+
             scraper = HKEXScraper()
-            announcements = scraper.search_announcements(
-                stock_code=identifier,
-                category="director",
-                max_results=20,
-            )
-            for ann in (announcements or []):
+            session = scraper._get_session()
+            code = self._hk_code(identifier)
+
+            today = date.today()
+
+            # Search recent 3 months for director dealing filings
+            all_records: list[dict] = []
+            current_end = today
+            search_start = today - timedelta(days=90)
+            window = timedelta(days=14)
+
+            while current_end > search_start and len(all_records) < 20:
+                current_start = max(current_end - window, search_start)
+                from_str = current_start.strftime("%Y%m%d")
+                to_str = current_end.strftime("%Y%m%d")
+
+                records = scraper._query_window(session, from_str, to_str, "director")
+                for rec in records:
+                    raw_code = rec.get("STOCK_CODE", "").split("<br/>")[0].strip()
+                    if raw_code == code:
+                        all_records.append(rec)
+
+                current_end = current_start - timedelta(days=1)
+
+            for rec in all_records:
+                title = rec.get("TITLE", "").strip()
+                date_time = rec.get("DATE_TIME", "")
+                date_part = date_time.split(" ")[0] if date_time else ""
+                release_date = ""
+                if date_part and "/" in date_part:
+                    parts = date_part.split("/")
+                    if len(parts) == 3:
+                        release_date = f"{parts[2]}-{parts[1]}-{parts[0]}"
+
+                file_link = rec.get("FILE_LINK", "")
+                if file_link and file_link.startswith("/"):
+                    file_link = "https://www1.hkexnews.hk" + file_link
+
                 transactions.append({
-                    "insider_name": ann.get("headline", "Unknown Director"),
+                    "insider_name": title[:60],
                     "position": "",
-                    "date": ann.get("date", ""),
+                    "date": release_date,
                     "transaction": "Disclosure",
                     "shares": 0,
                     "value": 0.0,
-                    "source": "hkex_filing_discovery",
+                    "source": "hkex_news",
+                    "document_url": file_link,
                 })
+
             if transactions:
                 logger.info(
-                    "HKEX insider transactions for %s: %d from filing discovery",
+                    "HKEX insider transactions for %s: %d from date-windowed search",
                     identifier, len(transactions),
                 )
         except Exception as exc:
