@@ -684,42 +684,101 @@ class USEdgarClient:
         holders: list[dict[str, Any]] = []
 
         # --- Path 1: SC 13D/13G filings (>5% beneficial owners) ---
+        # IMPORTANT: edgartools' filing.company attribute returns the ISSUER
+        # (e.g. "Apple Inc."), NOT the filer (e.g. "Berkshire Hathaway Inc").
+        # For SC 13G/13D filings, the filer IS the institutional holder.
+        # We extract the filer name from the SEC-HEADER in the filing's
+        # .txt file (first 3000 bytes), which contains:
+        #   FILED BY:
+        #     COMPANY CONFORMED NAME: BERKSHIRE HATHAWAY INC
         try:
+            import re
+            import requests as _requests
+
             self._init_edgartools()
             company = self._get_edgar_company(identifier)
             if company is not None:
+                seen_filers: set[str] = set()
                 for form_type in ("SC 13G/A", "SC 13G", "SC 13D/A", "SC 13D"):
                     try:
                         filings = company.get_filings(form=form_type)
                         if filings is None or len(filings) == 0:
                             continue
-                        seen_filers: set[str] = set()
-                        for filing in filings[:15]:
+                        # Use list() to avoid edgartools pyarrow slicing bug
+                        # (filings[:N] raises AttributeError on ChunkedArray.as_py)
+                        for filing in list(filings)[:20]:
                             try:
-                                filer_name = str(getattr(filing, "company", ""))
-                                if not filer_name:
-                                    filer_name = str(getattr(filing, "filer", ""))
-                                if not filer_name or filer_name in seen_filers:
-                                    continue
-                                seen_filers.add(filer_name)
                                 filing_date = str(getattr(filing, "filing_date", ""))
-                                # Try to extract percentage from filing text
+
+                                # Extract filer name from SEC-HEADER via text_url
+                                # This is the only reliable way to get the actual
+                                # filing entity (not the issuer) for SC 13G/13D.
+                                filer_name = ""
                                 pct = 0.0
+                                text_url = getattr(filing, "text_url", "")
+                                if text_url:
+                                    try:
+                                        resp = _requests.get(
+                                            text_url,
+                                            headers={"User-Agent": self._user_agent},
+                                            timeout=10,
+                                            stream=True,
+                                        )
+                                        if resp.status_code == 200:
+                                            # Read only first 4KB for the SEC-HEADER
+                                            header_chunk = next(resp.iter_content(4096), b"")
+                                            resp.close()
+                                            header_text = header_chunk.decode("utf-8", errors="replace")
+
+                                            # Extract FILED BY company name
+                                            filer_match = re.search(
+                                                r"FILED BY:.*?COMPANY CONFORMED NAME:\s*([^\n]+)",
+                                                header_text,
+                                                re.DOTALL | re.IGNORECASE,
+                                            )
+                                            if filer_match:
+                                                filer_name = filer_match.group(1).strip()
+                                        else:
+                                            resp.close()
+                                    except Exception:
+                                        pass
+
+                                # Fallback: use filing.company (issuer name)
+                                if not filer_name:
+                                    filer_name = str(getattr(filing, "company", ""))
+                                if not filer_name:
+                                    continue
+
+                                # Skip if same filer already seen
+                                filer_key = filer_name.upper().strip()
+                                if filer_key in seen_filers:
+                                    continue
+                                # Skip if the filer is the issuer itself
+                                issuer_name = str(getattr(company, "name", "")).upper()
+                                if filer_key == issuer_name:
+                                    continue
+                                seen_filers.add(filer_key)
+
+                                # Try to extract percentage from the filing HTML
                                 try:
-                                    import re
-                                    text = filing.text()[:5000] if hasattr(filing, "text") else ""
+                                    text = filing.text()[:8000] if hasattr(filing, "text") else ""
+                                    # SC 13G Item 11: Percent of Class
                                     pct_match = re.search(
-                                        r"(?:percent|percentage|%).*?(\d{1,3}(?:\.\d+)?)\s*%",
+                                        r"(?:percent\s+of\s+class|percent\s+of\s+shares)[:\s]*(\d{1,3}(?:\.\d+)?)\s*%",
                                         text, re.IGNORECASE,
                                     )
+                                    if not pct_match:
+                                        pct_match = re.search(
+                                            r"(\d{1,3}\.\d+)\s*%",
+                                            text,
+                                        )
                                     if pct_match:
                                         pct = float(pct_match.group(1))
-                                    else:
-                                        pct_match = re.search(r"(\d{1,3}\.\d+)%", text)
-                                        if pct_match:
-                                            pct = float(pct_match.group(1))
+                                        if pct > 90:
+                                            pct = 0.0  # Likely not ownership %
                                 except Exception:
                                     pass
+
                                 holders.append({
                                     "name": filer_name,
                                     "shares": 0,
