@@ -582,20 +582,43 @@ def _update_markets(region: str, market_select):
 # ---------------------------------------------------------------------------
 
 def render_report():
-    """Report viewer with tabs."""
+    """Report viewer with tabs including interactive plotly dashboard."""
     ui.label("Analysis Report").classes("text-2xl font-bold")
 
-    report_path = Path("cache/report/analysis_report.md")
+    # Discover all report files (support both old and new naming)
+    report_dir = Path("cache/report")
     profile_path = Path("cache/company_profile.json")
 
-    if not report_path.exists():
+    # Find the best available markdown report
+    report_path = None
+    for candidate in [
+        report_dir / "premium_report.md",
+        report_dir / "pro_report.md",
+        report_dir / "basic_report.md",
+        report_dir / "analysis_report.md",
+    ]:
+        if candidate.exists():
+            report_path = candidate
+            break
+
+    # Enhanced output paths
+    pdf_path = report_dir / "report.pdf"
+    tearsheet_path = report_dir / "tearsheet.html"
+    interactive_path = report_dir / "interactive_dashboard.html"
+
+    if report_path is None and not interactive_path.exists():
         ui.label("No report available. Run an analysis first.").classes("text-gray-400 mt-4")
         return
 
+    # Build tabs -- add Interactive tab when plotly dashboard exists
     with ui.tabs().classes("w-full") as tabs:
         tab_summary = ui.tab("Summary")
+        if interactive_path.exists():
+            tab_interactive = ui.tab("Interactive")
         tab_charts = ui.tab("Charts")
         tab_full = ui.tab("Full Report")
+        if tearsheet_path.exists():
+            tab_tearsheet = ui.tab("Tearsheet")
 
     with ui.tab_panels(tabs, value=tab_summary).classes("w-full"):
         with ui.tab_panel(tab_summary):
@@ -624,6 +647,16 @@ def render_report():
                                             ui.label(f"{k}: {v:,.2f}" if isinstance(v, float) else f"{k}: {v}").classes("text-xs text-gray-400")
                 except Exception:
                     pass
+
+        # Interactive plotly dashboard tab (embedded via iframe)
+        if interactive_path.exists():
+            with ui.tab_panel(tab_interactive):
+                ui.label("Interactive Financial Dashboard").classes("text-lg font-bold")
+                ui.label("Zoom, pan, and hover over charts for details.").classes("text-sm text-gray-400 mb-2")
+                # Serve the HTML file and embed via iframe
+                app.add_static_files("/report_assets", str(report_dir))
+                ui.html(f'<iframe src="/report_assets/interactive_dashboard.html" '
+                        f'style="width:100%; height:800px; border:none; border-radius:8px;"></iframe>')
 
         with ui.tab_panel(tab_charts):
             # Candlestick chart (from DearPyGui GPU chart concept)
@@ -660,22 +693,78 @@ def render_report():
                 # 5-tier radar chart (from DearPyGui polar plot concept)
                 render_radar_chart()
 
-        with ui.tab_panel(tab_full):
-            try:
-                md_text = report_path.read_text(encoding="utf-8")
-                ui.markdown(md_text).classes("w-full")
-            except Exception as exc:
-                ui.label(f"Error loading report: {exc}").classes("text-red-400")
+            # Show mplfinance enhanced charts if available
+            chart_dir = report_dir / "charts"
+            if chart_dir.exists():
+                enhanced_charts = list(chart_dir.glob("*.png"))
+                if enhanced_charts:
+                    ui.separator()
+                    ui.label("Enhanced Charts (mplfinance)").classes("text-lg font-bold mt-4")
+                    app.add_static_files("/chart_assets", str(chart_dir))
+                    for chart_file in enhanced_charts:
+                        title = chart_file.stem.replace("_", " ").title()
+                        ui.label(title).classes("text-sm text-gray-400 mt-2")
+                        ui.image(f"/chart_assets/{chart_file.name}").classes("w-full max-w-4xl")
 
-    # Download buttons
-    with ui.row().classes("gap-2 mt-4"):
-        if report_path.exists():
-            ui.button("Download MD", icon="download",
-                      on_click=lambda: ui.download(str(report_path)))
-        json_path = Path("cache/company_profile.json")
-        if json_path.exists():
-            ui.button("Download JSON", icon="download",
-                      on_click=lambda: ui.download(str(json_path)))
+        with ui.tab_panel(tab_full):
+            if report_path and report_path.exists():
+                try:
+                    md_text = report_path.read_text(encoding="utf-8")
+                    ui.markdown(md_text).classes("w-full")
+                except Exception as exc:
+                    ui.label(f"Error loading report: {exc}").classes("text-red-400")
+            else:
+                ui.label("No markdown report available.").classes("text-gray-400")
+
+        # Quantstats tearsheet tab (embedded via iframe)
+        if tearsheet_path.exists():
+            with ui.tab_panel(tab_tearsheet):
+                ui.label("Performance Tearsheet (quantstats)").classes("text-lg font-bold")
+                ui.label("40+ performance metrics: Sharpe, Sortino, max drawdown, rolling returns, and more.").classes("text-sm text-gray-400 mb-2")
+                app.add_static_files("/report_assets", str(report_dir))
+                ui.html(f'<iframe src="/report_assets/tearsheet.html" '
+                        f'style="width:100%; height:800px; border:none; border-radius:8px; background:white;"></iframe>')
+
+    # Download buttons (at the bottom of the Report page)
+    ui.separator()
+    ui.label("Downloads").classes("text-lg font-bold mt-4")
+    with ui.row().classes("gap-2 mt-2"):
+        # PDF download (fpdf2 branded PDF)
+        if pdf_path.exists():
+            size_kb = pdf_path.stat().st_size / 1024
+            ui.button(
+                f"Download PDF ({size_kb:.0f} KB)",
+                icon="picture_as_pdf",
+                on_click=lambda: ui.download(str(pdf_path)),
+            ).classes("bg-red-700 text-white")
+
+        # Markdown download
+        if report_path and report_path.exists():
+            ui.button("Download Markdown", icon="description",
+                      on_click=lambda: ui.download(str(report_path))).classes("bg-blue-600 text-white")
+
+        # Interactive dashboard download
+        if interactive_path.exists():
+            size_kb = interactive_path.stat().st_size / 1024
+            ui.button(
+                f"Download Interactive HTML ({size_kb:.0f} KB)",
+                icon="web",
+                on_click=lambda: ui.download(str(interactive_path)),
+            ).classes("bg-purple-600 text-white")
+
+        # Tearsheet download
+        if tearsheet_path.exists():
+            size_kb = tearsheet_path.stat().st_size / 1024
+            ui.button(
+                f"Download Tearsheet ({size_kb:.0f} KB)",
+                icon="analytics",
+                on_click=lambda: ui.download(str(tearsheet_path)),
+            ).classes("bg-green-700 text-white")
+
+        # JSON profile download
+        if profile_path.exists():
+            ui.button("Download JSON Profile", icon="data_object",
+                      on_click=lambda: ui.download(str(profile_path))).classes("bg-gray-600 text-white")
 
 
 # ---------------------------------------------------------------------------
