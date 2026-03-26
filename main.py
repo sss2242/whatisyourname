@@ -1941,6 +1941,69 @@ Non-interactive examples:
             logger.warning("Step 5.5 (enriched survival timeline) failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 5k: Adaptive model parameters (Tier 2)
+    # ------------------------------------------------------------------
+    # Compute data-derived model parameters from pipeline outputs.
+    # Must run after Step 5.5 (regime detector available) and before
+    # Step 6 (temporal models consume these parameters).
+    _adaptive_model_params = None
+    try:
+        from operator1.analysis.adaptive_model_params import (
+            compute_blend_weights,
+            compute_regime_risk_multiplier,
+            compute_garman_klass_factor,
+            compute_transition_halflife,
+            compute_adaptive_mc_params,
+            compute_adaptive_participation_rate,
+            AdaptiveModelParams,
+        )
+        _adaptive_model_params = AdaptiveModelParams()
+
+        # Cox/sigmoid blend recalibration (inverse-variance, Cochrane 1954)
+        if "survival_probability" in cache.columns and "cox_survival_score" in cache.columns:
+            _sig = cache.get("survival_probability")
+            _cox = cache.get("cox_survival_score")
+            _actual = cache.get("company_survival_mode_flag", pd.Series(0, index=cache.index))
+            if _sig is not None and _cox is not None:
+                w_sig, w_cox = compute_blend_weights(_sig, _cox, _actual)
+                _adaptive_model_params.blend_w_sig = w_sig
+                _adaptive_model_params.blend_w_cox = w_cox
+                # Re-blend with data-driven weights
+                cache["survival_probability"] = w_sig * _sig + w_cox * _cox.fillna(_sig)
+                _adaptive_model_params.methods_used["blend"] = f"inverse_variance(sig={w_sig:.3f},cox={w_cox:.3f})"
+                logger.info("Adaptive blend: w_sig=%.3f, w_cox=%.3f", w_sig, w_cox)
+
+        # Regime risk multiplier (HMM volatility ratio)
+        _adaptive_model_params.survival_risk_multiplier = compute_regime_risk_multiplier(
+            regime_detector, cache,
+        )
+        # Garman-Klass intraday factor
+        _adaptive_model_params.intraday_low_factor = compute_garman_klass_factor(cache)
+        # Transition half-life from enriched timeline
+        _adaptive_model_params.transition_halflife = compute_transition_halflife(
+            enriched_timeline_result,
+        )
+        # Participation rate (Amihud)
+        _adaptive_model_params.participation_rate = compute_adaptive_participation_rate(cache)
+        # MC parameters (precision-targeted)
+        _adaptive_model_params.mc_n_paths, _adaptive_model_params.mc_is_tilt = (
+            compute_adaptive_mc_params(cache)
+        )
+        _adaptive_model_params.adapted = True
+        logger.info(
+            "Adaptive model params: risk_mult=%.2f, gk_factor=%.2f, "
+            "transition_hl=%d, mc_paths=%d, mc_tilt=%.2f, participation=%.3f",
+            _adaptive_model_params.survival_risk_multiplier,
+            _adaptive_model_params.intraday_low_factor,
+            _adaptive_model_params.transition_halflife,
+            _adaptive_model_params.mc_n_paths,
+            _adaptive_model_params.mc_is_tilt,
+            _adaptive_model_params.participation_rate,
+        )
+    except Exception as exc:
+        logger.warning("Adaptive model params failed (using defaults): %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 6: Temporal modeling (optional)
     # ------------------------------------------------------------------
     forecast_result = None
@@ -2272,8 +2335,20 @@ Non-interactive examples:
                 if _adaptive_thresholds is not None and _adaptive_thresholds.adapted
                 else None
             )
+            _mc_n = (
+                _adaptive_model_params.mc_n_paths
+                if _adaptive_model_params is not None and _adaptive_model_params.adapted
+                else 10_000
+            )
+            _mc_tilt = (
+                _adaptive_model_params.mc_is_tilt
+                if _adaptive_model_params is not None and _adaptive_model_params.adapted
+                else 1.5
+            )
             mc_result = run_monte_carlo(
                 cache, returns_col=_mc_returns,
+                n_paths=_mc_n,
+                importance_tilt=_mc_tilt,
                 survival_thresholds=_mc_thresholds,
             )
             logger.info("Monte Carlo simulation complete")
