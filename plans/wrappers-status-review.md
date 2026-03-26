@@ -204,7 +204,7 @@ The `PITClient` protocol defines three holder-related methods: `get_holders()`, 
 | 12 | **South Africa** | `za_jse` | 2 | Yes | **JSE SENS** shareholding announcements | Yes | JSE SENS-derived snapshot | Yes | JSE SENS director dealings |
 | 13 | **UAE** | `ae_dfm` | 2 | Yes | **DFM eFsah API** (holder-related disclosures) | Yes | DFM eFsah-derived snapshot | Yes | DFM eFsah BOD meeting results |
 | 14 | **Mexico** | `mx_bmv` | 2 | Yes | BMV filing discovery + LLM/fuzzy PDF extraction | Yes | BMV filing-derived snapshot | Yes | BMV filing discovery (insider filings) |
-| 15 | **Singapore** | `sg_sgx` | 2 | Yes | **SGX DOI announcements** (Section 137 SFA) + annual report PDF extraction via fuzzy_pdf_parser. **No yfinance** (removed 2026-03-25). | Yes | Derived from get_holders() aggregation | Yes | **SGX Financial Reports API** (director/board announcements) |
+| 15 | **Singapore** | `sg_sgx` | 2 | Yes | **SGX DOI announcements** (Section 137 SFA) + **two-stage annual report PDF extraction** (Stage 1: fuzzy_pdf_parser for financials, Stage 2: page-level shareholding with section-isolated regex). **No yfinance** (removed 2026-03-25). **FIXED (2026-03-26)**: was extracting 27 garbage holders from full 107-page PDF; now extracts 20 legitimate top-20 shareholders via page-level isolation + stricter regex. | Yes | Derived from get_holders() aggregation (includes top20 holder_type). **FIXED (2026-03-26)**: was 0 rows; now returns 86.78% ownership, HHI=0.2177 for DBS (D05). | Yes | **SGX Financial Reports API** (director/board announcements) |
 | 16 | **Switzerland** | `ch_six` | 2 | **Partial** | **yfinance .SW** (no native SIX holder API). Native `get_insider_transactions()` from SIX management transactions API. | **yfinance** | yfinance .SW snapshot only | Yes | **SIX native** management transactions API |
 | 17 | **China** | `cn_sse` | 2 | Yes | **akshare/Sina Finance** (`stock_main_stock_holder`, top shareholders with name, shares, %, holder type) + circulating shareholder fallback | Yes | **akshare/EastMoney** (`stock_zh_a_gdhs_detail_em`, quarterly shareholder count + avg shares + change ratio) | Yes | **akshare/THS** (`stock_shareholder_change_ths`, shareholder buy/sell changes) |
 | 18 | **EU (pan-EU)** | `eu_esef` | 1 | Yes | **GLEIF API** (corporate ownership: ultimate parent, direct parent, subsidiaries via LEI relationships) | Yes | GLEIF-derived snapshot | No | -- (national regulators, not accessible) |
@@ -222,7 +222,28 @@ The `PITClient` protocol defines three holder-related methods: `get_holders()`, 
 - All other `get_holder_history()` implementations return single-row snapshots.
 - Switzerland (`ch_six`) is the only remaining wrapper that uses yfinance for holder data. SIX has no free native holder API; the Ownership/Ownership.svc is behind a paid Refinitiv subscription.
 - Singapore (`sg_sgx`) was fully de-yfinanced on 2026-03-25. All holder data now comes from native SGX DOI announcements + annual report PDF extraction.
+- Singapore (`sg_sgx`) **FIXED (2026-03-26)**: `_parse_sgx_shareholding_text()` was applying loose regex to entire 107-page annual report, producing 27 garbage holders ("Wholesale funding 16%", etc.). Fix: (1) page-level PDF extraction isolates only shareholding-relevant pages, (2) section heading isolation restricts regex to bounded 3000-char windows after headings, (3) stricter `_is_valid_name()` validator rejects table headers/labels/sentence fragments, (4) `get_holder_history()` now includes `"top20"` holder_type.
 - China (`cn_sse`) holder methods added on 2026-03-25 using akshare: `stock_main_stock_holder` (Sina Finance top shareholders), `stock_zh_a_gdhs_detail_em` (EastMoney shareholder count history), `stock_shareholder_change_ths` (THS insider changes).
+
+### Live Holder Data Test Results (2026-03-26)
+
+Live probe results for 8 markets with known holder data issues. All tests run from this container (no VPN, no geo-bypass).
+
+| # | Market | Ticker | `get_holders` | `get_holder_history` | Source | Root Cause | Status |
+|---|--------|--------|--------------|---------------------|--------|------------|--------|
+| 1 | **SG SGX** | D05 (DBS) | **20 holders** (was 27 garbage) | **1 row** (86.78% ownership, HHI=0.2177) | Two-stage PDF: fuzzy_pdf_parser (financials) + page-level shareholding regex | `_parse_sgx_shareholding_text()` regex was too loose; applied to full 107-page PDF instead of isolated shareholding sections | **FIXED** |
+| 2 | US EDGAR | AAPL | 0 | 0 | SEC EDGAR SC 13D/13G + DEF 14A proxy | edgartools filing search may timeout for large companies; 13D/13G filings are sparse for AAPL since most holders are passive | Needs network time |
+| 3 | BR CVM | PETR4 | 0 | 0 | CVM FRE archives (posicao_acionaria CSV in 120+ MB ZIP) | FRE master ZIP download exceeds 120s timeout; CNPJ/name matching may fail | Needs timeout increase |
+| 4 | IN BSE | 500325 | 0 | 0 | BSE SAST disclosures (Reg. 29/31) + PDF scraping | BSE SAST API may rate-limit or reject Referer; secondary path checks quarterly result PDFs for SEBI shareholding patterns | Needs rate limit handling |
+| 5 | AU ASX | BHP | 0 | 0 | ASX MarkitDigital substantial holder notices | Announcement keyword filter may not match BHP's specific headline formats; `count=50` may not reach older substantial holder notices | Needs broader keyword matching |
+| 6 | CA SEDAR | RY | 0 | 0 | TMX GraphQL insider activity summary | `getCompanyInsidersActivities` returns insider buy/sell aggregates, not institutional holders; method name is misleading | Needs separate institutional holder source |
+| 7 | ZA JSE | NPN | 0 | 0 | JSE SENS WCF shareholding announcements | `_resolve_master_id("NPN")` may fail if JSE issuer directory search doesn't match the short ticker code | Needs MasterID resolution fix |
+| 8 | HK HKEX | 00700 | 0 | 0 | akshare/EastMoney (stock_hk_main_board_stock_holder_em) | akshare function may have changed API contract or be rate-limited from cloud environments | Needs akshare version check |
+
+**Two-stage PDF extraction architecture** (all 6 filing-discoverer-backed wrappers):
+- The `fuzzy_pdf_parser.extract_shareholders_from_pdf()` function already implements page-level isolation: scores each page against shareholding keywords, processes top-5 scoring pages, extracts tables with pdfplumber, identifies name/shares/% columns from headers.
+- The `try_shareholding_extraction()` function in `filing_discoverer.py` chains: discover filings -> filter for shareholding filings -> download PDFs -> call `extract_shareholders_from_pdf()`. This is called by 6 wrappers (SG, ZA, MX, CA, AU, AE) as a final fallback.
+- The SGX fix adds a wrapper-specific improvement: the `_parse_sgx_shareholding_text()` regex parser (used before the `try_shareholding_extraction` fallback) now has section isolation and name validation. This catches SGX's specific format (substantial shareholder table + top-20 list) that the generic `extract_shareholders_from_pdf()` table parser may miss.
 
 ### Table 2: Wrappers WITHOUT Portfolio/Holder Data (9 markets)
 
