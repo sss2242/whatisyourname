@@ -515,6 +515,244 @@ Return valid JSON only, no markdown.
             return {}
 
     # ------------------------------------------------------------------
+    # 3-call entity discovery prompts (international + local + gap-fill)
+    # ------------------------------------------------------------------
+
+    _LINKED_ENTITIES_INTL_PROMPT = """\
+You are a financial analyst specializing in global competitive landscapes.
+
+Company profile:
+{profile_json}
+
+TASK: First determine if this company has significant international operations,
+revenue, exports, or supply chains outside its home country ({country}).
+
+Then list INTERNATIONAL (non-{country}) entities across these groups:
+- competitors: international competitors from OTHER countries
+- suppliers: international/cross-border suppliers
+- customers: international customers or export markets
+
+Rules:
+- Only include companies headquartered OUTSIDE {country}
+- Only include publicly traded companies
+- Include 5-8 entities per group if the company is truly international
+- If the company is primarily domestic, say so and list fewer entities
+- Include the entity's country of headquarters
+
+Return JSON:
+{{
+  "is_international": true/false,
+  "international_revenue_estimate": "high/medium/low/unknown",
+  "competitors": [{{"name": "Company Name", "country": "US", "relationship_start": "2020", "relationship_end": "current", "stability": "stable"}}],
+  "suppliers": [...],
+  "customers": [...]
+}}
+
+Only include entities you are reasonably confident about.
+Return valid JSON only, no markdown.
+"""
+
+    _LINKED_ENTITIES_LOCAL_PROMPT = """\
+You are a financial analyst specializing in the {country} market.
+
+Company profile:
+{profile_json}
+
+We already found these INTERNATIONAL entities (do NOT repeat them):
+{already_found}
+
+TASK: Focus on the DOMESTIC {country} market only. List:
+- competitors: at least 5 domestic competitors in the same sector/industry
+- suppliers: at least 3 domestic suppliers
+- customers: major domestic customers
+- financial_institutions: primary banks, lenders, or financial partners in {country}
+- logistics: key domestic logistics or distribution partners
+- regulators: relevant regulatory bodies (if publicly listed)
+
+Rules:
+- Only include entities headquartered IN {country}
+- Only include publicly traded companies (except regulators)
+- Be thorough: list MORE entities than you think necessary
+- Each entity should have the temporal context fields
+
+Return JSON with the same format:
+{{"competitors": [{{"name": "Company Name", "country": "{country}", "relationship_start": "2020", "relationship_end": "current", "stability": "stable"}}], ...}}
+
+Return valid JSON only, no markdown.
+"""
+
+    _LINKED_ENTITIES_GAPFILL_PROMPT = """\
+You are a financial analyst reviewing entity discovery results.
+
+Company: {company_name} ({ticker}), {sector} sector, {country}
+
+Entities found so far:
+{found_summary}
+
+Groups with few or no entities:
+{thin_groups}
+
+TASK: Fill the gaps. For each thin/empty group listed above, suggest
+additional entities that we missed. Also consider:
+- Any RECENT changes (last 12 months) in the competitive landscape
+- New market entrants or departures
+- Supply chain shifts or new partnerships
+- Any major customer wins or losses
+
+Return JSON with ONLY the additional entities (do not repeat existing ones):
+{{"competitors": [{{"name": "Company Name", "country": "XX", "relationship_start": "2024", "relationship_end": "current", "stability": "new"}}], ...}}
+
+Return valid JSON only, no markdown.
+"""
+
+    def propose_linked_entities_3call(
+        self,
+        target_profile: dict[str, Any],
+        sector_hints: str = "",
+    ) -> dict[str, list[str]]:
+        """3-call LLM entity discovery for thicker linked entity caches.
+
+        Call 1: International scope check + global peers
+        Call 2: Domestic deep dive (avoids duplicating Call 1 results)
+        Call 3: Gap-fill for underrepresented groups
+
+        Returns dict mapping relationship_group -> list of company names.
+        Falls back to single-call propose_linked_entities() on failure.
+        """
+        country = (target_profile.get("country") or "Unknown").upper()
+        company_name = target_profile.get("name", "Unknown")
+        ticker = target_profile.get("ticker", "")
+        sector = target_profile.get("sector", "Unknown")
+        profile_json = json.dumps(target_profile, indent=2)
+
+        all_entities: dict[str, list[str]] = {}
+        all_raw: dict[str, list] = {}
+
+        def _merge_results(parsed: dict) -> None:
+            """Merge parsed LLM response into all_entities."""
+            for group, entities in parsed.items():
+                if group.startswith("is_") or group.endswith("_estimate"):
+                    continue  # skip metadata fields
+                if not isinstance(entities, list):
+                    continue
+                if group not in all_entities:
+                    all_entities[group] = []
+                    all_raw[group] = []
+                existing_names = {n.lower() for n in all_entities[group]}
+                for ent in entities:
+                    name = ""
+                    if isinstance(ent, dict):
+                        name = ent.get("name", "")
+                    elif isinstance(ent, str):
+                        name = ent
+                    if name and name.lower() not in existing_names:
+                        all_entities[group].append(name)
+                        all_raw[group].append(ent)
+                        existing_names.add(name.lower())
+
+        # ---- Call 1: International scope + global peers ----
+        try:
+            prompt1 = self._LINKED_ENTITIES_INTL_PROMPT.format(
+                profile_json=profile_json,
+                country=country,
+            )
+            text1 = self._generate(prompt1)
+            parsed1 = self._parse_json_response(text1)
+            if isinstance(parsed1, dict):
+                is_intl = parsed1.get("is_international", False)
+                _merge_results(parsed1)
+                logger.info(
+                    "3-call discovery: Call 1 (international) done. "
+                    "is_international=%s, entities=%d",
+                    is_intl,
+                    sum(len(v) for k, v in all_entities.items()),
+                )
+        except Exception as exc:
+            logger.warning("3-call discovery: Call 1 failed: %s", exc)
+
+        # ---- Call 2: Domestic deep dive ----
+        try:
+            already_found = json.dumps(
+                {g: [n for n in names] for g, names in all_entities.items()},
+                indent=2,
+            )
+            prompt2 = self._LINKED_ENTITIES_LOCAL_PROMPT.format(
+                profile_json=profile_json,
+                country=country,
+                already_found=already_found,
+            )
+            text2 = self._generate(prompt2)
+            parsed2 = self._parse_json_response(text2)
+            if isinstance(parsed2, dict):
+                _merge_results(parsed2)
+                logger.info(
+                    "3-call discovery: Call 2 (local) done. total entities=%d",
+                    sum(len(v) for v in all_entities.values()),
+                )
+        except Exception as exc:
+            logger.warning("3-call discovery: Call 2 failed: %s", exc)
+
+        # ---- Call 3: Gap-fill ----
+        try:
+            # Identify thin groups
+            target_counts = {
+                "competitors": 5, "suppliers": 3, "customers": 3,
+                "financial_institutions": 2, "logistics": 2, "regulators": 1,
+            }
+            thin_groups = []
+            for group, target_count in target_counts.items():
+                actual = len(all_entities.get(group, []))
+                if actual < target_count:
+                    thin_groups.append(f"{group}: {actual} found (want {target_count}+)")
+
+            if thin_groups:
+                found_summary = "\n".join(
+                    f"  {g}: {', '.join(names[:5])}"
+                    + (f" (+{len(names)-5} more)" if len(names) > 5 else "")
+                    for g, names in all_entities.items()
+                    if names
+                )
+                prompt3 = self._LINKED_ENTITIES_GAPFILL_PROMPT.format(
+                    company_name=company_name,
+                    ticker=ticker,
+                    sector=sector,
+                    country=country,
+                    found_summary=found_summary or "  (none found)",
+                    thin_groups="\n".join(f"  - {tg}" for tg in thin_groups),
+                )
+                text3 = self._generate(prompt3)
+                parsed3 = self._parse_json_response(text3)
+                if isinstance(parsed3, dict):
+                    before = sum(len(v) for v in all_entities.values())
+                    _merge_results(parsed3)
+                    after = sum(len(v) for v in all_entities.values())
+                    logger.info(
+                        "3-call discovery: Call 3 (gap-fill) done. "
+                        "added %d entities, total=%d",
+                        after - before, after,
+                    )
+            else:
+                logger.info("3-call discovery: Call 3 skipped (all groups sufficient)")
+        except Exception as exc:
+            logger.warning("3-call discovery: Call 3 failed: %s", exc)
+
+        # Store raw data for temporal extraction
+        self._last_entity_proposals_raw = all_raw
+
+        total = sum(len(v) for v in all_entities.values())
+        logger.info(
+            "3-call discovery complete: %d total entities across %d groups",
+            total, len(all_entities),
+        )
+
+        if total == 0:
+            # Fall back to single-call if 3-call produced nothing
+            logger.warning("3-call discovery returned 0 entities; falling back to single call")
+            return self.propose_linked_entities(target_profile, sector_hints=sector_hints)
+
+        return all_entities
+
+    # ------------------------------------------------------------------
     # World Bank mapping suggestions (Sec 4)
     # ------------------------------------------------------------------
 

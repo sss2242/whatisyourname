@@ -192,6 +192,9 @@ class PooledLLMClient:
     def propose_linked_entities(self, profile: dict, **kwargs) -> dict:
         return self._call_with_rotation("propose_linked_entities", profile, **kwargs)
 
+    def propose_linked_entities_3call(self, profile: dict, **kwargs) -> dict:
+        return self._call_with_rotation("propose_linked_entities_3call", profile, **kwargs)
+
     def score_sentiment(self, headlines: list[str], **kwargs) -> list[float]:
         return self._call_with_rotation("score_sentiment", headlines, **kwargs)
 
