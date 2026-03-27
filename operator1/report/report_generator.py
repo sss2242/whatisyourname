@@ -2041,6 +2041,154 @@ def _build_advanced_insights(profile: dict[str, Any]) -> str:
                         "deep learning for growth forecasting).*")
             lines.append("")
 
+    # Candlestick pattern detection
+    patterns = ext.get("candlestick_patterns", {})
+    if isinstance(patterns, dict) and patterns.get("available"):
+        lines.append("### Candlestick Pattern Detection")
+        lines.append("")
+        lines.append(
+            "Automated detection of classical candlestick patterns (doji, hammer, "
+            "engulfing, etc.) plus motif discovery via Matrix Profile -- recurring "
+            "price micro-structures that repeat across the history."
+        )
+        lines.append("")
+        lines.append(f"- **Patterns detected**: {patterns.get('n_patterns', 0)}")
+        pat_list = patterns.get("patterns", [])
+        if pat_list:
+            lines.append("")
+            lines.append("**Most recent patterns:**")
+            lines.append("")
+            for p in (pat_list[-5:] if isinstance(pat_list, list) else []):
+                if isinstance(p, dict):
+                    lines.append(
+                        f"- {p.get('pattern', '?')} on {p.get('date', '?')} "
+                        f"({p.get('signal', 'neutral')})"
+                    )
+            lines.append("")
+        motifs = patterns.get("motifs", [])
+        discords = patterns.get("discords", [])
+        if motifs or discords:
+            lines.append(
+                f"- **Recurring motifs**: {len(motifs)} "
+                f"*(patterns that repeat multiple times in the price history)*"
+            )
+            lines.append(
+                f"- **Anomalous discords**: {len(discords)} "
+                f"*(rare patterns that deviate significantly from normal behavior)*"
+            )
+            lines.append("")
+
+    # Walk-forward model evaluation
+    wf = ext.get("walk_forward", {})
+    if isinstance(wf, dict) and wf.get("available"):
+        lines.append("### Walk-Forward Model Evaluation")
+        lines.append("")
+        lines.append(
+            "Walk-forward analysis evaluates forecasting model accuracy by stepping "
+            "through history day-by-day, retraining at regime switches, and tracking "
+            "which model performs best in each survival mode."
+        )
+        lines.append("")
+        lines.append(f"- **Overall best model**: {wf.get('overall_best_model', 'N/A')}")
+        lines.append(f"- **Overall MAE**: {_fmt(wf.get('overall_mae'), '.6f')}")
+        lines.append(f"- **Retrain events**: {wf.get('n_retrains', 0)} "
+                     "*(model retrained at each regime switch)*")
+        lines.append("")
+        best_by_mode = wf.get("best_model_by_mode", {})
+        if best_by_mode:
+            lines.append("**Best model per survival mode:**")
+            lines.append("")
+            for mode, model in best_by_mode.items():
+                lines.append(f"- {mode}: **{model}**")
+            lines.append("")
+
+    # Burn-out weight calibration
+    bo = ext.get("burnout", {})
+    if isinstance(bo, dict) and bo.get("available"):
+        lines.append("### Online Weight Calibration (Burn-Out Phase)")
+        lines.append("")
+        lines.append(
+            "The burn-out phase recalibrates model ensemble weights using "
+            "exponential gradient learning on the most recent data. This adapts "
+            "the forecast blend to current market conditions rather than relying "
+            "on long-term averages."
+        )
+        lines.append("")
+        lines.append(f"- **Iterations completed**: {bo.get('iterations_completed', 0)}")
+        lines.append(f"- **Converged**: {'Yes' if bo.get('converged') else 'No'}")
+        lines.append(f"- **Calibrated**: {'Yes' if bo.get('calibrated') else 'No'}")
+        lines.append(f"- **Weight stability**: {_fmt(bo.get('weight_stability'))}")
+        lines.append("")
+        regime_w = bo.get("regime_weights", {})
+        if regime_w:
+            lines.append("**Per-regime calibrated weights:**")
+            lines.append("")
+            for regime, weights in regime_w.items():
+                if isinstance(weights, dict):
+                    top = sorted(weights.items(), key=lambda x: -(x[1] or 0))[:3]
+                    top_str = ", ".join(f"{k}={v:.2f}" for k, v in top)
+                    lines.append(f"- {regime}: {top_str}")
+            lines.append("")
+
+    # Time-varying causal dynamics
+    tvg = ext.get("time_varying_granger", {})
+    if isinstance(tvg, dict) and tvg.get("available"):
+        lines.append("### Time-Varying Causal Dynamics")
+        lines.append("")
+        lines.append(
+            "Rolling-window Granger causality reveals how causal relationships "
+            "between financial variables evolve over time. Emerging pairs indicate "
+            "new dependencies forming; disappearing pairs suggest decoupling."
+        )
+        lines.append("")
+        lines.append(f"- **Analysis windows**: {tvg.get('n_windows', 0)}")
+        emerging = tvg.get("emerging_pairs", [])
+        disappearing = tvg.get("disappearing_pairs", [])
+        if emerging:
+            lines.append("")
+            lines.append("**Emerging causal relationships** (newly significant):")
+            lines.append("")
+            for pair in emerging[:5]:
+                if isinstance(pair, dict):
+                    lines.append(
+                        f"- {pair.get('source', '?')} -> {pair.get('target', '?')}"
+                    )
+                elif isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                    lines.append(f"- {pair[0]} -> {pair[1]}")
+            lines.append("")
+        if disappearing:
+            lines.append("**Disappearing causal relationships** (recently lost significance):")
+            lines.append("")
+            for pair in disappearing[:5]:
+                if isinstance(pair, dict):
+                    lines.append(
+                        f"- {pair.get('source', '?')} -> {pair.get('target', '?')}"
+                    )
+                elif isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                    lines.append(f"- {pair[0]} -> {pair[1]}")
+            lines.append("")
+
+    # Multivariate Monte Carlo
+    mvmc = ext.get("multivariate_monte_carlo", {})
+    if isinstance(mvmc, dict) and mvmc.get("available"):
+        lines.append("### Multivariate Monte Carlo Simulation")
+        lines.append("")
+        lines.append(
+            "Unlike standard Monte Carlo (which simulates price returns only), "
+            "the multivariate simulation jointly models financial ratios "
+            "(current ratio, FCF yield, debt-to-equity) using their historical "
+            "correlation structure. Survival is checked directly on simulated "
+            "ratio values, not just price paths."
+        )
+        lines.append("")
+        surv = mvmc.get("survival_probability")
+        if surv is not None:
+            lines.append(f"- **Joint survival probability**: {_pct(surv)}")
+        vars_sim = mvmc.get("variables_simulated", [])
+        if vars_sim:
+            lines.append(f"- **Variables jointly simulated**: {', '.join(vars_sim)}")
+        lines.append("")
+
     # Capital Allocation Deep Dive (premium-only detailed breakdown)
     vanity = profile.get("vanity", {})
     if vanity.get("v2_available"):

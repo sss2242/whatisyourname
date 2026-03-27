@@ -387,6 +387,74 @@ def render_home():
                       "", "shield")
                 _card("Regime", survival.get("survival_regime", "unknown"), "", "timeline")
 
+            # Extended models summary
+            ext = profile.get("extended_models", {})
+            if ext:
+                available_count = sum(
+                    1 for v in ext.values()
+                    if isinstance(v, dict) and v.get("available")
+                )
+                ui.separator()
+                ui.label("Advanced Model Results").classes("text-lg font-bold mt-4")
+                ui.label(
+                    f"{available_count} of {len(ext)} models produced results"
+                ).classes("monokai-muted text-sm")
+
+                _model_labels = {
+                    "transfer_entropy": "Transfer Entropy",
+                    "cycle_decomposition": "Cycle Decomposition",
+                    "candlestick_patterns": "Candlestick Patterns",
+                    "copula": "Copula Tail Risk",
+                    "conformal_prediction": "Conformal Intervals",
+                    "dtw_analogs": "DTW Analogs",
+                    "shap_explanations": "SHAP Explainability",
+                    "sobol_sensitivity": "Sobol Sensitivity",
+                    "particle_filter": "Particle Filter",
+                    "transformer": "Transformer NN",
+                    "granger_causality": "Granger Causality",
+                    "dual_regimes": "Dual Regimes",
+                    "walk_forward": "Walk-Forward",
+                    "burnout": "Burn-Out Calibration",
+                    "genetic_optimizer": "Genetic Optimizer",
+                    "time_varying_granger": "Time-Varying Granger",
+                    "multivariate_monte_carlo": "Multivariate MC",
+                }
+                columns = [
+                    {"name": "model", "label": "Model", "field": "model"},
+                    {"name": "status", "label": "Status", "field": "status"},
+                    {"name": "detail", "label": "Key Result", "field": "detail"},
+                ]
+                rows = []
+                for key in sorted(ext.keys()):
+                    data = ext[key]
+                    if not isinstance(data, dict):
+                        continue
+                    avail = data.get("available", False)
+                    label = _model_labels.get(key, key.replace("_", " ").title())
+                    detail = ""
+                    if key == "walk_forward" and avail:
+                        detail = f"Best: {data.get('overall_best_model', '?')}"
+                    elif key == "burnout" and avail:
+                        detail = "Converged" if data.get("converged") else "Running"
+                    elif key == "candlestick_patterns" and avail:
+                        detail = f"{data.get('n_patterns', 0)} patterns"
+                    elif key == "time_varying_granger" and avail:
+                        detail = f"{len(data.get('emerging_pairs', []))} emerging"
+                    elif key == "multivariate_monte_carlo" and avail:
+                        sp = data.get("survival_probability")
+                        detail = f"Surv: {sp:.1%}" if sp else ""
+                    elif key == "granger_causality" and avail:
+                        detail = f"{data.get('n_significant_pairs', 0)} causal links"
+                    elif key == "copula" and avail:
+                        detail = f"Best: {data.get('best_copula', '?')}"
+                    rows.append({
+                        "model": label,
+                        "status": "OK" if avail else "--",
+                        "detail": detail,
+                    })
+                if rows:
+                    ui.table(columns=columns, rows=rows).classes("w-full mt-2")
+
             return
         except Exception:
             pass
