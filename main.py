@@ -1050,6 +1050,28 @@ Non-interactive examples:
         logger.warning("Conflict risk assessment failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 4a.4: Market buying power (demand-side signal)
+    # ------------------------------------------------------------------
+    buying_power_result = None
+    try:
+        from operator1.features.market_buying_power import compute_market_buying_power
+        cache, buying_power_result = compute_market_buying_power(
+            cache,
+            sector=target_profile.get("sector"),
+            country_iso2=market_info.country_code,
+            macro_data=macro_data,
+        )
+        if buying_power_result and buying_power_result.available:
+            logger.info(
+                "Market buying power: index=%.0f, momentum=%+.3f, demand_risk=%s",
+                buying_power_result.buying_power_index,
+                buying_power_result.sector_demand_momentum,
+                buying_power_result.demand_risk_flag,
+            )
+    except Exception as exc:
+        logger.warning("Market buying power failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 4a.5: SIX proxy computation + canonical column seeding
     # Must run BEFORE estimation so proxy values flow into the estimator.
     # ------------------------------------------------------------------
@@ -1781,6 +1803,32 @@ Non-interactive examples:
             logger.info("Sentiment: no articles available for scoring")
     except Exception as exc:
         logger.warning("News sentiment scoring failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 5i.5: Product catalyst detection
+    # ------------------------------------------------------------------
+    catalyst_result = None
+    try:
+        from operator1.features.product_catalysts import detect_product_catalysts
+        # Pass news articles from sentiment step if available
+        _news_articles = []
+        if sentiment_result is not None:
+            _news_articles = getattr(sentiment_result, "articles", [])
+        cache, catalyst_result = detect_product_catalysts(
+            cache,
+            profile=target_profile,
+            news_articles=_news_articles if _news_articles else None,
+        )
+        if catalyst_result and catalyst_result.available:
+            logger.info(
+                "Product catalysts: score=%.2f, type=%s, rnd=%.2f, news=%.2f",
+                catalyst_result.catalyst_score,
+                catalyst_result.catalyst_type,
+                catalyst_result.rnd_acceleration,
+                catalyst_result.news_catalyst_score,
+            )
+    except Exception as exc:
+        logger.warning("Product catalyst detection failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Step 5j: Adaptive threshold calibration
@@ -2928,6 +2976,35 @@ Non-interactive examples:
                         "observations": len(series),
                     }
             profile["macro_indicators"] = macro_summary
+
+        # Inject market buying power
+        if buying_power_result is not None and buying_power_result.available:
+            profile["market_buying_power"] = {
+                "available": True,
+                "buying_power_index": buying_power_result.buying_power_index,
+                "sector_demand_momentum": buying_power_result.sector_demand_momentum,
+                "real_revenue_growth_ppp": buying_power_result.real_revenue_growth_ppp,
+                "demand_risk_flag": buying_power_result.demand_risk_flag,
+                "consumer_confidence_trend": buying_power_result.consumer_confidence_trend,
+                "inflation_drag": buying_power_result.inflation_drag,
+            }
+        else:
+            profile["market_buying_power"] = {"available": False}
+
+        # Inject product catalyst signals
+        if catalyst_result is not None and catalyst_result.available:
+            profile["product_catalysts"] = {
+                "available": True,
+                "catalyst_score": catalyst_result.catalyst_score,
+                "catalyst_type": catalyst_result.catalyst_type,
+                "rnd_acceleration": catalyst_result.rnd_acceleration,
+                "news_catalyst_score": catalyst_result.news_catalyst_score,
+                "earnings_momentum": catalyst_result.earnings_momentum,
+                "revenue_diversification_delta": catalyst_result.revenue_diversification_delta,
+                "n_catalyst_articles": catalyst_result.n_catalyst_articles,
+            }
+        else:
+            profile["product_catalysts"] = {"available": False}
 
         # Inject reconciliation report
         if reconciliation_report:
