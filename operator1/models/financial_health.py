@@ -915,6 +915,43 @@ def compute_financial_health(
         composite = pd.Series(np.nan, index=cache.index)
 
     composite = composite.clip(0, 100)
+
+    # ------------------------------------------------------------------
+    # Financial health calibration adjustments
+    # ------------------------------------------------------------------
+    # Fix: mega-cap companies with high debt but excellent debt serviceability
+    # (e.g., Apple: D/E=1.7 but interest coverage=29x, cash > debt)
+    # should not be penalized as heavily as distressed companies.
+
+    # Adjustment 1: Debt serviceability override
+    # When interest coverage > 10x AND OCF can repay all debt within 3 years,
+    # cap the solvency penalty at -10 instead of the full penalty.
+    if "interest_coverage" in cache.columns and "total_debt" in cache.columns:
+        ic = cache["interest_coverage"].fillna(0)
+        ocf = cache.get("operating_cash_flow", pd.Series(0, index=cache.index)).fillna(0)
+        debt = cache["total_debt"].fillna(0)
+        well_serviced = (ic > 10) & (ocf * 3 > debt) & (debt > 0)
+        if well_serviced.any():
+            # Boost composite where debt is well-serviced but solvency score is low
+            solvency = tier_scores.get("tier2", pd.Series(50, index=cache.index))
+            solvency_penalty = (50 - solvency).clip(lower=0)  # how much solvency is below average
+            # Recover up to 60% of the solvency penalty
+            recovery = solvency_penalty * 0.6 * well_serviced.astype(float) * weights.get("tier2", 0.2)
+            composite = composite + recovery
+
+    # Adjustment 2: Cash reserves bonus
+    # When cash + short-term investments > total debt, add a bonus.
+    if "cash_and_equivalents" in cache.columns and "total_debt" in cache.columns:
+        cash = cache["cash_and_equivalents"].fillna(0)
+        debt = cache["total_debt"].fillna(0)
+        net_cash_positive = (cash > debt) & (debt > 0)
+        if net_cash_positive.any():
+            # Bonus proportional to net cash / debt ratio, capped at +8
+            cash_ratio_to_debt = (cash / debt.clip(lower=1)).clip(upper=3.0)
+            bonus = (cash_ratio_to_debt - 1.0).clip(lower=0) * 4.0 * net_cash_positive.astype(float)
+            composite = composite + bonus.clip(upper=8.0)
+
+    composite = composite.clip(0, 100)
     cache["fh_composite_score"] = composite
     result.columns_added.append("fh_composite_score")
 

@@ -287,22 +287,62 @@ def create_splash(on_complete):
 # ---------------------------------------------------------------------------
 
 def create_main_layout():
-    """Create the main dashboard with sidebar navigation."""
+    """Create the main dashboard with browser-style top tab navigation."""
 
-    # Track current page
-    current_page = {"value": "home"}
-    content_area = None
-
-    # Header
+    # Header bar with branding + connection indicator
     with ui.header().classes("bg-monokai-card text-white items-center justify-between"):
-        ui.label("OPERATOR 1").classes("text-xl font-bold")
+        with ui.row().classes("items-center gap-3"):
+            ui.label("OPERATOR 1").classes("text-xl font-bold")
+            # Connection status dot (green = online, red = offline)
+            conn_dot = ui.html(
+                '<span id="conn-dot" style="display:inline-block;width:10px;height:10px;'
+                'border-radius:50%;background:#666;margin-left:4px;" title="Checking..."></span>'
+            )
+            conn_label = ui.label("").classes("text-xs text-gray-400")
         with ui.row().classes("items-center gap-4"):
-            # Health indicator
             health_badge = ui.badge("--/25 OK", color="gray").classes("text-xs")
             dark = ui.dark_mode(True)
             ui.button(icon="dark_mode", on_click=dark.toggle).props("flat color=white size=sm")
 
-    # Load health status
+    # Internet connection check (runs async, updates the dot)
+    async def _check_connection():
+        import socket as _sock
+        online = False
+        latency_ms = 0
+        hosts = [("data.sec.gov", 443), ("api.stlouisfed.org", 443), ("1.1.1.1", 53)]
+        for host, port in hosts:
+            try:
+                import time as _t
+                t0 = _t.time()
+                s = _sock.create_connection((host, port), timeout=3)
+                latency_ms = int((_t.time() - t0) * 1000)
+                s.close()
+                online = True
+                break
+            except Exception:
+                continue
+        if online:
+            conn_dot.set_content(
+                '<span id="conn-dot" style="display:inline-block;width:10px;height:10px;'
+                'border-radius:50%;background:#00b894;box-shadow:0 0 6px #00b89488;" '
+                f'title="Connected ({latency_ms}ms)"></span>'
+            )
+            conn_label.text = f"{latency_ms}ms"
+            conn_label.classes(replace="text-xs monokai-green")
+        else:
+            conn_dot.set_content(
+                '<span id="conn-dot" style="display:inline-block;width:10px;height:10px;'
+                'border-radius:50%;background:#e17055;box-shadow:0 0 6px #e1705588;" '
+                'title="No connection"></span>'
+            )
+            conn_label.text = "offline"
+            conn_label.classes(replace="text-xs monokai-coral")
+
+    # Check connection on load and every 30 seconds
+    ui.timer(0.5, _check_connection, once=True)
+    ui.timer(30.0, _check_connection)
+
+    # Load health status into badge
     try:
         health_file = Path("cache/wrapper_health.json")
         if health_file.exists():
@@ -314,44 +354,28 @@ def create_main_layout():
     except Exception:
         pass
 
-    # Sidebar + Content
-    with ui.row().classes("w-full h-full no-wrap"):
-        # Sidebar
-        with ui.column().classes("w-48 bg-monokai-surface p-4 gap-2 min-h-screen"):
-            def nav(page: str, icon: str, label: str):
-                def click():
-                    current_page["value"] = page
-                    render_page(page)
-                ui.button(label, icon=icon, on_click=click).props(
-                    "flat color=white align=left"
-                ).classes("w-full justify-start")
+    # Browser-style tab bar (static, non-closable tabs)
+    with ui.tabs().classes("w-full bg-monokai-surface") as tabs:
+        tab_home = ui.tab("Home", icon="home")
+        tab_analyze = ui.tab("New Analysis", icon="search")
+        tab_report = ui.tab("Report", icon="description")
+        tab_health = ui.tab("Health", icon="monitor_heart")
+        tab_models = ui.tab("Model Tests", icon="science")
+        tab_config = ui.tab("Settings", icon="settings")
 
-            nav("home", "home", "Home")
-            nav("analyze", "search", "New Analysis")
-            nav("report", "description", "Report")
-            nav("health", "monitor_heart", "Health")
-            nav("config", "settings", "Settings")
-
-        # Main content
-        content_container = ui.column().classes("flex-grow p-6 gap-4")
-
-    def render_page(page: str):
-        content_container.clear()
-        with content_container:
-            if page == "home":
-                render_home()
-            elif page == "analyze":
-                render_analyze()
-            elif page == "report":
-                render_report()
-            elif page == "health":
-                render_health()
-            elif page == "config":
-                render_config()
-
-    # Initial page
-    with content_container:
-        render_home()
+    with ui.tab_panels(tabs, value=tab_home).classes("w-full flex-grow"):
+        with ui.tab_panel(tab_home).classes("p-6"):
+            render_home()
+        with ui.tab_panel(tab_analyze).classes("p-6"):
+            render_analyze()
+        with ui.tab_panel(tab_report).classes("p-6"):
+            render_report()
+        with ui.tab_panel(tab_health).classes("p-6"):
+            render_health()
+        with ui.tab_panel(tab_models).classes("p-6"):
+            render_model_tests()
+        with ui.tab_panel(tab_config).classes("p-6"):
+            render_config()
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1031,256 @@ async def _run_health_check():
             ui.notify("Health check failed", type="negative")
     except Exception as exc:
         ui.notify(f"Error: {exc}", type="negative")
+
+
+# ---------------------------------------------------------------------------
+# Page: Model Tests
+# ---------------------------------------------------------------------------
+
+def render_model_tests():
+    """Model smoke tests -- tests all 45 analytical models (not wrappers).
+
+    Three layers: Features (11 modules), Analysis (10 modules), Temporal (24 modules).
+    Each test builds a synthetic cache and calls the model's entry point.
+    """
+    ui.label("Model Smoke Tests").classes("text-2xl font-bold")
+    ui.label(
+        "Tests all analytical models by importing them, building a synthetic cache, "
+        "and calling their main entry point. This checks features, analysis, and "
+        "temporal models -- wrappers are tested on the Health tab."
+    ).classes("text-sm text-gray-400 mb-2")
+
+    # Summary cards (populated after tests run)
+    summary_row = ui.row().classes("gap-4 mt-2")
+    progress = ui.linear_progress(value=0, show_value=False).classes("w-full hidden")
+    progress_label = ui.label("").classes("text-sm text-gray-400 hidden")
+
+    # Results area with sub-tabs per layer
+    results_container = ui.column().classes("w-full mt-4")
+
+    # Cache for last results
+    _test_state: dict = {"results": [], "running": False}
+
+    def _render_results(results: list):
+        """Render test results grouped by layer."""
+        results_container.clear()
+
+        if not results:
+            with results_container:
+                ui.label("No test results yet. Click 'Run All Tests' to start.").classes("text-gray-400")
+            return
+
+        # Count stats
+        ok = sum(1 for r in results if r.status == "ok")
+        fail = sum(1 for r in results if r.status == "fail")
+        skip = sum(1 for r in results if r.status == "skip")
+        total_ms = sum(r.latency_ms for r in results)
+
+        # Update summary cards
+        summary_row.clear()
+        with summary_row:
+            _card("Total", f"{len(results)}", "models tested", "science")
+            _card("Passed", f"{ok}", f"{ok}/{len(results)}", "check_circle")
+            _card("Failed", f"{fail}", "need attention" if fail else "all clear", "error")
+            _card("Time", f"{total_ms / 1000:.1f}s", "total runtime", "timer")
+
+        # Group by layer
+        layers = {"features": [], "analysis": [], "temporal": []}
+        for r in results:
+            layers.setdefault(r.layer, []).append(r)
+
+        layer_meta = {
+            "features": {"icon": "data_object", "label": "Feature Engineering", "desc": "11 modules -- transforms cache into model-ready features"},
+            "analysis": {"icon": "analytics", "label": "Analysis", "desc": "10 modules -- survival flags, fuzzy logic, adaptive calibration"},
+            "temporal": {"icon": "timeline", "label": "Temporal Models", "desc": "24 modules -- forecasting, regime detection, Monte Carlo, ML"},
+        }
+
+        with results_container:
+            with ui.tabs().classes("w-full") as layer_tabs:
+                tab_all = ui.tab("All Models")
+                tab_features = ui.tab("Features")
+                tab_analysis = ui.tab("Analysis")
+                tab_temporal = ui.tab("Temporal")
+                tab_failures = ui.tab(f"Failures ({fail})")
+
+            with ui.tab_panels(layer_tabs, value=tab_all).classes("w-full"):
+                # All models
+                with ui.tab_panel(tab_all):
+                    _render_results_table(results)
+
+                # Per-layer tabs
+                for layer_key, tab in [("features", tab_features), ("analysis", tab_analysis), ("temporal", tab_temporal)]:
+                    with ui.tab_panel(tab):
+                        meta = layer_meta.get(layer_key, {})
+                        with ui.row().classes("items-center gap-2 mb-2"):
+                            ui.icon(meta.get("icon", "")).classes("text-xl monokai-purple")
+                            ui.label(meta.get("label", layer_key.title())).classes("text-lg font-bold")
+                        ui.label(meta.get("desc", "")).classes("text-sm text-gray-400 mb-2")
+
+                        layer_results = layers.get(layer_key, [])
+                        layer_ok = sum(1 for r in layer_results if r.status == "ok")
+                        ui.linear_progress(
+                            value=layer_ok / len(layer_results) if layer_results else 0,
+                        ).classes("w-96 mb-2")
+                        ui.label(f"{layer_ok}/{len(layer_results)} passed").classes("text-sm text-gray-400 mb-2")
+
+                        _render_results_table(layer_results)
+
+                # Failures only
+                with ui.tab_panel(tab_failures):
+                    failures = [r for r in results if r.status == "fail"]
+                    if failures:
+                        ui.label(f"{len(failures)} models failed:").classes("text-lg font-bold text-red-400 mb-2")
+                        _render_results_table(failures)
+                    else:
+                        ui.label("No failures -- all models passed!").classes("text-lg monokai-green")
+
+    def _render_results_table(results: list):
+        """Render a table of test results."""
+        columns = [
+            {"name": "status_icon", "label": "", "field": "status_icon", "sortable": False},
+            {"name": "name", "label": "Model", "field": "name", "sortable": True},
+            {"name": "layer", "label": "Layer", "field": "layer", "sortable": True},
+            {"name": "status", "label": "Status", "field": "status", "sortable": True},
+            {"name": "latency", "label": "Time (ms)", "field": "latency", "sortable": True},
+            {"name": "detail", "label": "Result / Error", "field": "detail"},
+        ]
+        rows = []
+        for r in results:
+            icon = "+" if r.status == "ok" else "X" if r.status == "fail" else "~"
+            rows.append({
+                "status_icon": icon,
+                "name": r.name,
+                "layer": r.layer,
+                "status": r.status.upper(),
+                "latency": r.latency_ms,
+                "detail": r.error[:100] if r.error else r.detail[:100],
+            })
+        ui.table(columns=columns, rows=rows, row_key="name").classes("w-full")
+
+    async def _run_all_tests():
+        """Run all model smoke tests asynchronously."""
+        if _test_state["running"]:
+            ui.notify("Tests already running", type="warning")
+            return
+
+        _test_state["running"] = True
+        progress.classes(remove="hidden")
+        progress_label.classes(remove="hidden")
+        progress.value = 0
+        progress_label.text = "Importing model_tests..."
+
+        try:
+            from operator1.monitoring.model_tests import (
+                MODEL_TESTS, _IMPORT_ONLY_TESTS, _build_synthetic_cache,
+                run_single_test,
+            )
+
+            all_names = list(MODEL_TESTS.keys()) + list(_IMPORT_ONLY_TESTS.keys())
+            total = len(all_names)
+            cache = _build_synthetic_cache()
+            results = []
+
+            for i, name in enumerate(all_names):
+                progress_label.text = f"Testing {name} ({i + 1}/{total})..."
+                progress.value = i / total
+
+                # Run test in thread to avoid blocking UI
+                import functools
+                loop = asyncio.get_event_loop()
+                r = await loop.run_in_executor(
+                    None, functools.partial(run_single_test, name, cache),
+                )
+                results.append(r)
+
+                # Brief yield to let UI update
+                await asyncio.sleep(0.01)
+
+            progress.value = 1.0
+            progress_label.text = f"Done -- {sum(1 for r in results if r.status == 'ok')}/{total} passed"
+
+            _test_state["results"] = results
+            _render_results(results)
+
+            ok = sum(1 for r in results if r.status == "ok")
+            if ok == total:
+                ui.notify(f"All {total} models passed!", type="positive")
+            else:
+                fail = sum(1 for r in results if r.status == "fail")
+                ui.notify(f"{ok} passed, {fail} failed out of {total}", type="warning")
+
+        except Exception as exc:
+            ui.notify(f"Test runner error: {exc}", type="negative")
+            progress_label.text = f"Error: {exc}"
+        finally:
+            _test_state["running"] = False
+
+    async def _run_layer_tests(layer: str):
+        """Run tests for a single layer."""
+        if _test_state["running"]:
+            ui.notify("Tests already running", type="warning")
+            return
+
+        _test_state["running"] = True
+        progress.classes(remove="hidden")
+        progress_label.classes(remove="hidden")
+
+        try:
+            from operator1.monitoring.model_tests import (
+                MODEL_TESTS, _IMPORT_ONLY_TESTS, _build_synthetic_cache,
+                run_single_test,
+            )
+
+            names = [
+                name for name, cfg in MODEL_TESTS.items()
+                if cfg["layer"] == layer
+            ]
+            if layer == "temporal":
+                names += list(_IMPORT_ONLY_TESTS.keys())
+
+            total = len(names)
+            cache = _build_synthetic_cache()
+            results = []
+
+            for i, name in enumerate(names):
+                progress_label.text = f"Testing {name} ({i + 1}/{total})..."
+                progress.value = i / total
+
+                import functools
+                loop = asyncio.get_event_loop()
+                r = await loop.run_in_executor(
+                    None, functools.partial(run_single_test, name, cache),
+                )
+                results.append(r)
+                await asyncio.sleep(0.01)
+
+            progress.value = 1.0
+            progress_label.text = f"Done -- {sum(1 for r in results if r.status == 'ok')}/{total} passed"
+
+            _test_state["results"] = results
+            _render_results(results)
+
+        except Exception as exc:
+            ui.notify(f"Test runner error: {exc}", type="negative")
+        finally:
+            _test_state["running"] = False
+
+    # Action buttons
+    with ui.row().classes("gap-2 mt-2"):
+        ui.button("Run All Tests", icon="play_arrow", on_click=_run_all_tests).classes(
+            "bg-monokai-purple text-white"
+        )
+        ui.button("Features Only", icon="data_object",
+                  on_click=lambda: _run_layer_tests("features")).classes("bg-monokai-surface text-white")
+        ui.button("Analysis Only", icon="analytics",
+                  on_click=lambda: _run_layer_tests("analysis")).classes("bg-monokai-surface text-white")
+        ui.button("Temporal Only", icon="timeline",
+                  on_click=lambda: _run_layer_tests("temporal")).classes("bg-monokai-surface text-white")
+
+    ui.separator()
+
+    # Render existing results or placeholder
+    _render_results(_test_state["results"])
 
 
 # ---------------------------------------------------------------------------
