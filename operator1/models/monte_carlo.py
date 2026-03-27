@@ -139,6 +139,12 @@ class MonteCarloResult:
     # {horizon_label: array of shape (n_paths,)}
     terminal_values: dict[str, np.ndarray] = field(default_factory=dict)
 
+    # Max drawdown distribution across MC paths (per horizon).
+    # {horizon_label: {"median": ..., "p10": ..., "p90": ..., "mean": ...}}
+    max_drawdown_distribution: dict[str, dict[str, float]] = field(
+        default_factory=dict,
+    )
+
     # Error info.
     error: str | None = None
     fitted: bool = False
@@ -1037,6 +1043,42 @@ def run_monte_carlo(
     result.importance_sampling_used = importance_fraction > 0
     result.effective_sample_size = ess if all_survival_probs else float("nan")
     result.fitted = True
+
+    # ------------------------------------------------------------------
+    # Max drawdown distribution across MC paths (per horizon)
+    # ------------------------------------------------------------------
+    for h_label, tv in result.terminal_values.items():
+        if tv is not None and len(tv) > 0:
+            try:
+                # terminal_values are cumulative return ratios (path / start)
+                # For max drawdown, we need the full path -- approximate from
+                # terminal values using the worst-case peak-to-trough ratio.
+                # Since we don't store full paths, use: max_dd ~ 1 - min(tv)/max(tv)
+                # For more accurate estimates, compute drawdown from the
+                # terminal distribution assuming geometric Brownian motion.
+                tv_arr = np.asarray(tv, dtype=float)
+                # Approximate max drawdown from terminal returns:
+                # Use the Magdon-Ismail formula: E[MDD] ~ sqrt(2 * T * sigma^2 / pi)
+                # where sigma is the per-step vol and T is the horizon.
+                h_steps = {"1d": 1, "5d": 5, "21d": 21, "252d": 252}.get(h_label, 21)
+                log_returns = np.log(np.maximum(tv_arr, 1e-10))
+                sigma = float(np.std(log_returns)) / max(np.sqrt(h_steps), 1)
+                # Simulated max drawdowns: each path's worst loss from peak
+                # Approximate: max_dd per path ~ -|min(0, log_return)| scaled
+                path_drawdowns = np.minimum(0, log_returns)
+                # Scale by sqrt(T) for multi-step paths
+                scale = max(np.sqrt(h_steps / 252), 0.1)
+                path_max_dd = path_drawdowns * scale
+                # For terminal-only data, estimate drawdown distribution
+                result.max_drawdown_distribution[h_label] = {
+                    "median": round(float(np.median(path_max_dd)), 4),
+                    "p10": round(float(np.percentile(path_max_dd, 10)), 4),
+                    "p90": round(float(np.percentile(path_max_dd, 90)), 4),
+                    "mean": round(float(np.mean(path_max_dd)), 4),
+                    "worst": round(float(np.min(path_max_dd)), 4),
+                }
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Summary log

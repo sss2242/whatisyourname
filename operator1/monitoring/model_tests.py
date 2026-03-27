@@ -144,6 +144,18 @@ def _test_institutional_flow(cache: pd.DataFrame) -> str:
     return f"cols={len(result.columns)}"
 
 
+def _test_market_buying_power(cache: pd.DataFrame) -> str:
+    from operator1.features.market_buying_power import compute_market_buying_power
+    c, result = compute_market_buying_power(cache.copy(), sector="Technology", country_iso2="US")
+    return f"bpi={result.buying_power_index:.0f}, momentum={result.sector_demand_momentum:+.2f}"
+
+
+def _test_product_catalysts(cache: pd.DataFrame) -> str:
+    from operator1.features.product_catalysts import detect_product_catalysts
+    c, result = detect_product_catalysts(cache.copy(), profile={"sector": "Technology"})
+    return f"score={result.catalyst_score:.2f}, type={result.catalyst_type}"
+
+
 def _test_survival_mode(cache: pd.DataFrame) -> str:
     from operator1.analysis.survival_mode import compute_company_survival_flag
     flags = compute_company_survival_flag(cache.copy())
@@ -315,6 +327,8 @@ MODEL_TESTS: dict[str, dict[str, Any]] = {
     "peer_ranking":         {"layer": "features", "fn": _test_peer_ranking},
     "private_company":      {"layer": "features", "fn": _test_private_company},
     "institutional_flow":   {"layer": "features", "fn": _test_institutional_flow},
+    "market_buying_power":  {"layer": "features", "fn": _test_market_buying_power},
+    "product_catalysts":    {"layer": "features", "fn": _test_product_catalysts},
     # Layer 2: Analysis
     "survival_mode":        {"layer": "analysis", "fn": _test_survival_mode},
     "hierarchy_weights":    {"layer": "analysis", "fn": _test_hierarchy_weights},
