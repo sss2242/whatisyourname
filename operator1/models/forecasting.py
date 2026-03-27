@@ -2091,14 +2091,24 @@ class KalmanWrapper(BaseModelWrapper):
 
 
 class GARCHWrapper(BaseModelWrapper):
-    """Online GARCH wrapper with recursive variance update.
+    """Online GARCH wrapper with regime-switching volatility forecast.
 
-    Update rule: sigma2[t+1] = omega + alpha * eps^2[t] + beta * sigma2[t]
+    Supports two modes:
+    1. **Single-regime** (default): standard GARCH(1,1) on full sample.
+       Update rule: sigma2[t+1] = omega + alpha * eps^2[t] + beta * sigma2[t]
+    2. **Regime-switching** (when regime_labels provided): fits separate
+       GARCH per HMM regime, blends forecasts using transition probs.
+       This prevents volatility mean-reversion to the unconditional
+       variance, which causes underestimates during regime transitions.
     """
 
     name = "garch"
 
-    def __init__(self, returns: np.ndarray) -> None:
+    def __init__(
+        self,
+        returns: np.ndarray,
+        regime_labels: np.ndarray | None = None,
+    ) -> None:
         clean = returns[~np.isnan(returns)]
         # Default GARCH(1,1) parameters
         self._omega = 0.0001
@@ -2108,10 +2118,22 @@ class GARCHWrapper(BaseModelWrapper):
         self._last_return = float(clean[-1]) if len(clean) else 0.0
         self._fitted = len(clean) >= _MIN_OBS_GARCH
 
+        # Regime-switching state
+        self._regime_params: dict[str, dict[str, float]] = {}
+        self._transition_probs: dict[str, dict[str, float]] = {}
+        self._current_regime: str = ""
+        self._regime_switching = False
+
         if self._fitted:
             try:
                 from arch import arch_model  # type: ignore[import-untyped]
 
+                # Try regime-switching GARCH when labels are available
+                if regime_labels is not None and len(regime_labels) == len(returns):
+                    clean_labels = regime_labels[~np.isnan(returns)]
+                    self._fit_regime_switching(clean, clean_labels)
+
+                # Always fit single-regime as fallback
                 scaled = clean * 100.0
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
@@ -2124,8 +2146,94 @@ class GARCHWrapper(BaseModelWrapper):
             except Exception:
                 pass
 
+    def _fit_regime_switching(
+        self,
+        returns: np.ndarray,
+        labels: np.ndarray,
+    ) -> None:
+        """Fit per-regime GARCH models and compute transition matrix."""
+        try:
+            from arch import arch_model  # type: ignore[import-untyped]
+
+            unique_regimes = [str(r) for r in np.unique(labels) if str(r) != "nan"]
+            if len(unique_regimes) < 2:
+                return
+
+            # Fit GARCH per regime
+            for regime in unique_regimes:
+                mask = np.array([str(l) == regime for l in labels])
+                regime_returns = returns[mask]
+                if len(regime_returns) < 30:
+                    # Not enough data -- use sample variance
+                    self._regime_params[regime] = {
+                        "sigma2": float(np.var(regime_returns)) if len(regime_returns) > 1 else 0.0004,
+                        "omega": 0.0001,
+                        "alpha": 0.10,
+                        "beta": 0.85,
+                    }
+                    continue
+
+                try:
+                    scaled = regime_returns * 100.0
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        model = arch_model(scaled, vol="Garch", p=1, q=1, mean="Constant", rescale=False)
+                        res = model.fit(disp="off", show_warning=False)
+                    self._regime_params[regime] = {
+                        "sigma2": float(res.conditional_volatility.iloc[-1] ** 2) / 10000.0,
+                        "omega": float(res.params.get("omega", 0.0001)),
+                        "alpha": float(res.params.get("alpha[1]", 0.10)),
+                        "beta": float(res.params.get("beta[1]", 0.85)),
+                    }
+                except Exception:
+                    self._regime_params[regime] = {
+                        "sigma2": float(np.var(regime_returns)),
+                        "omega": 0.0001, "alpha": 0.10, "beta": 0.85,
+                    }
+
+            # Compute transition probabilities from label sequence
+            for i in range(len(labels) - 1):
+                from_r = str(labels[i])
+                to_r = str(labels[i + 1])
+                if from_r not in self._transition_probs:
+                    self._transition_probs[from_r] = {}
+                self._transition_probs[from_r][to_r] = (
+                    self._transition_probs[from_r].get(to_r, 0) + 1
+                )
+
+            # Normalize to probabilities
+            for from_r in self._transition_probs:
+                total = sum(self._transition_probs[from_r].values())
+                if total > 0:
+                    self._transition_probs[from_r] = {
+                        k: v / total for k, v in self._transition_probs[from_r].items()
+                    }
+
+            self._current_regime = str(labels[-1]) if len(labels) > 0 else ""
+            if len(self._regime_params) >= 2:
+                self._regime_switching = True
+                logger.debug(
+                    "Regime-switching GARCH: %d regimes, current=%s, "
+                    "vols=%s",
+                    len(self._regime_params),
+                    self._current_regime,
+                    {r: f"{p['sigma2']:.6f}" for r, p in self._regime_params.items()},
+                )
+        except Exception:
+            pass
+
     def predict(self, state_t: np.ndarray) -> np.ndarray:
-        # Forecast next-step conditional volatility (as std dev)
+        if self._regime_switching and self._current_regime in self._transition_probs:
+            # Regime-switching forecast: blend per-regime vol by transition probs
+            blended_sigma2 = 0.0
+            trans = self._transition_probs.get(self._current_regime, {})
+            for regime, prob in trans.items():
+                if regime in self._regime_params:
+                    blended_sigma2 += prob * self._regime_params[regime]["sigma2"]
+            if blended_sigma2 > 1e-12:
+                return np.array([np.sqrt(blended_sigma2)])
+
+        # Fallback: single-regime forecast
         return np.array([np.sqrt(max(self._sigma2, 1e-12))])
 
     def update(
@@ -2139,7 +2247,15 @@ class GARCHWrapper(BaseModelWrapper):
             if np.isnan(r):
                 return
             eps2 = r ** 2
+
+            # Update single-regime GARCH
             self._sigma2 = self._omega + self._alpha * eps2 + self._beta * self._sigma2
+
+            # Update per-regime GARCH if active
+            if self._regime_switching and self._current_regime in self._regime_params:
+                p = self._regime_params[self._current_regime]
+                p["sigma2"] = p["omega"] + p["alpha"] * eps2 + p["beta"] * p["sigma2"]
+
             self._last_return = r
             self.failed_update = False
         except Exception as exc:
@@ -2938,9 +3054,16 @@ def _init_model_wrappers(
         if w._fitted:
             wrappers.append(w)
 
-    # GARCH (for volatility-related variables)
+    # GARCH (for volatility-related variables) -- regime-switching when HMM labels available
     if "volatility" in variable or "return" in variable:
-        w = GARCHWrapper(series)
+        _regime_labels = None
+        if cache is not None and "regime_label" in cache.columns:
+            _rl = cache["regime_label"].values
+            if len(_rl) == len(series):
+                _regime_labels = _rl
+            elif len(_rl) > len(series):
+                _regime_labels = _rl[-len(series):]
+        w = GARCHWrapper(series, regime_labels=_regime_labels)
         if w._fitted:
             wrappers.append(w)
 
