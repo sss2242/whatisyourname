@@ -88,8 +88,8 @@ class ReportMode(str, Enum):
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20},
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 20},
-    ReportTier.PREMIUM: set(range(1, 23)) | {75, 195, 196, 197, 198},  # all 22 sections + economic position + geopolitical + SIX + holders + ownership deep
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 20},
+    ReportTier.PREMIUM: set(range(1, 23)) | {75, 195, 196, 197, 198, 199, 1995},  # all 22 sections + economic position + geopolitical + SIX + holders + ownership deep + market demand + catalysts
 }
 
 
@@ -2577,6 +2577,122 @@ def _build_institutional_ownership_deep_section(profile: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_market_buying_power_section(profile: dict[str, Any]) -> str:
+    """Build Market Demand & Buying Power section (19.9)."""
+    mbp = profile.get("market_buying_power", {})
+    if not mbp.get("available"):
+        return "*No market buying power data available.*\n"
+
+    lines: list[str] = []
+    bpi = mbp.get("buying_power_index", 50)
+    momentum = mbp.get("sector_demand_momentum", 0)
+    trend = mbp.get("consumer_confidence_trend", "stable")
+    demand_risk = mbp.get("demand_risk_flag", False)
+    inflation_drag = mbp.get("inflation_drag", 0)
+    real_growth = mbp.get("real_revenue_growth_ppp")
+
+    # Status badge
+    if bpi >= 65:
+        badge = "STRONG DEMAND"
+    elif bpi >= 45:
+        badge = "STABLE DEMAND"
+    elif bpi >= 30:
+        badge = "WEAKENING DEMAND"
+    else:
+        badge = "DEMAND CONTRACTION"
+
+    lines.append(f"**Demand Environment:** {badge}")
+    lines.append("")
+
+    lines.append("| Indicator | Value |")
+    lines.append("|-----------|-------|")
+    lines.append(f"| Buying Power Index | **{bpi:.0f}** / 100 |")
+    lines.append(f"| Sector Demand Momentum | {momentum:+.3f} |")
+    lines.append(f"| Consumer Confidence Trend | {trend.title()} |")
+    lines.append(f"| Demand Risk Flag | {'YES' if demand_risk else 'No'} |")
+    if inflation_drag is not None:
+        lines.append(f"| Inflation Drag | {inflation_drag:.2f} |")
+    if real_growth is not None:
+        lines.append(f"| Real Revenue Growth (PPP) | {real_growth:+.1%} |")
+    lines.append("")
+
+    if demand_risk:
+        lines.append(
+            "> **Warning:** Consumer spending momentum is declining in this "
+            "company's primary markets. Revenue growth may face headwinds "
+            "regardless of the company's own execution."
+        )
+    elif bpi >= 60:
+        lines.append(
+            "Consumer spending in this sector's markets is healthy. "
+            "Demand-side conditions support continued revenue growth."
+        )
+
+    return "\n".join(lines)
+
+
+def _build_product_catalysts_section(profile: dict[str, Any]) -> str:
+    """Build Product Catalysts & Forward Signals section (19.10)."""
+    cat = profile.get("product_catalysts", {})
+    if not cat.get("available"):
+        return "*No product catalyst data available.*\n"
+
+    lines: list[str] = []
+    score = cat.get("catalyst_score", 0)
+    ctype = cat.get("catalyst_type", "none")
+    rnd = cat.get("rnd_acceleration", 0)
+    news = cat.get("news_catalyst_score", 0)
+    earnings = cat.get("earnings_momentum", 0)
+    rev_div = cat.get("revenue_diversification_delta", 0)
+    n_articles = cat.get("n_catalyst_articles", 0)
+
+    # Status badge
+    if score >= 0.6:
+        badge = "STRONG CATALYST SIGNALS"
+    elif score >= 0.3:
+        badge = "MODERATE CATALYST SIGNALS"
+    else:
+        badge = "NO SIGNIFICANT CATALYSTS"
+
+    type_labels = {
+        "product_launch": "Product Launch Likely",
+        "rnd_surge": "R&D Surge Detected",
+        "earnings_momentum": "Earnings Momentum",
+        "market_narrative": "Market Narrative Shift",
+        "segment_shift": "Revenue Mix Change",
+        "none": "Steady State",
+    }
+
+    lines.append(f"**Catalyst Status:** {badge}")
+    lines.append(f"**Catalyst Type:** {type_labels.get(ctype, ctype)}")
+    lines.append("")
+
+    lines.append("| Signal | Value | Interpretation |")
+    lines.append("|--------|-------|----------------|")
+    lines.append(f"| Composite Score | **{score:.2f}** | {'Active' if score > 0.3 else 'Quiet'} |")
+
+    rnd_label = "Accelerating" if rnd > 1.1 else "Stable" if rnd > 0.9 else "Decelerating"
+    lines.append(f"| R&D Acceleration | {rnd:.2f}x avg | {rnd_label} |")
+
+    lines.append(f"| News Catalyst Score | {news:.2f} | {n_articles} catalyst articles |")
+
+    earn_label = "Strong positive" if earnings > 0.5 else "Positive" if earnings > 0 else "Negative" if earnings < -0.5 else "Neutral"
+    lines.append(f"| Earnings Momentum | {earnings:+.2f} | {earn_label} |")
+
+    lines.append(f"| Revenue Diversification | {rev_div:.3f} | {'Shifting' if rev_div > 0.1 else 'Stable'} |")
+    lines.append("")
+
+    if score >= 0.5:
+        lines.append(
+            "> **Forward signal:** The combination of R&D acceleration and "
+            "catalyst news suggests this company may be approaching a "
+            "product cycle inflection point. Historical analogs from similar "
+            "periods have been weighted accordingly in forecasts."
+        )
+
+    return "\n".join(lines)
+
+
 def _build_geopolitical_risk_section(profile: dict[str, Any]) -> str:
     """Build Geopolitical & Conflict Risk section from conflict_risk data."""
     lines: list[str] = []
@@ -2963,6 +3079,8 @@ def _build_fallback_report(
         196: ("19.6. SIX Swiss Exchange Analysis", _build_six_swiss_exchange_section(profile)),
         197: ("19.7. Institutional / Major Holders", _build_institutional_holders_section(profile)),
         198: ("19.8. Institutional Ownership Deep Analysis", _build_institutional_ownership_deep_section(profile)),
+        199: ("19.9. Market Demand & Buying Power", _build_market_buying_power_section(profile)),
+        1995: ("19.10. Product Catalysts & Forward Signals", _build_product_catalysts_section(profile)),
         20: ("20. Risk Factors & Limitations", (
             _build_risk_assessment(profile) + "\n\n### 20.1 LIMITATIONS\n\n" + _build_limitations(profile)
         )),

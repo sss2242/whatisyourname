@@ -2554,10 +2554,31 @@ Non-interactive examples:
                                     pass
                             if not _nested_forecasts[var]:
                                 del _nested_forecasts[var]
+                # Compute regime transition probability for interval widening
+                _conf_trans_prob = None
+                _conf_vol_ratio = None
+                if regime_detector is not None and "regime_label" in cache.columns:
+                    try:
+                        _rl = cache["regime_label"].dropna()
+                        if len(_rl) >= 2:
+                            _current = str(_rl.iloc[-1])
+                            _transitions = sum(
+                                1 for i in range(max(0, len(_rl) - 63), len(_rl) - 1)
+                                if str(_rl.iloc[i]) != str(_rl.iloc[i + 1])
+                            )
+                            _conf_trans_prob = min(1.0, _transitions / 63.0)
+                        if "return_1d" in cache.columns:
+                            _regime_vols = cache.groupby("regime_label")["return_1d"].std()
+                            if len(_regime_vols) >= 2:
+                                _conf_vol_ratio = float(_regime_vols.max() / max(_regime_vols.min(), 1e-8))
+                    except Exception:
+                        pass
                 conformal_result = build_conformal_result(
                     calibrator,
                     forecasts=_nested_forecasts,
                     horizons={"1d": 1, "5d": 5, "21d": 21, "252d": 252},
+                    regime_transition_prob=_conf_trans_prob,
+                    regime_vol_ratio=_conf_vol_ratio,
                 )
                 logger.info("Conformal prediction intervals computed")
         except Exception as exc:
@@ -2571,9 +2592,15 @@ Non-interactive examples:
                 _dtw_vars = [c for c in ["equity_value", "revenue", "net_income",
                              "total_debt", "operating_cash_flow"]
                              if c in cache.columns and cache[c].notna().sum() > 30]
+            _dtw_catalyst = (
+                catalyst_result.catalyst_score
+                if catalyst_result is not None and catalyst_result.available
+                else None
+            )
             dtw_result = find_historical_analogs(
                 cache, variables=_dtw_vars,
                 linked_caches=linked_caches if linked_caches else None,
+                catalyst_score=_dtw_catalyst,
             )
             logger.info("DTW analogs complete")
         except Exception as exc:
