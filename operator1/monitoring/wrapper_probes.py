@@ -10,6 +10,9 @@ requirements:
 - **Session probe**: validate session cookie lifecycle (JSESSIONID pattern)
 - **Schema probe**: detect API response structure changes vs baseline
 - **Referer probe**: detect Referer-gated APIs (BSE India pattern)
+- **Token probe**: validate Bearer token acquisition (BMV/WSO2 pattern)
+- **Content validation**: detect WAF challenge pages, CAPTCHAs, error bodies
+- **Date window probe**: detect date range restriction changes (HKEX pattern)
 
 Each market gets probes matching its actual wrapper implementation pattern.
 
@@ -23,9 +26,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import socket
 import ssl
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +40,19 @@ logger = logging.getLogger(__name__)
 
 _BASELINE_DIR = Path("config/probe_baselines")
 _PROBE_TIMEOUT = 15  # seconds
+
+# Patterns that indicate a WAF challenge page, CAPTCHA, or error body
+# in an otherwise 200 OK response.
+_REJECT_PATTERNS: list[re.Pattern] = [
+    re.compile(r"<title>\s*(Access Denied|Attention Required|Just a moment)", re.I),
+    re.compile(r"cf-browser-verification|cf-challenge-running", re.I),
+    re.compile(r"akamai.*ghost|akamaized\.net", re.I),
+    re.compile(r"hCaptcha|recaptcha|g-recaptcha", re.I),
+    re.compile(r"<noscript>.*enable JavaScript", re.I | re.S),
+    re.compile(r'"error"\s*:\s*"(rate.limit|unauthorized|forbidden)"', re.I),
+    re.compile(r"This API has been deprecated", re.I),
+    re.compile(r"Service Unavailable|Under Maintenance", re.I),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +406,269 @@ def _compare_schemas(baseline: dict, current: dict) -> list[str]:
     return diffs
 
 
+def _probe_token(
+    page_url: str,
+    token_url: str,
+    api_url: str,
+    api_method: str = "POST",
+    api_json: dict | None = None,
+    token_json_path: str = "response.access_token",
+    label: str = "token_lifecycle",
+) -> ProbeStepResult:
+    """Token acquisition lifecycle probe (BMV/WSO2 Pattern 3).
+
+    Tests: session init -> GET token -> authenticated API call.
+    """
+    result = ProbeStepResult(step_name=label, method="token")
+    t0 = time.time()
+    try:
+        import requests
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        })
+
+        # Step 1: Session bootstrap (cookies)
+        r1 = session.get(page_url, timeout=_PROBE_TIMEOUT)
+        if r1.status_code not in (200, 301, 302):
+            result.error = f"Session init failed: HTTP {r1.status_code}"
+            result.latency_ms = int((time.time() - t0) * 1000)
+            return result
+
+        # Step 2: Token acquisition
+        r2 = session.get(token_url, headers={
+            "Referer": page_url,
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }, timeout=_PROBE_TIMEOUT)
+
+        if r2.status_code != 200:
+            result.error = f"Token endpoint returned HTTP {r2.status_code}"
+            result.latency_ms = int((time.time() - t0) * 1000)
+            return result
+
+        # Extract token from nested JSON path
+        token_data = r2.json()
+        token = token_data
+        for key in token_json_path.split("."):
+            if isinstance(token, dict):
+                token = token.get(key)
+            else:
+                token = None
+                break
+
+        if not token or not isinstance(token, str):
+            result.error = f"Token not found at path '{token_json_path}'"
+            result.latency_ms = int((time.time() - t0) * 1000)
+            return result
+
+        # Step 3: Authenticated API call
+        auth_headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Referer": page_url,
+        }
+        if api_method.upper() == "POST":
+            r3 = session.post(api_url, json=api_json or {}, headers=auth_headers,
+                              timeout=_PROBE_TIMEOUT)
+        else:
+            r3 = session.get(api_url, headers=auth_headers, timeout=_PROBE_TIMEOUT)
+
+        if r3.status_code == 200:
+            result.passed = True
+            result.detail = f"Token lifecycle OK (token={token[:8]}...)"
+        else:
+            result.error = f"Authenticated call failed: HTTP {r3.status_code}"
+
+    except Exception as exc:
+        result.error = f"Token probe failed: {str(exc)[:100]}"
+    result.latency_ms = int((time.time() - t0) * 1000)
+    return result
+
+
+def _probe_content_validation(
+    url: str,
+    headers: dict | None = None,
+    params: dict | None = None,
+    reject_patterns: list[re.Pattern] | None = None,
+    expect_json: bool = False,
+    expect_min_bytes: int = 100,
+    label: str = "content_validation",
+) -> ProbeStepResult:
+    """Validate response body content beyond HTTP status codes.
+
+    Detects WAF challenge pages, CAPTCHAs, deprecation notices, and
+    empty responses that masquerade as 200 OK.
+    """
+    result = ProbeStepResult(step_name=label, method="content")
+    patterns = reject_patterns or _REJECT_PATTERNS
+    t0 = time.time()
+    try:
+        import requests
+        resp = requests.get(url, headers=headers or {}, params=params,
+                            timeout=_PROBE_TIMEOUT, allow_redirects=True)
+        result.latency_ms = int((time.time() - t0) * 1000)
+
+        if resp.status_code != 200:
+            result.error = f"HTTP {resp.status_code}"
+            return result
+
+        body = resp.text
+        body_len = len(resp.content)
+
+        # Check minimum size
+        if body_len < expect_min_bytes:
+            result.error = f"Response too small: {body_len} bytes (min: {expect_min_bytes})"
+            return result
+
+        # Check for reject patterns (WAF, CAPTCHA, errors)
+        for pat in patterns:
+            match = pat.search(body[:5000])  # only scan first 5KB
+            if match:
+                result.error = f"Blocked content detected: {match.group(0)[:60]}"
+                return result
+
+        # Check JSON validity if expected
+        if expect_json:
+            try:
+                data = resp.json()
+                if isinstance(data, dict) and not data:
+                    result.error = "Empty JSON object"
+                    return result
+                if isinstance(data, list) and not data:
+                    result.error = "Empty JSON array"
+                    return result
+            except Exception:
+                result.error = "Expected JSON but got non-JSON response"
+                return result
+
+        result.passed = True
+        result.detail = f"Content OK ({body_len} bytes)"
+
+    except Exception as exc:
+        result.latency_ms = int((time.time() - t0) * 1000)
+        result.error = f"Content validation failed: {str(exc)[:100]}"
+    return result
+
+
+def _probe_date_window(
+    page_url: str,
+    api_url: str,
+    api_headers: dict | None = None,
+    cookie_name: str = "JSESSIONID",
+    param_from: str = "from",
+    param_to: str = "to",
+    base_params: dict | None = None,
+    windows_days: list[int] | None = None,
+    expect_json_key: str = "recordCnt",
+    label: str = "date_window_regression",
+) -> ProbeStepResult:
+    """Date window regression probe (HKEX Pattern 1).
+
+    Tests multiple date window sizes to detect if an API has narrowed
+    its accepted range. Returns the maximum working window size.
+    """
+    result = ProbeStepResult(step_name=label, method="date_window")
+    windows = windows_days or [7, 14, 30, 60]
+    t0 = time.time()
+
+    try:
+        import requests
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        })
+
+        # Session init
+        session.get(page_url, timeout=_PROBE_TIMEOUT)
+
+        hdrs = api_headers or {}
+        working_windows: list[int] = []
+        empty_windows: list[int] = []
+
+        for days in windows:
+            from_date = (date.today() - timedelta(days=days)).strftime("%Y%m%d")
+            to_date = date.today().strftime("%Y%m%d")
+            params = dict(base_params or {})
+            params[param_from] = from_date
+            params[param_to] = to_date
+
+            try:
+                r = session.get(api_url, params=params, headers=hdrs,
+                                timeout=_PROBE_TIMEOUT)
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                        # Check if results were returned
+                        has_data = False
+                        if expect_json_key:
+                            val = data.get(expect_json_key)
+                            if val and (isinstance(val, int) and val > 0
+                                        or isinstance(val, str) and val != "0"):
+                                has_data = True
+                        else:
+                            has_data = bool(data)
+
+                        if has_data:
+                            working_windows.append(days)
+                        else:
+                            empty_windows.append(days)
+                    except Exception:
+                        empty_windows.append(days)
+                else:
+                    empty_windows.append(days)
+            except Exception:
+                empty_windows.append(days)
+
+            time.sleep(0.3)  # rate limiting between window tests
+
+        result.latency_ms = int((time.time() - t0) * 1000)
+
+        if working_windows:
+            max_window = max(working_windows)
+            result.passed = True
+            result.detail = (
+                f"Max working window: {max_window}d "
+                f"(tested: {windows}, working: {working_windows})"
+            )
+            # Detect regression: if 30+ day windows used to work but now don't
+            if 14 in working_windows and 30 not in working_windows and 30 in empty_windows:
+                result.detail += " WARNING: 30d window no longer works (was 14d OK)"
+        else:
+            result.error = f"All date windows empty: {windows}"
+
+    except Exception as exc:
+        result.latency_ms = int((time.time() - t0) * 1000)
+        result.error = f"Date window probe failed: {str(exc)[:100]}"
+    return result
+
+
+def _probe_post(
+    url: str,
+    data: dict | None = None,
+    headers: dict | None = None,
+    expect_status: int = 200,
+    label: str = "http_post",
+) -> ProbeStepResult:
+    """HTTP POST probe for form-based APIs (SEDAR Catalyst pattern)."""
+    result = ProbeStepResult(step_name=label, method="http_post")
+    t0 = time.time()
+    try:
+        import requests
+        resp = requests.post(url, data=data or {}, headers=headers or {},
+                             timeout=_PROBE_TIMEOUT, allow_redirects=True)
+        result.latency_ms = int((time.time() - t0) * 1000)
+        result.detail = f"HTTP {resp.status_code}, {len(resp.content)} bytes"
+        if resp.status_code == expect_status:
+            result.passed = True
+        else:
+            result.error = f"Expected {expect_status}, got {resp.status_code}"
+    except Exception as exc:
+        result.latency_ms = int((time.time() - t0) * 1000)
+        result.error = f"POST failed: {str(exc)[:100]}"
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Per-market probe configurations
 # ---------------------------------------------------------------------------
@@ -528,6 +809,28 @@ def _build_probe_configs() -> dict[str, dict[str, Any]]:
                     "cookie_name": "JSESSIONID",
                     "expect_json_key": "recordCnt",
                 }},
+                # Improvement 8: Date window regression -- detect narrowed ranges
+                {"fn": _probe_date_window, "args": {
+                    "page_url": "https://www1.hkexnews.hk/search/titlesearch.xhtml",
+                    "api_url": "https://www1.hkexnews.hk/search/titleSearchServlet.do",
+                    "api_headers": {
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": "https://www1.hkexnews.hk/search/titlesearch.xhtml",
+                        "Accept": "application/json, text/javascript, */*; q=0.01",
+                    },
+                    "base_params": {
+                        "searchType": "1",
+                        "stockCode": "00700",
+                        "t1code": "50000",
+                        "t2Gcode": "-2",
+                        "t2code": "-2",
+                        "rowRange": "10",
+                    },
+                    "param_from": "from",
+                    "param_to": "to",
+                    "windows_days": [7, 14, 30, 60],
+                    "expect_json_key": "recordCnt",
+                }},
             ],
         },
         "sg_sgx": {
@@ -573,13 +876,29 @@ def _build_probe_configs() -> dict[str, dict[str, Any]]:
             "probes": [
                 {"fn": _probe_dns, "args": {"host": "www.sse.com.cn"}},
                 {"fn": _probe_http, "args": {"url": "http://www.sse.com.cn"}},
+                # akshare/Sina Finance is the actual data source
+                {"fn": _probe_content_validation, "args": {
+                    "url": "https://vip.stock.finance.sina.com.cn/corp/go.php/vFD_FinancialGuideLine/stockid/600519/ctrl/2019/displaytype/4.phtml",
+                    "expect_min_bytes": 500,
+                    "label": "sina_finance_content",
+                }},
             ],
         },
         "ca_sedar": {
-            "pattern": "free_api",
+            "pattern": "session",
             "probes": [
                 {"fn": _probe_dns, "args": {"host": "www.sedarplus.ca"}},
                 {"fn": _probe_http, "args": {"url": "https://www.sedarplus.ca"}},
+                # Catalyst form POST probe (the actual search mechanism)
+                {"fn": _probe_post, "args": {
+                    "url": "https://www.sedarplus.ca/csa-party/records/filter",
+                    "data": {"searchText": "RY", "typeCodes": "documents"},
+                    "headers": {
+                        "Referer": "https://www.sedarplus.ca/",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                    "label": "sedar_catalyst_post",
+                }},
             ],
         },
         "au_asx": {
@@ -597,6 +916,13 @@ def _build_probe_configs() -> dict[str, dict[str, Any]]:
             "probes": [
                 {"fn": _probe_dns, "args": {"host": "www.jse.co.za"}},
                 {"fn": _probe_http, "args": {"url": "https://www.jse.co.za"}},
+                # WCF SOAP endpoint (the actual data source)
+                {"fn": _probe_content_validation, "args": {
+                    "url": "https://clientportal.jse.co.za/api/downloadservice/CustomerRoleService.svc/GetAllIssuers",
+                    "expect_json": True,
+                    "expect_min_bytes": 200,
+                    "label": "jse_wcf_issuers",
+                }},
             ],
         },
         "mx_bmv": {
@@ -604,6 +930,28 @@ def _build_probe_configs() -> dict[str, dict[str, Any]]:
             "probes": [
                 {"fn": _probe_dns, "args": {"host": "www.bmv.com.mx"}},
                 {"fn": _probe_http, "args": {"url": "https://www.bmv.com.mx"}},
+                # Token lifecycle probe (WSO2 Pattern 3)
+                {"fn": _probe_token, "args": {
+                    "page_url": "https://www.bmv.com.mx",
+                    "token_url": "https://www.bmv.com.mx/rest/tokenservice/token",
+                    "api_url": "https://www.bmv.com.mx/api/searchservice/v1",
+                    "api_method": "POST",
+                    "api_json": {
+                        "lang": "en",
+                        "payload": {
+                            "term": "WALMEX",
+                            "searchType": "busquedaClaveCotizacion",
+                        },
+                    },
+                    "token_json_path": "response.access_token",
+                    "label": "bmv_token_lifecycle",
+                }},
+                # XBRL ZIP index schema probe
+                {"fn": _probe_schema, "args": {
+                    "url": "https://www.bmv.com.mx/es/grupos-corporativos/informacion-financiera-702",
+                    "market_id": "mx_bmv",
+                    "headers": {"Accept": "text/html"},
+                }},
             ],
         },
         "ae_dfm": {
@@ -611,6 +959,19 @@ def _build_probe_configs() -> dict[str, dict[str, Any]]:
             "probes": [
                 {"fn": _probe_dns, "args": {"host": "www.dfm.ae"}},
                 {"fn": _probe_http, "args": {"url": "https://www.dfm.ae"}},
+                # DFM api2 stocks endpoint
+                {"fn": _probe_content_validation, "args": {
+                    "url": "https://www.dfm.ae/api2/stocks",
+                    "expect_json": True,
+                    "expect_min_bytes": 200,
+                    "label": "dfm_api2_stocks",
+                }},
+                # eFsah disclosures API
+                {"fn": _probe_content_validation, "args": {
+                    "url": "https://www.dfm.ae/api/efsah/disclosures",
+                    "expect_min_bytes": 100,
+                    "label": "dfm_efsah_api",
+                }},
             ],
         },
         "ch_six": {
@@ -618,6 +979,19 @@ def _build_probe_configs() -> dict[str, dict[str, Any]]:
             "probes": [
                 {"fn": _probe_dns, "args": {"host": "www.six-group.com"}},
                 {"fn": _probe_http, "args": {"url": "https://www.six-group.com"}},
+                # FQS ref.json schema probe (the actual securities directory)
+                {"fn": _probe_schema, "args": {
+                    "url": "https://www.six-group.com/fqs/ref.json?select=ValorId,TradingBaseCurrency,ShortName&where=ValorSymbol%3D%27NESN%27",
+                    "market_id": "ch_six",
+                    "headers": {"Accept": "application/json"},
+                    "json_path": "",
+                }},
+                # Historic CSV probe
+                {"fn": _probe_content_validation, "args": {
+                    "url": "https://www.six-group.com/sheldon/market_data/v1/3886335/historic.csv",
+                    "expect_min_bytes": 200,
+                    "label": "six_historic_csv",
+                }},
             ],
         },
         "nl_esef": {
@@ -734,8 +1108,12 @@ def run_deep_probe(market_id: str) -> WrapperProbeResult:
 
 def run_deep_probes(
     markets: list[str] | None = None,
+    max_workers: int = 8,
 ) -> dict[str, WrapperProbeResult]:
-    """Run deep probes on all (or specified) markets.
+    """Run deep probes on all (or specified) markets in parallel.
+
+    Uses ThreadPoolExecutor to probe markets concurrently (capped at
+    max_workers to avoid flooding APIs).
 
     Returns dict mapping market_id -> WrapperProbeResult.
     """
@@ -743,24 +1121,27 @@ def run_deep_probes(
         markets = list(WRAPPER_PROBES.keys())
 
     results: dict[str, WrapperProbeResult] = {}
-    for market_id in markets:
-        logger.info("Deep probing %s ...", market_id)
+
+    def _probe_one(mid: str) -> tuple[str, WrapperProbeResult]:
         try:
-            results[market_id] = run_deep_probe(market_id)
-            logger.info(
-                "  [%s] %s: %s (%dms, pattern=%s)",
-                "+" if results[market_id].status == "working" else "!",
-                market_id,
-                results[market_id].status,
-                results[market_id].total_latency_ms,
-                results[market_id].pattern,
-            )
+            return mid, run_deep_probe(mid)
         except Exception as exc:
-            results[market_id] = WrapperProbeResult(
-                market_id=market_id,
+            return mid, WrapperProbeResult(
+                market_id=mid,
                 status="down",
                 probe_timestamp=datetime.now(timezone.utc).isoformat(),
             )
-            logger.warning("  Deep probe crashed for %s: %s", market_id, exc)
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(markets))) as executor:
+        futures = {executor.submit(_probe_one, mid): mid for mid in markets}
+        for future in as_completed(futures):
+            mid, result = future.result()
+            results[mid] = result
+            icon = "+" if result.status == "working" else "!"
+            logger.info(
+                "  [%s] %s: %s (%dms, pattern=%s)",
+                icon, mid, result.status,
+                result.total_latency_ms, result.pattern,
+            )
 
     return results
