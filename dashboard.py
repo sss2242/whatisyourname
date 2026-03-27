@@ -289,13 +289,58 @@ def create_splash(on_complete):
 def create_main_layout():
     """Create the main dashboard with browser-style top tab navigation."""
 
-    # Header bar with branding
+    # Header bar with branding + connection indicator
     with ui.header().classes("bg-monokai-card text-white items-center justify-between"):
-        ui.label("OPERATOR 1").classes("text-xl font-bold")
+        with ui.row().classes("items-center gap-3"):
+            ui.label("OPERATOR 1").classes("text-xl font-bold")
+            # Connection status dot (green = online, red = offline)
+            conn_dot = ui.html(
+                '<span id="conn-dot" style="display:inline-block;width:10px;height:10px;'
+                'border-radius:50%;background:#666;margin-left:4px;" title="Checking..."></span>'
+            )
+            conn_label = ui.label("").classes("text-xs text-gray-400")
         with ui.row().classes("items-center gap-4"):
             health_badge = ui.badge("--/25 OK", color="gray").classes("text-xs")
             dark = ui.dark_mode(True)
             ui.button(icon="dark_mode", on_click=dark.toggle).props("flat color=white size=sm")
+
+    # Internet connection check (runs async, updates the dot)
+    async def _check_connection():
+        import socket as _sock
+        online = False
+        latency_ms = 0
+        hosts = [("data.sec.gov", 443), ("api.stlouisfed.org", 443), ("1.1.1.1", 53)]
+        for host, port in hosts:
+            try:
+                import time as _t
+                t0 = _t.time()
+                s = _sock.create_connection((host, port), timeout=3)
+                latency_ms = int((_t.time() - t0) * 1000)
+                s.close()
+                online = True
+                break
+            except Exception:
+                continue
+        if online:
+            conn_dot.set_content(
+                '<span id="conn-dot" style="display:inline-block;width:10px;height:10px;'
+                'border-radius:50%;background:#00b894;box-shadow:0 0 6px #00b89488;" '
+                f'title="Connected ({latency_ms}ms)"></span>'
+            )
+            conn_label.text = f"{latency_ms}ms"
+            conn_label.classes(replace="text-xs monokai-green")
+        else:
+            conn_dot.set_content(
+                '<span id="conn-dot" style="display:inline-block;width:10px;height:10px;'
+                'border-radius:50%;background:#e17055;box-shadow:0 0 6px #e1705588;" '
+                'title="No connection"></span>'
+            )
+            conn_label.text = "offline"
+            conn_label.classes(replace="text-xs monokai-coral")
+
+    # Check connection on load and every 30 seconds
+    ui.timer(0.5, _check_connection, once=True)
+    ui.timer(30.0, _check_connection)
 
     # Load health status into badge
     try:
