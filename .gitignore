@@ -11,4 +11,3 @@ cache/
 
 # Prevent accidental commit of git internals as a regular folder
 git/
-mise.toml
