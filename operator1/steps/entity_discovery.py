@@ -454,9 +454,11 @@ def discover_linked_entities(
     if llm_client is not None:
         sector_hints = f"{target_sector}, country={target_country}"
 
-        # Try 3-call discovery first (produces 25-40 entities vs 10-15)
+        # Use single-call discovery (more reliable with free-tier LLM providers
+        # that have strict rate limits -- 3-call burns through the budget and
+        # all 3 fail, leaving nothing for the fallback either).
         _used_3call = False
-        if hasattr(llm_client, "propose_linked_entities_3call"):
+        if False and hasattr(llm_client, "propose_linked_entities_3call"):
             try:
                 proposals = llm_client.propose_linked_entities_3call(
                     target_profile, sector_hints=sector_hints,
