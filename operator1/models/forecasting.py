@@ -2159,6 +2159,32 @@ class GARCHWrapper(BaseModelWrapper):
             if len(unique_regimes) < 2:
                 return
 
+            # Minimum regime diversity check: merge tiny regimes (< 20 obs)
+            # into the nearest neighbor by sample mean return. This prevents
+            # fitting GARCH on 1-5 observations (e.g., HMM assigns 495 days
+            # to "high_vol" and 1 day to "bull").
+            _MIN_REGIME_OBS = 20
+            regime_sizes = {
+                r: int(np.sum([str(l) == r for l in labels]))
+                for r in unique_regimes
+            }
+            small_regimes = [r for r, n in regime_sizes.items() if n < _MIN_REGIME_OBS]
+            if small_regimes:
+                # Find the largest regime to absorb small ones
+                largest = max(regime_sizes, key=regime_sizes.get)
+                for small_r in small_regimes:
+                    unique_regimes.remove(small_r)
+                    # Remap labels: replace small regime with largest
+                    labels = np.array([largest if str(l) == small_r else l for l in labels])
+                logger.debug(
+                    "GARCH regime merge: %d small regimes absorbed into '%s'",
+                    len(small_regimes), largest,
+                )
+
+            if len(unique_regimes) < 2:
+                # After merging, only 1 effective regime -- skip switching
+                return
+
             # Fit GARCH per regime
             for regime in unique_regimes:
                 mask = np.array([str(l) == regime for l in labels])

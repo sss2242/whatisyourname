@@ -861,6 +861,73 @@ def compute_online_change_scores(
         return None
 
 
+def compute_distribution_drift(
+    cache: pd.DataFrame,
+    variable: str = "return_1d",
+    window: int = 63,
+    reference_window: int = 252,
+) -> pd.Series | None:
+    """Compute Wasserstein distance between recent and reference return distributions.
+
+    A large distance indicates the return process has structurally changed,
+    suggesting GARCH parameters may be stale and a regime shift has occurred.
+
+    Uses ``scipy.stats.wasserstein_distance`` (already installed).
+
+    Parameters
+    ----------
+    cache:
+        Daily cache with the target variable.
+    variable:
+        Column name to measure drift on.
+    window:
+        Rolling window for "recent" distribution (default: 63 ~ 3 months).
+    reference_window:
+        Lookback for the "reference" distribution (default: 252 ~ 1 year).
+
+    Returns
+    -------
+    pd.Series of Wasserstein distances, or None if insufficient data.
+    """
+    if variable not in cache.columns:
+        return None
+    series = cache[variable].dropna()
+    if len(series) < reference_window + window:
+        return None
+
+    try:
+        from scipy.stats import wasserstein_distance
+
+        drift_scores = pd.Series(np.nan, index=cache.index)
+        values = series.values
+        idx = series.index
+
+        for i in range(reference_window, len(values) - window + 1):
+            ref = values[i - reference_window:i]
+            recent = values[i:i + window]
+            if len(ref) > 10 and len(recent) > 10:
+                drift_scores.loc[idx[i + window - 1]] = wasserstein_distance(ref, recent)
+
+        # Normalize to [0, 1] by dividing by the max observed distance
+        max_drift = drift_scores.max()
+        if max_drift > 0:
+            drift_scores = drift_scores / max_drift
+
+        logger.debug(
+            "Distribution drift: %d scores, max=%.3f, mean=%.3f",
+            drift_scores.notna().sum(),
+            drift_scores.max() if drift_scores.notna().any() else 0,
+            drift_scores.mean() if drift_scores.notna().any() else 0,
+        )
+        return drift_scores
+    except ImportError:
+        logger.debug("scipy not available for Wasserstein distance")
+        return None
+    except Exception as exc:
+        logger.debug("Distribution drift computation failed: %s", exc)
+        return None
+
+
 def run_early_regime_detection(
     cache: pd.DataFrame,
     *,
@@ -946,6 +1013,22 @@ def run_early_regime_detection(
 
         early.fitted = True
         logger.info("Early regime detection complete for enriched survival timeline")
+
+        # Compute Wasserstein distribution drift (non-parametric regime shift signal)
+        try:
+            _drift = compute_distribution_drift(cache, variable=target_variable)
+            if _drift is not None and _drift.notna().any():
+                cache["wasserstein_drift"] = _drift
+                # Flag significant drift (top 10% of observed distances)
+                _threshold = _drift.quantile(0.90)
+                cache["distribution_shift_flag"] = (_drift > _threshold).astype(int)
+                logger.info(
+                    "Wasserstein drift: mean=%.3f, max=%.3f, %d shift days flagged",
+                    _drift.mean(), _drift.max(),
+                    cache["distribution_shift_flag"].sum(),
+                )
+        except Exception as _exc:
+            logger.debug("Wasserstein drift skipped: %s", _exc)
 
     except Exception as exc:
         early.error = f"Early regime detection failed: {exc}"

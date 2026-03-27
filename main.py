@@ -1138,8 +1138,43 @@ Non-interactive examples:
     # ------------------------------------------------------------------
     estimation_coverage = None
     try:
-        logger.info("")
-        logger.info("Step 4b: Running estimation (Sudoku inference)...")
+    # ------------------------------------------------------------------
+    # Step 4a.6: Lightweight pre-estimation ratio computation
+    # Compute basic financial ratios from raw statement data BEFORE
+    # estimation, so the estimator can use them as features and the FH
+    # calibration (interest_coverage > 10, cash > debt) sees non-NaN values.
+    # ------------------------------------------------------------------
+    try:
+        from operator1.constants import EPSILON as _EPS
+        _pre_ratios = {
+            "current_ratio": ("current_assets", "current_liabilities"),
+            "interest_coverage": ("ebit", "interest_expense"),
+            "cash_ratio": ("cash_and_equivalents", "current_liabilities"),
+            "gross_margin": ("gross_profit", "revenue"),
+            "net_margin": ("net_income", "revenue"),
+            "operating_margin": ("operating_income", "revenue"),
+            "debt_to_equity_abs": ("total_debt", "total_equity"),
+        }
+        _n_pre = 0
+        for ratio_name, (num_col, den_col) in _pre_ratios.items():
+            if (ratio_name not in cache.columns
+                    and num_col in cache.columns
+                    and den_col in cache.columns):
+                _num = cache[num_col].astype(float)
+                _den = cache[den_col].astype(float)
+                _safe_den = _den.where(_den.abs() > _EPS)
+                cache[ratio_name] = _num / _safe_den
+                _n_pre += 1
+        if _n_pre > 0:
+            logger.info("Pre-estimation ratios computed: %d ratios", _n_pre)
+    except Exception as exc:
+        logger.debug("Pre-estimation ratio computation skipped: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 4b: Estimation
+    # ------------------------------------------------------------------
+    logger.info("")
+    logger.info("Step 4b: Running estimation (Sudoku inference)...")
 
         from operator1.estimation.estimator import run_estimation
         from operator1.config_loader import load_config
@@ -2191,8 +2226,12 @@ Non-interactive examples:
             if (c.startswith("fh_") or c.startswith("sentiment_")
                 or c.startswith("peer_") or c.startswith("macro_")
                 or c.startswith("inst_")
+                or c.startswith("buying_power_") or c.startswith("catalyst_")
+                or c.startswith("conflict_") or c.startswith("demand_")
                 or c in ("survival_intensity", "regime_confidence",
-                         "regime_transition_prob", "stability_score_21d")
+                         "regime_transition_prob", "stability_score_21d",
+                         "buying_power_index", "sector_demand_momentum",
+                         "catalyst_score", "online_change_score")
                 or any(c.startswith(p) for p in _linked_prefixes))
             and cache[c].dtype in ("float64", "float32", "int64")
             and not c.startswith("is_missing_")
