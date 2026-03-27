@@ -1882,10 +1882,14 @@ Non-interactive examples:
     catalyst_result = None
     try:
         from operator1.features.product_catalysts import detect_product_catalysts
-        # Pass news articles from sentiment step if available
+        # Pass news articles from sentiment step if available.
+        # _sent_result is the SentimentResult dataclass (has .articles list);
+        # sentiment_result is a plain dict for the profile (no .articles).
         _news_articles = []
-        if sentiment_result is not None:
-            _news_articles = getattr(sentiment_result, "articles", [])
+        try:
+            _news_articles = _sent_result.articles if '_sent_result' in dir() else []
+        except (NameError, AttributeError):
+            _news_articles = []
         cache, catalyst_result = detect_product_catalysts(
             cache,
             profile=target_profile,

@@ -1770,6 +1770,31 @@ def run_forecasting(
             }
             result.model_used["volatility_garch"] = "garch"
 
+        # HAR-RV (Corsi 2009): Heterogeneous Autoregressive Realized Volatility.
+        # Uses daily, weekly, and monthly RV as regressors. Captures long-memory
+        # of volatility that single-regime GARCH misses. Often outperforms GARCH
+        # in empirical tests.
+        try:
+            from arch.univariate import HARX  # type: ignore[import-untyped]
+
+            _rv = returns.dropna() ** 2  # daily realized variance proxy
+            if len(_rv) >= 63:
+                har_model = HARX(_rv * 10000, lags=[1, 5, 22])
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    har_res = har_model.fit(disp="off", show_warning=False)
+                har_fcast = har_res.forecast(horizon=max(HORIZONS.values()))
+                if har_fcast is not None and har_fcast.variance is not None:
+                    _har_var = har_fcast.variance.iloc[-1].values / 10000
+                    result.forecasts["volatility_har"] = {
+                        label: float(np.sqrt(max(_har_var[min(h - 1, len(_har_var) - 1)], 0)))
+                        for label, h in HORIZONS.items()
+                    }
+                    result.model_used["volatility_har"] = "har_rv"
+                    logger.debug("HAR-RV volatility forecast computed")
+        except Exception as _har_exc:
+            logger.debug("HAR-RV forecast skipped: %s", _har_exc)
+
     # ------------------------------------------------------------------
     # Per-variable forecasting
     # ------------------------------------------------------------------
