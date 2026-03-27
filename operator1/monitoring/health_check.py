@@ -35,6 +35,7 @@ import logging
 import os
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -276,6 +277,239 @@ def _probe_l3_financials(market_id: str, secrets: dict | None = None) -> ProbeRe
     return result
 
 
+def _probe_l5_holders(market_id: str, secrets: dict | None = None) -> ProbeResult:
+    """L5: Holder data probe -- tests get_holders() for the canary company.
+
+    Holder data sources are the most fragile (scraping, frequently-changing
+    APIs), so this probe detects breakage before pipeline runs hit it.
+    """
+    result = ProbeResult(level="L5")
+    canary = CANARY_COMPANIES.get(market_id)
+    if not canary:
+        result.error = f"No canary company for {market_id}"
+        return result
+
+    try:
+        from operator1.clients.equity_provider import create_pit_client
+        client = create_pit_client(market_id, secrets or {})
+
+        if not hasattr(client, "get_holders"):
+            result.error = "Client does not implement get_holders()"
+            return result
+
+        t0 = time.time()
+        holders = client.get_holders(canary["identifier"])
+        result.latency_ms = int((time.time() - t0) * 1000)
+
+        if holders and len(holders) > 0:
+            result.passed = True
+            top_name = holders[0].get("name", "?")[:30]
+            result.detail = f"Holders: {len(holders)} (top: {top_name})"
+        else:
+            result.error = "get_holders() returned empty list"
+    except Exception as exc:
+        result.error = f"Holders failed: {str(exc)[:200]}"
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# OHLCV provider health probes (Improvement 5)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OHLCVProbeResult:
+    """Health status for a single OHLCV provider."""
+    provider: str = ""
+    status: str = "unknown"  # healthy, broken
+    latency_ms: int = 0
+    rows: int = 0
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+OHLCV_CANARIES: dict[str, dict[str, str]] = {
+    "yfinance": {"symbol": "AAPL", "module": "yfinance"},
+    "baostock": {"symbol": "sh.600519", "module": "baostock"},
+    "pykrx": {"symbol": "005930", "module": "pykrx"},
+    "twstock": {"symbol": "2330", "module": "twstock"},
+}
+
+
+def _probe_ohlcv_yfinance() -> OHLCVProbeResult:
+    result = OHLCVProbeResult(provider="yfinance")
+    try:
+        import yfinance as yf
+        t0 = time.time()
+        df = yf.download("AAPL", period="5d", progress=False, timeout=15)
+        result.latency_ms = int((time.time() - t0) * 1000)
+        if df is not None and not df.empty:
+            result.status = "healthy"
+            result.rows = len(df)
+        else:
+            result.status = "broken"
+            result.error = "Empty DataFrame"
+    except Exception as exc:
+        result.status = "broken"
+        result.error = str(exc)[:150]
+    return result
+
+
+def _probe_ohlcv_baostock() -> OHLCVProbeResult:
+    result = OHLCVProbeResult(provider="baostock")
+    try:
+        import baostock as bs
+        t0 = time.time()
+        bs.login()
+        rs = bs.query_history_k_data_plus(
+            "sh.600519", "date,open,high,low,close,volume",
+            start_date="2026-03-01", end_date="2026-03-27",
+        )
+        rows = []
+        while rs.error_code == "0" and rs.next():
+            rows.append(rs.get_row_data())
+        bs.logout()
+        result.latency_ms = int((time.time() - t0) * 1000)
+        if rows:
+            result.status = "healthy"
+            result.rows = len(rows)
+        else:
+            result.status = "broken"
+            result.error = f"No rows (error: {rs.error_msg})"
+    except Exception as exc:
+        result.status = "broken"
+        result.error = str(exc)[:150]
+    return result
+
+
+def _probe_ohlcv_pykrx() -> OHLCVProbeResult:
+    result = OHLCVProbeResult(provider="pykrx")
+    try:
+        from pykrx import stock as pykrx_stock
+        from datetime import date, timedelta
+        t0 = time.time()
+        end = date.today().strftime("%Y%m%d")
+        start = (date.today() - timedelta(days=7)).strftime("%Y%m%d")
+        df = pykrx_stock.get_market_ohlcv_by_date(start, end, "005930")
+        result.latency_ms = int((time.time() - t0) * 1000)
+        if df is not None and not df.empty:
+            result.status = "healthy"
+            result.rows = len(df)
+        else:
+            result.status = "broken"
+            result.error = "Empty DataFrame"
+    except Exception as exc:
+        result.status = "broken"
+        result.error = str(exc)[:150]
+    return result
+
+
+def _probe_ohlcv_twstock() -> OHLCVProbeResult:
+    result = OHLCVProbeResult(provider="twstock")
+    try:
+        import twstock
+        t0 = time.time()
+        stock = twstock.Stock("2330")
+        # Fetch recent data
+        if stock.price and len(stock.price) > 0:
+            result.status = "healthy"
+            result.rows = len(stock.price)
+        else:
+            result.status = "broken"
+            result.error = "No price data"
+        result.latency_ms = int((time.time() - t0) * 1000)
+    except Exception as exc:
+        result.status = "broken"
+        result.error = str(exc)[:150]
+    return result
+
+
+def run_ohlcv_probes() -> dict[str, OHLCVProbeResult]:
+    """Probe all OHLCV providers in parallel.
+
+    Returns dict mapping provider name -> OHLCVProbeResult.
+    """
+    probes = {
+        "yfinance": _probe_ohlcv_yfinance,
+        "baostock": _probe_ohlcv_baostock,
+        "pykrx": _probe_ohlcv_pykrx,
+        "twstock": _probe_ohlcv_twstock,
+    }
+    results: dict[str, OHLCVProbeResult] = {}
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(fn): name for name, fn in probes.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as exc:
+                results[name] = OHLCVProbeResult(
+                    provider=name, status="broken", error=str(exc)[:150],
+                )
+            logger.info(
+                "  OHLCV %s: %s (%dms, %d rows)",
+                name, results[name].status,
+                results[name].latency_ms, results[name].rows,
+            )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Latency degradation detection (Improvement 7)
+# ---------------------------------------------------------------------------
+
+def detect_latency_degradation(
+    market_id: str,
+    threshold_multiplier: float = 2.0,
+    min_history: int = 5,
+) -> tuple[bool, str]:
+    """Check if a market's latency has degraded significantly.
+
+    Reads the JSONL history file and compares recent latency to the
+    historical median. Alerts when p95 exceeds threshold_multiplier * median.
+
+    Returns (is_degraded, message).
+    """
+    if not _HISTORY_FILE.exists():
+        return False, "No history data"
+
+    latencies: list[int] = []
+    try:
+        with open(_HISTORY_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                market_data = entry.get("markets", {}).get(market_id)
+                if market_data and isinstance(market_data, dict):
+                    ms = market_data.get("latency_ms", 0)
+                    if ms > 0:
+                        latencies.append(ms)
+    except Exception:
+        return False, "Failed to read history"
+
+    if len(latencies) < min_history:
+        return False, f"Insufficient history ({len(latencies)}/{min_history})"
+
+    import statistics
+    median = statistics.median(latencies)
+    recent = latencies[-3:]  # last 3 checks
+    recent_avg = sum(recent) / len(recent)
+
+    if median > 0 and recent_avg > median * threshold_multiplier:
+        return True, (
+            f"Latency degradation: recent avg {recent_avg:.0f}ms "
+            f"vs historical median {median:.0f}ms "
+            f"({recent_avg / median:.1f}x)"
+        )
+    return False, f"Latency normal: {recent_avg:.0f}ms (median: {median:.0f}ms)"
+
+
 # ---------------------------------------------------------------------------
 # Market health assessment
 # ---------------------------------------------------------------------------
@@ -309,7 +543,7 @@ def check_market_health(
     if previous:
         health.consecutive_failures = previous.consecutive_failures
 
-    levels = ["L0", "L1", "L2", "L3"]
+    levels = ["L0", "L1", "L2", "L3", "L5"]
     target_idx = levels.index(max_level) if max_level in levels else 3
 
     probes: list[ProbeResult] = []
@@ -324,6 +558,8 @@ def check_market_health(
             probe = _probe_l2_profile(market_id, secrets)
         elif level == "L3":
             probe = _probe_l3_financials(market_id, secrets)
+        elif level == "L5":
+            probe = _probe_l5_holders(market_id, secrets)
         else:
             continue
 
@@ -419,40 +655,45 @@ def run_health_check(
         total_markets=len(markets),
     )
 
-    for market_id in markets:
-        logger.info("Checking %s ...", market_id)
+    # Parallel market probing (Improvement 1)
+    def _check_one(mid: str) -> tuple[str, MarketHealth]:
         try:
-            health = check_market_health(
-                market_id,
+            return mid, check_market_health(
+                mid,
                 secrets=secrets,
                 max_level=max_level,
-                previous=previous_states.get(market_id),
+                previous=previous_states.get(mid),
             )
         except Exception as exc:
-            health = MarketHealth(
-                market_id=market_id,
+            return mid, MarketHealth(
+                market_id=mid,
                 status="critical",
                 degraded_reason=f"Health check crashed: {exc}",
             )
 
-        report.markets[market_id] = health
+    max_workers = min(8, len(markets))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_check_one, mid): mid for mid in markets}
+        for future in as_completed(futures):
+            market_id, health = future.result()
+            report.markets[market_id] = health
 
-        # Count statuses
-        if health.status == "healthy":
-            report.healthy += 1
-        elif health.status == "degraded":
-            report.degraded += 1
-        elif health.status == "critical":
-            report.critical += 1
-        else:
-            report.unknown += 1
+            # Count statuses
+            if health.status == "healthy":
+                report.healthy += 1
+            elif health.status == "degraded":
+                report.degraded += 1
+            elif health.status == "critical":
+                report.critical += 1
+            else:
+                report.unknown += 1
 
-        # Log result
-        icon = {"healthy": "+", "degraded": "~", "critical": "!", "unknown": "?"}.get(health.status, "?")
-        logger.info(
-            "  [%s] %s: %s (level=%s, latency=%dms)",
-            icon, market_id, health.status, health.level_passed, health.latency_ms,
-        )
+            # Log result
+            icon = {"healthy": "+", "degraded": "~", "critical": "!", "unknown": "?"}.get(health.status, "?")
+            logger.info(
+                "  [%s] %s: %s (level=%s, latency=%dms)",
+                icon, market_id, health.status, health.level_passed, health.latency_ms,
+            )
 
     # Run deep probes (L4: per-wrapper pattern-specific probes)
     try:
@@ -478,6 +719,38 @@ def run_health_check(
         logger.info("Deep probes complete: %d markets probed", len(deep_results))
     except Exception as exc:
         logger.warning("Deep probes failed (non-fatal): %s", exc)
+
+    # Run OHLCV provider probes (Improvement 5)
+    try:
+        ohlcv_results = run_ohlcv_probes()
+        ohlcv_healthy = sum(1 for r in ohlcv_results.values() if r.status == "healthy")
+        ohlcv_total = len(ohlcv_results)
+        logger.info(
+            "OHLCV providers: %d/%d healthy",
+            ohlcv_healthy, ohlcv_total,
+        )
+        # Store in report for persistence
+        report._ohlcv_sources = {  # type: ignore[attr-defined]
+            name: r.to_dict() for name, r in ohlcv_results.items()
+        }
+    except Exception as exc:
+        logger.warning("OHLCV probes failed (non-fatal): %s", exc)
+
+    # Latency degradation detection (Improvement 7)
+    for market_id in markets:
+        try:
+            is_degraded, msg = detect_latency_degradation(market_id)
+            if is_degraded:
+                logger.warning("LATENCY ALERT: %s -- %s", market_id, msg)
+                if market_id in report.markets:
+                    mh = report.markets[market_id]
+                    if mh.status == "healthy":
+                        mh.status = "degraded"
+                        mh.degraded_reason = msg
+                        report.healthy -= 1
+                        report.degraded += 1
+        except Exception:
+            pass
 
     # Detect status changes and alert
     _detect_and_alert(report, previous_report)
@@ -527,7 +800,11 @@ def load_health_report() -> HealthReport | None:
 
 
 def _append_history(report: HealthReport) -> None:
-    """Append a summary line to the health history log."""
+    """Append a summary line to the health history log.
+
+    Includes per-market latency for latency degradation detection
+    (Improvement 7).
+    """
     _HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "timestamp": report.last_check,
@@ -535,9 +812,14 @@ def _append_history(report: HealthReport) -> None:
         "degraded": report.degraded,
         "critical": report.critical,
         "markets": {
-            mid: mh.status for mid, mh in report.markets.items()
+            mid: {"status": mh.status, "latency_ms": mh.latency_ms}
+            for mid, mh in report.markets.items()
         },
     }
+    # Include OHLCV source status if available
+    ohlcv = getattr(report, "_ohlcv_sources", None)
+    if ohlcv:
+        entry["ohlcv_sources"] = ohlcv
     with open(_HISTORY_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, default=str) + "\n")
 
@@ -748,9 +1030,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--level",
-        choices=["L0", "L1", "L2", "L3"],
+        choices=["L0", "L1", "L2", "L3", "L5"],
         default="L3",
-        help="Maximum probe level (default: L3)",
+        help="Maximum probe level (default: L3, L5 includes holder data)",
     )
     parser.add_argument(
         "--json",

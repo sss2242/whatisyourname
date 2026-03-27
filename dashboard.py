@@ -217,7 +217,7 @@ def get_llm_providers(keys: dict) -> list[dict]:
 
 def create_splash(on_complete):
     """Create splash screen with dependency loading bar."""
-    with ui.column().classes("w-full h-screen items-center justify-center bg-gray-900"):
+    with ui.column().classes("w-full h-screen items-center justify-center bg-monokai-base"):
         ui.label("OPERATOR 1").classes("text-4xl font-bold text-white mb-2")
         ui.label("Point-in-Time Financial Analysis").classes("text-lg text-gray-400 mb-1")
         ui.label("25 markets | $95T+ coverage | 25+ models").classes("text-sm text-gray-500 mb-8")
@@ -247,7 +247,7 @@ def create_splash(on_complete):
 
         # Each stage
         for stage_name, packages in DEPENDENCY_STAGES.items():
-            stage_labels[stage_name].classes(replace="text-sm text-blue-400")
+            stage_labels[stage_name].classes(replace="text-sm monokai-purple")
             for import_name, pip_name in packages:
                 progress_label.text = f"Loading {pip_name}..."
                 try:
@@ -294,7 +294,7 @@ def create_main_layout():
     content_area = None
 
     # Header
-    with ui.header().classes("bg-gray-900 text-white items-center justify-between"):
+    with ui.header().classes("bg-monokai-card text-white items-center justify-between"):
         ui.label("OPERATOR 1").classes("text-xl font-bold")
         with ui.row().classes("items-center gap-4"):
             # Health indicator
@@ -317,7 +317,7 @@ def create_main_layout():
     # Sidebar + Content
     with ui.row().classes("w-full h-full no-wrap"):
         # Sidebar
-        with ui.column().classes("w-48 bg-gray-800 p-4 gap-2 min-h-screen"):
+        with ui.column().classes("w-48 bg-monokai-surface p-4 gap-2 min-h-screen"):
             def nav(page: str, icon: str, label: str):
                 def click():
                     current_page["value"] = page
@@ -387,6 +387,74 @@ def render_home():
                       "", "shield")
                 _card("Regime", survival.get("survival_regime", "unknown"), "", "timeline")
 
+            # Extended models summary
+            ext = profile.get("extended_models", {})
+            if ext:
+                available_count = sum(
+                    1 for v in ext.values()
+                    if isinstance(v, dict) and v.get("available")
+                )
+                ui.separator()
+                ui.label("Advanced Model Results").classes("text-lg font-bold mt-4")
+                ui.label(
+                    f"{available_count} of {len(ext)} models produced results"
+                ).classes("monokai-muted text-sm")
+
+                _model_labels = {
+                    "transfer_entropy": "Transfer Entropy",
+                    "cycle_decomposition": "Cycle Decomposition",
+                    "candlestick_patterns": "Candlestick Patterns",
+                    "copula": "Copula Tail Risk",
+                    "conformal_prediction": "Conformal Intervals",
+                    "dtw_analogs": "DTW Analogs",
+                    "shap_explanations": "SHAP Explainability",
+                    "sobol_sensitivity": "Sobol Sensitivity",
+                    "particle_filter": "Particle Filter",
+                    "transformer": "Transformer NN",
+                    "granger_causality": "Granger Causality",
+                    "dual_regimes": "Dual Regimes",
+                    "walk_forward": "Walk-Forward",
+                    "burnout": "Burn-Out Calibration",
+                    "genetic_optimizer": "Genetic Optimizer",
+                    "time_varying_granger": "Time-Varying Granger",
+                    "multivariate_monte_carlo": "Multivariate MC",
+                }
+                columns = [
+                    {"name": "model", "label": "Model", "field": "model"},
+                    {"name": "status", "label": "Status", "field": "status"},
+                    {"name": "detail", "label": "Key Result", "field": "detail"},
+                ]
+                rows = []
+                for key in sorted(ext.keys()):
+                    data = ext[key]
+                    if not isinstance(data, dict):
+                        continue
+                    avail = data.get("available", False)
+                    label = _model_labels.get(key, key.replace("_", " ").title())
+                    detail = ""
+                    if key == "walk_forward" and avail:
+                        detail = f"Best: {data.get('overall_best_model', '?')}"
+                    elif key == "burnout" and avail:
+                        detail = "Converged" if data.get("converged") else "Running"
+                    elif key == "candlestick_patterns" and avail:
+                        detail = f"{data.get('n_patterns', 0)} patterns"
+                    elif key == "time_varying_granger" and avail:
+                        detail = f"{len(data.get('emerging_pairs', []))} emerging"
+                    elif key == "multivariate_monte_carlo" and avail:
+                        sp = data.get("survival_probability")
+                        detail = f"Surv: {sp:.1%}" if sp else ""
+                    elif key == "granger_causality" and avail:
+                        detail = f"{data.get('n_significant_pairs', 0)} causal links"
+                    elif key == "copula" and avail:
+                        detail = f"Best: {data.get('best_copula', '?')}"
+                    rows.append({
+                        "model": label,
+                        "status": "OK" if avail else "--",
+                        "detail": detail,
+                    })
+                if rows:
+                    ui.table(columns=columns, rows=rows).classes("w-full mt-2")
+
             return
         except Exception:
             pass
@@ -399,9 +467,9 @@ def render_home():
 
     with ui.row().classes("gap-4 mt-6"):
         ui.button("Start New Analysis", icon="search",
-                  on_click=lambda: None).classes("bg-blue-600")
+                  on_click=lambda: None).classes("bg-monokai-purple")
         ui.button("Configure API Keys", icon="key",
-                  on_click=lambda: None).classes("bg-gray-600")
+                  on_click=lambda: None).classes("bg-monokai-surface")
 
     # History table
     if state.history:
@@ -418,7 +486,7 @@ def render_home():
 def _card(title: str, value: str, subtitle: str, icon: str):
     with ui.card().classes("p-4 min-w-48"):
         with ui.row().classes("items-center gap-2"):
-            ui.icon(icon).classes("text-2xl text-blue-400")
+            ui.icon(icon).classes("text-2xl monokai-purple")
             ui.label(title).classes("text-sm text-gray-400")
         ui.label(value).classes("text-2xl font-bold mt-1")
         if subtitle:
@@ -561,7 +629,7 @@ def render_analyze():
             ui.notify("Pipeline failed", type="negative")
 
     ui.button("Run Analysis", icon="play_arrow", on_click=run_pipeline).classes(
-        "bg-blue-600 text-white mt-4"
+        "bg-monokai-purple text-white mt-4"
     )
 
 
@@ -735,12 +803,12 @@ def render_report():
                 f"Download PDF ({size_kb:.0f} KB)",
                 icon="picture_as_pdf",
                 on_click=lambda: ui.download(str(pdf_path)),
-            ).classes("bg-red-700 text-white")
+            ).classes("bg-monokai-card text-white")
 
         # Markdown download
         if report_path and report_path.exists():
             ui.button("Download Markdown", icon="description",
-                      on_click=lambda: ui.download(str(report_path))).classes("bg-blue-600 text-white")
+                      on_click=lambda: ui.download(str(report_path))).classes("bg-monokai-purple text-white")
 
         # Interactive dashboard download
         if interactive_path.exists():
@@ -749,7 +817,7 @@ def render_report():
                 f"Download Interactive HTML ({size_kb:.0f} KB)",
                 icon="web",
                 on_click=lambda: ui.download(str(interactive_path)),
-            ).classes("bg-purple-600 text-white")
+            ).classes("bg-monokai-purple text-white")
 
         # Tearsheet download
         if tearsheet_path.exists():
@@ -758,12 +826,12 @@ def render_report():
                 f"Download Tearsheet ({size_kb:.0f} KB)",
                 icon="analytics",
                 on_click=lambda: ui.download(str(tearsheet_path)),
-            ).classes("bg-green-700 text-white")
+            ).classes("bg-monokai-surface text-white")
 
         # JSON profile download
         if profile_path.exists():
             ui.button("Download JSON Profile", icon="data_object",
-                      on_click=lambda: ui.download(str(profile_path))).classes("bg-gray-600 text-white")
+                      on_click=lambda: ui.download(str(profile_path))).classes("bg-monokai-surface text-white")
 
 
 # ---------------------------------------------------------------------------
@@ -794,7 +862,7 @@ def render_health():
             pct = (healthy / total * 100) if total > 0 else 0
             ui.label(f"{pct:.0f}% operational").classes("text-lg font-bold")
             ui.label(f"Last check: {last_check[:16] if len(last_check) > 16 else last_check}").classes("text-sm text-gray-400")
-            ui.button("Run Full Check", icon="refresh", on_click=_run_health_check).classes("bg-blue-600")
+            ui.button("Run Full Check", icon="refresh", on_click=_run_health_check).classes("bg-monokai-purple")
 
         ui.linear_progress(value=healthy / total if total > 0 else 0).classes("mt-2")
 
@@ -994,7 +1062,7 @@ def render_config():
             cache_dir.mkdir()
         ui.notify("Cache cleared", type="positive")
 
-    ui.button("Clear Cache", icon="delete", on_click=clear_cache).classes("bg-red-600 mt-2")
+    ui.button("Clear Cache", icon="delete", on_click=clear_cache).classes("bg-monokai-card mt-2")
 
     ui.separator()
 
@@ -1077,10 +1145,10 @@ def render_candlestick_chart(container=None):
                 "xAxisIndex": 0,
                 "yAxisIndex": 0,
                 "itemStyle": {
-                    "color": "#26a69a",       # up candle
-                    "color0": "#ef5350",      # down candle
-                    "borderColor": "#26a69a",
-                    "borderColor0": "#ef5350",
+                    "color": "#00b894",       # up candle (Proton green)
+                    "color0": "#e17055",      # down candle (Monokai coral)
+                    "borderColor": "#00b894",
+                    "borderColor0": "#e17055",
                 },
             },
             {
@@ -1088,7 +1156,7 @@ def render_candlestick_chart(container=None):
                 "data": volumes,
                 "xAxisIndex": 1,
                 "yAxisIndex": 1,
-                "itemStyle": {"color": "#4fc3f7", "opacity": 0.5},
+                "itemStyle": {"color": "#a29bfe", "opacity": 0.5},
             },
         ],
         "backgroundColor": "transparent",
@@ -1146,7 +1214,7 @@ def render_radar_chart():
                 "areaStyle": {"opacity": 0.3},
                 "lineStyle": {"width": 2},
             }],
-            "itemStyle": {"color": "#42a5f5"},
+            "itemStyle": {"color": "#6c5ce7"},
         }],
         "backgroundColor": "transparent",
     }).classes("w-80 h-80")
@@ -1162,7 +1230,7 @@ def create_status_bar():
     Ported from Textual's Footer widget concept -- always-visible
     status indicators at the bottom of the screen.
     """
-    with ui.footer().classes("bg-gray-900 text-gray-400 text-xs py-1 px-4"):
+    with ui.footer().classes("bg-monokai-card text-gray-400 text-xs py-1 px-4"):
         with ui.row().classes("w-full justify-between items-center"):
             with ui.row().classes("gap-4"):
                 # Python version
@@ -1212,7 +1280,7 @@ def create_command_palette():
     dialog = ui.dialog().props("persistent maximized=false")
 
     with dialog:
-        with ui.card().classes("w-96 bg-gray-800"):
+        with ui.card().classes("w-96 bg-monokai-surface"):
             ui.label("Command Palette").classes("text-sm text-gray-400")
             search_input = ui.input(
                 placeholder="Type a command... (market name, company, action)",
@@ -1238,7 +1306,7 @@ def create_command_palette():
                     for name, icon, action in actions:
                         if query in name.lower():
                             with ui.row().classes("items-center gap-2 p-2 hover:bg-gray-700 cursor-pointer rounded"):
-                                ui.icon(icon).classes("text-blue-400")
+                                ui.icon(icon).classes("monokai-purple")
                                 ui.label(name)
 
                     # Search markets
@@ -1294,11 +1362,11 @@ def render_meter(label: str, value: float, max_val: float = 100,
 
     # Color based on value
     if pct >= 0.7:
-        color = "#26a69a"  # green
+        color = "#00b894"  # Proton green
     elif pct >= 0.4:
-        color = "#ffa726"  # orange
+        color = "#fdcb6e"  # Monokai amber
     else:
-        color = "#ef5350"  # red
+        color = "#e17055"  # Monokai coral
 
     ui.echart({
         "series": [{
@@ -1360,7 +1428,147 @@ def main_page():
         create_splash(on_splash_complete)
 
 
+def _inject_monokai_theme():
+    """Inject Proton.me-inspired Monokai dark theme via CSS overrides.
+
+    Color palette:
+      - Background:     #1a1a2e (deep navy-purple)
+      - Surface:        #16213e (dark slate)
+      - Card:           #0f3460 (muted indigo)
+      - Primary:        #6c5ce7 (Proton purple)
+      - Secondary:      #a29bfe (light purple)
+      - Success/Green:  #00b894 (Proton green)
+      - Warning/Amber:  #fdcb6e (warm amber)
+      - Error/Red:      #e17055 (soft coral)
+      - Text primary:   #dfe6e9 (off-white)
+      - Text secondary: #b2bec3 (muted gray)
+      - Accent:         #e84393 (Monokai pink for highlights)
+    """
+    ui.add_head_html("""
+    <style>
+      /* Proton.me Monokai base */
+      body, .q-page, .q-layout, .nicegui-content {
+        background-color: #1a1a2e !important;
+        color: #dfe6e9 !important;
+      }
+      .q-header {
+        background-color: #0f3460 !important;
+        border-bottom: 1px solid #6c5ce733 !important;
+      }
+      .q-footer {
+        background-color: #0f3460 !important;
+        border-top: 1px solid #6c5ce733 !important;
+        color: #b2bec3 !important;
+      }
+      .q-drawer, .q-drawer__content {
+        background-color: #16213e !important;
+      }
+      .q-card, .q-expansion-item, .q-table {
+        background-color: #16213e !important;
+        color: #dfe6e9 !important;
+        border: 1px solid #6c5ce722 !important;
+        border-radius: 8px !important;
+      }
+      .q-table__container {
+        background-color: #16213e !important;
+      }
+      .q-table thead th {
+        color: #a29bfe !important;
+        border-bottom-color: #6c5ce744 !important;
+      }
+      .q-table tbody td {
+        color: #dfe6e9 !important;
+        border-bottom-color: #6c5ce722 !important;
+      }
+      .q-tab {
+        color: #b2bec3 !important;
+      }
+      .q-tab--active {
+        color: #6c5ce7 !important;
+      }
+      .q-tabs__content .q-tab__indicator {
+        background-color: #6c5ce7 !important;
+      }
+      .q-tab-panel {
+        background-color: #1a1a2e !important;
+      }
+      .q-btn {
+        border-radius: 6px !important;
+      }
+      .q-separator {
+        background-color: #6c5ce733 !important;
+      }
+      .q-badge {
+        border-radius: 4px !important;
+      }
+      .q-linear-progress {
+        border-radius: 4px !important;
+      }
+      .q-linear-progress__track {
+        background-color: #16213e !important;
+      }
+      .q-input .q-field__control, .q-select .q-field__control {
+        background-color: #16213e !important;
+        color: #dfe6e9 !important;
+        border: 1px solid #6c5ce744 !important;
+        border-radius: 6px !important;
+      }
+      .q-input .q-field__label, .q-select .q-field__label {
+        color: #b2bec3 !important;
+      }
+      .q-notification {
+        background-color: #16213e !important;
+        border: 1px solid #6c5ce744 !important;
+        border-radius: 8px !important;
+      }
+      .q-toggle__inner--truthy .q-toggle__track {
+        background-color: #6c5ce7 !important;
+      }
+      /* Scrollbar styling */
+      ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: #1a1a2e;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #6c5ce744;
+        border-radius: 4px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #6c5ce7;
+      }
+      /* ECharts transparent background */
+      .nicegui-echart canvas {
+        background: transparent !important;
+      }
+      /* Log area */
+      .q-log {
+        background-color: #0f3460 !important;
+        color: #00b894 !important;
+        font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
+        border: 1px solid #6c5ce733 !important;
+        border-radius: 8px !important;
+      }
+      /* Custom accent classes */
+      .monokai-purple { color: #6c5ce7 !important; }
+      .monokai-green { color: #00b894 !important; }
+      .monokai-pink { color: #e84393 !important; }
+      .monokai-amber { color: #fdcb6e !important; }
+      .monokai-coral { color: #e17055 !important; }
+      .monokai-light { color: #dfe6e9 !important; }
+      .monokai-muted { color: #b2bec3 !important; }
+      .bg-monokai-surface { background-color: #16213e !important; }
+      .bg-monokai-card { background-color: #0f3460 !important; }
+      .bg-monokai-base { background-color: #1a1a2e !important; }
+      .bg-monokai-purple { background-color: #6c5ce7 !important; }
+    </style>
+    """)
+
+
 if __name__ == "__main__":
+    _inject_monokai_theme()
     ui.run(
         title="Operator 1 -- Financial Analysis",
         dark=True,
