@@ -1134,11 +1134,6 @@ Non-interactive examples:
             logger.warning("SIX proxy module failed: %s", exc)
 
     # ------------------------------------------------------------------
-    # Step 4b: Estimation -- fill missing financials
-    # ------------------------------------------------------------------
-    estimation_coverage = None
-    try:
-    # ------------------------------------------------------------------
     # Step 4a.6: Lightweight pre-estimation ratio computation
     # Compute basic financial ratios from raw statement data BEFORE
     # estimation, so the estimator can use them as features and the FH
@@ -1171,10 +1166,12 @@ Non-interactive examples:
         logger.debug("Pre-estimation ratio computation skipped: %s", exc)
 
     # ------------------------------------------------------------------
-    # Step 4b: Estimation
+    # Step 4b: Estimation -- fill missing financials
     # ------------------------------------------------------------------
-    logger.info("")
-    logger.info("Step 4b: Running estimation (Sudoku inference)...")
+    estimation_coverage = None
+    try:
+        logger.info("")
+        logger.info("Step 4b: Running estimation (Sudoku inference)...")
 
         from operator1.estimation.estimator import run_estimation
         from operator1.config_loader import load_config
@@ -1887,7 +1884,7 @@ Non-interactive examples:
         # sentiment_result is a plain dict for the profile (no .articles).
         _news_articles = []
         try:
-            _news_articles = _sent_result.articles if '_sent_result' in dir() else []
+            _news_articles = _sent_result.articles  # noqa: F821
         except (NameError, AttributeError):
             _news_articles = []
         cache, catalyst_result = detect_product_catalysts(
