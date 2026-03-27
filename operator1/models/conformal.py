@@ -379,6 +379,8 @@ def build_conformal_result(
     calibrator: ConformalCalibrator,
     forecasts: dict[str, dict[str, float]],
     horizons: dict[str, int],
+    regime_transition_prob: float | None = None,
+    regime_vol_ratio: float | None = None,
 ) -> ConformalResult:
     """Build a full ConformalResult across all variables and horizons.
 
@@ -390,6 +392,13 @@ def build_conformal_result(
         ``{variable: {horizon_label: point_forecast}}``.
     horizons:
         ``{horizon_label: days}``.
+    regime_transition_prob:
+        Probability of transitioning out of the current HMM regime.
+        When > 0.3, intervals are widened by the regime volatility ratio
+        to capture regime-change uncertainty.
+    regime_vol_ratio:
+        Ratio of cross-regime volatilities (sigma_worst / sigma_current).
+        Used as the widening multiplier when transition is likely.
 
     Returns
     -------
@@ -400,15 +409,42 @@ def build_conformal_result(
         method="adaptive_conformal" if calibrator._adaptive else "split_conformal",
     )
 
+    # Regime transition widening: when transition probability > 30%,
+    # widen intervals proportionally to cross-regime volatility ratio.
+    # This captures "we might switch regimes" uncertainty.
+    regime_widen_factor = 1.0
+    if (regime_transition_prob is not None
+            and regime_vol_ratio is not None
+            and regime_transition_prob > 0.3):
+        # Linear interpolation: at 30% -> 1.0x, at 70% -> full vol_ratio
+        blend = min(1.0, (regime_transition_prob - 0.3) / 0.4)
+        regime_widen_factor = 1.0 + blend * (min(regime_vol_ratio, 3.0) - 1.0)
+        logger.debug(
+            "Conformal regime widening: trans_prob=%.2f, vol_ratio=%.2f, factor=%.2f",
+            regime_transition_prob, regime_vol_ratio, regime_widen_factor,
+        )
+
     for var, horizon_forecasts in forecasts.items():
         result.intervals[var] = {}
         for h_label, point in horizon_forecasts.items():
             days = horizons.get(h_label, 1)
-            result.intervals[var][h_label] = calibrator.predict_interval(
+            interval = calibrator.predict_interval(
                 variable=var,
                 point_forecast=point,
                 horizon_days=days,
             )
+            # Apply regime widening to the interval
+            if regime_widen_factor > 1.0 and isinstance(interval, dict):
+                center = point
+                lower = interval.get("lower", center)
+                upper = interval.get("upper", center)
+                half_width = (upper - lower) / 2.0
+                widened_half = half_width * regime_widen_factor
+                interval["lower"] = center - widened_half
+                interval["upper"] = center + widened_half
+                interval["regime_widened"] = True
+                interval["regime_widen_factor"] = round(regime_widen_factor, 3)
+            result.intervals[var][h_label] = interval
 
     result.calibration_scores_count = sum(
         len(s) for s in calibrator._scores.values()

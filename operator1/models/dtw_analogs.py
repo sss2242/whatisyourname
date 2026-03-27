@@ -173,6 +173,7 @@ def find_historical_analogs(
     min_gap: int = 10,
     linked_caches: dict[str, pd.DataFrame] | None = None,
     peer_weight: float = 0.7,
+    catalyst_score: float | None = None,
 ) -> DTWAnalogResult:
     """Find the K closest historical analogs to the current state.
 
@@ -292,6 +293,42 @@ def find_historical_analogs(
 
     # Sort by distance (ascending)
     candidates.sort(key=lambda x: x[0])
+
+    # Catalyst-weighted re-ranking: when the current period has a high
+    # catalyst_score, give more weight to historical analogs from periods
+    # that also had high R&D growth or margin shifts (catalyst periods
+    # historically produce larger returns than steady-state periods).
+    if catalyst_score is not None and catalyst_score > 0.3:
+        try:
+            # Compute a proxy catalyst signal for each historical window:
+            # use rolling margin change as a proxy for "something new happening"
+            margin_col = None
+            for mc in ["gross_margin", "operating_margin", "revenue"]:
+                if mc in cache.columns and cache[mc].notna().sum() > 30:
+                    margin_col = mc
+                    break
+            if margin_col is not None:
+                margin_change = cache[margin_col].pct_change(21).fillna(0).abs().values
+                # Re-score candidates: reduce distance for periods with high change
+                reweighted = []
+                for dist, start, end in candidates:
+                    if end < len(margin_change):
+                        period_change = float(np.mean(margin_change[start:end]))
+                        # Catalyst similarity bonus: reduce distance by up to 30%
+                        # when the historical period also had high margin change
+                        similarity_bonus = min(0.3, period_change * 5.0) * catalyst_score
+                        adjusted_dist = dist * (1.0 - similarity_bonus)
+                        reweighted.append((adjusted_dist, start, end))
+                    else:
+                        reweighted.append((dist, start, end))
+                candidates = reweighted
+                candidates.sort(key=lambda x: x[0])
+                logger.debug(
+                    "DTW catalyst reweighting: catalyst_score=%.2f, %d candidates reweighted",
+                    catalyst_score, len(candidates),
+                )
+        except Exception as exc:
+            logger.debug("DTW catalyst reweighting failed: %s", exc)
 
     # Detect method used
     try:
