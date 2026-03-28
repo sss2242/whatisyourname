@@ -2124,6 +2124,23 @@ def run_prediction_aggregation(
                 interval_source = "rmse"
 
             # ----------------------------------------------------------
+            # Phase 2.5: Per-tier confidence multipliers (survival mode).
+            # In survival mode, Tier 4/5 predictions are less reliable.
+            # Widen their intervals to reflect reduced confidence.
+            # Source: The_Apps_core_idea.pdf Section 6.7
+            # ----------------------------------------------------------
+            if survival_adjusted:
+                _TIER_CONFIDENCE = {1: 1.0, 2: 1.0, 3: 0.9, 4: 0.5, 5: 0.3}
+                _var_tier = _get_tier_for_variable(var_name, tier_map) if tier_map else None
+                _tier_num = int(_var_tier.replace("tier", "")) if _var_tier and _var_tier.startswith("tier") else 3
+                _conf_mult = _TIER_CONFIDENCE.get(_tier_num, 1.0)
+                if _conf_mult < 1.0:
+                    mid = point if not math.isnan(point) else (lower + upper) / 2.0
+                    half_width = (upper - lower) / 2.0
+                    lower = mid - half_width / _conf_mult
+                    upper = mid + half_width / _conf_mult
+
+            # ----------------------------------------------------------
             # Phase 3: Copula tail risk widening.
             # ----------------------------------------------------------
             copula_multiplier = compute_copula_tail_adjustment(
