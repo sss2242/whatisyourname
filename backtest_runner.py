@@ -1167,6 +1167,8 @@ def extract_predictions(state: BacktestState) -> dict:
         mc = {}
         if hasattr(state.mc_result, "survival_probability"):
             mc["survival_probability"] = {k: float(v) for k, v in (state.mc_result.survival_probability or {}).items()}
+        if hasattr(state.mc_result, "max_drawdown_distribution") and state.mc_result.max_drawdown_distribution:
+            mc["max_drawdown_distribution"] = state.mc_result.max_drawdown_distribution
         summary["monte_carlo"] = mc
 
     # Prediction aggregator
@@ -1196,12 +1198,24 @@ def extract_predictions(state: BacktestState) -> dict:
 
     # OHLC predictions
     if state.ohlc_result is not None and state.ohlc_result.fitted:
-        summary["ohlc_next_day"] = {
-            "open": getattr(state.ohlc_result, "next_open", None),
-            "high": getattr(state.ohlc_result, "next_high", None),
-            "low": getattr(state.ohlc_result, "next_low", None),
-            "close": getattr(state.ohlc_result, "next_close", None),
-        }
+        nd = getattr(state.ohlc_result, "next_day", None)
+        if nd is not None:
+            summary["ohlc_next_day"] = {
+                "open": getattr(nd, "open", None),
+                "high": getattr(nd, "high", None),
+                "low": getattr(nd, "low", None),
+                "close": getattr(nd, "close", None),
+            }
+        # Also extract week/month/year series summaries
+        for period, attr in [("next_week", "next_week"), ("next_month", "next_month"), ("next_year", "next_year")]:
+            series = getattr(state.ohlc_result, attr, None)
+            if series and len(series) > 0:
+                last_candle = series[-1]
+                summary[f"ohlc_{period}_end"] = {
+                    "close": getattr(last_candle, "close", None),
+                    "high": max((getattr(c, "high", 0) or 0) for c in series),
+                    "low": min((getattr(c, "low", float("inf")) or float("inf")) for c in series),
+                }
 
     return summary
 

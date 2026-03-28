@@ -479,11 +479,11 @@ def compute_news_sentiment(
             logger.warning("Gemini sentiment failed, falling back to keyword: %s", exc)
             scores = []
 
-    if not scores:
-        # Keyword fallback (0 API calls)
+    if not scores or all(s == 0.0 for s in scores):
+        # LLM failed or returned all zeros -- use VADER/keyword fallback
         scores = [_keyword_score(h) for h in headlines]
         result.scoring_method = "keyword"
-        logger.info("Scored %d headlines via keyword fallback", len(scores))
+        logger.info("Scored %d headlines via VADER/keyword fallback", len(scores))
 
     articles["sentiment"] = scores
     result.n_articles_scored = len(scores)

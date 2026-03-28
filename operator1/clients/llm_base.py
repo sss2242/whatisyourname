@@ -415,8 +415,12 @@ class LLMClient(ABC):
     def _parse_json_response(text: str) -> Any:
         """Best-effort extraction of JSON from an LLM response.
 
-        Handles responses that wrap JSON in markdown code fences.
+        Handles responses that wrap JSON in markdown code fences,
+        preamble text before/after JSON, and other common LLM quirks.
+        Uses regex extraction as a fallback when direct parsing fails.
         """
+        import re
+
         cleaned = text.strip()
         # Strip markdown code fences if present
         if cleaned.startswith("```"):
@@ -424,11 +428,39 @@ class LLMClient(ABC):
             # Remove first and last fence lines
             lines = [l for l in lines if not l.strip().startswith("```")]
             cleaned = "\n".join(lines).strip()
+
+        # Attempt 1: Direct JSON parse
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError:
-            logger.warning("Failed to parse LLM JSON response; returning raw text")
-            return None
+            pass
+
+        # Attempt 2: Extract JSON array via regex (handles preamble/postamble)
+        array_match = re.search(r'\[[\s\S]*?\]', cleaned)
+        if array_match:
+            try:
+                return json.loads(array_match.group())
+            except json.JSONDecodeError:
+                pass
+
+        # Attempt 3: Extract JSON object via regex
+        obj_match = re.search(r'\{[\s\S]*?\}', cleaned)
+        if obj_match:
+            try:
+                return json.loads(obj_match.group())
+            except json.JSONDecodeError:
+                pass
+
+        # Attempt 4: Try to extract comma-separated numbers (sentiment scores)
+        numbers = re.findall(r'-?\d+\.?\d*', cleaned)
+        if len(numbers) >= 3:
+            try:
+                return [float(n) for n in numbers]
+            except ValueError:
+                pass
+
+        logger.warning("Failed to parse LLM JSON response; returning None")
+        return None
 
     # ------------------------------------------------------------------
     # Linked entity discovery (Sec 5)
