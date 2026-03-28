@@ -1180,8 +1180,8 @@ def extract_predictions(state: BacktestState) -> dict:
                     key = f"{var}_{h}"
                     agg[key] = {
                         "point_forecast": getattr(hp, "point_forecast", None),
-                        "lower_bound": getattr(hp, "lower_bound", None),
-                        "upper_bound": getattr(hp, "upper_bound", None),
+                        "lower_bound": getattr(hp, "lower_ci", None),
+                        "upper_bound": getattr(hp, "upper_ci", None),
                     }
         summary["aggregated_predictions"] = agg
 

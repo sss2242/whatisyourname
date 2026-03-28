@@ -489,8 +489,10 @@ def compute_news_sentiment(
     result.n_articles_scored = len(scores)
 
     # Store scored articles for downstream modules (e.g., product_catalysts)
+    # Filter out NaN-scored articles so catalysts sees real scores only.
     try:
-        result.articles = articles[["title", "sentiment"]].to_dict("records")
+        valid_articles = articles[articles["sentiment"].notna()]
+        result.articles = valid_articles[["title", "sentiment"]].to_dict("records")
     except Exception:
         result.articles = []
 
