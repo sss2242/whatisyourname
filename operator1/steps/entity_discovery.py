@@ -201,6 +201,73 @@ def _resolve_entity(
 # Fallback: sector peers
 # ---------------------------------------------------------------------------
 
+def _load_static_competitors(
+    target_ticker: str,
+    target_sector: str,
+    target_industry: str,
+) -> list[LinkedEntity]:
+    """Load competitors from static whale_competitors.yml registry.
+
+    Returns LinkedEntity list for the target's sector/industry, excluding
+    the target itself. Zero API calls, zero LLM calls.
+    """
+    try:
+        from operator1.config_loader import load_config
+        registry = load_config("whale_competitors")
+    except (FileNotFoundError, Exception):
+        return []
+
+    # Normalize sector/industry for matching
+    sector_lower = (target_sector or "").lower().replace(" ", "_").replace("&", "and")
+    industry_lower = (target_industry or "").lower().replace(" ", "_").replace("&", "and")
+    ticker_upper = (target_ticker or "").upper()
+
+    candidates: list[LinkedEntity] = []
+
+    for sector_key, industries in registry.items():
+        if not isinstance(industries, dict):
+            continue
+        # Match by sector name (fuzzy)
+        sector_match = any(
+            kw in sector_lower
+            for kw in sector_key.lower().split("_")
+        ) or any(
+            kw in sector_key.lower()
+            for kw in sector_lower.split("_") if len(kw) > 3
+        )
+
+        if not sector_match:
+            continue
+
+        for industry_key, companies in industries.items():
+            if not isinstance(companies, list):
+                continue
+            for comp in companies:
+                if not isinstance(comp, dict):
+                    continue
+                comp_ticker = str(comp.get("ticker", "")).upper()
+                # Skip the target itself
+                if comp_ticker == ticker_upper:
+                    continue
+                candidates.append(LinkedEntity(
+                    isin="",
+                    ticker=comp_ticker,
+                    name=comp.get("name", comp_ticker),
+                    country="",
+                    sector=sector_key,
+                    relationship_group="competitors",
+                    match_score=85,  # high confidence (static registry)
+                    market_cap=None,
+                ))
+
+    if candidates:
+        logger.info(
+            "Static competitor registry: %d competitors loaded for sector '%s'",
+            len(candidates), target_sector,
+        )
+    return candidates[:10]  # cap at 10
+
+
 def _fallback_sector_peers(
     target_isin: str,
     pit_client: EquityProvider,
@@ -549,9 +616,17 @@ def discover_linked_entities(
     competitors = result.linked.get("competitors", [])
     if not competitors:
         logger.warning("No competitors resolved -- triggering peer fallback")
-        peers = _fallback_sector_peers(
-            target_isin, pit_client, target_sector=target_sector,
+        # Try static whale competitor registry first (zero API calls)
+        peers = _load_static_competitors(
+            target_ticker=target_profile.get("ticker", ""),
+            target_sector=target_sector,
+            target_industry=target_profile.get("industry", ""),
         )
+        if not peers:
+            # Fall back to SIC code sector peer search
+            peers = _fallback_sector_peers(
+                target_isin, pit_client, target_sector=target_sector,
+            )
         result.linked["competitors"] = peers
         progress["resolved"]["competitors"] = [
             {

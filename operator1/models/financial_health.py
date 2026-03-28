@@ -1003,6 +1003,62 @@ def compute_financial_health(
     except Exception as exc:
         logger.warning("Beneish M-Score failed: %s", exc)
 
+    # Merton Distance-to-Default (Merton 1974) -- structural credit risk
+    # Models equity as a call option on firm assets. DD measures how many
+    # standard deviations the asset value is above the default point.
+    # DD > 5 = extremely safe, DD < 2 = distress zone.
+    try:
+        _has_mcap = "close" in cache.columns and "shares_outstanding" in cache.columns
+        _has_vol = "volatility_21d" in cache.columns
+        _has_debt = "total_debt" in cache.columns
+        if _has_debt and _has_vol:
+            _total_debt = cache["total_debt"].fillna(0)
+            _equity_vol = cache["volatility_21d"].fillna(0.01) * np.sqrt(252)  # annualize
+            # Estimate market cap: close * shares_outstanding, or use total_equity as proxy
+            if _has_mcap:
+                _mcap = (cache["close"] * cache["shares_outstanding"]).fillna(0)
+            elif "market_cap" in cache.columns:
+                _mcap = cache["market_cap"].fillna(0)
+            elif "total_equity" in cache.columns:
+                _mcap = cache["total_equity"].fillna(0).clip(lower=1)
+            else:
+                _mcap = pd.Series(0, index=cache.index)
+
+            _V = _mcap + _total_debt  # asset value proxy
+            _D = _total_debt.clip(lower=1)  # default point (avoid div by zero)
+            _equity_fraction = (_V - _D) / _V.clip(lower=1)
+            _sigma_V = _equity_vol * _V / (_V - _D).clip(lower=1)  # asset volatility
+            _r = 0.04  # risk-free rate approximation
+            _T = 1.0   # 1-year horizon
+
+            _dd_num = np.log(_V / _D) + (_r - 0.5 * _sigma_V ** 2) * _T
+            _dd_den = _sigma_V * np.sqrt(_T)
+            _dd = _dd_num / _dd_den.clip(lower=0.001)
+            _dd = _dd.clip(-10, 20)  # bound extreme values
+
+            # Probability of default: PD = N(-DD) using standard normal CDF
+            from scipy.stats import norm
+            _pd = norm.cdf(-_dd)
+
+            cache["fh_merton_dd"] = _dd
+            cache["fh_merton_pd"] = _pd
+            result.columns_added.extend(["fh_merton_dd", "fh_merton_pd"])
+
+            # Boost composite for extremely safe companies (DD > 5)
+            _dd_bonus = (_dd - 5.0).clip(lower=0, upper=5) * 2.0  # up to +10 bonus
+            _dd_valid = _dd.notna() & (_total_debt > 0)
+            composite = composite + _dd_bonus * _dd_valid.astype(float)
+            composite = composite.clip(0, 100)
+            cache["fh_composite_score"] = composite
+
+            latest_dd = float(_dd.iloc[-1]) if _dd.notna().any() else float("nan")
+            logger.info(
+                "Merton DD: latest=%.2f, PD=%.6f, DD>5 bonus applied",
+                latest_dd, float(_pd.iloc[-1]) if _pd.notna().any() else 0,
+            )
+    except Exception as exc:
+        logger.warning("Merton Distance-to-Default failed: %s", exc)
+
     # Liquidity Runway -- months of cash survival (strengthens Tier 1)
     try:
         runway_result = compute_liquidity_runway(cache)

@@ -350,6 +350,60 @@ def persist_linked_aggregates(
     if output_path is None:
         output_path = str(Path(CACHE_DIR) / "linked_aggregates_daily.parquet")
 
+
+def compute_relative_metrics(
+    target_cache: pd.DataFrame,
+    linked_agg_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Compute company-relative metrics vs sector/industry aggregates.
+
+    Returns a DataFrame with relative strength, valuation premium, and
+    other company-vs-peer metrics from The_Apps_core_idea.pdf Section 5.1.
+    """
+    result = pd.DataFrame(index=target_cache.index)
+
+    # rel_strength_vs_sector = company return - sector avg return
+    _return_col = None
+    for col in ("return_1d", "return_21d"):
+        if col in target_cache.columns:
+            _return_col = col
+            break
+
+    if _return_col is not None and linked_agg_df is not None:
+        for prefix in ("competitors_avg_", "sector_peers_avg_", "industry_peers_avg_"):
+            peer_col = f"{prefix}{_return_col}"
+            if peer_col in linked_agg_df.columns:
+                result["rel_strength_vs_sector"] = (
+                    target_cache[_return_col] - linked_agg_df[peer_col]
+                )
+                break
+
+    # valuation_premium_vs_industry = company PE - industry median PE
+    if "pe_ratio_calc" in target_cache.columns and linked_agg_df is not None:
+        for prefix in ("competitors_avg_", "industry_peers_avg_", "sector_peers_avg_"):
+            peer_col = f"{prefix}pe_ratio_calc"
+            if peer_col in linked_agg_df.columns:
+                result["valuation_premium_vs_industry"] = (
+                    target_cache["pe_ratio_calc"] - linked_agg_df[peer_col]
+                )
+                break
+
+    # rel_volatility = company vol / sector avg vol
+    if "volatility_21d" in target_cache.columns and linked_agg_df is not None:
+        for prefix in ("competitors_avg_", "sector_peers_avg_"):
+            peer_col = f"{prefix}volatility_21d"
+            if peer_col in linked_agg_df.columns:
+                peer_vol = linked_agg_df[peer_col].replace(0, float("nan"))
+                result["rel_volatility_vs_sector"] = (
+                    target_cache["volatility_21d"] / peer_vol
+                )
+                break
+
+    n_cols = len([c for c in result.columns if result[c].notna().any()])
+    if n_cols > 0:
+        logger.info("Relative metrics computed: %d metrics with data", n_cols)
+    return result
+
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     aggregates.to_parquet(output_path)
     logger.info(

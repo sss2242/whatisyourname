@@ -1022,9 +1022,9 @@ def run_monte_carlo(
 
         result.n_paths_importance = int(n_paths * importance_fraction)
 
-        # Store terminal cumulative return ratios for drawdown distribution.
-        # Generate a lightweight batch of return paths (100 paths) to get
-        # terminal price ratios without the overhead of full simulation.
+        # Store terminal cumulative return ratios AND full-path max drawdowns.
+        # Generate paths to compute both terminal values and realistic
+        # max drawdown distribution (not just terminal approximation).
         try:
             _n_tv = min(n_paths, 500)
             _tv_returns, _ = simulate_return_paths(
@@ -1035,6 +1035,20 @@ def run_monte_carlo(
             # Terminal cumulative return as price ratio (e^sum(log_returns))
             _tv_cum = np.exp(np.sum(_tv_returns, axis=1))
             result.terminal_values[h_label] = _tv_cum
+
+            # Compute TRUE max drawdown from full paths (not approximation)
+            if h_steps >= 5:
+                _cum_returns = np.exp(np.cumsum(_tv_returns, axis=1))  # (n_paths, h_steps)
+                _running_max = np.maximum.accumulate(_cum_returns, axis=1)
+                _drawdowns = (_cum_returns - _running_max) / np.maximum(_running_max, 1e-10)
+                _path_max_dd = np.min(_drawdowns, axis=1)  # worst drawdown per path
+                result.max_drawdown_distribution[h_label] = {
+                    "median": round(float(np.median(_path_max_dd)), 4),
+                    "p10": round(float(np.percentile(_path_max_dd, 10)), 4),
+                    "p90": round(float(np.percentile(_path_max_dd, 90)), 4),
+                    "mean": round(float(np.mean(_path_max_dd)), 4),
+                    "worst": round(float(np.min(_path_max_dd)), 4),
+                }
         except Exception:
             pass  # non-critical
 
@@ -1061,37 +1075,21 @@ def run_monte_carlo(
     result.fitted = True
 
     # ------------------------------------------------------------------
-    # Max drawdown distribution across MC paths (per horizon)
+    # Max drawdown distribution (backfill for short horizons not computed above)
     # ------------------------------------------------------------------
     for h_label, tv in result.terminal_values.items():
-        if tv is not None and len(tv) > 0:
+        if h_label not in result.max_drawdown_distribution and tv is not None and len(tv) > 0:
             try:
-                # terminal_values are cumulative return ratios (path / start)
-                # For max drawdown, we need the full path -- approximate from
-                # terminal values using the worst-case peak-to-trough ratio.
-                # Since we don't store full paths, use: max_dd ~ 1 - min(tv)/max(tv)
-                # For more accurate estimates, compute drawdown from the
-                # terminal distribution assuming geometric Brownian motion.
+                # Fallback for 1d horizon where full-path DD was skipped
                 tv_arr = np.asarray(tv, dtype=float)
-                # Approximate max drawdown from terminal returns:
-                # Use the Magdon-Ismail formula: E[MDD] ~ sqrt(2 * T * sigma^2 / pi)
-                # where sigma is the per-step vol and T is the horizon.
-                h_steps = {"1d": 1, "5d": 5, "21d": 21, "252d": 252}.get(h_label, 21)
                 log_returns = np.log(np.maximum(tv_arr, 1e-10))
-                sigma = float(np.std(log_returns)) / max(np.sqrt(h_steps), 1)
-                # Simulated max drawdowns: each path's worst loss from peak
-                # Approximate: max_dd per path ~ -|min(0, log_return)| scaled
                 path_drawdowns = np.minimum(0, log_returns)
-                # Scale by sqrt(T) for multi-step paths
-                scale = max(np.sqrt(h_steps / 252), 0.1)
-                path_max_dd = path_drawdowns * scale
-                # For terminal-only data, estimate drawdown distribution
                 result.max_drawdown_distribution[h_label] = {
-                    "median": round(float(np.median(path_max_dd)), 4),
-                    "p10": round(float(np.percentile(path_max_dd, 10)), 4),
-                    "p90": round(float(np.percentile(path_max_dd, 90)), 4),
-                    "mean": round(float(np.mean(path_max_dd)), 4),
-                    "worst": round(float(np.min(path_max_dd)), 4),
+                    "median": round(float(np.median(path_drawdowns)), 4),
+                    "p10": round(float(np.percentile(path_drawdowns, 10)), 4),
+                    "p90": round(float(np.percentile(path_drawdowns, 90)), 4),
+                    "mean": round(float(np.mean(path_drawdowns)), 4),
+                    "worst": round(float(np.min(path_drawdowns)), 4),
                 }
             except Exception:
                 pass

@@ -1,0 +1,105 @@
+# Static competitor registry for mega-cap / well-known companies.
+# Used by entity_discovery.py as a fast-path when LLM rate limits
+# or SIC code searches fail. Zero API calls, zero LLM calls.
+#
+# Format: sector -> industry -> list of {ticker, name, market (optional)}
+# If market is omitted, defaults to us_sec_edgar.
+
+technology:
+  hardware:
+    - {ticker: AAPL, name: Apple Inc.}
+    - {ticker: MSFT, name: Microsoft Corporation}
+    - {ticker: GOOGL, name: Alphabet Inc.}
+    - {ticker: "005930", name: Samsung Electronics, market: kr_dart}
+    - {ticker: DELL, name: Dell Technologies}
+    - {ticker: HPQ, name: HP Inc.}
+  software:
+    - {ticker: MSFT, name: Microsoft Corporation}
+    - {ticker: ORCL, name: Oracle Corporation}
+    - {ticker: CRM, name: Salesforce Inc.}
+    - {ticker: ADBE, name: Adobe Inc.}
+    - {ticker: SAP, name: SAP SE, market: de_esef}
+  semiconductors:
+    - {ticker: NVDA, name: NVIDIA Corporation}
+    - {ticker: AMD, name: Advanced Micro Devices}
+    - {ticker: INTC, name: Intel Corporation}
+    - {ticker: TSM, name: Taiwan Semiconductor, market: tw_mops}
+    - {ticker: AVGO, name: Broadcom Inc.}
+    - {ticker: QCOM, name: Qualcomm Inc.}
+  internet:
+    - {ticker: GOOGL, name: Alphabet Inc.}
+    - {ticker: META, name: Meta Platforms Inc.}
+    - {ticker: AMZN, name: Amazon.com Inc.}
+    - {ticker: NFLX, name: Netflix Inc.}
+    - {ticker: "00700", name: Tencent Holdings, market: hk_hkex}
+
+energy:
+  oil_gas:
+    - {ticker: XOM, name: Exxon Mobil Corporation}
+    - {ticker: CVX, name: Chevron Corporation}
+    - {ticker: SHEL, name: Shell plc, market: uk_companies_house}
+    - {ticker: TTE, name: TotalEnergies SE, market: fr_esef}
+    - {ticker: COP, name: ConocoPhillips}
+    - {ticker: PETR4, name: Petrobras, market: br_cvm}
+  renewables:
+    - {ticker: NEE, name: NextEra Energy}
+    - {ticker: ENPH, name: Enphase Energy}
+    - {ticker: FSLR, name: First Solar}
+
+financials:
+  banks:
+    - {ticker: JPM, name: JPMorgan Chase & Co.}
+    - {ticker: BAC, name: Bank of America}
+    - {ticker: WFC, name: Wells Fargo & Company}
+    - {ticker: GS, name: Goldman Sachs Group}
+    - {ticker: MS, name: Morgan Stanley}
+    - {ticker: HSBA, name: HSBC Holdings, market: uk_companies_house}
+  insurance:
+    - {ticker: BRK-B, name: Berkshire Hathaway}
+    - {ticker: AIG, name: American International Group}
+    - {ticker: MET, name: MetLife Inc.}
+
+healthcare:
+  pharma:
+    - {ticker: JNJ, name: Johnson & Johnson}
+    - {ticker: PFE, name: Pfizer Inc.}
+    - {ticker: MRK, name: Merck & Co.}
+    - {ticker: LLY, name: Eli Lilly and Company}
+    - {ticker: NVS, name: Novartis AG, market: ch_six}
+    - {ticker: ROG, name: Roche Holding, market: ch_six}
+  biotech:
+    - {ticker: AMGN, name: Amgen Inc.}
+    - {ticker: GILD, name: Gilead Sciences}
+    - {ticker: REGN, name: Regeneron Pharmaceuticals}
+
+consumer:
+  retail:
+    - {ticker: AMZN, name: Amazon.com Inc.}
+    - {ticker: WMT, name: Walmart Inc.}
+    - {ticker: COST, name: Costco Wholesale}
+    - {ticker: TGT, name: Target Corporation}
+  automotive:
+    - {ticker: TSLA, name: Tesla Inc.}
+    - {ticker: "7203", name: Toyota Motor, market: jp_jquants}
+    - {ticker: GM, name: General Motors}
+    - {ticker: F, name: Ford Motor Company}
+  luxury:
+    - {ticker: MC, name: LVMH, market: fr_esef}
+    - {ticker: RACE, name: Ferrari NV}
+
+industrials:
+  aerospace:
+    - {ticker: BA, name: Boeing Company}
+    - {ticker: LMT, name: Lockheed Martin}
+    - {ticker: RTX, name: RTX Corporation}
+    - {ticker: GE, name: GE Aerospace}
+  conglomerates:
+    - {ticker: HON, name: Honeywell International}
+    - {ticker: MMM, name: 3M Company}
+    - {ticker: SIE, name: Siemens AG, market: de_esef}
+
+telecom:
+  carriers:
+    - {ticker: T, name: AT&T Inc.}
+    - {ticker: VZ, name: Verizon Communications}
+    - {ticker: TMUS, name: T-Mobile US}

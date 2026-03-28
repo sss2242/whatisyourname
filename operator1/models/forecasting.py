@@ -314,6 +314,90 @@ def fit_kalman(
 
 
 # ---------------------------------------------------------------------------
+# 1-regime. Per-Regime Kalman (Section K.2 of core idea)
+# ---------------------------------------------------------------------------
+
+
+def fit_kalman_per_regime(
+    series: np.ndarray,
+    regime_labels: np.ndarray,
+    regime_probs: dict[str, float] | None = None,
+    n_forecast: int = 1,
+    min_regime_obs: int = 30,
+) -> tuple[np.ndarray | None, ModelMetrics]:
+    """Fit separate Kalman filters per regime and blend predictions.
+
+    For each regime with sufficient data, fits a local-level state-space
+    model. The final forecast is a probability-weighted blend:
+    ``pred = sum(P(regime_k) * kalman_k.predict())``
+
+    Source: The_Apps_core_idea.pdf Section K.2 -- per-regime model parameters.
+
+    Falls back to standard ``fit_kalman()`` if regime data is insufficient
+    or only one effective regime exists.
+    """
+    metrics = ModelMetrics(model_name="kalman_per_regime")
+
+    if regime_labels is None or len(regime_labels) != len(series):
+        return fit_kalman(series, n_forecast)
+
+    # Identify regimes with sufficient data
+    unique_regimes = [r for r in np.unique(regime_labels) if not (isinstance(r, float) and np.isnan(r))]
+    regime_data = {}
+    for r in unique_regimes:
+        mask = regime_labels == r
+        regime_series = series[mask]
+        clean = regime_series[~np.isnan(regime_series)]
+        if len(clean) >= min_regime_obs:
+            regime_data[r] = clean
+
+    if len(regime_data) < 2:
+        # Not enough regimes with data -- fall back to standard Kalman
+        return fit_kalman(series, n_forecast)
+
+    # Fit per-regime Kalman models
+    regime_forecasts = {}
+    for regime, r_series in regime_data.items():
+        fcast, met = fit_kalman(r_series, n_forecast)
+        if fcast is not None:
+            regime_forecasts[regime] = fcast
+
+    if not regime_forecasts:
+        return fit_kalman(series, n_forecast)
+
+    # Blend forecasts using regime probabilities
+    if regime_probs is None:
+        # Use frequency-based probabilities
+        total = sum(len(series[regime_labels == r]) for r in regime_forecasts)
+        regime_probs = {
+            r: len(series[regime_labels == r]) / max(total, 1)
+            for r in regime_forecasts
+        }
+
+    blended = np.zeros(n_forecast)
+    total_weight = 0.0
+    for regime, fcast in regime_forecasts.items():
+        prob = regime_probs.get(regime, regime_probs.get(str(regime), 0.0))
+        if prob > 0.01:
+            blended += prob * fcast
+            total_weight += prob
+
+    if total_weight > 0:
+        blended /= total_weight
+    else:
+        return fit_kalman(series, n_forecast)
+
+    metrics.fitted = True
+    metrics.model_name = f"kalman_per_regime({len(regime_forecasts)})"
+    logger.info(
+        "Per-regime Kalman: %d regimes fitted, probs=%s",
+        len(regime_forecasts),
+        {k: f"{v:.2f}" for k, v in regime_probs.items() if k in regime_forecasts},
+    )
+    return blended, metrics
+
+
+# ---------------------------------------------------------------------------
 # 1a. AutoARIMA via statsforecast (100x faster than statsmodels)
 # ---------------------------------------------------------------------------
 
@@ -1812,8 +1896,21 @@ def run_forecasting(
         best_metrics: ModelMetrics | None = None
 
         # --- Kalman (preferred for tier1/tier2) ---
+        # Try per-regime Kalman first (Section K.2), fall back to standard
         if tier in ("tier1", "tier2"):
-            fcast, met = fit_kalman(series, n_forecast=max_horizon)
+            _regime_labels_arr = cache.get("regime_label")
+            if _regime_labels_arr is not None and has_returns:
+                _rl = _regime_labels_arr.values if hasattr(_regime_labels_arr, "values") else _regime_labels_arr
+                # Build regime probability dict from current HMM state
+                _rp = None
+                _prob_cols = [c for c in cache.columns if c.startswith("regime_hmm_prob_")]
+                if _prob_cols and len(cache) > 0:
+                    _last_probs = cache[_prob_cols].iloc[-1]
+                    _regime_map = {0: "bull", 1: "bear", 2: "high_vol", 3: "low_vol"}
+                    _rp = {_regime_map.get(i, str(i)): float(_last_probs.iloc[i]) for i in range(len(_last_probs)) if not np.isnan(_last_probs.iloc[i])}
+                fcast, met = fit_kalman_per_regime(series, _rl, regime_probs=_rp, n_forecast=max_horizon)
+            else:
+                fcast, met = fit_kalman(series, n_forecast=max_horizon)
             met.variable = var_name
             result.metrics.append(met)
             if fcast is not None:
@@ -3324,9 +3421,16 @@ def run_forward_pass(
             # Step C: Simple ensemble (average of available predictions)
             ensemble_pred = float(np.mean(predictions))
 
-            # Step D: Reality check
+            # Step D: Reality check (with observed-vs-estimated weighting)
+            # Source: The_Apps_core_idea.pdf Section J.3 -- penalize
+            # observed values more than estimated ones in the loss.
             error = float(actual_t1[0]) - ensemble_pred
-            weighted_error = (error ** 2) * (tier_weight / 20.0)
+            source_col = f"{var_name}_source"
+            obs_weight = 1.0  # default: treat as observed
+            if source_col in cache.columns:
+                src = cache.iloc[t + 1].get(source_col)
+                obs_weight = 1.0 if src == "observed" else 0.3
+            weighted_error = (error ** 2) * (tier_weight / 20.0) * obs_weight
 
             result.errors_by_tier[tier_num].append(weighted_error)
             if regime_t not in result.errors_by_regime:
@@ -3739,9 +3843,29 @@ def run_burnout(
             result.model_states = forward_pass_result.model_states
         logger.info("Burn-out: using existing forward pass predictions_log (%d entries)", len(predictions_log))
     else:
-        # Run a forward pass on the burn-out window
+        # Run a forward pass on the burn-out window with regime weighting.
+        # Source: The_Apps_core_idea.pdf Section L.1 -- weight historical
+        # days by: w(tau) = exp(-delta_t/half_life) * regime_similarity.
         actual_window = min(burnout_window, len(cache))
         burnout_cache = cache.iloc[-actual_window:].copy()
+
+        # Apply regime-weighted sample importance (exponential decay * regime similarity)
+        if "regime_hmm_prob_0" in burnout_cache.columns:
+            _regime_cols = [c for c in burnout_cache.columns if c.startswith("regime_hmm_prob_")]
+            if _regime_cols:
+                _regime_matrix = burnout_cache[_regime_cols].fillna(0).values
+                _current_regime = _regime_matrix[-1]  # current day's regime probabilities
+                _n = len(burnout_cache)
+                # Exponential recency decay (half-life = 63 trading days)
+                _days_ago = np.arange(_n, 0, -1)
+                _recency = np.exp(-_days_ago / 63.0)
+                # Regime similarity: Gaussian kernel on probability vectors
+                _diff = _regime_matrix - _current_regime
+                _similarity = np.exp(-np.sum(_diff ** 2, axis=1) / 0.5)
+                # Combined weight
+                _sample_weights = _recency * _similarity
+                _sample_weights = _sample_weights / _sample_weights.sum() * _n
+                burnout_cache["_burnout_sample_weight"] = _sample_weights
 
         if len(burnout_cache) < validation_days + 30:
             logger.warning("Insufficient data for burn-out (%d rows)", len(burnout_cache))
