@@ -48,9 +48,9 @@ def _load_dotenv() -> None:
             logger.warning("Failed to parse .env file: %s", exc)
 
 
-# All keys -- pipeline will halt if any are missing.
+# All keys known to the pipeline.
 # Each key maps to a human-readable description for error messages.
-_REQUIRED_KEYS: dict[str, str] = {
+_ALL_KEYS: dict[str, str] = {
     # LLM provider (at least one required for report generation)
     "GEMINI_API_KEY":          "LLM report generation (Google Gemini) -- https://aistudio.google.com/app/apikey",
     "ANTHROPIC_API_KEY":       "LLM report generation (Anthropic Claude) -- https://console.anthropic.com/",
@@ -70,6 +70,38 @@ _REQUIRED_KEYS: dict[str, str] = {
     "openfigi_key":            "OpenFIGI identifier resolution -- https://www.openfigi.com/api",
 }
 
+# Backward compat alias
+_REQUIRED_KEYS = _ALL_KEYS
+
+# Which keys are needed per market region.
+# LLM keys use "any_llm" sentinel -- at least one LLM provider is required.
+_MARKET_KEYS: dict[str, list[str]] = {
+    "us_sec_edgar":       ["EDGAR_IDENTITY", "any_llm"],
+    "uk_companies_house": ["COMPANIES_HOUSE_API_KEY", "any_llm"],
+    "eu_esef":            ["any_llm"],
+    "fr_esef":            ["any_llm"],
+    "de_esef":            ["any_llm"],
+    "jp_jquants":         ["JQUANTS_API_KEY", "any_llm"],
+    "kr_dart":            ["DART_API_KEY", "any_llm"],
+    "tw_mops":            ["any_llm"],
+    "br_cvm":             ["any_llm"],
+    "cl_cmf":             ["any_llm"],
+    "cn_sse":             ["any_llm"],
+    "in_bse":             ["any_llm"],
+    "ca_sedar":           ["any_llm"],
+    "hk_hkex":            ["any_llm"],
+    "sg_sgx":             ["any_llm"],
+    "au_asx":             ["any_llm"],
+    "za_jse":             ["any_llm"],
+    "ae_dfm":             ["any_llm"],
+    "sa_tadawul":         ["any_llm"],
+    "mx_bmv":             ["BANXICO_TOKEN", "any_llm"],
+    "ch_six":             ["any_llm"],
+}
+
+# LLM provider key names (at least one must be present)
+_LLM_KEYS = ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY")
+
 
 def _load_from_kaggle() -> dict[str, str]:
     """Attempt to read secrets via Kaggle UserSecretsClient."""
@@ -77,7 +109,7 @@ def _load_from_kaggle() -> dict[str, str]:
         from kaggle_secrets import UserSecretsClient  # type: ignore[import-untyped]
         client = UserSecretsClient()
         secrets: dict[str, str] = {}
-        for key in _REQUIRED_KEYS:
+        for key in _ALL_KEYS:
             try:
                 value = client.get_secret(key)
                 if value:
@@ -92,7 +124,7 @@ def _load_from_kaggle() -> dict[str, str]:
 def _load_from_env() -> dict[str, str]:
     """Fallback: read from OS environment variables."""
     secrets: dict[str, str] = {}
-    for key in _REQUIRED_KEYS:
+    for key in _ALL_KEYS:
         value = os.environ.get(key)
         if value:
             secrets[key] = value.strip()
@@ -163,24 +195,49 @@ def get_key_pool(secrets: dict[str, str], key_name: str) -> list[str]:
     return [k for k in keys if k and not k.startswith("placeholder")]
 
 
-def validate_secrets(secrets: dict[str, str]) -> None:
-    """Validate that ALL required API keys and identities are present.
+def validate_secrets(secrets: dict[str, str], market_id: str = "") -> None:
+    """Validate that required API keys are present for the chosen market.
+
+    When *market_id* is provided, only keys needed for that specific
+    market region are enforced (plus at least one LLM provider key).
+    When *market_id* is empty, falls back to requiring all keys.
 
     Call this from your entry point (main.py, run.py) after loading
     secrets.  Raises ``SystemExit`` with a clear message listing every
     missing key and where to register for it (all free).
     """
-    missing = [
-        f"  - {key}: {desc}"
-        for key, desc in _REQUIRED_KEYS.items()
-        if not secrets.get(key)
-    ]
+    if market_id and market_id in _MARKET_KEYS:
+        # Market-specific validation: only require what's needed
+        needed = _MARKET_KEYS[market_id]
+        missing = []
+        for key in needed:
+            if key == "any_llm":
+                # At least one LLM provider key must be present
+                has_any = any(secrets.get(k) for k in _LLM_KEYS)
+                if not has_any:
+                    missing.append(
+                        "  - At least one LLM API key (GEMINI_API_KEY, "
+                        "ANTHROPIC_API_KEY, or OPENROUTER_API_KEY)"
+                    )
+            elif not secrets.get(key):
+                desc = _ALL_KEYS.get(key, key)
+                missing.append(f"  - {key}: {desc}")
+    else:
+        # Legacy: require everything
+        missing = [
+            f"  - {key}: {desc}"
+            for key, desc in _ALL_KEYS.items()
+            if not secrets.get(key)
+        ]
+
     if missing:
+        market_hint = f" for market '{market_id}'" if market_id else ""
         raise SystemExit(
-            "Missing required API keys / identities.\n"
-            "Create a .env file from .env.example and fill in ALL values.\n"
+            f"Missing required API keys{market_hint}.\n"
+            "Create a .env file from .env.example and fill in the values.\n"
             "All registrations are FREE.\n\n"
             "Missing keys:\n" + "\n".join(missing) + "\n"
         )
 
-    logger.info("All %d required API keys loaded successfully.", len(_REQUIRED_KEYS))
+    n_loaded = sum(1 for k in _ALL_KEYS if secrets.get(k))
+    logger.info("API keys validated: %d loaded (%s).", n_loaded, market_id or "all")

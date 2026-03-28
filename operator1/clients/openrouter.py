@@ -23,18 +23,13 @@ from operator1.constants import OPENROUTER_BASE_URL
 
 logger = logging.getLogger(__name__)
 
-# Default model: free Nvidia Nemotron via OpenRouter (tested working for extraction)
-_DEFAULT_MODEL = "nvidia/nemotron-nano-9b-v2:free"
+# Default model: free Nemotron 120B via OpenRouter (tested working for structured JSON)
+# Fallback chain: nemotron 120B -> qwen3 80B -> nemotron 9B
+_DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 
 # Registry of known OpenRouter models with capabilities
 OPENROUTER_MODELS: dict[str, dict[str, Any]] = {
-    # Free models (no credits needed)
-    "nvidia/nemotron-nano-9b-v2:free": {
-        "max_output_tokens": 4096,
-        "context_window": 32768,
-        "report_capable": True,
-        "tier": "free",
-    },
+    # Free models (no credits needed) -- ordered by reliability for JSON extraction
     "nvidia/nemotron-3-super-120b-a12b:free": {
         "max_output_tokens": 4096,
         "context_window": 131072,
@@ -44,6 +39,12 @@ OPENROUTER_MODELS: dict[str, dict[str, Any]] = {
     "qwen/qwen3-next-80b-a3b-instruct:free": {
         "max_output_tokens": 4096,
         "context_window": 65536,
+        "report_capable": True,
+        "tier": "free",
+    },
+    "nvidia/nemotron-nano-9b-v2:free": {
+        "max_output_tokens": 4096,
+        "context_window": 32768,
         "report_capable": True,
         "tier": "free",
     },

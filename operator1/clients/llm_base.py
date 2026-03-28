@@ -50,7 +50,7 @@ _last_request_time_by_host: dict[str, float] = {}
 _LLM_HOST_RATE_LIMITS: dict[str, float] = {
     "generativelanguage.googleapis.com": 0.25,  # Gemini free tier
     "api.anthropic.com": 0.8,                   # Claude Tier 1
-    "openrouter.ai": 1.0,                       # OpenRouter (varies by model)
+    "openrouter.ai": 0.15,                      # OpenRouter free tier: ~10 RPM = 0.17/s (conservative)
 }
 
 
@@ -323,10 +323,10 @@ class LLMClient(ABC):
                     )
 
                 # Retryable error -- backoff.
-                # For 429 (rate limit), fail fast after 2 attempts so the
-                # PooledLLMClient can rotate to the next API key quickly.
+                # For 429 (rate limit), give enough attempts for the rate
+                # limiter to cool down (especially for free-tier OpenRouter).
                 # For 5xx (server errors), use the full retry budget.
-                _max_attempts_for_code = 2 if resp.status_code == 429 else max_retries
+                _max_attempts_for_code = 4 if resp.status_code == 429 else max_retries
 
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after:

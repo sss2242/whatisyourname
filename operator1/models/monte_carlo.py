@@ -1022,6 +1022,22 @@ def run_monte_carlo(
 
         result.n_paths_importance = int(n_paths * importance_fraction)
 
+        # Store terminal cumulative return ratios for drawdown distribution.
+        # Generate a lightweight batch of return paths (100 paths) to get
+        # terminal price ratios without the overhead of full simulation.
+        try:
+            _n_tv = min(n_paths, 500)
+            _tv_returns, _ = simulate_return_paths(
+                _n_tv, h_steps, current_idx,
+                transition_matrix, dist_list, rng,
+                importance_tilt=0.0,
+            )
+            # Terminal cumulative return as price ratio (e^sum(log_returns))
+            _tv_cum = np.exp(np.sum(_tv_returns, axis=1))
+            result.terminal_values[h_label] = _tv_cum
+        except Exception:
+            pass  # non-critical
+
         logger.info(
             "Horizon '%s': survival_prob=%.4f (p5=%.4f, p95=%.4f), ESS=%.1f",
             h_label,

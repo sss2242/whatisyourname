@@ -85,8 +85,26 @@ def _fit_gaussian_copula(uniform_data: np.ndarray) -> np.ndarray:
             0, 1e-6, size=(len(normal_data), int(zero_var_mask.sum()))
         )
 
-    # Correlation matrix of the normal-transformed data = copula parameter
-    corr = np.corrcoef(normal_data, rowvar=False)
+    # Correlation matrix of the normal-transformed data = copula parameter.
+    # Use robust Minimum Covariance Determinant when available (sklearn).
+    # MCD is resistant to up to 50% outliers, preventing a single earnings
+    # surprise day from corrupting the copula for weeks.
+    corr = None
+    if len(normal_data) >= 2 * normal_data.shape[1]:
+        try:
+            from sklearn.covariance import MinCovDet
+            mcd = MinCovDet(random_state=42).fit(normal_data)
+            # Convert covariance to correlation
+            cov = mcd.covariance_
+            d = np.sqrt(np.diag(cov))
+            d[d < 1e-12] = 1.0  # avoid division by zero
+            corr = cov / np.outer(d, d)
+            np.fill_diagonal(corr, 1.0)
+        except Exception:
+            corr = None  # fall back to np.corrcoef
+
+    if corr is None:
+        corr = np.corrcoef(normal_data, rowvar=False)
 
     # Final NaN guard: replace any remaining NaN with identity
     if np.isnan(corr).any():

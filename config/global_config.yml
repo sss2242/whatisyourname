@@ -19,6 +19,11 @@ http_cache_ttl_hours: 24
 search_budget_per_group: 15   # max search calls per relationship group
 search_budget_global: 80      # max total search calls across all groups
 
+# Cross-region entity discovery: search all 25+ PIT clients when resolving
+# linked entities from other regions.  Set to false to only search the
+# primary market (much faster, works for most US/EU companies).
+cross_region_discovery: false
+
 # Cache rebuild control
 # Set to true to force re-fetching all data even when caches exist.
 FORCE_REBUILD: false

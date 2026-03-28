@@ -75,6 +75,8 @@ class SentimentResult:
     n_articles_fetched: int = 0
     n_articles_scored: int = 0
     scoring_method: str = "none"  # "gemini", "keyword", "none"
+    # Scored article headlines for downstream modules (e.g., product_catalysts)
+    articles: list[dict] = field(default_factory=list)
     mean_sentiment: float = float("nan")
     latest_sentiment: float = float("nan")
     latest_label: str = "Unknown"
@@ -485,6 +487,12 @@ def compute_news_sentiment(
 
     articles["sentiment"] = scores
     result.n_articles_scored = len(scores)
+
+    # Store scored articles for downstream modules (e.g., product_catalysts)
+    try:
+        result.articles = articles[["title", "sentiment"]].to_dict("records")
+    except Exception:
+        result.articles = []
 
     # Step 3: Align to daily cache via as-of logic
     if "publishedDate" not in articles.columns:

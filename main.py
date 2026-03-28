@@ -381,6 +381,14 @@ Non-interactive examples:
         help="Lookback window in years (default: 2.0)",
     )
     parser.add_argument(
+        "--end-date", type=str, default="",
+        help=(
+            "Override end date for the analysis window (YYYY-MM-DD). "
+            "Default: today. Use this for backtesting, e.g. --end-date 2024-12-31 "
+            "to run on 2023-2024 data and validate predictions against 2025."
+        ),
+    )
+    parser.add_argument(
         "--skip-linked", action="store_true",
         help="Skip linked entity discovery (faster, target-only analysis)",
     )
@@ -437,6 +445,19 @@ Non-interactive examples:
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # ------------------------------------------------------------------
+    # Parse --end-date for backtesting (override date.today())
+    # ------------------------------------------------------------------
+    _backtest_end_date = None
+    if args.end_date:
+        from datetime import datetime as _dt
+        try:
+            _backtest_end_date = _dt.strptime(args.end_date, "%Y-%m-%d").date()
+            logger.info("Backtest mode: end_date=%s (predictions target future from this date)", _backtest_end_date)
+        except ValueError:
+            logger.error("Invalid --end-date format: %s (expected YYYY-MM-DD)", args.end_date)
+            return 1
 
     # ------------------------------------------------------------------
     # Apply LLM CLI overrides to environment (before any LLM usage)
@@ -497,7 +518,8 @@ Non-interactive examples:
     try:
         from operator1.secrets_loader import load_secrets, validate_secrets
         secrets = load_secrets()
-        validate_secrets(secrets)
+        # Pass market_id so only region-relevant keys are enforced
+        validate_secrets(secrets, market_id=args.market)
     except SystemExit as exc:
         logger.error("Failed to load API keys: %s", exc)
         logger.error("Create a .env file from .env.example with ALL keys filled in")
@@ -815,7 +837,7 @@ Non-interactive examples:
             cache = quotes_df.copy()
     else:
         # Fallback: create empty cache with date range
-        end = date.today()
+        end = _backtest_end_date if _backtest_end_date else date.today()
         start = end - timedelta(days=int(args.years * 365))
         idx = pd.date_range(start, end, freq="B", name="date")
         cache = pd.DataFrame(index=idx)
@@ -916,6 +938,21 @@ Non-interactive examples:
             cache[conf_col] = conf_series
 
     logger.info("Cache built: %d rows x %d columns", len(cache), len(cache.columns))
+
+    # ------------------------------------------------------------------
+    # Backtest date filter: trim cache to end at --end-date
+    # ------------------------------------------------------------------
+    if _backtest_end_date is not None:
+        _bt_end_ts = pd.Timestamp(_backtest_end_date)
+        _bt_start_ts = _bt_end_ts - pd.Timedelta(days=int(args.years * 365))
+        _pre_len = len(cache)
+        cache = cache[(cache.index >= _bt_start_ts) & (cache.index <= _bt_end_ts)]
+        logger.info(
+            "Backtest filter: %d -> %d rows (window %s to %s)",
+            _pre_len, len(cache),
+            cache.index[0].date() if len(cache) > 0 else "N/A",
+            cache.index[-1].date() if len(cache) > 0 else "N/A",
+        )
 
     # ------------------------------------------------------------------
     # Step 4a: Fetch macro data for survival mode analysis
@@ -1095,6 +1132,38 @@ Non-interactive examples:
                 logger.warning("SIX proxy computation failed: %s", six_proxy_result.error)
         except Exception as exc:
             logger.warning("SIX proxy module failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 4a.6: Lightweight pre-estimation ratio computation
+    # Compute basic financial ratios from raw statement data BEFORE
+    # estimation, so the estimator can use them as features and the FH
+    # calibration (interest_coverage > 10, cash > debt) sees non-NaN values.
+    # ------------------------------------------------------------------
+    try:
+        from operator1.constants import EPSILON as _EPS
+        _pre_ratios = {
+            "current_ratio": ("current_assets", "current_liabilities"),
+            "interest_coverage": ("ebit", "interest_expense"),
+            "cash_ratio": ("cash_and_equivalents", "current_liabilities"),
+            "gross_margin": ("gross_profit", "revenue"),
+            "net_margin": ("net_income", "revenue"),
+            "operating_margin": ("operating_income", "revenue"),
+            "debt_to_equity_abs": ("total_debt", "total_equity"),
+        }
+        _n_pre = 0
+        for ratio_name, (num_col, den_col) in _pre_ratios.items():
+            if (ratio_name not in cache.columns
+                    and num_col in cache.columns
+                    and den_col in cache.columns):
+                _num = cache[num_col].astype(float)
+                _den = cache[den_col].astype(float)
+                _safe_den = _den.where(_den.abs() > _EPS)
+                cache[ratio_name] = _num / _safe_den
+                _n_pre += 1
+        if _n_pre > 0:
+            logger.info("Pre-estimation ratios computed: %d ratios", _n_pre)
+    except Exception as exc:
+        logger.debug("Pre-estimation ratio computation skipped: %s", exc)
 
     # ------------------------------------------------------------------
     # Step 4b: Estimation -- fill missing financials
@@ -1810,10 +1879,14 @@ Non-interactive examples:
     catalyst_result = None
     try:
         from operator1.features.product_catalysts import detect_product_catalysts
-        # Pass news articles from sentiment step if available
+        # Pass news articles from sentiment step if available.
+        # _sent_result is the SentimentResult dataclass (has .articles list);
+        # sentiment_result is a plain dict for the profile (no .articles).
         _news_articles = []
-        if sentiment_result is not None:
-            _news_articles = getattr(sentiment_result, "articles", [])
+        try:
+            _news_articles = _sent_result.articles  # noqa: F821
+        except (NameError, AttributeError):
+            _news_articles = []
         cache, catalyst_result = detect_product_catalysts(
             cache,
             profile=target_profile,
@@ -2154,8 +2227,12 @@ Non-interactive examples:
             if (c.startswith("fh_") or c.startswith("sentiment_")
                 or c.startswith("peer_") or c.startswith("macro_")
                 or c.startswith("inst_")
+                or c.startswith("buying_power_") or c.startswith("catalyst_")
+                or c.startswith("conflict_") or c.startswith("demand_")
                 or c in ("survival_intensity", "regime_confidence",
-                         "regime_transition_prob", "stability_score_21d")
+                         "regime_transition_prob", "stability_score_21d",
+                         "buying_power_index", "sector_demand_momentum",
+                         "catalyst_score", "online_change_score")
                 or any(c.startswith(p) for p in _linked_prefixes))
             and cache[c].dtype in ("float64", "float32", "int64")
             and not c.startswith("is_missing_")
@@ -3275,7 +3352,16 @@ Non-interactive examples:
                 "pattern_drift_applied": _pattern_drift if not args.skip_models else 1.0,
             }
 
-        # Save profile
+        # Save profile -- sanitize dict keys (some model results use tuple keys)
+        def _sanitize_keys(obj):
+            """Recursively convert non-string dict keys to strings for JSON."""
+            if isinstance(obj, dict):
+                return {str(k): _sanitize_keys(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_sanitize_keys(i) for i in obj]
+            return obj
+
+        profile = _sanitize_keys(profile)
         profile_path = Path(args.output_dir) / "company_profile.json"
         profile_path.parent.mkdir(parents=True, exist_ok=True)
         with open(profile_path, "w", encoding="utf-8") as fh:

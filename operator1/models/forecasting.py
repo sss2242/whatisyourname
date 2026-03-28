@@ -1770,6 +1770,31 @@ def run_forecasting(
             }
             result.model_used["volatility_garch"] = "garch"
 
+        # HAR-RV (Corsi 2009): Heterogeneous Autoregressive Realized Volatility.
+        # Uses daily, weekly, and monthly RV as regressors. Captures long-memory
+        # of volatility that single-regime GARCH misses. Often outperforms GARCH
+        # in empirical tests.
+        try:
+            from arch.univariate import HARX  # type: ignore[import-untyped]
+
+            _rv = returns.dropna() ** 2  # daily realized variance proxy
+            if len(_rv) >= 63:
+                har_model = HARX(_rv * 10000, lags=[1, 5, 22])
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    har_res = har_model.fit(disp="off", show_warning=False)
+                har_fcast = har_res.forecast(horizon=max(HORIZONS.values()))
+                if har_fcast is not None and har_fcast.variance is not None:
+                    _har_var = har_fcast.variance.iloc[-1].values / 10000
+                    result.forecasts["volatility_har"] = {
+                        label: float(np.sqrt(max(_har_var[min(h - 1, len(_har_var) - 1)], 0)))
+                        for label, h in HORIZONS.items()
+                    }
+                    result.model_used["volatility_har"] = "har_rv"
+                    logger.debug("HAR-RV volatility forecast computed")
+        except Exception as _har_exc:
+            logger.debug("HAR-RV forecast skipped: %s", _har_exc)
+
     # ------------------------------------------------------------------
     # Per-variable forecasting
     # ------------------------------------------------------------------
@@ -2157,6 +2182,32 @@ class GARCHWrapper(BaseModelWrapper):
 
             unique_regimes = [str(r) for r in np.unique(labels) if str(r) != "nan"]
             if len(unique_regimes) < 2:
+                return
+
+            # Minimum regime diversity check: merge tiny regimes (< 20 obs)
+            # into the nearest neighbor by sample mean return. This prevents
+            # fitting GARCH on 1-5 observations (e.g., HMM assigns 495 days
+            # to "high_vol" and 1 day to "bull").
+            _MIN_REGIME_OBS = 20
+            regime_sizes = {
+                r: int(np.sum([str(l) == r for l in labels]))
+                for r in unique_regimes
+            }
+            small_regimes = [r for r, n in regime_sizes.items() if n < _MIN_REGIME_OBS]
+            if small_regimes:
+                # Find the largest regime to absorb small ones
+                largest = max(regime_sizes, key=regime_sizes.get)
+                for small_r in small_regimes:
+                    unique_regimes.remove(small_r)
+                    # Remap labels: replace small regime with largest
+                    labels = np.array([largest if str(l) == small_r else l for l in labels])
+                logger.debug(
+                    "GARCH regime merge: %d small regimes absorbed into '%s'",
+                    len(small_regimes), largest,
+                )
+
+            if len(unique_regimes) < 2:
+                # After merging, only 1 effective regime -- skip switching
                 return
 
             # Fit GARCH per regime
