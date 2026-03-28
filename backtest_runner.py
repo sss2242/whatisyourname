@@ -1361,7 +1361,12 @@ def validate_predictions(state: BacktestState) -> dict:
     for c in comparisons:
         bounds_str = ""
         if "actual_in_bounds" in c:
-            bounds_str = f" [{'IN' if c['actual_in_bounds'] else 'OUT'} bounds: {c.get('lower_bound', '?'):.2f}-{c.get('upper_bound', '?'):.2f}]"
+            lb = c.get('lower_bound')
+            ub = c.get('upper_bound')
+            if lb is not None and ub is not None:
+                bounds_str = f" [{'IN' if c.get('actual_in_bounds') else 'OUT'} bounds: {lb:.2f}-{ub:.2f}]"
+            else:
+                bounds_str = ""
         logger.info("  %s %s: predicted=$%.2f, actual=$%.2f, error=%.2f%%$%s",
                      c["variable"], c["horizon"], c["predicted"], c["actual"], c["pct_error"], bounds_str)
 
