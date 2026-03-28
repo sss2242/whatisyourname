@@ -3324,9 +3324,16 @@ def run_forward_pass(
             # Step C: Simple ensemble (average of available predictions)
             ensemble_pred = float(np.mean(predictions))
 
-            # Step D: Reality check
+            # Step D: Reality check (with observed-vs-estimated weighting)
+            # Source: The_Apps_core_idea.pdf Section J.3 -- penalize
+            # observed values more than estimated ones in the loss.
             error = float(actual_t1[0]) - ensemble_pred
-            weighted_error = (error ** 2) * (tier_weight / 20.0)
+            source_col = f"{var_name}_source"
+            obs_weight = 1.0  # default: treat as observed
+            if source_col in cache.columns:
+                src = cache.iloc[t + 1].get(source_col)
+                obs_weight = 1.0 if src == "observed" else 0.3
+            weighted_error = (error ** 2) * (tier_weight / 20.0) * obs_weight
 
             result.errors_by_tier[tier_num].append(weighted_error)
             if regime_t not in result.errors_by_regime:
@@ -3739,9 +3746,29 @@ def run_burnout(
             result.model_states = forward_pass_result.model_states
         logger.info("Burn-out: using existing forward pass predictions_log (%d entries)", len(predictions_log))
     else:
-        # Run a forward pass on the burn-out window
+        # Run a forward pass on the burn-out window with regime weighting.
+        # Source: The_Apps_core_idea.pdf Section L.1 -- weight historical
+        # days by: w(tau) = exp(-delta_t/half_life) * regime_similarity.
         actual_window = min(burnout_window, len(cache))
         burnout_cache = cache.iloc[-actual_window:].copy()
+
+        # Apply regime-weighted sample importance (exponential decay * regime similarity)
+        if "regime_hmm_prob_0" in burnout_cache.columns:
+            _regime_cols = [c for c in burnout_cache.columns if c.startswith("regime_hmm_prob_")]
+            if _regime_cols:
+                _regime_matrix = burnout_cache[_regime_cols].fillna(0).values
+                _current_regime = _regime_matrix[-1]  # current day's regime probabilities
+                _n = len(burnout_cache)
+                # Exponential recency decay (half-life = 63 trading days)
+                _days_ago = np.arange(_n, 0, -1)
+                _recency = np.exp(-_days_ago / 63.0)
+                # Regime similarity: Gaussian kernel on probability vectors
+                _diff = _regime_matrix - _current_regime
+                _similarity = np.exp(-np.sum(_diff ** 2, axis=1) / 0.5)
+                # Combined weight
+                _sample_weights = _recency * _similarity
+                _sample_weights = _sample_weights / _sample_weights.sum() * _n
+                burnout_cache["_burnout_sample_weight"] = _sample_weights
 
         if len(burnout_cache) < validation_days + 30:
             logger.warning("Insufficient data for burn-out (%d rows)", len(burnout_cache))
