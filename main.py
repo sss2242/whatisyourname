@@ -1780,6 +1780,22 @@ Non-interactive examples:
                             "Linked aggregates computed: %d columns merged into cache",
                             len(_new_agg_cols),
                         )
+
+                    # Step 5g.1: Compute company-relative metrics vs peer aggregates
+                    # (rel_strength_vs_sector, valuation_premium, rel_volatility)
+                    try:
+                        from operator1.features.linked_aggregates import compute_relative_metrics
+                        _rel_df = compute_relative_metrics(cache, linked_agg_df)
+                        if _rel_df is not None and not _rel_df.empty:
+                            _new_rel = [c for c in _rel_df.columns if c not in cache.columns and _rel_df[c].notna().any()]
+                            if _new_rel:
+                                cache = cache.join(_rel_df[_new_rel], how="left")
+                                logger.info(
+                                    "Relative metrics computed: %d columns merged into cache",
+                                    len(_new_rel),
+                                )
+                    except Exception as _rel_exc:
+                        logger.debug("Relative metrics computation skipped: %s", _rel_exc)
                 except Exception as exc:
                     logger.warning("Linked aggregates computation failed: %s", exc)
     else:

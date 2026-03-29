@@ -3430,7 +3430,17 @@ def run_forward_pass(
             if source_col in cache.columns:
                 src = cache.iloc[t + 1].get(source_col)
                 obs_weight = 1.0 if src == "observed" else 0.3
-            weighted_error = (error ** 2) * (tier_weight / 20.0) * obs_weight
+
+            # Apply burn-out sample weight if available (exponential
+            # recency decay * regime similarity from run_burnout).
+            # Source: The_Apps_core_idea.pdf Section L.1
+            sample_w = 1.0
+            if "_burnout_sample_weight" in cache.columns:
+                _sw = cache["_burnout_sample_weight"].iloc[t]
+                if not np.isnan(_sw) and _sw > 0:
+                    sample_w = float(_sw)
+
+            weighted_error = (error ** 2) * (tier_weight / 20.0) * obs_weight * sample_w
 
             result.errors_by_tier[tier_num].append(weighted_error)
             if regime_t not in result.errors_by_regime:
