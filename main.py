@@ -2389,6 +2389,7 @@ Non-interactive examples:
             cache, forecast_result = run_forecasting(
                 cache,
                 extra_variables=_extra_vars,
+                windows=_adaptive_tier3.windows if _adaptive_tier3 is not None and _adaptive_tier3.adapted else None,
             )
             logger.info("Forecasting complete")
         except Exception as exc:
@@ -2624,14 +2625,21 @@ Non-interactive examples:
         try:
             from operator1.models.conformal import ConformalPIDCalibrator, ConformalCalibrator, build_conformal_result
             if forecast_result is not None:
-                try:
-                    calibrator = ConformalPIDCalibrator(target_coverage=0.9)
-                    logger.info("Using ConformalPIDCalibrator (PID + Mondrian)")
-                except Exception:
-                    calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
-                if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
-                    for r in forecast_result.residuals:
-                        calibrator.update(r)
+                # Prefer the forward pass calibrator which has per-variable
+                # per-survival-mode scores (Mondrian partitioning).
+                calibrator = None
+                if forward_pass_result is not None and hasattr(forward_pass_result, "conformal_calibrator") and forward_pass_result.conformal_calibrator is not None:
+                    calibrator = forward_pass_result.conformal_calibrator
+                    logger.info("Reusing forward pass conformal calibrator (per-variable per-mode scores)")
+                else:
+                    try:
+                        calibrator = ConformalPIDCalibrator(target_coverage=0.9)
+                        logger.info("Using new ConformalPIDCalibrator (PID + Mondrian)")
+                    except Exception:
+                        calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
+                    if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
+                        for r in forecast_result.residuals:
+                            calibrator.update(r)
                 # build_conformal_result expects nested dict:
                 # {variable: {horizon_label: point_forecast}}
                 # Use forecast_result.forecasts (available now) instead of
