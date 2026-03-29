@@ -88,8 +88,8 @@ class ReportMode(str, Enum):
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20},
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 20},
-    ReportTier.PREMIUM: set(range(1, 23)) | {75, 195, 196, 197, 198, 199, 1995},  # all 22 sections + economic position + geopolitical + SIX + holders + ownership deep + market demand + catalysts
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 20},
+    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995},  # all 22 sections + economic position + geopolitical + SIX + holders + ownership deep + market demand + catalysts
 }
 
 
@@ -467,6 +467,40 @@ def _build_financial_health(profile: dict[str, Any]) -> str:
 
     if not lines:
         return "Financial health data unavailable."
+
+    return "\n".join(lines)
+
+
+def _build_enriched_survival_timeline_section(profile: dict[str, Any]) -> str:
+    """Build enriched survival timeline section (regime + survival bridge)."""
+    est = profile.get("enriched_survival_timeline", {})
+    if not est.get("available"):
+        return "Enriched survival timeline data unavailable."
+
+    lines = []
+    lines.append(f"- **Regime detection available**: {'Yes' if est.get('regime_available') else 'No'}")
+    lines.append(f"- **Mean survival intensity**: {est.get('mean_intensity', 0):.3f} "
+                 "(0.0 = stable, 1.0 = extreme crisis)")
+
+    # State distribution
+    dist = est.get("combined_state_distribution", {})
+    if dist:
+        lines.extend(["", "### Combined State Distribution", ""])
+        for state, pct in sorted(dist.items(), key=lambda x: -x[1]):
+            if pct > 0.01:
+                label = state.replace("_", " ").title()
+                lines.append(f"- **{label}**: {pct * 100:.1f}% of days")
+
+    # Regime switch statistics
+    n_switches = est.get("base_n_switches")
+    mean_stability = est.get("base_mean_stability")
+    if n_switches is not None or mean_stability is not None:
+        lines.extend(["", "### Regime Stability", ""])
+        if n_switches is not None:
+            lines.append(f"- **Regime switches (2yr window)**: {n_switches}")
+        if mean_stability is not None:
+            lines.append(f"- **Mean stability score (21d)**: {mean_stability:.3f} "
+                         "(1.0 = fully stable, 0.0 = constantly switching)")
 
     return "\n".join(lines)
 
@@ -3061,6 +3095,7 @@ def _build_fallback_report(
         4: ("4. Current Financial Snapshot (Tier-by-Tier)", _build_current_state_snapshot(profile)),
         5: ("5. Financial Health Scoring", _build_financial_health(profile)),
         6: ("6. Survival Mode Analysis", _build_survival_analysis(profile)),
+        65: ("6.5. Enriched Survival Timeline", _build_enriched_survival_timeline_section(profile)),
         7: ("7. Linked Variables & Market Context", _build_linked_entities_section(profile)),
         75: ("7.5. Economic Position & Industry Classification", _build_economic_position(profile)),
         8: ("8. Temporal Analysis & Model Insights", _build_regime_analysis(profile)),

@@ -2237,6 +2237,7 @@ Non-interactive examples:
         _linked_prefixes = (
             "competitors_", "suppliers_", "customers_",
             "financial_institutions_", "sector_peers_", "industry_peers_",
+            "rel_", "valuation_premium_",
         )
         _extra_vars = [
             c for c in cache.columns

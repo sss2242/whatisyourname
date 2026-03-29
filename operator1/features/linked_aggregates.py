@@ -350,6 +350,14 @@ def persist_linked_aggregates(
     if output_path is None:
         output_path = str(Path(CACHE_DIR) / "linked_aggregates_daily.parquet")
 
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    aggregates.to_parquet(output_path)
+    logger.info(
+        "Linked aggregates saved: %s (%d rows, %d cols)",
+        output_path, len(aggregates), len(aggregates.columns),
+    )
+    return output_path
+
 
 def compute_relative_metrics(
     target_cache: pd.DataFrame,
@@ -403,11 +411,3 @@ def compute_relative_metrics(
     if n_cols > 0:
         logger.info("Relative metrics computed: %d metrics with data", n_cols)
     return result
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    aggregates.to_parquet(output_path)
-    logger.info(
-        "Linked aggregates saved: %s (%d rows, %d cols)",
-        output_path, len(aggregates), len(aggregates.columns),
-    )
-    return output_path
