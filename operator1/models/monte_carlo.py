@@ -97,6 +97,8 @@ class RegimeDistribution:
     mean: float = 0.0
     std: float = 1.0
     n_obs: int = 0
+    use_student_t: bool = False  # True when Jarque-Bera rejects normality
+    df_t: float = 30.0           # degrees of freedom for Student-t
 
 
 @dataclass
@@ -207,6 +209,25 @@ def estimate_regime_distributions(
             if dist.std < 1e-12:
                 dist.std = 1e-6  # avoid zero volatility
             dist.n_obs = len(regime_returns)
+
+            # Jarque-Bera test: if normality is rejected (p < 0.05),
+            # fit Student-t which captures fat tails (Mandelbrot 1963).
+            # Financial returns in crisis regimes often have kurtosis > 3
+            # causing Normal MC to underestimate tail probability by 10-100x.
+            if len(regime_returns) >= 30:
+                try:
+                    from scipy.stats import jarque_bera, t as t_dist
+                    _jb_stat, _jb_p = jarque_bera(regime_returns)
+                    if _jb_p < 0.05:
+                        _t_params = t_dist.fit(regime_returns)
+                        dist.use_student_t = True
+                        dist.df_t = max(2.1, float(_t_params[0]))  # df >= 2.1 for finite variance
+                        logger.info(
+                            "Regime '%s': Jarque-Bera p=%.4f, using Student-t(df=%.1f)",
+                            regime, _jb_p, dist.df_t,
+                        )
+                except Exception as _exc:
+                    logger.debug("Student-t fit skipped for regime '%s': %s", regime, _exc)
         else:
             # Fallback to overall distribution.
             if len(clean_returns) >= _MIN_OBS_PER_REGIME:
@@ -423,7 +444,18 @@ def simulate_return_paths(
             tilted_std = nominal_std
 
             # Sample from tilted distribution.
-            z = rng.normal(tilted_mean, tilted_std)
+            # Use Student-t when Jarque-Bera rejected normality for this
+            # regime (fat tails -- Mandelbrot 1963).  Student-t with low df
+            # generates more extreme returns, improving tail probability
+            # estimates that Normal MC underestimates by 10-100x.
+            if getattr(dist, "use_student_t", False) and dist.df_t > 2.0:
+                try:
+                    from scipy.stats import t as t_dist
+                    z = t_dist.rvs(dist.df_t, loc=tilted_mean, scale=tilted_std, random_state=rng)
+                except Exception:
+                    z = rng.normal(tilted_mean, tilted_std)
+            else:
+                z = rng.normal(tilted_mean, tilted_std)
             return_paths[i, t] = z
 
             if importance_tilt > 0:

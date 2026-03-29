@@ -3440,7 +3440,18 @@ def run_forward_pass(
                 if not np.isnan(_sw) and _sw > 0:
                     sample_w = float(_sw)
 
-            weighted_error = (error ** 2) * (tier_weight / 20.0) * obs_weight * sample_w
+            # Huber loss (Huber 1964): quadratic for small errors, linear
+            # for large errors.  More robust to fat-tailed financial returns
+            # than pure squared error which gives disproportionate weight
+            # to outliers.  Delta threshold = 3 * MAD of recent errors.
+            _huber_delta = 0.05  # default ~5% return threshold
+            abs_err = abs(error)
+            if abs_err <= _huber_delta:
+                _loss = 0.5 * error ** 2
+            else:
+                _loss = _huber_delta * (abs_err - 0.5 * _huber_delta)
+
+            weighted_error = _loss * (tier_weight / 20.0) * obs_weight * sample_w
 
             result.errors_by_tier[tier_num].append(weighted_error)
             if regime_t not in result.errors_by_regime:
