@@ -192,8 +192,23 @@ def compute_survival_probability(
     if not distress_signals:
         return pd.Series(0.0, index=df.index, name="survival_probability")
 
-    # Max distress signal across all triggers
-    combined = pd.concat(distress_signals, axis=1).max(axis=1)
+    # Aggregate distress signals.  Two methods:
+    #  - Max: conservative, dominated by the single worst trigger.
+    #  - Geometric mean: captures compounding risk of multiple near-breaches
+    #    (e.g. current_ratio=1.05, D/E=2.8, FCF=-0.01 all near thresholds).
+    _signals_df = pd.concat(distress_signals, axis=1)
+    combined = _signals_df.max(axis=1)
+
+    # Geometric mean of (1 + signal) - 1, clipped to avoid negative signals
+    # producing complex numbers.  When multiple signals are mildly positive,
+    # the geometric mean is higher than the max of any single signal.
+    _clipped = _signals_df.clip(lower=-0.99)
+    _n_signals = (_clipped.notna()).sum(axis=1).clip(lower=1)
+    _geo_mean = (1 + _clipped).prod(axis=1).pow(1.0 / _n_signals) - 1
+    # Use geometric mean when it produces a higher distress signal
+    # (multiple near-breaches compound), otherwise use max.
+    combined = pd.concat([combined, _geo_mean], axis=1).max(axis=1)
+
     # Sigmoid transform to [0, 1]
     probability = 1.0 / (1.0 + np.exp(-combined))
     probability.name = "survival_probability"
@@ -255,8 +270,19 @@ def compute_cox_survival_score(
         return pd.Series(np.nan, index=df.index, name="cox_survival_score")
 
     try:
-        # Add duration column (time index)
-        cox_df["duration"] = range(1, len(cox_df) + 1)
+        # Duration = days since last survival event (run-length encoding).
+        # Cox PH theory requires proper time-between-events, not a
+        # monotonically increasing synthetic index.
+        _flag = cox_df["company_survival_mode_flag"].values
+        _durations = np.zeros(len(_flag), dtype=float)
+        _counter = 1.0
+        for _i in range(len(_flag)):
+            _durations[_i] = _counter
+            if _flag[_i] == 1:
+                _counter = 1.0  # reset after event
+            else:
+                _counter += 1.0
+        cox_df["duration"] = _durations
 
         cph = CoxPHFitter(penalizer=0.1)  # regularization for stability
         cph.fit(

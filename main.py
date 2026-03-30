@@ -1780,6 +1780,22 @@ Non-interactive examples:
                             "Linked aggregates computed: %d columns merged into cache",
                             len(_new_agg_cols),
                         )
+
+                    # Step 5g.1: Compute company-relative metrics vs peer aggregates
+                    # (rel_strength_vs_sector, valuation_premium, rel_volatility)
+                    try:
+                        from operator1.features.linked_aggregates import compute_relative_metrics
+                        _rel_df = compute_relative_metrics(cache, linked_agg_df)
+                        if _rel_df is not None and not _rel_df.empty:
+                            _new_rel = [c for c in _rel_df.columns if c not in cache.columns and _rel_df[c].notna().any()]
+                            if _new_rel:
+                                cache = cache.join(_rel_df[_new_rel], how="left")
+                                logger.info(
+                                    "Relative metrics computed: %d columns merged into cache",
+                                    len(_new_rel),
+                                )
+                    except Exception as _rel_exc:
+                        logger.debug("Relative metrics computation skipped: %s", _rel_exc)
                 except Exception as exc:
                     logger.warning("Linked aggregates computation failed: %s", exc)
     else:
@@ -2221,6 +2237,7 @@ Non-interactive examples:
         _linked_prefixes = (
             "competitors_", "suppliers_", "customers_",
             "financial_institutions_", "sector_peers_", "industry_peers_",
+            "rel_", "valuation_premium_",
         )
         _extra_vars = [
             c for c in cache.columns
@@ -2372,6 +2389,7 @@ Non-interactive examples:
             cache, forecast_result = run_forecasting(
                 cache,
                 extra_variables=_extra_vars,
+                windows=_adaptive_tier3.windows if _adaptive_tier3 is not None and _adaptive_tier3.adapted else None,
             )
             logger.info("Forecasting complete")
         except Exception as exc:
@@ -2607,14 +2625,21 @@ Non-interactive examples:
         try:
             from operator1.models.conformal import ConformalPIDCalibrator, ConformalCalibrator, build_conformal_result
             if forecast_result is not None:
-                try:
-                    calibrator = ConformalPIDCalibrator(target_coverage=0.9)
-                    logger.info("Using ConformalPIDCalibrator (PID + Mondrian)")
-                except Exception:
-                    calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
-                if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
-                    for r in forecast_result.residuals:
-                        calibrator.update(r)
+                # Prefer the forward pass calibrator which has per-variable
+                # per-survival-mode scores (Mondrian partitioning).
+                calibrator = None
+                if forward_pass_result is not None and hasattr(forward_pass_result, "conformal_calibrator") and forward_pass_result.conformal_calibrator is not None:
+                    calibrator = forward_pass_result.conformal_calibrator
+                    logger.info("Reusing forward pass conformal calibrator (per-variable per-mode scores)")
+                else:
+                    try:
+                        calibrator = ConformalPIDCalibrator(target_coverage=0.9)
+                        logger.info("Using new ConformalPIDCalibrator (PID + Mondrian)")
+                    except Exception:
+                        calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
+                    if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
+                        for r in forecast_result.residuals:
+                            calibrator.update(r)
                 # build_conformal_result expects nested dict:
                 # {variable: {horizon_label: point_forecast}}
                 # Use forecast_result.forecasts (available now) instead of

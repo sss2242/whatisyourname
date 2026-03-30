@@ -169,6 +169,12 @@ def _compute_returns_and_risk(df: pd.DataFrame) -> pd.DataFrame:
     df["volatility_21d"] = df["return_1d"].rolling(window=21, min_periods=5).std()
     df["is_missing_volatility_21d"] = df["volatility_21d"].isna().astype(int)
 
+    # EWMA volatility (RiskMetrics, JP Morgan 1996): gives more weight to
+    # recent observations, adapting faster to regime changes than simple
+    # rolling std.  Both are available for temporal models to choose from.
+    df["volatility_ewma_21d"] = df["return_1d"].ewm(span=21, min_periods=5).std()
+    df["is_missing_volatility_ewma_21d"] = df["volatility_ewma_21d"].isna().astype(int)
+
     # Rolling 252-day max drawdown
     rolling_max = close.rolling(window=252, min_periods=1).max()
     drawdown = (close - rolling_max) / rolling_max
@@ -373,8 +379,11 @@ def _compute_valuation(df: pd.DataFrame) -> pd.DataFrame:
     _set_ratio_columns(df, "ps_ratio_calc", result, ism, inv)
 
     # Enterprise value = market_cap + total_debt - cash
-    ev = market_cap.fillna(0) + total_debt.fillna(0) - cash.fillna(0)
-    ev_missing = market_cap.isna() & total_debt.isna() & cash.isna()
+    # Require at least market_cap to be non-null; treat missing debt/cash
+    # as zero (conservative: understates EV rather than producing a
+    # negative value from 0 + debt - cash when market_cap is unknown).
+    ev = market_cap + total_debt.fillna(0) - cash.fillna(0)
+    ev_missing = market_cap.isna()
     df["enterprise_value"] = ev.where(~ev_missing, other=np.nan)
     df["is_missing_enterprise_value"] = ev_missing.astype(int)
 

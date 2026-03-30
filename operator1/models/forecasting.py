@@ -1687,6 +1687,7 @@ def run_forecasting(
     variables: list[str] | None = None,
     *,
     extra_variables: list[str] | None = None,
+    windows: Any | None = None,
     random_state: int = 42,
     enable_burnout: bool = True,
 ) -> tuple[pd.DataFrame, ForecastResult]:
@@ -1703,6 +1704,11 @@ def run_forecasting(
     variables:
         List of variable names to forecast.  If ``None``, all tier
         variables from the survival hierarchy are used.
+    windows:
+        Adaptive window sizes from ``adaptive_windows.compute_adaptive_windows()``.
+        If provided, overrides hardcoded LSTM lookback and burnout window
+        with filing-frequency-anchored values (Nyquist-Shannon).  Expected
+        attributes: ``short``, ``medium``, ``long``, ``trend``.
     random_state:
         Random seed for reproducible models.
     enable_burnout:
@@ -1714,6 +1720,25 @@ def run_forecasting(
         The (possibly augmented) cache and the ``ForecastResult``.
     """
     logger.info("Starting forecasting pipeline...")
+
+    # Override hardcoded window sizes with adaptive values when available.
+    # Nyquist-anchored windows prevent aliasing with the filing cycle
+    # (e.g. a 21-day lookback on semi-annual data sees only 1/6 of a
+    # filing period -- pure sub-period noise).
+    global _LSTM_LOOKBACK, _BURNOUT_WINDOW
+    _orig_lstm_lookback = _LSTM_LOOKBACK
+    _orig_burnout_window = _BURNOUT_WINDOW
+    if windows is not None:
+        _new_lookback = getattr(windows, "short", None)
+        _new_burnout = getattr(windows, "long", None)
+        if _new_lookback and _new_lookback > 0:
+            _LSTM_LOOKBACK = int(_new_lookback)
+        if _new_burnout and _new_burnout > 0:
+            _BURNOUT_WINDOW = int(_new_burnout)
+        logger.info(
+            "Adaptive windows applied: lstm_lookback=%d (was %d), burnout=%d (was %d)",
+            _LSTM_LOOKBACK, _orig_lstm_lookback, _BURNOUT_WINDOW, _orig_burnout_window,
+        )
 
     result = ForecastResult()
     tier_map = _load_tier_variables()
@@ -2074,6 +2099,11 @@ def run_forecasting(
             "Collected %d %s residual samples for conformal calibration",
             len(_residuals), "real" if _has_real else "synthetic",
         )
+
+    # Restore original window constants (avoid leaking adaptive values
+    # into subsequent calls from tests or multi-company pipelines).
+    _LSTM_LOOKBACK = _orig_lstm_lookback
+    _BURNOUT_WINDOW = _orig_burnout_window
 
     return cache, result
 
@@ -3281,14 +3311,23 @@ def run_forward_pass(
     except ImportError:
         _pid_available = False
 
-    # Initialise conformal calibrator for adaptive prediction intervals
+    # Initialise conformal calibrator for adaptive prediction intervals.
+    # Prefer ConformalPIDCalibrator (PID-controlled + Mondrian per survival
+    # mode) so that crisis-mode intervals are calibrated from crisis residuals.
     _conformal_calibrator = None
+    _conformal_is_pid = False
     try:
-        from operator1.models.conformal import ConformalCalibrator
-        _conformal_calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
-        logger.info("Conformal calibrator initialised (target coverage=90%%)")
-    except ImportError:
-        logger.debug("Conformal prediction not available")
+        from operator1.models.conformal import ConformalPIDCalibrator
+        _conformal_calibrator = ConformalPIDCalibrator(target_coverage=0.9)
+        _conformal_is_pid = True
+        logger.info("ConformalPIDCalibrator initialised (PID + Mondrian, coverage=90%%)")
+    except (ImportError, Exception):
+        try:
+            from operator1.models.conformal import ConformalCalibrator
+            _conformal_calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
+            logger.info("ConformalCalibrator initialised (adaptive, coverage=90%%)")
+        except ImportError:
+            logger.debug("Conformal prediction not available")
 
     # Pre-compute candlestick pattern signals as daily features
     try:
@@ -3430,17 +3469,52 @@ def run_forward_pass(
             if source_col in cache.columns:
                 src = cache.iloc[t + 1].get(source_col)
                 obs_weight = 1.0 if src == "observed" else 0.3
-            weighted_error = (error ** 2) * (tier_weight / 20.0) * obs_weight
+
+            # Apply burn-out sample weight if available (exponential
+            # recency decay * regime similarity from run_burnout).
+            # Source: The_Apps_core_idea.pdf Section L.1
+            sample_w = 1.0
+            if "_burnout_sample_weight" in cache.columns:
+                _sw = cache["_burnout_sample_weight"].iloc[t]
+                if not np.isnan(_sw) and _sw > 0:
+                    sample_w = float(_sw)
+
+            # Huber loss (Huber 1964): quadratic for small errors, linear
+            # for large errors.  More robust to fat-tailed financial returns
+            # than pure squared error which gives disproportionate weight
+            # to outliers.  Delta threshold = 3 * MAD of recent errors.
+            _huber_delta = 0.05  # default ~5% return threshold
+            abs_err = abs(error)
+            if abs_err <= _huber_delta:
+                _loss = 0.5 * error ** 2
+            else:
+                _loss = _huber_delta * (abs_err - 0.5 * _huber_delta)
+
+            weighted_error = _loss * (tier_weight / 20.0) * obs_weight * sample_w
 
             result.errors_by_tier[tier_num].append(weighted_error)
             if regime_t not in result.errors_by_regime:
                 result.errors_by_regime[regime_t] = []
             result.errors_by_regime[regime_t].append(weighted_error)
 
-            # Step D2: Update conformal calibrator with this prediction/actual pair
+            # Step D2: Update conformal calibrator with this prediction/actual pair.
+            # When using ConformalPIDCalibrator, pass the survival_mode so
+            # Mondrian partitioning calibrates crisis intervals from crisis
+            # residuals (not diluted by normal-mode data).
             if _conformal_calibrator is not None:
                 try:
-                    _conformal_calibrator.add_score(var_name, ensemble_pred, float(actual_t1[0]))
+                    _survival_mode_t = "normal"
+                    if "survival_mode" in cache.columns:
+                        _sm = cache["survival_mode"].iloc[t]
+                        if pd.notna(_sm):
+                            _survival_mode_t = str(_sm)
+                    if _conformal_is_pid:
+                        _conformal_calibrator.add_score(
+                            var_name, ensemble_pred, float(actual_t1[0]),
+                            mode=_survival_mode_t,
+                        )
+                    else:
+                        _conformal_calibrator.add_score(var_name, ensemble_pred, float(actual_t1[0]))
                     _was_covered = _conformal_calibrator.predict_interval(
                         var_name, ensemble_pred,
                     )

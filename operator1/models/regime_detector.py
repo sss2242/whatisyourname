@@ -59,7 +59,20 @@ DEFAULT_REGIME_LABELS: dict[int, str] = {
 }
 
 # PELT default penalty (higher = fewer breakpoints, more conservative).
+# Overridden by BIC-based penalty when data length is known.
 DEFAULT_PELT_PENALTY: float = 10.0
+
+
+def _bic_pelt_penalty(n_obs: int, n_features: int = 2) -> float:
+    """BIC-based PELT penalty (Schwarz 1978).
+
+    Automatically balances model complexity against fit, adapting to data
+    length and dimensionality.  Replaces the fixed default when called.
+    """
+    import math
+    if n_obs < 30:
+        return DEFAULT_PELT_PENALTY
+    return 2.0 * n_features * math.log(n_obs)
 
 # Minimum observations required for HMM / GMM fitting.
 _MIN_OBS_HMM: int = 60
@@ -723,6 +736,11 @@ def detect_regimes_and_breaks(
     # ------------------------------------------------------------------
     # Structural breaks (PELT)
     # ------------------------------------------------------------------
+    # Use BIC-based penalty when the caller passed the default value.
+    # BIC automatically adapts to data length (Schwarz 1978).
+    if pelt_penalty == DEFAULT_PELT_PENALTY:
+        pelt_penalty = _bic_pelt_penalty(len(cache), n_features=2)
+        logger.info("PELT penalty auto-set via BIC: %.2f (n=%d)", pelt_penalty, len(cache))
     bp_pelt = detector.detect_breakpoints_pelt(close, penalty=pelt_penalty)
 
     cache["structural_break"] = 0
