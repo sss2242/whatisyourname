@@ -384,12 +384,4 @@ def run_scenario_engine(
     )
 
     result.available = True
-    logger.info(
-        "Scenario engine: orderly=%.1f%% / muddle=%.1f%% / catastrophic=%.1f%% "
-        "(252d survival)",
-        result.orderly.survival_prob_252d * 100,
-        result.muddle_through.survival_prob_252d * 100,
-        result.catastrophic.survival_prob_252d * 100,
-    )
-
     return result

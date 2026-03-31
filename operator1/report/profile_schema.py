@@ -63,6 +63,14 @@ OPTIONAL_PROFILE_KEYS: set[str] = {
     "cycle_decomposition",
     "institutional_holders",
     "institutional_ownership_analysis",
+    "unified_survival_system",
+    "scenario_analysis",
+    "corporate_structure",
+    "market_buying_power",
+    "product_catalysts",
+    "macro_indicators",
+    "synergies_applied",
+    "enriched_survival_timeline",
 }
 
 

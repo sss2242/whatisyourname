@@ -249,7 +249,7 @@ def _build_cash_runway_section(
             o = float(ocf)
             monthly_burn = o / 12.0
             if monthly_burn < 0 and c > 0:
-                runway_days = -c / (monthly_burn / 30.0)  # In days
+                runway_days = -c / (monthly_burn / 21.0)  # In business days (consistent with scenario_engine)
                 zero_cash_date = date.today() + timedelta(days=int(runway_days))
         except (TypeError, ValueError):
             pass

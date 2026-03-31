@@ -2792,6 +2792,33 @@ Non-interactive examples:
             except Exception as exc:
                 logger.warning("Prediction aggregation failed: %s", exc)
 
+        # USS: Bound aggregated predictions (not just raw forecasts)
+        if (survival_controller is not None
+                and survival_controller.is_survival
+                and pred_result is not None
+                and hasattr(pred_result, "predictions")):
+            try:
+                from operator1.analysis.survival_regime_controller import bound_survival_forecast
+                _n_bounded = 0
+                for var, horizons_dict in pred_result.predictions.items():
+                    if isinstance(horizons_dict, dict):
+                        for h, hp in horizons_dict.items():
+                            pf = getattr(hp, "point_forecast", None)
+                            if pf is not None:
+                                bounded = bound_survival_forecast(
+                                    var, float(pf), cache,
+                                    survival_controller.current_regime,
+                                )
+                                if bounded != float(pf):
+                                    hp.point_forecast = bounded
+                                    _n_bounded += 1
+                if _n_bounded > 0:
+                    logger.info(
+                        "USS: bounded %d aggregated prediction points", _n_bounded,
+                    )
+            except Exception as exc:
+                logger.debug("USS aggregated prediction bounding failed: %s", exc)
+
         # SHAP explainability (after aggregation -- needs pred_result)
         try:
             from operator1.models.explainability import compute_shap_explanations
@@ -3543,8 +3570,11 @@ Non-interactive examples:
         except Exception as exc:
             logger.error("Report generation failed: %s", exc)
 
-        # Step 8-USS: Generate triage card when in survival mode
-        if survival_controller is not None and survival_controller.is_survival:
+        # Step 8-USS: Generate triage card when in company distress
+        # Only for company_survival and extreme_survival (not modified_survival,
+        # where the company itself is healthy but country is in crisis)
+        if (survival_controller is not None
+                and survival_controller.current_regime in ("company_survival", "extreme_survival")):
             try:
                 from operator1.report.triage_card import generate_triage_card
                 triage_output = generate_triage_card(

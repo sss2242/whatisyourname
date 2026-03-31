@@ -23,7 +23,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 from operator1.config_loader import load_config
@@ -68,6 +67,9 @@ def _get_tier_membership() -> dict[str, int]:
 
 # Triage status per (regime, tier) combination
 # "active" = full computation, "priority" = extra resources, "frozen" = carry forward
+# TODO: Tier 3 in company_survival and extreme_survival should enforce
+# "reduced" model subset (Kalman + baseline only, skip LSTM/transformer/tree)
+# per the architecture spec.  Currently all models run for Tier 3 "active".
 _TRIAGE_TABLE: dict[str, dict[int, str]] = {
     "normal": {1: "active", 2: "active", 3: "active", 4: "active", 5: "active"},
     "company_survival": {1: "priority", 2: "priority", 3: "active", 4: "frozen", 5: "frozen"},
@@ -294,7 +296,7 @@ def bound_survival_forecast(
     float
         Bounded forecast value.
     """
-    if regime not in ("company_survival", "extreme_survival"):
+    if regime not in ("company_survival", "modified_survival", "extreme_survival"):
         return forecast
 
     if variable not in cache.columns:
@@ -386,8 +388,6 @@ def compute_early_warning_score(cache: pd.DataFrame) -> pd.Series:
     This does NOT change the computational mode -- it is informational only.
     The actual switch happens when the binary flag flips.
     """
-    from operator1.constants import EPSILON
-
     scores: list[pd.Series] = []
 
     # Current ratio proximity (trigger at 1.0)
