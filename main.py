@@ -1348,6 +1348,39 @@ Non-interactive examples:
     except Exception as exc:
         logger.warning("Survival mode detection failed: %s", exc)
 
+    # ------------------------------------------------------------------
+    # Step 5-USS: Unified Survival System -- Create central controller
+    # ------------------------------------------------------------------
+    # The SurvivalRegimeController determines the current regime and
+    # configures all downstream modules across 5 dimensions:
+    # variable triage, model switching, horizon compression,
+    # correlation switching, and forecast bounding.
+    survival_controller = None
+    scenario_result = None
+    try:
+        from operator1.analysis.survival_regime_controller import SurvivalRegimeController
+        survival_controller = SurvivalRegimeController.from_cache(cache)
+
+        # Inject early warning score into cache
+        if not survival_controller.early_warning.empty:
+            cache["early_warning_score"] = survival_controller.early_warning
+            if survival_controller.is_approaching_survival():
+                logger.warning(
+                    "EARLY WARNING: Score %.2f -- company approaching survival triggers",
+                    survival_controller.get_early_warning_latest(),
+                )
+
+        logger.info(
+            "Unified Survival System: regime=%s, survival=%s, "
+            "frozen=%d vars, horizons=%s",
+            survival_controller.current_regime,
+            survival_controller.is_survival,
+            len(survival_controller.get_frozen_variables()),
+            list(survival_controller.horizons.keys()),
+        )
+    except Exception as exc:
+        logger.warning("Unified Survival System controller failed: %s", exc)
+
     # Step 5e variables: initialized early so fuzzy protection (Step 5b)
     # can safely access relationships.get("parent_companies") for
     # protection inheritance from GLEIF corporate structure.
@@ -1966,6 +1999,19 @@ Non-interactive examples:
             )
     except Exception as exc:
         logger.warning("Adaptive threshold calibration failed (using defaults): %s", exc)
+
+    # Refresh USS controller after adaptive thresholds recalibrate survival
+    if survival_controller is not None:
+        try:
+            from operator1.analysis.survival_regime_controller import SurvivalRegimeController
+            survival_controller = SurvivalRegimeController.from_cache(cache)
+            logger.info(
+                "USS controller refreshed: regime=%s, survival=%s",
+                survival_controller.current_regime,
+                survival_controller.is_survival,
+            )
+        except Exception as exc:
+            logger.debug("USS controller refresh failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Step 5.5: Enriched survival timeline (bridge: rule-based + HMM)
@@ -2746,6 +2792,33 @@ Non-interactive examples:
             except Exception as exc:
                 logger.warning("Prediction aggregation failed: %s", exc)
 
+        # USS: Bound aggregated predictions (not just raw forecasts)
+        if (survival_controller is not None
+                and survival_controller.is_survival
+                and pred_result is not None
+                and hasattr(pred_result, "predictions")):
+            try:
+                from operator1.analysis.survival_regime_controller import bound_survival_forecast
+                _n_bounded = 0
+                for var, horizons_dict in pred_result.predictions.items():
+                    if isinstance(horizons_dict, dict):
+                        for h, hp in horizons_dict.items():
+                            pf = getattr(hp, "point_forecast", None)
+                            if pf is not None:
+                                bounded = bound_survival_forecast(
+                                    var, float(pf), cache,
+                                    survival_controller.current_regime,
+                                )
+                                if bounded != float(pf):
+                                    hp.point_forecast = bounded
+                                    _n_bounded += 1
+                if _n_bounded > 0:
+                    logger.info(
+                        "USS: bounded %d aggregated prediction points", _n_bounded,
+                    )
+            except Exception as exc:
+                logger.debug("USS aggregated prediction bounding failed: %s", exc)
+
         # SHAP explainability (after aggregation -- needs pred_result)
         try:
             from operator1.models.explainability import compute_shap_explanations
@@ -2867,6 +2940,53 @@ Non-interactive examples:
     else:
         logger.info("Step 6: Skipped (--skip-models)")
         # regime_detector may have been set in Step 5.5; keep it if so.
+
+    # ------------------------------------------------------------------
+    # Step 6-USS: Unified Survival System -- Post-model integration
+    # ------------------------------------------------------------------
+    # Apply forecast bounding (Dimension 5) and run scenario engine
+    # when survival mode is active.
+    if survival_controller is not None and not args.skip_models:
+        # Forecast bounding: apply hard bounds to survival-mode forecasts
+        if survival_controller.is_survival and forecast_result is not None:
+            try:
+                from operator1.analysis.survival_regime_controller import bound_forecast_dict
+                if hasattr(forecast_result, "forecasts") and forecast_result.forecasts:
+                    forecast_result.forecasts = bound_forecast_dict(
+                        forecast_result.forecasts, cache, survival_controller.current_regime,
+                    )
+                    logger.info(
+                        "USS forecast bounding applied (regime=%s)",
+                        survival_controller.current_regime,
+                    )
+            except Exception as exc:
+                logger.debug("USS forecast bounding failed: %s", exc)
+
+        # Scenario engine: 3-scenario MC simulation for survival mode
+        if survival_controller.is_survival:
+            try:
+                from operator1.analysis.scenario_engine import run_scenario_engine
+                scenario_result = run_scenario_engine(
+                    cache,
+                    regime=survival_controller.current_regime,
+                    n_paths=survival_controller.model_config.mc_n_paths,
+                )
+                if scenario_result and scenario_result.available:
+                    logger.info(
+                        "Scenario engine: orderly=%.1f%% / muddle=%.1f%% / catastrophic=%.1f%% (252d survival)",
+                        scenario_result.orderly.survival_prob_252d * 100,
+                        scenario_result.muddle_through.survival_prob_252d * 100,
+                        scenario_result.catastrophic.survival_prob_252d * 100,
+                    )
+            except Exception as exc:
+                logger.warning("Scenario engine failed: %s", exc)
+        else:
+            # Not in survival but check early warning
+            if survival_controller.is_approaching_survival():
+                logger.warning(
+                    "USS early warning: score=%.2f -- approaching survival triggers",
+                    survival_controller.get_early_warning_latest(),
+                )
 
     # ------------------------------------------------------------------
     # Step 6.5: Retroactive calibration (Category D)
@@ -3377,6 +3497,18 @@ Non-interactive examples:
                 "pattern_drift_applied": _pattern_drift if not args.skip_models else 1.0,
             }
 
+        # Inject Unified Survival System data into profile
+        if survival_controller is not None:
+            profile["unified_survival_system"] = survival_controller.to_profile_dict()
+        else:
+            profile["unified_survival_system"] = {"available": False}
+
+        # Inject scenario engine results
+        if scenario_result is not None and scenario_result.available:
+            profile["scenario_analysis"] = scenario_result.to_dict()
+        else:
+            profile["scenario_analysis"] = {"available": False}
+
         # Save profile -- sanitize dict keys (some model results use tuple keys)
         def _sanitize_keys(obj):
             """Recursively convert non-string dict keys to strings for JSON."""
@@ -3437,6 +3569,25 @@ Non-interactive examples:
                 logger.info("PDF saved: %s", premium["pdf_path"])
         except Exception as exc:
             logger.error("Report generation failed: %s", exc)
+
+        # Step 8-USS: Generate triage card when in company distress
+        # Only for company_survival and extreme_survival (not modified_survival,
+        # where the company itself is healthy but country is in crisis)
+        if (survival_controller is not None
+                and survival_controller.current_regime in ("company_survival", "extreme_survival")):
+            try:
+                from operator1.report.triage_card import generate_triage_card
+                triage_output = generate_triage_card(
+                    profile=profile,
+                    cache=cache,
+                    scenario_result=scenario_result,
+                    controller=survival_controller,
+                    output_dir=Path(args.output_dir) / "report",
+                )
+                if triage_output.get("markdown_path"):
+                    logger.info("Triage card saved: %s", triage_output["markdown_path"])
+            except Exception as exc:
+                logger.warning("Triage card generation failed: %s", exc)
     else:
         logger.info("Step 8: Skipped (--skip-report)")
 

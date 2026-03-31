@@ -88,8 +88,8 @@ class ReportMode(str, Enum):
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20},
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 20},
-    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995},  # all 22 sections + economic position + geopolitical + SIX + holders + ownership deep + market demand + catalysts
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 20},
+    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997},  # all 22 sections + extended sections + USS + scenarios
 }
 
 
@@ -1811,6 +1811,97 @@ def _build_macro_quadrant_section(profile: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_unified_survival_system_section(profile: dict[str, Any]) -> str:
+    """Build the Unified Survival System section."""
+    uss = profile.get("unified_survival_system", {})
+    if not uss.get("available"):
+        return "*Unified Survival System not available.*\n"
+
+    lines = []
+    regime = uss.get("current_regime", "normal")
+    is_survival = uss.get("is_survival", False)
+    regime_label = regime.upper().replace("_", " ")
+
+    if is_survival:
+        lines.append(f"**SURVIVAL MODE ACTIVE: {regime_label}**\n")
+    else:
+        lines.append(f"Regime: **{regime_label}** (normal operations)\n")
+
+    lines.append("| Dimension | Configuration |")
+    lines.append("|:----------|:-------------|")
+    lines.append(f"| Active Horizons | {', '.join(uss.get('active_horizons', []))} |")
+    lines.append(f"| Primary Horizon | {uss.get('primary_horizon', 'N/A')} |")
+    lines.append(f"| Active Variables | {uss.get('n_active_variables', 0)} |")
+    lines.append(f"| Frozen Variables | {uss.get('n_frozen_variables', 0)} |")
+    lines.append(f"| Priority Variables | {uss.get('n_priority_variables', 0)} |")
+    lines.append(f"| Correlation Override | {uss.get('correlation_override', 'None (empirical)')} |")
+    lines.append(f"| Copula Override | {uss.get('copula_override', 'None (AIC selection)')} |")
+    lines.append(f"| Regime Switches | {uss.get('regime_switches', 0)} |")
+
+    ew = uss.get("early_warning_latest", 0)
+    if ew > 0.5:
+        lines.append(f"\n**Early Warning Score: {ew:.2f}/1.00**")
+        if uss.get("approaching_survival"):
+            lines.append("> Company is approaching survival mode triggers.\n")
+
+    dist = uss.get("regime_distribution", {})
+    if dist:
+        lines.append("\n**Regime Distribution (historical):**\n")
+        for r, pct in sorted(dist.items(), key=lambda x: -x[1]):
+            lines.append(f"- {r}: {pct:.1%}")
+
+    mc = uss.get("model_config", {})
+    if mc and is_survival:
+        lines.append("\n**Model Reconfiguration:**\n")
+        lines.append(f"- Kalman noise: {mc.get('kalman_process_noise_mult', 1.0):.1f}x process, "
+                     f"{mc.get('kalman_obs_noise_mult', 1.0):.1f}x observation")
+        cap = mc.get("nn_lookback_cap")
+        if cap:
+            lines.append(f"- NN lookback capped at {cap} days")
+        lines.append(f"- MC simulation: {mc.get('mc_n_paths', 10000):,} paths, "
+                     f"P{mc.get('mc_stress_percentile', 0.95) * 100:.0f} stress")
+
+    return "\n".join(lines) + "\n"
+
+
+def _build_scenario_analysis_section(profile: dict[str, Any]) -> str:
+    """Build the Scenario Analysis section."""
+    sa = profile.get("scenario_analysis", {})
+    if not sa.get("available"):
+        return "*Scenario analysis not available (only runs in survival mode).*\n"
+
+    lines = []
+    lines.append(f"Three-scenario Monte Carlo analysis ({sa.get('n_paths', 0):,} paths, "
+                 f"{sa.get('horizon_days', 252)} day horizon):\n")
+
+    lines.append("| Scenario | Cash Runway | 90d Survival | 252d Survival | Median Return | Max Drawdown |")
+    lines.append("|:---------|:----------:|:------------:|:-------------:|:-------------:|:------------:|")
+
+    for key, label in [("orderly_resolution", "Orderly Resolution"),
+                       ("muddle_through", "Muddle Through"),
+                       ("catastrophic", "Catastrophic")]:
+        s = sa.get(key, {})
+        if not s:
+            continue
+        runway = s.get("cash_runway_days", 0)
+        s90 = s.get("survival_prob_90d", 0)
+        s252 = s.get("survival_prob_252d", 0)
+        med_ret = s.get("median_return", 0)
+        mdd = s.get("max_drawdown_median", 0)
+        lines.append(
+            f"| **{label}** | {runway:.0f}d | {s90:.1%} | {s252:.1%} | "
+            f"{med_ret:+.1%} | {mdd:.1%} |"
+        )
+
+    # Scenario descriptions
+    for key in ("orderly_resolution", "muddle_through", "catastrophic"):
+        s = sa.get(key, {})
+        if s.get("description"):
+            lines.append(f"\n**{s.get('name', key)}:** {s['description']}")
+
+    return "\n".join(lines) + "\n"
+
+
 def _build_advanced_insights(profile: dict[str, Any]) -> str:
     """Build the Advanced Quantitative Insights section.
 
@@ -3116,6 +3207,8 @@ def _build_fallback_report(
         198: ("19.8. Institutional Ownership Deep Analysis", _build_institutional_ownership_deep_section(profile)),
         199: ("19.9. Market Demand & Buying Power", _build_market_buying_power_section(profile)),
         1995: ("19.10. Product Catalysts & Forward Signals", _build_product_catalysts_section(profile)),
+        1996: ("19.11. Unified Survival System", _build_unified_survival_system_section(profile)),
+        1997: ("19.12. Scenario Analysis", _build_scenario_analysis_section(profile)),
         20: ("20. Risk Factors & Limitations", (
             _build_risk_assessment(profile) + "\n\n### 20.1 LIMITATIONS\n\n" + _build_limitations(profile)
         )),

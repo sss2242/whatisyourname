@@ -104,6 +104,10 @@ class BacktestState:
         self._adaptive_tier3 = None
         self._ohlcv_source_label: str = ""
 
+        # USS (Unified Survival System) outputs
+        self.survival_controller = None
+        self.scenario_result = None
+
         # Stage 2 outputs
         self.forecast_result = None
         self.forward_pass_result = None
@@ -1035,6 +1039,36 @@ def run_stage2(state: BacktestState) -> None:
     except Exception:
         pass
 
+    # USS: Unified Survival System integration
+    try:
+        from operator1.analysis.survival_regime_controller import (
+            SurvivalRegimeController, bound_forecast_dict,
+        )
+        state.survival_controller = SurvivalRegimeController.from_cache(cache)
+        if state.survival_controller.is_survival:
+            # Apply forecast bounding
+            if state.forecast_result is not None and hasattr(state.forecast_result, "forecasts"):
+                state.forecast_result.forecasts = bound_forecast_dict(
+                    state.forecast_result.forecasts, cache,
+                    state.survival_controller.current_regime,
+                )
+                logger.info("USS forecast bounding applied")
+            # Run scenario engine
+            from operator1.analysis.scenario_engine import run_scenario_engine
+            state.scenario_result = run_scenario_engine(
+                cache, regime=state.survival_controller.current_regime,
+                n_paths=state.survival_controller.model_config.mc_n_paths,
+            )
+            if state.scenario_result and state.scenario_result.available:
+                logger.info(
+                    "USS scenario engine: orderly=%.1f%% / muddle=%.1f%% / catastrophic=%.1f%%",
+                    state.scenario_result.orderly.survival_prob_252d * 100,
+                    state.scenario_result.muddle_through.survival_prob_252d * 100,
+                    state.scenario_result.catastrophic.survival_prob_252d * 100,
+                )
+    except Exception as exc:
+        logger.debug("USS integration skipped: %s", exc)
+
     state.cache = cache
     state.save(stage=2)
     logger.info("STAGE 2 COMPLETE")
@@ -1116,6 +1150,16 @@ def run_stage3(state: BacktestState) -> None:
             if isinstance(obj, dict): return {str(k): _sanitize(v) for k, v in obj.items()}
             if isinstance(obj, list): return [_sanitize(i) for i in obj]
             return obj
+
+        # Inject USS data into profile
+        if state.survival_controller is not None:
+            profile["unified_survival_system"] = state.survival_controller.to_profile_dict()
+        else:
+            profile["unified_survival_system"] = {"available": False}
+        if state.scenario_result is not None and state.scenario_result.available:
+            profile["scenario_analysis"] = state.scenario_result.to_dict()
+        else:
+            profile["scenario_analysis"] = {"available": False}
 
         profile = _sanitize(profile)
         with open(profile_path, "w") as f:
