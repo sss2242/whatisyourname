@@ -31,6 +31,19 @@ shap==0.50.0              # SHAP explainability
 mapie==1.3.0              # Conformal prediction
 dtaidistance==2.4.0       # Dynamic Time Warping
 PyWavelets>=1.7           # Wavelet transform for cycle decomposition
+ta>=0.11                  # Technical analysis indicators (ADX, OBV, BB, MACD)
+lifelines>=0.29           # Cox PH survival analysis
+changefinder>=0.3         # Online change point detection (SDAR)
+copulae>=0.7              # Copula fitting (Gaussian, Student-t, Clayton)
+stumpy>=1.13              # Matrix Profile motifs and discords
+miceforest>=5.7           # LightGBM MICE imputation
+SALib>=1.5                # Sobol global sensitivity analysis
+scikit-fuzzy>=0.5         # Mamdani fuzzy inference engine
+tigramite>=5.2            # PCMCI causal discovery
+optuna>=4.0               # TPE hyperparameter optimization
+statsforecast>=2.0        # Fast AutoARIMA
+vaderSentiment>=3.3       # VADER rule-based sentiment
+EMD-signal>=1.6           # CEEMDAN cycle decomposition
 
 # --- Stage 3: Deep Learning + Bayesian ---
 torch==2.10.0             # ~2 GB download -- skip if bandwidth is limited
@@ -65,9 +78,18 @@ fredapi==0.5.2             # US FRED (needs FRED_API_KEY)
 sdmx1==2.25.1              # EU/ECB/Bundesbank (no key)
 python-bcb==0.3.4          # Brazil BCB (no key)
 banxicoapi==1.0.2          # Mexico Banxico (needs BANXICO_TOKEN)
+# WAF bypass and scraping
+curl_cffi>=0.13            # Chrome TLS impersonation for WAF bypass
+onnxruntime>=1.19          # ONNX neural net for Bundesanzeiger CAPTCHA
 # News sentiment
 gnews==0.4.3               # Google News scraper (no key)
 feedparser==6.0.12         # RSS parser
+# Enhanced outputs (dashboard, charts, PDF)
+mplfinance>=0.12           # Professional OHLCV charts
+plotly>=6.0                # Interactive HTML dashboards
+fpdf2>=2.8                 # Pure-Python PDF generation
+quantstats>=0.0.62         # Performance tearsheets
+nicegui>=2.0               # Desktop dashboard framework
 
 # --- Testing ---
 pytest==9.0.2

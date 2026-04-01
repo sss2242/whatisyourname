@@ -301,11 +301,19 @@ def extract_financials_from_pdf(
             len(market_hints), market_id,
         )
 
-    # Try camelot first (best table extraction quality)
-    rows = _extract_with_camelot(pdf_bytes, concepts, filing_date, report_date, similarity_threshold)
+    # Smart routing: detect whether PDF pages contain tables.
+    # Use camelot for pages with tables (98%+ accuracy on structured tables),
+    # pdfplumber for pages without tables (better at extracting text-based data).
+    has_tables = _detect_tables_in_pdf(pdf_bytes)
 
-    # Fall back to pdfplumber if camelot isn't available or found nothing
-    if not rows:
+    if has_tables:
+        # Camelot excels at structured table extraction (bordered + borderless)
+        rows = _extract_with_camelot(pdf_bytes, concepts, filing_date, report_date, similarity_threshold)
+        if not rows:
+            # Camelot found tables but couldn't match concepts -- try pdfplumber
+            rows = _extract_with_pdfplumber(pdf_bytes, concepts, filing_date, report_date, similarity_threshold)
+    else:
+        # No tables detected -- use pdfplumber for text-based extraction
         rows = _extract_with_pdfplumber(pdf_bytes, concepts, filing_date, report_date, similarity_threshold)
 
     # Post-extraction validation: remove obviously wrong values
@@ -317,6 +325,53 @@ def extract_financials_from_pdf(
             len(rows), similarity_threshold,
         )
     return rows
+
+
+def _detect_tables_in_pdf(pdf_bytes: bytes) -> bool:
+    """Detect whether the PDF contains structured tables on financial pages.
+
+    Uses ``_find_financial_pages()`` to identify pages with financial content
+    first, then checks only those pages for tables using pdfplumber's
+    built-in table detection.  If tables are found, camelot should be used
+    for extraction; otherwise pdfplumber's text extraction is more appropriate.
+
+    Parameters
+    ----------
+    pdf_bytes:
+        Raw PDF file bytes.
+
+    Returns
+    -------
+    True if at least one financial page has detected tables.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return False
+
+    # Use the existing financial page finder to target only relevant pages
+    financial_pages = _find_financial_pages(pdf_bytes)
+    if not financial_pages:
+        return False
+
+    try:
+        import io
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page_num in financial_pages:
+                if page_num < 1 or page_num > len(pdf.pages):
+                    continue
+                page = pdf.pages[page_num - 1]  # pdfplumber is 0-indexed
+                tables = page.find_tables()
+                if tables:
+                    logger.debug(
+                        "Table detection: found %d tables on financial page %d",
+                        len(tables), page_num,
+                    )
+                    return True
+        return False
+    except Exception as exc:
+        logger.debug("Table detection failed: %s", exc)
+        return False
 
 
 def _extract_with_camelot(

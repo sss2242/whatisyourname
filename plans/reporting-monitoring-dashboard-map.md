@@ -1,6 +1,6 @@
-# Reporting, Monitoring & Dashboard Map (2026-03-27)
+# Reporting, Monitoring & Dashboard Map (2026-04-01)
 
-Complete map of all modules in the output/presentation layer: report generation (4 modules, 6,218 lines), monitoring (2 modules, 2,219 lines), and dashboard (1 module, 1,510 lines). Covers inputs, outputs, wiring status, and current state.
+Complete map of all modules in the output/presentation layer: report generation (4 modules, ~6,850 lines), monitoring (3 modules, ~3,100 lines), and dashboard (1 module, ~1,850 lines). Covers inputs, outputs, wiring status, and current state.
 
 ---
 
@@ -10,7 +10,7 @@ The report layer consumes `company_profile.json` from the profile builder and pr
 
 ### 1.1 Profile Builder -- `profile_builder.py`
 
-**Lines:** 1,271 | **Location:** `operator1/report/profile_builder.py` | **Status:** WORKING
+**Lines:** 1,276 | **Location:** `operator1/report/profile_builder.py` | **Status:** WORKING
 
 | | Detail |
 |---|--------|
@@ -63,6 +63,12 @@ The report layer consumes `company_profile.json` from the profile builder and pr
 | `institutional_ownership_analysis` | Contagion + flow results | When contagion or flow computed |
 | `macro_indicators` | Macro data summary | When macro data fetched |
 | `synergies_applied` | `_synergy_meta` dict | When synergies ran |
+| `predicted_regime_shifts` | `regime_shift_result.to_dict()` | When regime shift predictor ran |
+| `model_diagnostics` | `model_diagnostics_result.to_dict()` | When model diagnostics ran |
+| `market_buying_power` | `BuyingPowerResult` | When buying power computed |
+| `supply_chain_stress` | `supply_chain_stress_result` | When supply chain stress computed |
+| `product_catalysts` | `CatalystResult` | When catalyst detection ran |
+| `scenario_analysis` | `scenario_result.to_dict()` | When USS scenario engine ran |
 
 ### 1.2 Profile Schema -- `profile_schema.py`
 
@@ -79,7 +85,7 @@ The report layer consumes `company_profile.json` from the profile builder and pr
 
 ### 1.3 Report Generator -- `report_generator.py`
 
-**Lines:** 4,067 | **Location:** `operator1/report/report_generator.py` | **Status:** WORKING
+**Lines:** 4,628 | **Location:** `operator1/report/report_generator.py` | **Status:** WORKING
 
 | | Detail |
 |---|--------|
@@ -126,6 +132,10 @@ The report layer consumes `company_profile.json` from the profile builder and pr
 | 19.6 | SIX Proxy Analysis | `_build_six_proxy_section()` | extended_models (if ch_six) | Pro+ |
 | 19.7 | Institutional Holders | `_build_institutional_holders_section()` | institutional_holders | Pro+ |
 | 19.8 | Ownership Deep Analysis | `_build_ownership_deep_section()` | institutional_ownership_analysis | Pro+ |
+| 19.95 | Unified Survival System | `_build_uss_section()` | unified_survival_system | Premium |
+| 19.96 | Scenario Analysis | `_build_scenario_section()` | scenario_analysis | Premium |
+| 19.97 | Model Diagnostics | `_build_model_diagnostics_section()` | model_diagnostics | Premium |
+| 19.98 | Predicted Regime Shifts | `_build_regime_shifts_section()` | predicted_regime_shifts | Premium |
 | 20 | Risk Factors & Limitations | `_build_risk_assessment()` | data_quality, estimation | All |
 | 21 | Investment Recommendation | `_build_investment_recommendation()` | All sections | Premium |
 | 22 | Appendix & Methodology | `_build_appendix()` | model_metrics, meta | Premium |
@@ -170,7 +180,7 @@ The monitoring layer checks all 25 PIT market wrappers and OHLCV providers, dete
 
 ### 2.1 Health Check -- `health_check.py`
 
-**Lines:** 1,072 | **Location:** `operator1/monitoring/health_check.py` | **Status:** WORKING
+**Lines:** 1,073 | **Location:** `operator1/monitoring/health_check.py` | **Status:** WORKING
 
 | | Detail |
 |---|--------|
@@ -311,6 +321,33 @@ The monitoring layer checks all 25 PIT market wrappers and OHLCV providers, dete
 
 **Deep probe status values:** working, restructured, down, geo_blocked, waf_blocked, rate_limited, auth_changed, partial.
 
+### 2.3 Model Diagnostics -- `model_diagnostics.py`
+
+**Lines:** 875 | **Location:** `operator1/monitoring/model_diagnostics.py` | **Status:** WORKING
+
+| | Detail |
+|---|--------|
+| **Entry point** | `compute_model_diagnostics()` |
+| **Input** | `cache`, all temporal model results (forecast, MC, copula, granger, cycle, DTW, conformal) |
+| **Output** | `ModelDiagnosticsResult` -> stored in `profile["model_diagnostics"]` |
+| **Wired in** | `main.py` Step 6.6 |
+
+**Purpose:** For each of 10 models, pre-computes what it SHOULD produce based on data characteristics (series length, stationarity, variable count), then compares against actual output. Produces per-model robustness ratings.
+
+**Models assessed (10):** Kalman, GARCH, VAR, LSTM, Tree, Monte Carlo, Copula, Granger, Cycle, DTW, Conformal.
+
+**Robustness ratings:**
+
+| Rating | Meaning |
+|--------|---------|
+| on_track | Model output matches expected behavior for the data |
+| degraded | Model ran but results are questionable (e.g., poor convergence) |
+| failed | Model did not produce usable output |
+
+**Overall robustness:** Fraction of models rated `on_track`. Used by report generator for confidence disclaimers.
+
+**Report integration:** Rendered in Premium report section 19.97 (Model Diagnostics).
+
 ---
 
 ## Section 3: Dashboard (dashboard.py)
@@ -319,7 +356,7 @@ The NiceGUI desktop dashboard provides a visual interface for running analyses, 
 
 ### 3.1 Dashboard -- `dashboard.py`
 
-**Lines:** 1,510 | **Location:** `dashboard.py` | **Status:** WORKING
+**Lines:** 1,853 | **Location:** `dashboard.py` | **Status:** WORKING
 
 | | Detail |
 |---|--------|
@@ -384,7 +421,7 @@ The NiceGUI desktop dashboard provides a visual interface for running analyses, 
 
 | Layer | Modules | Lines | Key Outputs |
 |-------|---------|-------|-------------|
-| Report Generation | 4 | 6,221 | Markdown (3 tiers), PDF (pandoc + fpdf2), charts (matplotlib + mplfinance), interactive HTML (plotly), tearsheet (quantstats) |
-| Monitoring | 2 | 2,219 | Health JSON, history JSONL, 6 probe levels, 11 probe types, OHLCV probes, latency trending, parallel execution |
-| Dashboard | 1 | 1,510 | NiceGUI desktop app, 5 pages, ECharts, Proton.me Monokai theme, command palette, live pipeline execution |
-| **Total** | **7** | **9,950** | |
+| Report Generation | 4 | ~6,850 | Markdown (3 tiers), PDF (pandoc + fpdf2), charts (matplotlib + mplfinance), interactive HTML (plotly), tearsheet (quantstats) |
+| Monitoring | 3 | ~3,100 | Health JSON, history JSONL, 6 probe levels, 11 probe types, OHLCV probes, latency trending, model diagnostics, parallel execution |
+| Dashboard | 1 | ~1,853 | NiceGUI desktop app, 5 pages, ECharts, Proton.me Monokai theme, command palette, live pipeline execution |
+| **Total** | **8** | **~11,800** | |

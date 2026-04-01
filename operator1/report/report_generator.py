@@ -88,8 +88,8 @@ class ReportMode(str, Enum):
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20},
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 20},
-    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998},  # all 22 sections + extended sections + USS + scenarios + diagnostics
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20},
+    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004},  # all 22 sections + extended sections + USS + scenarios + diagnostics + structure + calendar + macro + supply chain + synergies
 }
 
 
@@ -3328,6 +3328,163 @@ def _build_six_swiss_exchange_section(profile: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_corporate_structure_section(profile: dict[str, Any]) -> str:
+    """Render GLEIF corporate structure (parent/subsidiary hierarchy)."""
+    cs = profile.get("corporate_structure", {})
+    if not cs.get("available"):
+        return "*Corporate structure data not available.*\n"
+
+    lines = []
+    parents = cs.get("parent_companies", [])
+    if parents:
+        lines.append("**Parent Companies:**\n")
+        lines.append("| Name | Country | LEI | Relationship |")
+        lines.append("|------|---------|-----|-------------|")
+        for p in parents:
+            lines.append(
+                f"| {p.get('name', 'N/A')} | {p.get('country', 'N/A')} "
+                f"| {p.get('lei', 'N/A')[:20]} | {p.get('relationship', 'parent')} |"
+            )
+        lines.append("")
+
+    n_subs = cs.get("n_subsidiaries", 0)
+    subs = cs.get("subsidiaries", [])
+    sub_countries = cs.get("subsidiaries_countries", [])
+    cross_border = cs.get("cross_border", False)
+
+    if n_subs > 0:
+        lines.append(f"**Subsidiaries:** {n_subs} entities across {len(sub_countries)} countries")
+        if cross_border:
+            lines.append(f"  - Cross-border operations: {', '.join(sub_countries[:10])}")
+        lines.append("")
+        if subs:
+            lines.append("| Name | Country | LEI |")
+            lines.append("|------|---------|-----|")
+            for s in subs[:10]:
+                lines.append(
+                    f"| {s.get('name', 'N/A')} | {s.get('country', 'N/A')} "
+                    f"| {s.get('lei', 'N/A')[:20]} |"
+                )
+            if n_subs > 10:
+                lines.append(f"\n*... and {n_subs - 10} more subsidiaries.*")
+    else:
+        lines.append("*No subsidiary data available from GLEIF.*")
+
+    lines.append(f"\n*Source: GLEIF (Global Legal Entity Identifier Foundation)*")
+    return "\n".join(lines)
+
+
+def _build_filing_calendar_section(profile: dict[str, Any]) -> str:
+    """Render filing calendar analysis (frequency, staleness, next filing)."""
+    fc = profile.get("filing_calendar", {})
+    if not fc.get("available"):
+        return "*Filing calendar analysis not available.*\n"
+
+    lines = []
+    freq = fc.get("detected_frequency", "unknown")
+    coverage = fc.get("coverage_ratio", 0)
+    expected = fc.get("expected_filings_2yr", 0)
+    actual = fc.get("actual_filings_2yr", 0)
+    stale = fc.get("is_stale", False)
+    age = fc.get("latest_filing_age_days", 0)
+
+    lines.append(f"**Filing Frequency:** {freq.title()}")
+    lines.append(f"**Coverage:** {actual}/{expected} filings in 2-year window ({coverage:.0%})")
+    lines.append(f"**Latest Filing Age:** {age} days")
+
+    if stale:
+        lines.append(f"\n> **WARNING:** Data is stale -- latest filing is {age} days old.")
+
+    gaps = fc.get("gaps", [])
+    if gaps:
+        lines.append(f"\n**Filing Gaps Detected:** {len(gaps)}")
+        for gap in gaps[:5]:
+            lines.append(f"  - {gap}")
+
+    next_filing = fc.get("next_expected_filing", {})
+    if next_filing and next_filing.get("available", False):
+        lines.append(f"\n**Next Expected Filing:** {next_filing.get('predicted_date', 'N/A')}")
+        lines.append(f"  - Confidence: {next_filing.get('confidence', 'N/A')}")
+
+    return "\n".join(lines)
+
+
+def _build_macro_indicators_section(profile: dict[str, Any]) -> str:
+    """Render macro indicator data summary."""
+    indicators = profile.get("macro_indicators", {})
+    if not indicators:
+        return "*Macro indicator data not available.*\n"
+
+    lines = []
+    lines.append("| Indicator | Latest Value | Latest Date | Observations |")
+    lines.append("|-----------|-------------|-------------|-------------|")
+    for name, data in sorted(indicators.items()):
+        val = data.get("latest_value", "N/A")
+        if isinstance(val, float):
+            val = f"{val:.4f}"
+        lines.append(
+            f"| {name.replace('_', ' ').title()} | {val} "
+            f"| {data.get('latest_date', 'N/A')} | {data.get('observations', 0)} |"
+        )
+
+    return "\n".join(lines)
+
+
+def _build_supply_chain_stress_section(profile: dict[str, Any]) -> str:
+    """Render supply chain stress assessment."""
+    scs = profile.get("supply_chain_stress", {})
+    if not scs.get("available"):
+        return "*Supply chain stress assessment not available.*\n"
+
+    flag = scs.get("supply_chain_stress_flag", False)
+    score = scs.get("supply_chain_stress_score", 0)
+    sources = scs.get("stress_sources", [])
+
+    badge = "STRESSED" if flag else "NORMAL"
+    lines = [
+        f"**Supply Chain Status:** {badge}",
+        f"**Stress Score:** {score:.3f}",
+    ]
+    if sources:
+        lines.append("\n**Stress Sources:**")
+        for src in sources:
+            lines.append(f"  - {src}")
+
+    return "\n".join(lines)
+
+
+def _build_synergies_section(profile: dict[str, Any]) -> str:
+    """Render model synergies metadata."""
+    syn = profile.get("synergies_applied", {})
+    if not syn:
+        return "*Model synergies metadata not available.*\n"
+
+    lines = []
+    cycle_feats = syn.get("cycle_features_added", [])
+    if cycle_feats:
+        lines.append(f"**Cycle Features Injected:** {', '.join(cycle_feats[:5])}")
+
+    ucn = syn.get("unified_causal_network", {})
+    if ucn:
+        lines.append(f"**Unified Causal Network:** {ucn.get('n_pairs', 0)} pairs, "
+                      f"density={ucn.get('density', 0):.3f}, "
+                      f"{ucn.get('n_retained', 0)} variables retained")
+
+    n_vars = syn.get("variables_after_pruning", 0)
+    if n_vars:
+        lines.append(f"**Variables After Causal Pruning:** {n_vars}")
+
+    drift = syn.get("pattern_drift_applied", 1.0)
+    if drift != 1.0:
+        lines.append(f"**Pattern Drift Multiplier:** {drift:.3f}")
+
+    thresholds = syn.get("adjusted_survival_thresholds", {})
+    if thresholds:
+        lines.append(f"**Peer-Adjusted Survival Thresholds:** {len(thresholds)} adjusted")
+
+    return "\n".join(lines) if lines else "*No synergies were applied.*\n"
+
+
 def _build_fallback_report(
     profile: dict[str, Any],
     tier: ReportTier = ReportTier.PREMIUM,
@@ -3381,6 +3538,11 @@ def _build_fallback_report(
         )),
         21: ("21. Investment Recommendation", _build_investment_recommendation(profile)),
         1998: ("21.5. Model Robustness Diagnostics", _build_model_diagnostics_section(profile)),
+        1999: ("21.6. Corporate Structure", _build_corporate_structure_section(profile)),
+        2001: ("21.7. Filing Calendar & Data Freshness", _build_filing_calendar_section(profile)),
+        2002: ("21.8. Macro Indicator Summary", _build_macro_indicators_section(profile)),
+        2003: ("21.9. Supply Chain Stress Assessment", _build_supply_chain_stress_section(profile)),
+        2004: ("21.10. Model Synergies Applied", _build_synergies_section(profile)),
         22: ("22. Appendix & Methodology", _build_appendix(profile)),
     }
 

@@ -11,3 +11,16 @@ mapie==1.3.0
 dtaidistance==2.4.0
 PyWavelets>=1.7
 ripser==0.6.14              # Persistent homology (replaces giotto-tda which needs scikit-learn==1.3.2)
+ta>=0.11                    # Technical analysis indicators (ADX, OBV, BB, MACD)
+lifelines>=0.29             # Cox PH survival analysis
+changefinder>=0.3           # Online change point detection (SDAR)
+copulae>=0.7                # Copula fitting (Gaussian, Student-t, Clayton) with AIC selection
+stumpy>=1.13                # Matrix Profile motifs and discords
+miceforest>=5.7             # LightGBM-based MICE imputation
+SALib>=1.5                  # Sobol global sensitivity analysis
+scikit-fuzzy>=0.5           # Mamdani fuzzy inference engine
+tigramite>=5.2              # PCMCI causal discovery
+optuna>=4.0                 # TPE hyperparameter optimization
+statsforecast>=2.0          # Fast AutoARIMA (100x faster than pmdarima)
+vaderSentiment>=3.3         # Rule-based sentiment analysis (VADER)
+EMD-signal>=1.6             # CEEMDAN cycle decomposition

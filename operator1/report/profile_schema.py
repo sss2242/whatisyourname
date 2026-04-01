@@ -71,6 +71,9 @@ OPTIONAL_PROFILE_KEYS: set[str] = {
     "macro_indicators",
     "synergies_applied",
     "enriched_survival_timeline",
+    "predicted_regime_shifts",
+    "model_diagnostics",
+    "supply_chain_stress",
 }
 
 
@@ -96,7 +99,9 @@ def validate_profile(profile: dict[str, Any]) -> list[str]:
 
     # Check that available sections have the 'available' flag
     for key in ("graph_risk", "game_theory", "fuzzy_protection",
-                "pid_controller", "conflict_risk"):
+                "pid_controller", "conflict_risk",
+                "predicted_regime_shifts", "model_diagnostics",
+                "supply_chain_stress"):
         section = profile.get(key, {})
         if isinstance(section, dict) and "available" not in section:
             issues.append(
