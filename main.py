@@ -3146,6 +3146,30 @@ Non-interactive examples:
             logger.warning("Retroactive calibration failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 6.6: Model expected path vs actual path diagnostics
+    # ------------------------------------------------------------------
+    # For each model, pre-computes what it SHOULD produce based on data
+    # characteristics, then compares against what it actually produced.
+    # Produces per-model robustness ratings for the profile and report.
+    model_diagnostics_result = None
+    try:
+        from operator1.monitoring.model_diagnostics import compute_model_diagnostics
+        model_diagnostics_result = compute_model_diagnostics(
+            cache,
+            forecast_result=forecast_result,
+            mc_result=mc_result,
+        )
+        if model_diagnostics_result and model_diagnostics_result.available:
+            logger.info(
+                "Model diagnostics: %d/%d on track, overall=%s",
+                model_diagnostics_result.n_models_on_track,
+                model_diagnostics_result.n_models_assessed,
+                model_diagnostics_result.overall_robustness,
+            )
+    except Exception as exc:
+        logger.debug("Model diagnostics failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 7: Build company profile
     # ------------------------------------------------------------------
     # Item 5: When --skip-models is used, the following variables are None:
@@ -3642,6 +3666,12 @@ Non-interactive examples:
             profile["unified_survival_system"] = survival_controller.to_profile_dict()
         else:
             profile["unified_survival_system"] = {"available": False}
+
+        # Inject model diagnostics (expected path vs actual path)
+        if model_diagnostics_result is not None and model_diagnostics_result.available:
+            profile["model_diagnostics"] = model_diagnostics_result.to_dict()
+        else:
+            profile["model_diagnostics"] = {"available": False}
 
         # Inject scenario engine results
         if scenario_result is not None and scenario_result.available:
