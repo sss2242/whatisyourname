@@ -301,11 +301,19 @@ def extract_financials_from_pdf(
             len(market_hints), market_id,
         )
 
-    # Try camelot first (best table extraction quality)
-    rows = _extract_with_camelot(pdf_bytes, concepts, filing_date, report_date, similarity_threshold)
+    # Smart routing: detect whether PDF pages contain tables.
+    # Use camelot for pages with tables (98%+ accuracy on structured tables),
+    # pdfplumber for pages without tables (better at extracting text-based data).
+    has_tables = _detect_tables_in_pdf(pdf_bytes)
 
-    # Fall back to pdfplumber if camelot isn't available or found nothing
-    if not rows:
+    if has_tables:
+        # Camelot excels at structured table extraction (bordered + borderless)
+        rows = _extract_with_camelot(pdf_bytes, concepts, filing_date, report_date, similarity_threshold)
+        if not rows:
+            # Camelot found tables but couldn't match concepts -- try pdfplumber
+            rows = _extract_with_pdfplumber(pdf_bytes, concepts, filing_date, report_date, similarity_threshold)
+    else:
+        # No tables detected -- use pdfplumber for text-based extraction
         rows = _extract_with_pdfplumber(pdf_bytes, concepts, filing_date, report_date, similarity_threshold)
 
     # Post-extraction validation: remove obviously wrong values
@@ -317,6 +325,48 @@ def extract_financials_from_pdf(
             len(rows), similarity_threshold,
         )
     return rows
+
+
+def _detect_tables_in_pdf(pdf_bytes: bytes, max_pages: int = 20) -> bool:
+    """Detect whether the PDF contains structured tables on financial pages.
+
+    Uses pdfplumber's built-in table detection (fast, no camelot needed)
+    to determine if the PDF has tabular data. If tables are found,
+    camelot should be used for extraction; otherwise pdfplumber's
+    text extraction is more appropriate.
+
+    Parameters
+    ----------
+    pdf_bytes:
+        Raw PDF file bytes.
+    max_pages:
+        Maximum pages to scan for tables.
+
+    Returns
+    -------
+    True if at least one page has detected tables.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return False
+
+    try:
+        import io
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            pages_to_check = pdf.pages[:max_pages]
+            for page in pages_to_check:
+                tables = page.find_tables()
+                if tables:
+                    logger.debug(
+                        "Table detection: found %d tables on page %d",
+                        len(tables), page.page_number,
+                    )
+                    return True
+        return False
+    except Exception as exc:
+        logger.debug("Table detection failed: %s", exc)
+        return False
 
 
 def _extract_with_camelot(
