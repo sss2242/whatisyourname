@@ -416,6 +416,16 @@ def run_stage1(state: BacktestState) -> None:
         idx = pd.date_range(start_dt, end_dt, freq="B", name="date")
         cache = pd.DataFrame(index=idx)
 
+    # Benchmark returns for beta_252d
+    try:
+        from operator1.clients.ohlcv_provider import fetch_benchmark_returns
+        _bench = fetch_benchmark_returns(state.market_id, years=int(state.years))
+        if not _bench.empty:
+            cache["benchmark_return_1d"] = _bench.reindex(cache.index, method="ffill")
+            logger.info("Benchmark returns merged for beta_252d")
+    except Exception as exc:
+        logger.debug("Benchmark fetch skipped: %s", exc)
+
     # Merge statements
     try:
         from operator1.estimation.frequency_interpolator import interpolate_statement_to_daily
@@ -741,6 +751,64 @@ def run_stage1(state: BacktestState) -> None:
     except Exception:
         pass
 
+    # Adaptive model parameters (Tier 2)
+    try:
+        from operator1.analysis.adaptive_model_params import (
+            compute_blend_weights, compute_regime_risk_multiplier,
+            compute_garman_klass_factor, compute_transition_halflife,
+            compute_adaptive_mc_params, compute_adaptive_participation_rate,
+            AdaptiveModelParams,
+        )
+        state._adaptive_model_params = AdaptiveModelParams()
+        if "survival_probability" in cache.columns and "cox_survival_score" in cache.columns:
+            _sig = cache.get("survival_probability")
+            _cox = cache.get("cox_survival_score")
+            _actual = cache.get("company_survival_mode_flag", pd.Series(0, index=cache.index))
+            if _sig is not None and _cox is not None:
+                w_sig, w_cox = compute_blend_weights(_sig, _cox, _actual)
+                state._adaptive_model_params.blend_w_sig = w_sig
+                state._adaptive_model_params.blend_w_cox = w_cox
+                cache["survival_probability"] = w_sig * _sig + w_cox * _cox.fillna(_sig)
+        state._adaptive_model_params.survival_risk_multiplier = compute_regime_risk_multiplier(
+            state.regime_detector, cache,
+        )
+        state._adaptive_model_params.intraday_low_factor = compute_garman_klass_factor(cache)
+        state._adaptive_model_params.mc_n_paths, state._adaptive_model_params.mc_is_tilt = (
+            compute_adaptive_mc_params(cache)
+        )
+        state._adaptive_model_params.participation_rate = compute_adaptive_participation_rate(cache)
+        state._adaptive_model_params.adapted = True
+        logger.info("Adaptive model params computed")
+    except Exception as exc:
+        logger.debug("Adaptive model params skipped: %s", exc)
+
+    # Adaptive windows (Tier 3)
+    try:
+        from operator1.analysis.adaptive_windows import (
+            compute_adaptive_windows, compute_nn_hyperparams,
+            compute_pattern_thresholds, compute_stale_threshold,
+            AdaptiveTier3Params,
+        )
+        from operator1.analysis.adaptive_model_params import compute_effective_sample_size
+        _freq = (
+            state.filing_calendar_result.detected_frequency
+            if state.filing_calendar_result is not None
+            else "quarterly"
+        )
+        state._adaptive_tier3 = AdaptiveTier3Params()
+        state._adaptive_tier3.windows = compute_adaptive_windows(_freq)
+        state._adaptive_tier3.stale_threshold_days = compute_stale_threshold(_freq)
+        _n_eff = compute_effective_sample_size(cache, "close")
+        _n_feat = sum(1 for c in cache.columns if cache[c].dtype in ("float64", "float32") and cache[c].notna().sum() > 10)
+        state._adaptive_tier3.nn_params = compute_nn_hyperparams(n_eff=_n_eff, n_features=min(_n_feat, 30))
+        state._adaptive_tier3.pattern_body_threshold, state._adaptive_tier3.pattern_doji_threshold = (
+            compute_pattern_thresholds(cache, lookback=state._adaptive_tier3.windows.medium)
+        )
+        state._adaptive_tier3.adapted = True
+        logger.info("Adaptive windows computed")
+    except Exception as exc:
+        logger.debug("Adaptive windows skipped: %s", exc)
+
     # Enriched survival timeline
     try:
         from operator1.models.regime_detector import run_early_regime_detection
@@ -762,6 +830,56 @@ def run_stage1(state: BacktestState) -> None:
             logger.info("Enriched timeline: intensity=%.3f", state.enriched_timeline_result.mean_intensity)
     except Exception as exc:
         logger.warning("Enriched timeline failed: %s", exc)
+
+    # Linked aggregates (requires linked_caches from entity fetch above)
+    if state.linked_caches:
+        try:
+            from operator1.features.linked_aggregates import compute_linked_aggregates, compute_relative_metrics
+            _entity_groups = {}
+            for grp, ents in state.relationships.items():
+                if isinstance(ents, list):
+                    ids = []
+                    for e in ents:
+                        eid = ""
+                        if isinstance(e, dict):
+                            eid = e.get("isin", "") or e.get("ticker", "")
+                        elif hasattr(e, "isin"):
+                            eid = e.isin or getattr(e, "ticker", "")
+                        if eid:
+                            ids.append(eid)
+                    _entity_groups[grp] = ids
+            state.linked_agg_df = compute_linked_aggregates(
+                target_daily=cache, linked_daily=state.linked_caches,
+                entity_groups=_entity_groups,
+            )
+            if state.linked_agg_df is not None and not state.linked_agg_df.empty:
+                _new_agg = [c for c in state.linked_agg_df.columns if c not in cache.columns]
+                if _new_agg:
+                    cache = cache.join(state.linked_agg_df[_new_agg], how="left")
+                logger.info("Linked aggregates: %d columns merged", len(_new_agg))
+                # Relative metrics
+                _rel = compute_relative_metrics(cache, state.linked_agg_df)
+                if _rel is not None and not _rel.empty:
+                    _new_rel = [c for c in _rel.columns if c not in cache.columns and _rel[c].notna().any()]
+                    if _new_rel:
+                        cache = cache.join(_rel[_new_rel], how="left")
+        except Exception as exc:
+            logger.debug("Linked aggregates skipped: %s", exc)
+
+    # Ownership contagion
+    if state.target_holders:
+        try:
+            from operator1.models.ownership_contagion import compute_ownership_contagion, inject_contagion_into_cache
+            state.contagion_result = compute_ownership_contagion(
+                target_holders=state.target_holders,
+                competitor_holders={},
+                cache=cache,
+            )
+            if state.contagion_result and state.contagion_result.available:
+                cache = inject_contagion_into_cache(cache, state.contagion_result)
+                logger.info("Ownership contagion: MHHI=%.3f", state.contagion_result.mhhi_delta)
+        except Exception as exc:
+            logger.debug("Ownership contagion skipped: %s", exc)
 
     state.cache = cache
     state.save(stage=1)
@@ -918,6 +1036,36 @@ def run_stage2(state: BacktestState) -> None:
         logger.info("Monte Carlo complete")
     except Exception as exc:
         logger.warning("Monte Carlo failed: %s", exc)
+
+    # Regime shift prediction
+    try:
+        from operator1.models.regime_shift_predictor import predict_regime_shifts
+        _mc_trans = state.mc_result.transition_matrix if state.mc_result is not None else None
+        _mc_order = getattr(state.mc_result, "regime_order", None) if state.mc_result else None
+        _stab = None
+        if "stability_score_21d" in cache.columns:
+            _ss = cache["stability_score_21d"].dropna()
+            if len(_ss) > 0:
+                _stab = float(_ss.iloc[-1])
+        _thl = (
+            state._adaptive_model_params.transition_halflife
+            if state._adaptive_model_params is not None and getattr(state._adaptive_model_params, "adapted", False)
+            else None
+        )
+        from datetime import datetime as _dt
+        _ref = _dt.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None
+        regime_shift_result = predict_regime_shifts(
+            cache, transition_matrix=_mc_trans, regime_order=_mc_order,
+            stability_score=_stab, transition_halflife=_thl, reference_date=_ref,
+        )
+        if regime_shift_result and regime_shift_result.available:
+            logger.info(
+                "Regime shift: P(exit 21d)=%.1f%%, expected_days=%.0f",
+                regime_shift_result.prob_exit_21d * 100,
+                regime_shift_result.expected_days_to_shift,
+            )
+    except Exception as exc:
+        logger.debug("Regime shift prediction skipped: %s", exc)
 
     # Copula
     try:
