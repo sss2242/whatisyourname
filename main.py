@@ -3175,6 +3175,44 @@ Non-interactive examples:
         logger.debug("Model diagnostics failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 6.7: Multi-frequency forecasting (sequential, slow-to-fast)
+    # ------------------------------------------------------------------
+    # Runs the full analytical pipeline at 5 frequencies (Annual -> Daily)
+    # with cascading context. Each slower frequency's insights constrain
+    # the next faster frequency's predictions.
+    multi_frequency_result = None
+    if not args.skip_models:
+        try:
+            from operator1.steps.multi_frequency_runner import run_multi_frequency_pipeline
+            from operator1.models.frequency_fusion import fuse_multi_frequency_results
+
+            logger.info("")
+            logger.info("Step 6.7: Multi-frequency forecasting (5 frequencies)...")
+
+            multi_frequency_result = run_multi_frequency_pipeline(
+                daily_cache=cache,
+                secrets=secrets,
+                market_id=market_id,
+                ticker=ticker,
+                reference_date=_backtest_end_date,
+                skip_models=False,
+            )
+
+            # Fuse results across all frequencies
+            if multi_frequency_result and multi_frequency_result.results:
+                multi_frequency_result = fuse_multi_frequency_results(multi_frequency_result)
+                logger.info(
+                    "Multi-frequency fusion: %d frequencies, regime=%s (%.0f%% agreement), "
+                    "survival=%.1f%%",
+                    multi_frequency_result.n_frequencies_used,
+                    multi_frequency_result.regime_consensus.consensus_regime,
+                    multi_frequency_result.regime_consensus.agreement_ratio * 100,
+                    multi_frequency_result.survival.fused_probability * 100,
+                )
+        except Exception as exc:
+            logger.warning("Multi-frequency pipeline failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 7: Build company profile
     # ------------------------------------------------------------------
     # Item 5: When --skip-models is used, the following variables are None:
@@ -3683,6 +3721,12 @@ Non-interactive examples:
             profile["scenario_analysis"] = scenario_result.to_dict()
         else:
             profile["scenario_analysis"] = {"available": False}
+
+        # Inject multi-frequency fusion results
+        if multi_frequency_result is not None and hasattr(multi_frequency_result, "available") and multi_frequency_result.available:
+            profile["multi_frequency"] = multi_frequency_result.to_profile_dict()
+        else:
+            profile["multi_frequency"] = {"available": False}
 
         # Save profile -- sanitize dict keys (some model results use tuple keys)
         def _sanitize_keys(obj):
