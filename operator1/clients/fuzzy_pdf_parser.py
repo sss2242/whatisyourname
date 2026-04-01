@@ -327,40 +327,45 @@ def extract_financials_from_pdf(
     return rows
 
 
-def _detect_tables_in_pdf(pdf_bytes: bytes, max_pages: int = 20) -> bool:
+def _detect_tables_in_pdf(pdf_bytes: bytes) -> bool:
     """Detect whether the PDF contains structured tables on financial pages.
 
-    Uses pdfplumber's built-in table detection (fast, no camelot needed)
-    to determine if the PDF has tabular data. If tables are found,
-    camelot should be used for extraction; otherwise pdfplumber's
-    text extraction is more appropriate.
+    Uses ``_find_financial_pages()`` to identify pages with financial content
+    first, then checks only those pages for tables using pdfplumber's
+    built-in table detection.  If tables are found, camelot should be used
+    for extraction; otherwise pdfplumber's text extraction is more appropriate.
 
     Parameters
     ----------
     pdf_bytes:
         Raw PDF file bytes.
-    max_pages:
-        Maximum pages to scan for tables.
 
     Returns
     -------
-    True if at least one page has detected tables.
+    True if at least one financial page has detected tables.
     """
     try:
         import pdfplumber
     except ImportError:
         return False
 
+    # Use the existing financial page finder to target only relevant pages
+    financial_pages = _find_financial_pages(pdf_bytes)
+    if not financial_pages:
+        return False
+
     try:
         import io
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            pages_to_check = pdf.pages[:max_pages]
-            for page in pages_to_check:
+            for page_num in financial_pages:
+                if page_num < 1 or page_num > len(pdf.pages):
+                    continue
+                page = pdf.pages[page_num - 1]  # pdfplumber is 0-indexed
                 tables = page.find_tables()
                 if tables:
                     logger.debug(
-                        "Table detection: found %d tables on page %d",
-                        len(tables), page.page_number,
+                        "Table detection: found %d tables on financial page %d",
+                        len(tables), page_num,
                     )
                     return True
         return False
