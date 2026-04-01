@@ -1571,6 +1571,11 @@ def _build_model_diagnostics_section(profile: dict[str, Any]) -> str:
             "monte_carlo": "Monte Carlo Simulation",
             "financial_health": "Financial Health",
             "estimation": "Data Estimation",
+            "copula": "Copula Analysis",
+            "granger_causality": "Granger Causality",
+            "cycle_decomposition": "Cycle Decomposition",
+            "dtw_analogs": "DTW Historical Analogs",
+            "conformal_prediction": "Conformal Prediction",
         }
 
         for model_key, card in models.items():

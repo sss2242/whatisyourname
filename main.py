@@ -3158,6 +3158,11 @@ Non-interactive examples:
             cache,
             forecast_result=forecast_result,
             mc_result=mc_result,
+            copula_result=copula_result,
+            granger_result=granger_result,
+            cycle_result=cycle_result,
+            dtw_result=dtw_result,
+            conformal_result=conformal_result,
         )
         if model_diagnostics_result and model_diagnostics_result.available:
             logger.info(

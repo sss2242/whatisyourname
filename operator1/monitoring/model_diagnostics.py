@@ -310,9 +310,231 @@ def _expected_estimation(chars: dict) -> dict[str, Any]:
     return expected
 
 
+def _expected_copula(chars: dict) -> dict[str, Any]:
+    """Predict which copula type should win AIC."""
+    expected = {
+        "model": "copula",
+        "expected_best_copula": "gaussian",
+        "reasoning": [],
+    }
+    kurt = chars.get("kurtosis", 0.0)
+    if kurt > 3:
+        expected["expected_best_copula"] = "student_t"
+        expected["reasoning"].append(
+            f"Fat tails (kurtosis={kurt:.1f}) favor Student-t copula (tail dependence)"
+        )
+    elif kurt > 1:
+        expected["reasoning"].append(
+            f"Moderate tails (kurtosis={kurt:.1f}) -- Gaussian copula likely adequate"
+        )
+    else:
+        expected["reasoning"].append("Thin tails suggest Gaussian copula")
+    return expected
+
+
+def _expected_granger(chars: dict) -> dict[str, Any]:
+    """Predict Granger causality network density."""
+    expected = {
+        "model": "granger_causality",
+        "expected_density_range": [0.0, 0.5],
+        "reasoning": [],
+    }
+    n_obs = chars.get("n_observations", 0)
+    if n_obs > 200:
+        expected["expected_density_range"] = [0.05, 0.4]
+        expected["reasoning"].append(f"Sufficient data ({n_obs} obs) for causal detection")
+    elif n_obs > 50:
+        expected["expected_density_range"] = [0.0, 0.2]
+        expected["reasoning"].append(f"Limited data ({n_obs} obs) -- sparse causal network expected")
+    else:
+        expected["expected_density_range"] = [0.0, 0.05]
+        expected["reasoning"].append(f"Very short series ({n_obs} obs) -- minimal causality detectable")
+    return expected
+
+
+def _expected_cycle(chars: dict) -> dict[str, Any]:
+    """Predict dominant cycle period from filing frequency."""
+    expected = {
+        "model": "cycle_decomposition",
+        "expected_dominant_period_range": [40, 130],
+        "reasoning": [],
+    }
+    freshness = chars.get("avg_filing_freshness", 0.5)
+    if freshness > 0.7:
+        expected["expected_dominant_period_range"] = [50, 80]
+        expected["reasoning"].append("High filing freshness suggests quarterly cycle (~63 days)")
+    elif freshness > 0.3:
+        expected["expected_dominant_period_range"] = [80, 180]
+        expected["reasoning"].append("Medium freshness suggests semi-annual cycle")
+    else:
+        expected["expected_dominant_period_range"] = [180, 280]
+        expected["reasoning"].append("Low freshness suggests annual cycle")
+    return expected
+
+
+def _expected_dtw(chars: dict) -> dict[str, Any]:
+    """Predict DTW analog match quality."""
+    expected = {
+        "model": "dtw_analogs",
+        "expected_match_quality": "medium",
+        "reasoning": [],
+    }
+    n_obs = chars.get("n_observations", 0)
+    vol_ratio = chars.get("vol_ratio", 1.0)
+    if n_obs > 300:
+        expected["expected_match_quality"] = "high"
+        expected["reasoning"].append(f"Long history ({n_obs} days) provides rich analog pool")
+    elif n_obs > 100:
+        expected["reasoning"].append(f"Moderate history ({n_obs} days) for analog matching")
+    else:
+        expected["expected_match_quality"] = "low"
+        expected["reasoning"].append(f"Short history ({n_obs} days) limits analog quality")
+    if vol_ratio > 3:
+        expected["reasoning"].append(f"High vol ratio ({vol_ratio:.1f}) -- analogs from similar vol regimes preferred")
+    return expected
+
+
+def _expected_conformal(chars: dict) -> dict[str, Any]:
+    """Predict conformal prediction interval behavior."""
+    expected = {
+        "model": "conformal_prediction",
+        "expected_coverage_near_target": True,
+        "expected_width": "normal",
+        "reasoning": [],
+    }
+    vol_ratio = chars.get("vol_ratio", 1.0)
+    if vol_ratio > 3:
+        expected["expected_width"] = "wide"
+        expected["reasoning"].append(
+            f"High vol ratio ({vol_ratio:.1f}) requires wider intervals for coverage"
+        )
+    else:
+        expected["reasoning"].append("Stable volatility should allow tight, accurate intervals")
+    return expected
+
+
 # ---------------------------------------------------------------------------
 # Compare expected vs actual
 # ---------------------------------------------------------------------------
+
+
+def _compare_copula(expected: dict, copula_result: Any) -> dict[str, Any]:
+    """Compare expected copula type against actual."""
+    result = {**expected, "actual": {}, "deviation": 0.0, "robustness": "unknown"}
+    if copula_result is None:
+        result["actual"]["status"] = "not_run"
+        result["robustness"] = "n/a"
+        return result
+    best = getattr(copula_result, "best_copula", None)
+    if best is None:
+        result["actual"]["status"] = "no_copula_fitted"
+        result["robustness"] = "low"
+        return result
+    result["actual"]["best_copula"] = str(best)
+    exp = expected.get("expected_best_copula", "gaussian")
+    result["deviation"] = 0.0 if str(best).lower() == exp.lower() else 0.5
+    result["robustness"] = "high" if result["deviation"] == 0 else "medium"
+    return result
+
+
+def _compare_granger(expected: dict, granger_result: Any) -> dict[str, Any]:
+    """Compare expected Granger density against actual."""
+    result = {**expected, "actual": {}, "deviation": 0.0, "robustness": "unknown"}
+    if granger_result is None:
+        result["actual"]["status"] = "not_run"
+        result["robustness"] = "n/a"
+        return result
+    density = getattr(granger_result, "network_density", None)
+    if density is None:
+        result["actual"]["status"] = "no_density"
+        result["robustness"] = "low"
+        return result
+    result["actual"]["network_density"] = round(float(density), 4)
+    lo, hi = expected.get("expected_density_range", [0, 1])
+    if density < lo:
+        deviation = (lo - density) / max(hi - lo, 0.01)
+    elif density > hi:
+        deviation = (density - hi) / max(hi - lo, 0.01)
+    else:
+        deviation = 0.0
+    result["deviation"] = round(min(deviation, 2.0), 3)
+    result["robustness"] = "high" if deviation < 0.3 else "medium" if deviation < 1.0 else "low"
+    return result
+
+
+def _compare_cycle(expected: dict, cycle_result: Any) -> dict[str, Any]:
+    """Compare expected cycle period against actual."""
+    result = {**expected, "actual": {}, "deviation": 0.0, "robustness": "unknown"}
+    if cycle_result is None:
+        result["actual"]["status"] = "not_run"
+        result["robustness"] = "n/a"
+        return result
+    cycles = getattr(cycle_result, "dominant_cycles", [])
+    if not cycles:
+        result["actual"]["status"] = "no_cycles_detected"
+        result["robustness"] = "medium"
+        return result
+    # Use the first (strongest) cycle
+    if isinstance(cycles[0], dict):
+        period = cycles[0].get("period", 0)
+    elif hasattr(cycles[0], "period"):
+        period = cycles[0].period
+    else:
+        period = 0
+    result["actual"]["dominant_period"] = round(float(period), 1) if period else 0
+    lo, hi = expected.get("expected_dominant_period_range", [40, 130])
+    if period and lo <= period <= hi:
+        deviation = 0.0
+    elif period:
+        mid = (lo + hi) / 2
+        deviation = abs(period - mid) / max(hi - lo, 1)
+    else:
+        deviation = 0.5
+    result["deviation"] = round(min(deviation, 2.0), 3)
+    result["robustness"] = "high" if deviation < 0.3 else "medium" if deviation < 1.0 else "low"
+    return result
+
+
+def _compare_dtw(expected: dict, dtw_result: Any) -> dict[str, Any]:
+    """Compare expected DTW match quality against actual."""
+    result = {**expected, "actual": {}, "deviation": 0.0, "robustness": "unknown"}
+    if dtw_result is None:
+        result["actual"]["status"] = "not_run"
+        result["robustness"] = "n/a"
+        return result
+    matches = getattr(dtw_result, "matches", []) or getattr(dtw_result, "analogs", [])
+    n_matches = len(matches) if matches else 0
+    result["actual"]["n_matches"] = n_matches
+    exp_quality = expected.get("expected_match_quality", "medium")
+    quality_map = {"high": 5, "medium": 3, "low": 1}
+    exp_n = quality_map.get(exp_quality, 3)
+    actual_quality = "high" if n_matches >= 5 else "medium" if n_matches >= 2 else "low"
+    result["actual"]["match_quality"] = actual_quality
+    result["deviation"] = 0.0 if actual_quality == exp_quality else 0.3 if abs(quality_map.get(actual_quality, 0) - exp_n) <= 2 else 0.7
+    result["robustness"] = "high" if result["deviation"] < 0.2 else "medium" if result["deviation"] < 0.5 else "low"
+    return result
+
+
+def _compare_conformal(expected: dict, conformal_result: Any) -> dict[str, Any]:
+    """Compare expected conformal coverage against actual."""
+    result = {**expected, "actual": {}, "deviation": 0.0, "robustness": "unknown"}
+    if conformal_result is None:
+        result["actual"]["status"] = "not_run"
+        result["robustness"] = "n/a"
+        return result
+    coverage = getattr(conformal_result, "empirical_coverage", None)
+    if coverage is None:
+        # Try alternate attributes
+        coverage = getattr(conformal_result, "coverage", None)
+    if coverage is not None:
+        result["actual"]["empirical_coverage"] = round(float(coverage), 3)
+        deviation = abs(float(coverage) - 0.9) / 0.1  # distance from 90% target
+        result["deviation"] = round(min(deviation, 2.0), 3)
+        result["robustness"] = "high" if deviation < 0.3 else "medium" if deviation < 1.0 else "low"
+    else:
+        result["actual"]["status"] = "coverage_not_available"
+        result["robustness"] = "medium"
+    return result
 
 
 def _compare_regime_detector(
@@ -526,6 +748,11 @@ def compute_model_diagnostics(
     cache: pd.DataFrame,
     forecast_result: Any = None,
     mc_result: Any = None,
+    copula_result: Any = None,
+    granger_result: Any = None,
+    cycle_result: Any = None,
+    dtw_result: Any = None,
+    conformal_result: Any = None,
 ) -> ModelDiagnosticsResult:
     """Compute expected path vs actual path diagnostics for all models.
 
@@ -566,6 +793,11 @@ def compute_model_diagnostics(
             "monte_carlo": _expected_monte_carlo(chars),
             "financial_health": _expected_financial_health(chars),
             "estimation": _expected_estimation(chars),
+            "copula": _expected_copula(chars),
+            "granger_causality": _expected_granger(chars),
+            "cycle_decomposition": _expected_cycle(chars),
+            "dtw_analogs": _expected_dtw(chars),
+            "conformal_prediction": _expected_conformal(chars),
         }
 
         # Step 3: Compare expected vs actual
@@ -584,6 +816,21 @@ def compute_model_diagnostics(
             ),
             "estimation": _compare_estimation(
                 expectations["estimation"], cache,
+            ),
+            "copula": _compare_copula(
+                expectations["copula"], copula_result,
+            ),
+            "granger_causality": _compare_granger(
+                expectations["granger_causality"], granger_result,
+            ),
+            "cycle_decomposition": _compare_cycle(
+                expectations["cycle_decomposition"], cycle_result,
+            ),
+            "dtw_analogs": _compare_dtw(
+                expectations["dtw_analogs"], dtw_result,
+            ),
+            "conformal_prediction": _compare_conformal(
+                expectations["conformal_prediction"], conformal_result,
             ),
         }
 
