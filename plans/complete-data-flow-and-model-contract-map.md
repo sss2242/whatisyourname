@@ -1,5 +1,7 @@
 # Complete Data Flow and Model Contract Map
 
+*Last updated: 2026-04-01*
+
 Every model in the Operator 1 pipeline, from raw cache construction through
 report generation, with expected vs actual inputs, outputs, and operations.
 
@@ -74,8 +76,8 @@ report generation, with expected vs actual inputs, outputs, and operations.
 | | Expected | Actual | Status |
 |---|----------|--------|--------|
 | **Input** | cache DataFrame with `close`, financial statement columns | Same | OK |
-| **Output** | cache + ~25 derived columns: `return_1d`, `log_return_1d`, `volatility_21d`, `drawdown_252d`, `current_ratio`, `debt_to_equity_abs`, `fcf_yield`, `cash_ratio`, `gross_margin`, `pe_ratio_calc`, etc. + `is_missing_*` and `invalid_math_*` flags | Same | OK |
-| **Operation** | 1. Returns and risk from close price. 2. Solvency ratios (debt_to_equity, net_debt). 3. Liquidity ratios (current_ratio, cash_ratio). 4. Profitability (margins). 5. TTM computations. 6. **Technical indicators via `ta` library: ADX, OBV, BB width, MACD histogram**. All use `safe_ratio()` to handle division by zero. | Same | **ENHANCED** |
+| **Output** | cache + ~50 derived columns: `return_1d`, `log_return_1d`, `volatility_21d`, `drawdown_252d`, `current_ratio`, `debt_to_equity_abs`, `fcf_yield`, `cash_ratio`, `gross_margin`, `pe_ratio_calc`, `beta_252d`, `debt_service_coverage`, etc. + `is_missing_*` and `invalid_math_*` flags | Same | OK |
+| **Operation** | 1. Returns and risk from close price. 2. Solvency ratios (debt_to_equity, net_debt, debt_service_coverage). 3. Liquidity ratios (current_ratio, cash_ratio). 4. Profitability (margins). 5. TTM computations. 6. **Technical indicators via `ta` library: ADX, OBV, BB width, MACD histogram**. 7. **Beta vs market benchmark** (`beta_252d` from `config/market_benchmarks.yml`, per-market index). All use `safe_ratio()` to handle division by zero. | Same | **ENHANCED** |
 
 ### C2. Survival Mode -- `compute_company_survival_flag()` + `compute_cox_survival_score()`
 
@@ -440,6 +442,27 @@ Three modules that replace fixed constants across the pipeline with data-derived
 | **Output** | `OHLCResult` with next-day OHLC predictions | Same | OK |
 | **Operation** | Combine forecast + Monte Carlo + pattern drift to predict next-day Open, High, Low, Close | Same | OK |
 
+### F23. Regime Shift Predictor -- `predict_regime_shifts()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache, `transition_matrix` (from MC), `regime_order`, `stability_score`, `transition_halflife` (from adaptive params), `reference_date` | Same | OK |
+| **Output** | `RegimeShiftResult` with `prob_exit_21d`, `prob_exit_252d`, `expected_days_to_shift`, `most_probable_next_regime`, `current_regime`, `transition_matrix_used` | Same | OK |
+| **Location** | `operator1/models/regime_shift_predictor.py` (351 lines) | | |
+| **Operation** | Uses HMM transition matrix from Monte Carlo to predict when the current regime is likely to change and to which regime. Computes geometric CDF of regime exit. Adjusts by stability_score and transition_halflife from adaptive params. | Same | OK |
+| **Profile** | Stored in `profile["predicted_regime_shifts"]` via `result.to_dict()` | Same | OK |
+
+### F24. Model Diagnostics -- `compute_model_diagnostics()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache, `forecast_result`, `mc_result`, `copula_result`, `granger_result`, `cycle_result`, `dtw_result`, `conformal_result` | Same | OK |
+| **Output** | `ModelDiagnosticsResult` with `n_models_assessed`, `n_models_on_track`, `overall_robustness`, per-model `expected_path` vs `actual_path` comparison | Same | OK |
+| **Location** | `operator1/monitoring/model_diagnostics.py` (875 lines) | | |
+| **Operation** | For each of 10 models (Kalman, GARCH, VAR, LSTM, Tree, MC, Copula, Granger, Cycle, DTW, Conformal), pre-computes what it SHOULD produce based on data characteristics, then compares against what it actually produced. Produces per-model robustness ratings (on_track/degraded/failed). | Same | OK |
+| **Profile** | Stored in `profile["model_diagnostics"]` via `result.to_dict()` | Same | OK |
+| **Report** | Rendered in sections 19.95-19.98 (Unified Survival System + Scenario Analysis + Model Diagnostics) in Premium tier | Same | OK |
+
 ---
 
 ## Phase F-extra: Modules Called Indirectly
@@ -499,6 +522,35 @@ Three modules that replace fixed constants across the pipeline with data-derived
 | **Output** | cache + columns: `country_conflict_flag`, `company_conflict_flag`, `conflict_intensity_score`, `sanctions_flag`, `fragile_state_flag`, `conflict_type`. Optional: `supply_chain_risk_score`, `revenue_exposure_score`, `competitive_advantage_score` | Same | OK |
 | **Operation** | Set daily columns from conflict assessment result. All values are constant across the daily index (conflict status doesn't change day-to-day within a pipeline run). | Same | OK |
 | **Downstream** | Consumed by `compute_company_survival_flag()` in `survival_mode.py` (conflict flag + sanctions flag are new survival triggers). Consumed by `_build_conflict_risk_profile_section()` in `profile_builder.py`. | Same | OK |
+
+### Fx6b. Supply Chain Stress -- `compute_supply_chain_stress()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `conflict_result`, `linked_caches`, `relationships` | Same | OK |
+| **Output** | Dict with `supply_chain_stress_flag`, `supply_chain_stress_score` (0-1), `stress_sources` list | Same | OK |
+| **Operation** | Combines geopolitical risk + supplier financial health into one unified supply chain stress signal. Injected into cache as `supply_chain_stress_flag` and `supply_chain_stress_score`. | Same | OK |
+| **Profile** | Stored in `profile["supply_chain_stress"]` | Same | OK |
+
+### Fx6c. Predicted Next Filing Date -- `predict_next_filing_date()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `filing_calendar_result`, `reference_date` | Same | OK |
+| **Output** | Dict with `predicted_date`, `confidence`, `method` | Same | OK |
+| **Location** | `operator1/features/filing_calendar.py` | | |
+| **Operation** | Extrapolates next expected filing date from detected filing frequency and last filing date. Uses median inter-filing gap + market-specific calendar adjustments. | Same | OK |
+| **Profile** | Stored in `profile["filing_calendar"]["next_expected_filing"]` | Same | OK |
+
+### Fx6d. Predicted OHLC Patterns -- `detect_patterns_on_predicted_ohlc()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `ohlc_result` (predicted candles from OHLC predictor), `last_candle` (latest actual) | Same | OK |
+| **Output** | List of pattern dicts with `pattern_name`, `date`, `confidence` for next week's predicted candles | Same | OK |
+| **Location** | `operator1/models/pattern_detector.py` | | |
+| **Operation** | Runs candlestick pattern detection on the predicted OHLC series (from OHLC predictor). Detects doji, hammer, engulfing, etc. on forward-looking candles. Results stored in `pattern_result.predicted_patterns_week`. | Same | OK |
+| **Profile** | Stored in `profile["extended_models"]["candlestick_patterns"]` via `_available_dict()` | Same | OK |
 
 ---
 

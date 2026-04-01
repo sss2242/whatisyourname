@@ -1,24 +1,24 @@
-# Analysis Models Map (2026-03-31)
+# Analysis Models Map (2026-04-01)
 
-Comprehensive reference for all 48 analytical modules in Operator 1. Each module documented with purpose, mathematical basis, inputs, outputs, pipeline wiring, profile/report integration, dependencies, and current status.
+Comprehensive reference for all 50 analytical modules in Operator 1. Each module documented with purpose, mathematical basis, inputs, outputs, pipeline wiring, profile/report integration, dependencies, and current status.
 
-Total: 36,245 lines of analytical code across 3 layers.
+Total: ~37,700 lines of analytical code across 3 layers.
 
 ---
 
 ## Layer 1: Feature Engineering
 
-11 modules in `operator1/features/` that transform the raw daily cache into model-ready features. These run in Steps 4-5 of main.py before any temporal modeling.
+12 modules in `operator1/features/` that transform the raw daily cache into model-ready features. These run in Steps 4-5 of main.py before any temporal modeling.
 
 ---
 
 ### 1.1 Derived Variables
 
-**File:** `operator1/features/derived_variables.py` (699 lines)
+**File:** `operator1/features/derived_variables.py` (818 lines)
 **Pipeline step:** Step 5
 **Profile key:** `current_state` (latest values of all derived columns)
 
-**Purpose:** Computes ~45 derived financial and technical columns from the raw cache. This is the primary feature engineering module -- every downstream model consumes its output.
+**Purpose:** Computes ~50 derived financial and technical columns from the raw cache. This is the primary feature engineering module -- every downstream model consumes its output.
 
 **Mathematical operations:**
 
@@ -32,18 +32,20 @@ Total: 36,245 lines of analytical code across 3 layers.
 - **Valuation:** `pe_ratio_calc = close / (eps_diluted or eps)`, `ev_to_ebitda`
 - **TTM computations:** Rolling 4-quarter sums for `revenue_ttm`, `net_income_ttm`, `operating_cash_flow_ttm`
 - **Technical indicators (via `ta` library):** ADX (trend strength), OBV (on-balance volume), Bollinger Band width, MACD histogram
+- **Beta:** `beta_252d` = 252-day rolling beta vs market benchmark index (per-market index from `config/market_benchmarks.yml`; benchmark returns fetched via `ohlcv_provider.fetch_benchmark_returns()`)
+- **Debt serviceability:** `debt_service_coverage = operating_cash_flow / (interest_expense + current_portion_ltd)`
 
 All division operations use `safe_ratio()` which returns NaN for zero/tiny denominators and sets `is_missing_{var}` and `invalid_math_{var}` companion flags.
 
 **Input:** Cache DataFrame with `close`, financial statement columns (revenue, total_assets, etc.)
-**Output:** Cache + ~45 new columns + `is_missing_*` + `invalid_math_*` flags
+**Output:** Cache + ~50 new columns + `is_missing_*` + `invalid_math_*` flags
 **Dependencies:** `ta` (technical indicators), `pandas`, `numpy`
 
 ---
 
 ### 1.2 Conflict Risk Assessment
 
-**File:** `operator1/features/conflict_risk.py` (1,018 lines)
+**File:** `operator1/features/conflict_risk.py` (1,111 lines)
 **Pipeline step:** Step 4a.3
 **Profile key:** `conflict_risk`
 
@@ -72,7 +74,7 @@ conflict_intensity = 0.40 * event_score + 0.20 * fatality_score + 0.25 * flag_sc
 
 ### 1.3 Filing Calendar
 
-**File:** `operator1/features/filing_calendar.py` (311 lines)
+**File:** `operator1/features/filing_calendar.py` (385 lines)
 **Pipeline step:** Step 4c
 **Profile key:** `filing_calendar`
 
@@ -89,9 +91,11 @@ conflict_intensity = 0.40 * event_score + 0.20 * fatality_score + 0.25 * flag_sc
 
 **Filing freshness injection** (`inject_filing_freshness`): Adds a `filing_freshness` column to cache -- a 0-1 score that decays with distance from the nearest filing date.
 
+**Predicted next filing date** (`predict_next_filing_date`): Extrapolates next expected filing date from detected filing frequency and last filing date. Uses median inter-filing gap + market-specific calendar adjustments. Stored in `profile["filing_calendar"]["next_expected_filing"]`.
+
 **Input:** Cache DataFrame, `market_id` string
-**Output:** `FilingCalendarResult` dataclass with frequency, coverage, staleness, gaps
-**Downstream consumers:** `adaptive_windows.py` (Nyquist-anchored window sizes), `triage_card.py` (staleness warnings)
+**Output:** `FilingCalendarResult` dataclass with frequency, coverage, staleness, gaps, predicted next filing
+**Downstream consumers:** `adaptive_windows.py` (Nyquist-anchored window sizes), `triage_card.py` (staleness warnings), `report_generator.py` (next filing date in report)
 
 ---
 
@@ -1020,7 +1024,7 @@ Gains (Kp, Ki, Kd) are derived from error ACF half-life via Dahlin tuning (adapt
 
 ### 3.17 Pattern Detector
 
-**File:** `operator1/models/pattern_detector.py` (385 lines)
+**File:** `operator1/models/pattern_detector.py` (507 lines)
 **Pipeline step:** Step 6f
 **Profile key:** `patterns`
 
@@ -1032,8 +1036,10 @@ Gains (Kp, Ki, Kd) are derived from error ACF half-life via Dahlin tuning (adapt
 
 **Matrix Profile discords** (via `stumpy`): Identifies the most unusual/anomalous subsequences. These are patterns that have never occurred before -- potential regime change indicators.
 
+**Predicted OHLC patterns** (`detect_patterns_on_predicted_ohlc`): Runs candlestick pattern detection on the predicted OHLC series from the OHLC predictor (Step 6v). Detects doji, hammer, engulfing, etc. on forward-looking candles. Results stored in `pattern_result.predicted_patterns_week`.
+
 **Input:** Cache with open, high, low, close columns
-**Output:** `PatternResult` with detected patterns, motifs, discords
+**Output:** `PatternResult` with detected patterns, motifs, discords, predicted_patterns_week
 **Dependencies:** `stumpy` (optional, pattern detection works without it)
 
 ---
@@ -1294,6 +1300,58 @@ DSRI, GMI, AQI, SGI, DEPI, SGAI, LVGI, TATA. M > -2.22 = likely manipulator.
 
 ---
 
+### 3.29 Regime Shift Predictor
+
+**File:** `operator1/models/regime_shift_predictor.py` (351 lines)
+**Pipeline step:** Step 6 (after Monte Carlo)
+**Profile key:** `predicted_regime_shifts`
+
+**Purpose:** Predicts when the current market regime is likely to change and to which regime it will transition. Uses the HMM transition matrix from Monte Carlo simulation.
+
+**Method:** Geometric CDF of regime exit probability. For each future horizon (21d, 63d, 252d), computes the probability that the current regime will have ended, using the Markov chain transition matrix. Adjusts by:
+- `stability_score_21d` from the enriched survival timeline (high stability = lower exit probability)
+- `transition_halflife` from adaptive model params (empirical decay rate)
+
+**Output fields:**
+- `prob_exit_21d`, `prob_exit_252d`: Probability of leaving current regime within N days
+- `expected_days_to_shift`: Expected number of days until regime change
+- `most_probable_next_regime`: Which regime is most likely next (from transition matrix row)
+- `current_regime`: Current regime label for reference
+
+**Input:** Cache, MC transition_matrix, regime_order, stability_score, transition_halflife, reference_date
+**Output:** `RegimeShiftResult` stored in profile via `result.to_dict()`
+
+---
+
+### 3.30 Model Diagnostics
+
+**File:** `operator1/monitoring/model_diagnostics.py` (875 lines)
+**Pipeline step:** Step 6.6 (after all temporal models)
+**Profile key:** `model_diagnostics`
+
+**Purpose:** For each model, pre-computes what it SHOULD produce based on data characteristics, then compares against what it actually produced. Produces per-model robustness ratings for the profile and report.
+
+**10 models assessed:**
+1. **Kalman**: Expected to fit with state_dim=1, produces MSE. Check: fitted + low MSE.
+2. **GARCH**: Expected for volatile series. Check: fitted + reasonable persistence params.
+3. **VAR**: Expected for multivariate series. Check: stable roots + reasonable lag order.
+4. **LSTM**: Expected with sufficient data (>200 points). Check: training converged.
+5. **Tree**: Expected always (no convergence issues). Check: reasonable feature importance.
+6. **Monte Carlo**: Expected survival_probability in [0, 1]. Check: path count matches config.
+7. **Copula**: Expected correlation structure. Check: AIC selection meaningful.
+8. **Granger**: Expected causal pairs. Check: network density reasonable.
+9. **Cycle**: Expected dominant cycles. Check: dominant period within plausible range.
+10. **DTW**: Expected analog matches. Check: distances within plausible range.
+11. **Conformal**: Expected coverage near target (90%). Check: empirical coverage.
+
+**Robustness ratings:** `on_track` (model behaves as expected), `degraded` (model ran but results questionable), `failed` (model did not produce usable output).
+
+**Input:** Cache, all temporal model results
+**Output:** `ModelDiagnosticsResult` with per-model assessments, overall_robustness score
+**Report:** Rendered in report section 19.97 (Premium tier)
+
+---
+
 ## Execution Order
 
 ```
@@ -1348,8 +1406,10 @@ Step 6:    [TEMPORAL MODELS -- skip if --skip-models]
   6t.2: multivariate_monte_carlo
   6u: genetic_optimizer
   6v: ohlc_predictor
+  6v.1: detect_patterns_on_predicted_ohlc (predicted OHLC patterns)
 Step 6-USS: forecast bounding + scenario engine
 Step 6.5:  retroactive_calibration
+Step 6.6:  model_diagnostics (expected path vs actual path)
 Step 7:    profile_builder
 Step 8:    report_generator + triage_card (USS)
 ```
@@ -1360,10 +1420,11 @@ Step 8:    report_generator + triage_card (USS)
 
 | Layer | Modules | Lines | Description |
 |-------|---------|-------|-------------|
-| Features | 12 | ~9,500 | Raw cache -> enriched features |
+| Features | 12 | ~10,200 | Raw cache -> enriched features |
 | Analysis | 10 | ~6,300 | Survival flags, hierarchy, protection, adaptive calibration, USS |
-| Temporal | 24 | ~17,800 | Regime, forecasting, MC, uncertainty, aggregation |
+| Temporal | 25 | ~18,200 | Regime, forecasting, MC, uncertainty, aggregation, regime shift prediction |
 | USS | 2 | ~1,040 | Unified Survival System (controller + scenario engine) |
-| **Total** | **48** | **~34,640** | |
+| Monitoring/Diagnostics | 1 | ~875 | Model expected path vs actual path diagnostics |
+| **Total** | **50** | **~36,615** | |
 
-All 48 modules wired in main.py. All results stored in profile_builder. All sections rendered in report_generator.
+All 50 modules wired in main.py. All results stored in profile_builder. All sections rendered in report_generator.
