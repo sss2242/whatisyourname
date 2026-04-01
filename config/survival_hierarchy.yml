@@ -31,6 +31,7 @@ tiers:
       - volatility_21d
       - drawdown_252d
       - volume
+      - beta_252d
   tier4:
     label: "Profitability"
     variables:

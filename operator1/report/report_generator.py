@@ -88,8 +88,8 @@ class ReportMode(str, Enum):
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20},
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 20},
-    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997},  # all 22 sections + extended sections + USS + scenarios
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 20},
+    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998},  # all 22 sections + extended sections + USS + scenarios + diagnostics
 }
 
 
@@ -685,6 +685,54 @@ def _build_regime_analysis(profile: dict[str, Any]) -> str:
         lines.append("Market regime classification was not performed for this analysis.")
         lines.append("")
 
+    # Predicted regime shifts (forward-looking)
+    shifts = profile.get("predicted_regime_shifts", {})
+    if shifts.get("available"):
+        lines.append("### Predicted Regime Shifts")
+        lines.append("")
+        lines.append(
+            f"Based on the HMM transition matrix, the probability of the current "
+            f"**{shifts.get('current_regime', 'unknown')}** regime ending within key horizons:"
+        )
+        lines.append("")
+        lines.append("| Horizon | Probability of Regime Change |")
+        lines.append("|---------|------------------------------|")
+        lines.append(f"| 1 week (5 days) | {shifts.get('prob_exit_5d', 0) * 100:.1f}% |")
+        lines.append(f"| 1 month (21 days) | {shifts.get('prob_exit_21d', 0) * 100:.1f}% |")
+        lines.append(f"| 1 quarter (63 days) | {shifts.get('prob_exit_63d', 0) * 100:.1f}% |")
+        lines.append(f"| 1 year (252 days) | {shifts.get('prob_exit_252d', 0) * 100:.1f}% |")
+        lines.append("")
+
+        exp_days = shifts.get("expected_days_to_shift")
+        if exp_days is not None:
+            lines.append(
+                f"**Expected days until regime change:** ~{exp_days:.0f} trading days"
+            )
+
+        next_regime = shifts.get("most_probable_next_regime", "")
+        next_prob = shifts.get("most_probable_next_prob", 0)
+        if next_regime:
+            lines.append(
+                f"**Most likely next regime:** {next_regime} "
+                f"({next_prob * 100:.0f}% of exit probability)"
+            )
+        lines.append("")
+
+        predicted = shifts.get("predicted_shifts", [])
+        if predicted:
+            lines.append("**Dated Transition Forecasts:**")
+            lines.append("")
+            lines.append("| From | To | Probability | Expected Around | Confidence |")
+            lines.append("|------|-----|-------------|-----------------|------------|")
+            for s in predicted[:4]:
+                lines.append(
+                    f"| {s.get('from_regime', '')} | {s.get('to_regime', '')} | "
+                    f"{s.get('probability', 0) * 100:.1f}% | "
+                    f"{s.get('expected_date', 'N/A')} | "
+                    f"{s.get('confidence', 0) * 100:.0f}% |"
+                )
+            lines.append("")
+
     _horizon_labels = {
         "1d": "Next Trading Day",
         "5d": "Next Week (5 trading days)",
@@ -1039,6 +1087,7 @@ def _build_current_state_snapshot(profile: dict[str, Any]) -> str:
         ("tier3_stability", "Tier 3: Market Stability", {
             "volatility_21d": ("21-Day Volatility (annualised)", ".1%"),
             "drawdown_252d": ("Maximum Drawdown (1-year)", ".1%"),
+            "beta_252d": ("Market Beta (252-day)", ".2f"),
             "close": ("Current Share Price", ".2f"),
             "volume": ("Daily Volume", ",.0f"),
             "volume_avg_21d": ("21-Day Average Volume", ",.0f"),
@@ -1118,6 +1167,13 @@ def _build_historical_performance(profile: dict[str, Any]) -> str:
     lines.append(f"- **Annualised Volatility:** {_pct(hist.get('volatility_annualized'))}")
     lines.append(f"- **Sharpe Ratio:** {_fmt(hist.get('sharpe_ratio'))}")
     lines.append(f"- **Maximum Drawdown:** {_pct(hist.get('max_drawdown'))}")
+    _rec_avg = hist.get("recovery_time_avg")
+    _rec_max = hist.get("recovery_time_max")
+    _rec_n = hist.get("n_recovery_episodes", 0)
+    if _rec_avg is not None:
+        lines.append(f"- **Average Recovery Time:** {_rec_avg:.0f} trading days ({_rec_n} episodes)")
+    if _rec_max is not None:
+        lines.append(f"- **Longest Recovery:** {_rec_max:.0f} trading days")
     lines.append(f"- **Up Days:** {_pct(hist.get('up_days_percentage'))}")
     lines.append(f"- **Down Days:** {_pct(hist.get('down_days_percentage'))}")
     lines.append(f"- **Best Day Return:** {_pct(hist.get('best_day_return'))}")
@@ -1445,6 +1501,112 @@ def _build_investment_recommendation(profile: dict[str, Any]) -> str:
                  "health scoring, survival analysis, and market sentiment. "
                  "Professional judgement and qualitative analysis should supplement "
                  "this assessment. This is not financial advice.*")
+
+    return "\n".join(lines)
+
+
+def _build_model_diagnostics_section(profile: dict[str, Any]) -> str:
+    """Build model expected vs actual path diagnostics section."""
+    diag = profile.get("model_diagnostics", {})
+    if not diag.get("available"):
+        return "Model diagnostics were not computed for this analysis."
+
+    lines = []
+
+    # Overall summary
+    overall = diag.get("overall_robustness", "unknown")
+    n_assessed = diag.get("n_models_assessed", 0)
+    n_on_track = diag.get("n_models_on_track", 0)
+    n_deviated = diag.get("n_models_deviated", 0)
+
+    badge = {"high": "HIGH", "medium": "MODERATE", "low": "LOW"}.get(overall, "UNKNOWN")
+    lines.append(f"**Overall Model Robustness: {badge}** "
+                 f"({n_on_track}/{n_assessed} models on track, "
+                 f"{n_deviated} deviated)")
+    lines.append("")
+
+    # Data characteristics summary
+    chars = diag.get("data_characteristics", {})
+    if chars:
+        lines.append("### Data Characteristics")
+        lines.append("")
+        lines.append("| Metric | Value | Interpretation |")
+        lines.append("|--------|-------|----------------|")
+        skew = chars.get("skewness")
+        if skew is not None:
+            interp = "negative (downside risk)" if skew < -0.3 else "positive (upward drift)" if skew > 0.3 else "symmetric"
+            lines.append(f"| Return Skewness | {skew:.3f} | {interp} |")
+        kurt = chars.get("kurtosis")
+        if kurt is not None:
+            interp = "fat tails (extreme events)" if kurt > 3 else "thin tails" if kurt < 0 else "normal"
+            lines.append(f"| Return Kurtosis | {kurt:.2f} | {interp} |")
+        bc = chars.get("bimodality_coeff")
+        if bc is not None:
+            interp = "bimodal (multi-regime)" if bc > 0.555 else "unimodal"
+            lines.append(f"| Bimodality | {bc:.3f} | {interp} |")
+        acf = chars.get("acf_lag1")
+        if acf is not None:
+            interp = "predictable (momentum)" if abs(acf) > 0.1 else "random walk"
+            lines.append(f"| Autocorrelation (lag 1) | {acf:.3f} | {interp} |")
+        arch = chars.get("arch_proxy")
+        if arch is not None:
+            interp = "volatility clusters" if arch > 0.15 else "stable volatility"
+            lines.append(f"| ARCH Effect | {arch:.3f} | {interp} |")
+        cov = chars.get("data_coverage")
+        if cov is not None:
+            lines.append(f"| Data Coverage | {cov:.0%} | {'rich' if cov > 0.7 else 'sparse'} |")
+        lines.append("")
+
+    # Per-model cards
+    models = diag.get("models", {})
+    if models:
+        lines.append("### Per-Model Assessment")
+        lines.append("")
+        lines.append("| Model | Expected | Actual | Deviation | Robustness |")
+        lines.append("|-------|----------|--------|-----------|------------|")
+
+        _labels = {
+            "regime_detector": "Regime Detection",
+            "forecasting": "Forecasting Engine",
+            "monte_carlo": "Monte Carlo Simulation",
+            "financial_health": "Financial Health",
+            "estimation": "Data Estimation",
+            "copula": "Copula Analysis",
+            "granger_causality": "Granger Causality",
+            "cycle_decomposition": "Cycle Decomposition",
+            "dtw_analogs": "DTW Historical Analogs",
+            "conformal_prediction": "Conformal Prediction",
+        }
+
+        for model_key, card in models.items():
+            label = _labels.get(model_key, model_key)
+            reasoning = card.get("reasoning", [])
+            expected_str = reasoning[0] if reasoning else "N/A"
+            # Truncate long reasoning
+            if len(expected_str) > 60:
+                expected_str = expected_str[:57] + "..."
+
+            actual = card.get("actual", {})
+            if isinstance(actual, dict):
+                actual_parts = []
+                for k, v in actual.items():
+                    if k != "status":
+                        actual_parts.append(f"{k}={v}")
+                actual_str = ", ".join(actual_parts[:2]) if actual_parts else actual.get("status", "N/A")
+            else:
+                actual_str = str(actual)
+            if len(actual_str) > 50:
+                actual_str = actual_str[:47] + "..."
+
+            deviation = card.get("deviation", 0.0)
+            robustness = card.get("robustness", "unknown")
+            rob_icon = {"high": "OK", "medium": "~", "low": "!!", "n/a": "--"}.get(robustness, "?")
+
+            lines.append(
+                f"| {label} | {expected_str} | {actual_str} | {deviation:.2f} | {rob_icon} {robustness} |"
+            )
+
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -2546,6 +2708,11 @@ def _build_key_indicators_table(profile: dict[str, Any], mode: ReportMode = Repo
         ("Volatility (21d)", "volatility_21d", ".1%",
          "How much the stock price fluctuates day-to-day. "
          "Higher volatility means more risk but also more opportunity."),
+        ("Market Beta", "beta_252d", ".2f",
+         "Measures how much the stock moves relative to the market. "
+         "Beta > 1 means it amplifies market moves (higher risk/reward). "
+         "Beta < 1 means it dampens market moves (defensive). "
+         "Beta = 1 means it tracks the market exactly."),
         ("Max Drawdown (1Y)", "drawdown_252d", ".1%",
          "Largest peak-to-trough decline in the past year. "
          "Shows the worst-case loss an investor would have experienced."),
@@ -3213,6 +3380,7 @@ def _build_fallback_report(
             _build_risk_assessment(profile) + "\n\n### 20.1 LIMITATIONS\n\n" + _build_limitations(profile)
         )),
         21: ("21. Investment Recommendation", _build_investment_recommendation(profile)),
+        1998: ("21.5. Model Robustness Diagnostics", _build_model_diagnostics_section(profile)),
         22: ("22. Appendix & Methodology", _build_appendix(profile)),
     }
 

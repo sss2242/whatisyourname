@@ -196,6 +196,7 @@ def _build_current_state_section(cache: pd.DataFrame | None) -> dict[str, Any]:
             "volatility_21d": _get("volatility_21d"),
             "drawdown_252d": _get("drawdown_252d"),
             "volume": _get("volume"),
+            "beta_252d": _get("beta_252d"),
             "volume_avg_21d": _get("volume_avg_21d"),
             "close": _get("close"),
         },
@@ -749,6 +750,10 @@ def _build_historical_section(
         "down_days_percentage": _safe_float(down_days / total_counted) if total_counted > 0 else None,
         "best_day_return": _safe_float(float(daily_returns.max())),
         "worst_day_return": _safe_float(float(daily_returns.min())),
+        # Recovery time metrics (computed by derived_variables._compute_recovery_time)
+        "recovery_time_avg": _safe_float(cache.get("recovery_time_avg", pd.Series()).iloc[-1]) if "recovery_time_avg" in cache.columns else None,
+        "recovery_time_max": _safe_float(cache.get("recovery_time_max", pd.Series()).iloc[-1]) if "recovery_time_max" in cache.columns else None,
+        "n_recovery_episodes": int(cache["n_recovery_episodes"].iloc[-1]) if "n_recovery_episodes" in cache.columns and cache["n_recovery_episodes"].notna().any() else 0,
     }
 
     return section

@@ -622,6 +622,110 @@ def _compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Beta vs market benchmark
+# ---------------------------------------------------------------------------
+
+
+def _compute_beta(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute rolling 252-day beta vs market benchmark.
+
+    ``beta_252d = Cov(stock_return, benchmark_return, 252) / Var(benchmark_return, 252)``
+
+    Requires ``benchmark_return_1d`` column in the cache (merged in main.py
+    Step 4 before derived_variables runs).  If missing, beta is NaN.
+
+    App core idea Section F.1 Tier 3: ``beta_252d``.
+    """
+    stock_ret = df.get("return_1d")
+    bench_ret = df.get("benchmark_return_1d")
+
+    if stock_ret is None or bench_ret is None or bench_ret.isna().all():
+        df["beta_252d"] = np.nan
+        df["is_missing_beta_252d"] = 1
+        return df
+
+    # Rolling covariance / variance (min 60 days for meaningful estimate)
+    cov = stock_ret.rolling(252, min_periods=60).cov(bench_ret)
+    var = bench_ret.rolling(252, min_periods=60).var()
+
+    # Safe division: avoid div-by-zero when benchmark variance is tiny
+    safe_var = var.where(var.abs() > EPSILON)
+    beta = cov / safe_var
+
+    df["beta_252d"] = beta
+    df["is_missing_beta_252d"] = beta.isna().astype(int)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Recovery time (days from trough to previous peak)
+# ---------------------------------------------------------------------------
+
+
+def _compute_recovery_time(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute average and maximum drawdown recovery time.
+
+    Recovery time = number of trading days from a drawdown trough until
+    the price recovers to the pre-drawdown peak.  Standard risk metric
+    from App core idea Section F.1 Category 3.
+
+    Variables: recovery_time_avg, recovery_time_max, n_recovery_episodes.
+    """
+    close = df.get("close")
+    if close is None or close.isna().all():
+        df["recovery_time_avg"] = np.nan
+        df["recovery_time_max"] = np.nan
+        df["n_recovery_episodes"] = 0
+        return df
+
+    close_clean = close.dropna()
+    if len(close_clean) < 10:
+        df["recovery_time_avg"] = np.nan
+        df["recovery_time_max"] = np.nan
+        df["n_recovery_episodes"] = 0
+        return df
+
+    # Track drawdown episodes: peak -> trough -> recovery
+    running_max = close_clean.expanding().max()
+    in_drawdown = close_clean < running_max
+
+    recovery_times: list[int] = []
+    dd_start_idx: int | None = None
+    peak_value: float = 0.0
+
+    for i in range(len(close_clean)):
+        val = float(close_clean.iloc[i])
+        peak = float(running_max.iloc[i])
+
+        if in_drawdown.iloc[i] and dd_start_idx is None:
+            # Entered a drawdown
+            dd_start_idx = i
+            peak_value = peak
+        elif dd_start_idx is not None and val >= peak_value:
+            # Recovered to pre-drawdown peak
+            recovery_days = i - dd_start_idx
+            if recovery_days > 0:
+                recovery_times.append(recovery_days)
+            dd_start_idx = None
+
+    n_episodes = len(recovery_times)
+    if n_episodes > 0:
+        avg_recovery = float(np.mean(recovery_times))
+        max_recovery = float(np.max(recovery_times))
+    else:
+        avg_recovery = np.nan
+        max_recovery = np.nan
+
+    # Store as scalar columns (same value for all days -- summary metric)
+    df["recovery_time_avg"] = avg_recovery
+    df["recovery_time_max"] = max_recovery
+    df["n_recovery_episodes"] = n_episodes
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -639,6 +743,8 @@ _COMPUTE_STAGES = (
     _compute_volume_avg,
     _compute_per_share,
     _compute_technical_indicators,
+    _compute_recovery_time,
+    _compute_beta,
 )
 
 # All derived variable names (for inspection / downstream reference)
@@ -669,6 +775,10 @@ DERIVED_VARIABLES: tuple[str, ...] = (
     # Technical indicators
     "sma_50", "sma_200", "rsi_14", "macd", "macd_signal",
     "bollinger_upper", "bollinger_lower",
+    # Beta
+    "beta_252d",
+    # Recovery time
+    "recovery_time_avg", "recovery_time_max", "n_recovery_episodes",
 )
 
 

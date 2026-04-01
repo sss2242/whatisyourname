@@ -130,6 +130,9 @@ class MonteCarloResult:
     # Regime transition matrix (n_regimes x n_regimes).
     transition_matrix: np.ndarray | None = None
 
+    # Regime label order corresponding to transition matrix rows/columns.
+    regime_order: list[str] = field(default_factory=list)
+
     # Current regime at simulation start.
     current_regime: str = ""
 
@@ -993,6 +996,7 @@ def run_monte_carlo(
         regime_labels, unique_regimes,
     )
     result.transition_matrix = transition_matrix
+    result.regime_order = list(regime_order)
 
     # Map current regime to index.
     regime_to_idx = {r: i for i, r in enumerate(regime_order)}

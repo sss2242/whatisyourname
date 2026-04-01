@@ -136,3 +136,88 @@ def fetch_ohlcv(
         logger.warning("No OHLCV data available for %s (market: %s)", ticker, market_id)
 
     return df
+
+
+# ---------------------------------------------------------------------------
+# Benchmark index returns (for beta computation)
+# ---------------------------------------------------------------------------
+
+_benchmark_cache: dict[str, pd.Series] = {}
+
+
+def _load_benchmarks() -> dict[str, str]:
+    """Load market_id -> benchmark ticker from config/market_benchmarks.yml."""
+    try:
+        import yaml
+        from pathlib import Path
+        path = Path(__file__).resolve().parent.parent.parent / "config" / "market_benchmarks.yml"
+        if not path.exists():
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def fetch_benchmark_returns(
+    market_id: str,
+    years: int = 2,
+) -> pd.Series:
+    """Fetch daily returns for the market benchmark index.
+
+    Uses yfinance to fetch the benchmark index OHLCV, then computes
+    daily returns.  Results are cached per market_id to avoid re-fetching.
+
+    Parameters
+    ----------
+    market_id:
+        Market identifier (e.g. "us_sec_edgar").
+    years:
+        Years of history.
+
+    Returns
+    -------
+    pd.Series with DatetimeIndex and name ``benchmark_return_1d``.
+    Empty Series if benchmark unavailable.
+    """
+    if market_id in _benchmark_cache:
+        return _benchmark_cache[market_id]
+
+    benchmarks = _load_benchmarks()
+    ticker = benchmarks.get(market_id)
+    if not ticker:
+        logger.debug("No benchmark ticker configured for %s", market_id)
+        empty = pd.Series(dtype=float, name="benchmark_return_1d")
+        _benchmark_cache[market_id] = empty
+        return empty
+
+    try:
+        from operator1.clients.ohlcv_yfinance import fetch_ohlcv_yfinance
+        df = fetch_ohlcv_yfinance(ticker, market_id="", years=years)
+    except Exception as exc:
+        logger.warning("Benchmark fetch failed for %s (%s): %s", market_id, ticker, exc)
+        empty = pd.Series(dtype=float, name="benchmark_return_1d")
+        _benchmark_cache[market_id] = empty
+        return empty
+
+    if df.empty or "close" not in df.columns:
+        logger.debug("Benchmark OHLCV empty for %s (%s)", market_id, ticker)
+        empty = pd.Series(dtype=float, name="benchmark_return_1d")
+        _benchmark_cache[market_id] = empty
+        return empty
+
+    # Compute daily returns
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+
+    returns = df["close"].pct_change()
+    returns.name = "benchmark_return_1d"
+
+    logger.info(
+        "Benchmark returns fetched: %s (%s), %d days",
+        market_id, ticker, returns.notna().sum(),
+    )
+
+    _benchmark_cache[market_id] = returns
+    return returns

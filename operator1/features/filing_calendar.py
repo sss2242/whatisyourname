@@ -309,3 +309,77 @@ def _detect_filing_dates_from_cache(cache: pd.DataFrame) -> list[pd.Timestamp]:
             change_dates.insert(0, first_date)
 
     return sorted(change_dates)
+
+
+def predict_next_filing_date(
+    result: FilingCalendarResult,
+    reference_date: pd.Timestamp | None = None,
+) -> dict[str, Any]:
+    """Predict the next expected filing date based on detected frequency.
+
+    Uses the detected filing frequency and the latest filing date to
+    extrapolate when the next filing is expected.
+
+    App core idea Section E.5: ``pred_key_events_next_month``.
+
+    Parameters
+    ----------
+    result:
+        ``FilingCalendarResult`` from ``analyze_filing_calendar()``.
+    reference_date:
+        Date to use as "today". Defaults to the latest filing date + period.
+
+    Returns
+    -------
+    Dict with ``next_expected_date``, ``confidence``, ``days_until``,
+    ``frequency_basis``.
+    """
+    freq = result.detected_frequency
+    filing_dates = result.filing_dates if hasattr(result, "filing_dates") else []
+
+    # Period in trading days per frequency
+    period_map = {
+        "quarterly": 63,
+        "semi-annual": 126,
+        "annual": 252,
+    }
+    period_days = period_map.get(freq, 90)  # default 90 for unknown
+
+    # Find the latest filing date
+    if filing_dates:
+        latest = max(filing_dates)
+    elif result.latest_filing_age_days > 0 and reference_date is not None:
+        latest = reference_date - pd.Timedelta(days=result.latest_filing_age_days)
+    else:
+        return {
+            "available": False,
+            "error": "no filing dates available for prediction",
+        }
+
+    # Predict next date: latest + period (in calendar days, ~1.4x trading days)
+    calendar_days = int(period_days * 1.4)
+    next_expected = pd.Timestamp(latest) + pd.Timedelta(days=calendar_days)
+
+    # If next_expected is in the past, add another period
+    now = reference_date if reference_date is not None else pd.Timestamp.now()
+    while next_expected < now:
+        next_expected += pd.Timedelta(days=calendar_days)
+
+    days_until = (next_expected - now).days
+
+    # Confidence: higher for regular filers
+    confidence = 0.7  # baseline
+    if result.coverage_ratio >= 0.9:
+        confidence = 0.9  # very regular filer
+    elif result.coverage_ratio >= 0.7:
+        confidence = 0.8
+    elif result.coverage_ratio < 0.5:
+        confidence = 0.5  # irregular
+
+    return {
+        "available": True,
+        "next_expected_date": next_expected.strftime("%Y-%m-%d"),
+        "days_until": days_until,
+        "confidence": round(confidence, 2),
+        "frequency_basis": freq,
+    }

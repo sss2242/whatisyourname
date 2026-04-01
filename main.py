@@ -955,6 +955,22 @@ Non-interactive examples:
         )
 
     # ------------------------------------------------------------------
+    # Step 4.bench: Fetch benchmark index returns for beta computation
+    # ------------------------------------------------------------------
+    try:
+        from operator1.clients.ohlcv_provider import fetch_benchmark_returns
+        _bench_returns = fetch_benchmark_returns(market_id, years=int(getattr(args, "years", 2)))
+        if not _bench_returns.empty:
+            _bench_aligned = _bench_returns.reindex(cache.index, method="ffill")
+            cache["benchmark_return_1d"] = _bench_aligned
+            logger.info(
+                "Benchmark returns merged: %d non-null days for %s",
+                int(_bench_aligned.notna().sum()), market_id,
+            )
+    except Exception as exc:
+        logger.debug("Benchmark fetch skipped: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 4a: Fetch macro data for survival mode analysis
     # ------------------------------------------------------------------
     macro_data = {}
@@ -1863,6 +1879,30 @@ Non-interactive examples:
         except Exception as exc:
             logger.warning("Linked entity conflict propagation failed: %s", exc)
 
+    # Step 5g.6: Unified supply chain stress flag
+    # Combines geopolitical risk + supplier financial health into one signal.
+    # App core idea Section F.1 Category 6.
+    supply_chain_stress_result = None
+    try:
+        from operator1.features.conflict_risk import compute_supply_chain_stress
+        supply_chain_stress_result = compute_supply_chain_stress(
+            conflict_result=conflict_result,
+            linked_caches=linked_caches if linked_caches else None,
+            relationships=relationships if relationships else None,
+        )
+        if supply_chain_stress_result and supply_chain_stress_result.get("available"):
+            # Inject flag into cache
+            cache["supply_chain_stress_flag"] = int(supply_chain_stress_result["supply_chain_stress_flag"])
+            cache["supply_chain_stress_score"] = supply_chain_stress_result["supply_chain_stress_score"]
+            logger.info(
+                "Supply chain stress: flag=%s, score=%.3f, sources=%s",
+                supply_chain_stress_result["supply_chain_stress_flag"],
+                supply_chain_stress_result["supply_chain_stress_score"],
+                supply_chain_stress_result["stress_sources"],
+            )
+    except Exception as exc:
+        logger.debug("Supply chain stress computation skipped: %s", exc)
+
     # Step 5h: Peer percentile ranking (requires linked caches)
     peer_ranking_result = None
     if linked_caches:
@@ -2260,6 +2300,7 @@ Non-interactive examples:
     granger_result = None
     ga_result = None
     ohlc_result = None
+    regime_shift_result = None
     _synergy_meta = {}
     _pattern_drift = 1.0
 
@@ -2279,12 +2320,27 @@ Non-interactive examples:
         # Collect injected feature columns for temporal model learning.
         # Include linked aggregate columns (competitors_avg_*, suppliers_median_*,
         # etc.) so that temporal models can learn from cross-entity signals.
-        # Also include enriched survival timeline columns.
+        #
+        # LOOK-AHEAD GUARD: survival_intensity, regime_confidence, and
+        # regime_transition_prob are EXCLUDED because they are derived from
+        # HMM regime labels fitted on the FULL 2-year cache (Step 5.5).
+        # Including them would let the forward pass "see" future regime
+        # information, violating the no-look-ahead principle (Spec J, 6.1).
+        # The online_change_score (ChangeFinder) IS safe -- it uses only
+        # past data for each score.  stability_score_21d is safe -- it
+        # uses a backward-looking 21-day rolling window on rule-based flags.
         _linked_prefixes = (
             "competitors_", "suppliers_", "customers_",
             "financial_institutions_", "sector_peers_", "industry_peers_",
             "rel_", "valuation_premium_",
         )
+        # Columns derived from full-cache HMM that would cause look-ahead
+        # bias if fed as features to the forward pass temporal models.
+        _hmm_lookahead_cols = {
+            "survival_intensity",    # blends rule-based (clean) + HMM (look-ahead)
+            "regime_confidence",     # from HMM posteriors fitted on full cache
+            "regime_transition_prob", # from enriched timeline using HMM labels
+        }
         _extra_vars = [
             c for c in cache.columns
             if (c.startswith("fh_") or c.startswith("sentiment_")
@@ -2292,13 +2348,13 @@ Non-interactive examples:
                 or c.startswith("inst_")
                 or c.startswith("buying_power_") or c.startswith("catalyst_")
                 or c.startswith("conflict_") or c.startswith("demand_")
-                or c in ("survival_intensity", "regime_confidence",
-                         "regime_transition_prob", "stability_score_21d",
+                or c in ("stability_score_21d",
                          "buying_power_index", "sector_demand_momentum",
                          "catalyst_score", "online_change_score")
                 or any(c.startswith(p) for p in _linked_prefixes))
             and cache[c].dtype in ("float64", "float32", "int64")
             and not c.startswith("is_missing_")
+            and c not in _hmm_lookahead_cols
         ]
         if _extra_vars:
             logger.info("Extra variables for temporal models (%d): %s", len(_extra_vars), _extra_vars[:10])
@@ -2610,6 +2666,46 @@ Non-interactive examples:
             logger.info("Monte Carlo simulation complete")
         except Exception as exc:
             logger.warning("Monte Carlo failed: %s", exc)
+
+        # Predicted regime shifts (Section E.5 from core idea)
+        # Uses the HMM transition matrix from MC to predict when the
+        # current regime is likely to change and to which regime.
+        regime_shift_result = None
+        try:
+            from operator1.models.regime_shift_predictor import predict_regime_shifts
+            _mc_transition = mc_result.transition_matrix if mc_result is not None else None
+            _mc_regime_order = None
+            if mc_result is not None and hasattr(mc_result, "regime_order"):
+                _mc_regime_order = mc_result.regime_order
+            _stab_score = None
+            if "stability_score_21d" in cache.columns:
+                _ss = cache["stability_score_21d"].dropna()
+                if len(_ss) > 0:
+                    _stab_score = float(_ss.iloc[-1])
+            _trans_hl = (
+                _adaptive_model_params.transition_halflife
+                if _adaptive_model_params is not None and _adaptive_model_params.adapted
+                else None
+            )
+            regime_shift_result = predict_regime_shifts(
+                cache,
+                transition_matrix=_mc_transition,
+                regime_order=_mc_regime_order,
+                stability_score=_stab_score,
+                transition_halflife=_trans_hl,
+                reference_date=_backtest_end_date,
+            )
+            if regime_shift_result and regime_shift_result.available:
+                logger.info(
+                    "Regime shift prediction: P(exit 21d)=%.1f%%, P(exit 252d)=%.1f%%, "
+                    "expected_days=%.0f, next=%s",
+                    regime_shift_result.prob_exit_21d * 100,
+                    regime_shift_result.prob_exit_252d * 100,
+                    regime_shift_result.expected_days_to_shift,
+                    regime_shift_result.most_probable_next_regime,
+                )
+        except Exception as exc:
+            logger.warning("Regime shift prediction failed: %s", exc)
 
         # Copula
         try:
@@ -2935,6 +3031,24 @@ Non-interactive examples:
             )
             if ohlc_result and ohlc_result.fitted:
                 logger.info("OHLC prediction complete")
+                # Run pattern detection on predicted OHLC candles
+                # (App core idea Section E.5: specific dated pattern formations)
+                try:
+                    from operator1.models.pattern_detector import detect_patterns_on_predicted_ohlc
+                    _last_candle = None
+                    if "close" in cache.columns and "open" in cache.columns:
+                        _last_candle = {
+                            "open": float(cache["open"].iloc[-1]) if cache["open"].notna().any() else None,
+                            "high": float(cache["high"].iloc[-1]) if "high" in cache.columns and cache["high"].notna().any() else None,
+                            "low": float(cache["low"].iloc[-1]) if "low" in cache.columns and cache["low"].notna().any() else None,
+                            "close": float(cache["close"].iloc[-1]) if cache["close"].notna().any() else None,
+                        }
+                    _pred_patterns = detect_patterns_on_predicted_ohlc(ohlc_result, _last_candle)
+                    if _pred_patterns and pattern_result is not None:
+                        pattern_result.predicted_patterns_week = _pred_patterns
+                        logger.info("Predicted OHLC patterns: %d formations detected", len(_pred_patterns))
+                except Exception as _pp_exc:
+                    logger.debug("Predicted OHLC pattern detection failed: %s", _pp_exc)
         except Exception as exc:
             logger.warning("OHLC candlestick prediction failed: %s", exc)
     else:
@@ -3030,6 +3144,35 @@ Non-interactive examples:
                 )
         except Exception as exc:
             logger.warning("Retroactive calibration failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 6.6: Model expected path vs actual path diagnostics
+    # ------------------------------------------------------------------
+    # For each model, pre-computes what it SHOULD produce based on data
+    # characteristics, then compares against what it actually produced.
+    # Produces per-model robustness ratings for the profile and report.
+    model_diagnostics_result = None
+    try:
+        from operator1.monitoring.model_diagnostics import compute_model_diagnostics
+        model_diagnostics_result = compute_model_diagnostics(
+            cache,
+            forecast_result=forecast_result,
+            mc_result=mc_result,
+            copula_result=copula_result,
+            granger_result=granger_result,
+            cycle_result=cycle_result,
+            dtw_result=dtw_result,
+            conformal_result=conformal_result,
+        )
+        if model_diagnostics_result and model_diagnostics_result.available:
+            logger.info(
+                "Model diagnostics: %d/%d on track, overall=%s",
+                model_diagnostics_result.n_models_on_track,
+                model_diagnostics_result.n_models_assessed,
+                model_diagnostics_result.overall_robustness,
+            )
+    except Exception as exc:
+        logger.debug("Model diagnostics failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Step 7: Build company profile
@@ -3154,7 +3297,7 @@ Non-interactive examples:
 
         # Inject filing calendar analysis
         if filing_calendar_result is not None:
-            profile["filing_calendar"] = {
+            _fc_dict = {
                 "available": True,
                 "expected_frequency": filing_calendar_result.expected_frequency,
                 "detected_frequency": filing_calendar_result.detected_frequency,
@@ -3165,6 +3308,16 @@ Non-interactive examples:
                 "is_stale": filing_calendar_result.is_stale,
                 "gaps": filing_calendar_result.gaps,
             }
+            # Predicted next filing date (Section E.5 from core idea)
+            try:
+                from operator1.features.filing_calendar import predict_next_filing_date
+                _ref_date = pd.Timestamp(_backtest_end_date) if _backtest_end_date else pd.Timestamp.now()
+                _next_filing = predict_next_filing_date(filing_calendar_result, reference_date=_ref_date)
+                _fc_dict["next_expected_filing"] = _next_filing
+            except Exception as _nf_exc:
+                logger.debug("Next filing prediction failed: %s", _nf_exc)
+                _fc_dict["next_expected_filing"] = {"available": False}
+            profile["filing_calendar"] = _fc_dict
         else:
             profile["filing_calendar"] = {"available": False}
 
@@ -3239,6 +3392,12 @@ Non-interactive examples:
             }
         else:
             profile["market_buying_power"] = {"available": False}
+
+        # Inject supply chain stress flag
+        if supply_chain_stress_result is not None and supply_chain_stress_result.get("available"):
+            profile["supply_chain_stress"] = supply_chain_stress_result
+        else:
+            profile["supply_chain_stress"] = {"available": False}
 
         # Inject product catalyst signals
         if catalyst_result is not None and catalyst_result.available:
@@ -3431,6 +3590,12 @@ Non-interactive examples:
         if _mv_mc_result is not None and _mv_mc_result.get("available"):
             profile["extended_models"]["multivariate_monte_carlo"] = _mv_mc_result
 
+        # Predicted regime shifts (Section E.5 from core idea)
+        if regime_shift_result is not None and regime_shift_result.available:
+            profile["predicted_regime_shifts"] = regime_shift_result.to_dict()
+        else:
+            profile["predicted_regime_shifts"] = {"available": False}
+
         # Dual regimes
         if dual_regime_result is not None and dual_regime_result.fitted:
             profile["extended_models"]["dual_regimes"] = {
@@ -3484,6 +3649,10 @@ Non-interactive examples:
             }
 
         # Synergy metadata
+        # Module contribution scores (Section F.1 Category 7 from core idea)
+        if pred_result is not None and hasattr(pred_result, "module_contributions") and pred_result.module_contributions:
+            profile.setdefault("model_metrics", {})["module_contributions"] = pred_result.module_contributions
+
         if _synergy_meta:
             profile["synergies_applied"] = {
                 "cycle_features_added": _synergy_meta.get("cycle_features_added", []),
@@ -3502,6 +3671,12 @@ Non-interactive examples:
             profile["unified_survival_system"] = survival_controller.to_profile_dict()
         else:
             profile["unified_survival_system"] = {"available": False}
+
+        # Inject model diagnostics (expected path vs actual path)
+        if model_diagnostics_result is not None and model_diagnostics_result.available:
+            profile["model_diagnostics"] = model_diagnostics_result.to_dict()
+        else:
+            profile["model_diagnostics"] = {"available": False}
 
         # Inject scenario engine results
         if scenario_result is not None and scenario_result.available:

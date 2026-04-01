@@ -383,3 +383,125 @@ def _detect_patterns_impl(
         motifs=motifs,
         discords=discords,
     )
+
+
+def detect_patterns_on_predicted_ohlc(
+    ohlc_result,
+    last_historical_candle: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """Run candlestick pattern detection on predicted OHLC candles.
+
+    Takes the OHLCPredictionResult from ohlc_predictor and applies the
+    same detection rules used for historical data.  Each detected pattern
+    has its confidence multiplied by the candle's own confidence (which
+    decays with horizon distance).
+
+    App core idea Section E.5: specific dated pattern formations like
+    "Doji on Feb 11, Hammer on Feb 13."
+
+    Parameters
+    ----------
+    ohlc_result:
+        ``OHLCPredictionResult`` from ``predict_ohlc_series()``.
+    last_historical_candle:
+        Last actual OHLC values ``{open, high, low, close}`` for
+        two-candle pattern detection (engulfing) on the first predicted day.
+
+    Returns
+    -------
+    List of dicts with ``pattern``, ``date``, ``direction``, ``confidence``.
+    """
+    predicted_patterns: list[dict[str, Any]] = []
+
+    if ohlc_result is None or not getattr(ohlc_result, "fitted", False):
+        return predicted_patterns
+
+    # Collect all predicted candles
+    candles = []
+    for series in [
+        getattr(ohlc_result, "next_week", []),
+        getattr(ohlc_result, "next_month", []),
+    ]:
+        if series:
+            candles.extend(series)
+
+    if not candles:
+        return predicted_patterns
+
+    # Build arrays from predicted candles
+    prev_o = last_historical_candle.get("open") if last_historical_candle else None
+    prev_c = last_historical_candle.get("close") if last_historical_candle else None
+
+    for i, candle in enumerate(candles):
+        o = getattr(candle, "open", None)
+        h = getattr(candle, "high", None)
+        lo = getattr(candle, "low", None)
+        c = getattr(candle, "close", None)
+        d = getattr(candle, "date", f"day+{i + 1}")
+        candle_conf = getattr(candle, "confidence", 1.0)
+
+        if any(v is None for v in (o, h, lo, c)):
+            prev_o, prev_c = o, c
+            continue
+
+        body = abs(c - o)
+        full_range = h - lo
+        if full_range < 1e-10:
+            prev_o, prev_c = o, c
+            continue
+
+        body_ratio = body / full_range
+
+        # Single-candle patterns
+        if body_ratio < 0.1:
+            predicted_patterns.append({
+                "pattern": "Doji",
+                "date": d,
+                "direction": "neutral",
+                "confidence": round(0.6 * candle_conf, 3),
+            })
+        elif body_ratio < 0.3:
+            lower_shadow = min(o, c) - lo
+            upper_shadow = h - max(o, c)
+            if lower_shadow > 2 * body and upper_shadow < body:
+                direction = "bullish"
+                predicted_patterns.append({
+                    "pattern": "Hammer",
+                    "date": d,
+                    "direction": direction,
+                    "confidence": round(0.65 * candle_conf, 3),
+                })
+            elif upper_shadow > 2 * body and lower_shadow < body:
+                predicted_patterns.append({
+                    "pattern": "Inverted Hammer",
+                    "date": d,
+                    "direction": "bearish",
+                    "confidence": round(0.6 * candle_conf, 3),
+                })
+
+        # Two-candle patterns (engulfing)
+        if prev_o is not None and prev_c is not None:
+            prev_body = abs(prev_c - prev_o)
+            if body > prev_body * 1.1:
+                if c > o and prev_c < prev_o:
+                    predicted_patterns.append({
+                        "pattern": "Bullish Engulfing",
+                        "date": d,
+                        "direction": "bullish",
+                        "confidence": round(0.7 * candle_conf, 3),
+                    })
+                elif c < o and prev_c > prev_o:
+                    predicted_patterns.append({
+                        "pattern": "Bearish Engulfing",
+                        "date": d,
+                        "direction": "bearish",
+                        "confidence": round(0.7 * candle_conf, 3),
+                    })
+
+        prev_o, prev_c = o, c
+
+    logger.info(
+        "Predicted OHLC pattern detection: %d patterns found in %d predicted candles",
+        len(predicted_patterns), len(candles),
+    )
+    return predicted_patterns

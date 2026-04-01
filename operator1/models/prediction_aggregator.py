@@ -337,6 +337,11 @@ class PredictionAggregatorResult:
     survival_probability_p5: float = float("nan")
     survival_probability_p95: float = float("nan")
 
+    # Module contribution scores (Section F.1 Category 7 from core idea).
+    # {model_name: contribution_pct} showing how much each model contributes
+    # to the final ensemble prediction.
+    module_contributions: dict[str, float] = field(default_factory=dict)
+
     # Current regime at prediction time.
     current_regime: str = ""
 
@@ -1959,6 +1964,20 @@ def run_prediction_aggregation(
     ]
     result.n_models_failed = sum(failed_flags)
     result.n_models_available = 5 - result.n_models_failed  # 5 model types
+
+    # Module contribution scores (Section F.1 Category 7 from core idea).
+    # Normalize ensemble weights to percentages for interpretability.
+    if result.ensemble_weights:
+        total_w = sum(result.ensemble_weights.values())
+        if total_w > 0:
+            result.module_contributions = {
+                name: round(w / total_w * 100, 1)
+                for name, w in sorted(
+                    result.ensemble_weights.items(),
+                    key=lambda x: -x[1],
+                )
+                if w > 0
+            }
 
     # ------------------------------------------------------------------
     # Aggregate forecasts
