@@ -548,6 +548,10 @@ def compute_model_diagnostics(
     result = ModelDiagnosticsResult()
 
     try:
+        if cache is None or cache.empty or len(cache) < 10:
+            result.error = "insufficient cache data"
+            return result
+
         # Step 1: Extract data characteristics
         chars = _extract_data_characteristics(cache)
         result.data_characteristics = {
