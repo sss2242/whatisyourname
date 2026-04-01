@@ -955,6 +955,22 @@ Non-interactive examples:
         )
 
     # ------------------------------------------------------------------
+    # Step 4.bench: Fetch benchmark index returns for beta computation
+    # ------------------------------------------------------------------
+    try:
+        from operator1.clients.ohlcv_provider import fetch_benchmark_returns
+        _bench_returns = fetch_benchmark_returns(market_id, years=int(getattr(args, "years", 2)))
+        if not _bench_returns.empty:
+            _bench_aligned = _bench_returns.reindex(cache.index, method="ffill")
+            cache["benchmark_return_1d"] = _bench_aligned
+            logger.info(
+                "Benchmark returns merged: %d non-null days for %s",
+                int(_bench_aligned.notna().sum()), market_id,
+            )
+    except Exception as exc:
+        logger.debug("Benchmark fetch skipped: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 4a: Fetch macro data for survival mode analysis
     # ------------------------------------------------------------------
     macro_data = {}

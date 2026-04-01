@@ -1087,6 +1087,7 @@ def _build_current_state_snapshot(profile: dict[str, Any]) -> str:
         ("tier3_stability", "Tier 3: Market Stability", {
             "volatility_21d": ("21-Day Volatility (annualised)", ".1%"),
             "drawdown_252d": ("Maximum Drawdown (1-year)", ".1%"),
+            "beta_252d": ("Market Beta (252-day)", ".2f"),
             "close": ("Current Share Price", ".2f"),
             "volume": ("Daily Volume", ",.0f"),
             "volume_avg_21d": ("21-Day Average Volume", ",.0f"),
@@ -2601,6 +2602,11 @@ def _build_key_indicators_table(profile: dict[str, Any], mode: ReportMode = Repo
         ("Volatility (21d)", "volatility_21d", ".1%",
          "How much the stock price fluctuates day-to-day. "
          "Higher volatility means more risk but also more opportunity."),
+        ("Market Beta", "beta_252d", ".2f",
+         "Measures how much the stock moves relative to the market. "
+         "Beta > 1 means it amplifies market moves (higher risk/reward). "
+         "Beta < 1 means it dampens market moves (defensive). "
+         "Beta = 1 means it tracks the market exactly."),
         ("Max Drawdown (1Y)", "drawdown_252d", ".1%",
          "Largest peak-to-trough decline in the past year. "
          "Shows the worst-case loss an investor would have experienced."),

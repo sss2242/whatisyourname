@@ -622,6 +622,43 @@ def _compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Beta vs market benchmark
+# ---------------------------------------------------------------------------
+
+
+def _compute_beta(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute rolling 252-day beta vs market benchmark.
+
+    ``beta_252d = Cov(stock_return, benchmark_return, 252) / Var(benchmark_return, 252)``
+
+    Requires ``benchmark_return_1d`` column in the cache (merged in main.py
+    Step 4 before derived_variables runs).  If missing, beta is NaN.
+
+    App core idea Section F.1 Tier 3: ``beta_252d``.
+    """
+    stock_ret = df.get("return_1d")
+    bench_ret = df.get("benchmark_return_1d")
+
+    if stock_ret is None or bench_ret is None or bench_ret.isna().all():
+        df["beta_252d"] = np.nan
+        df["is_missing_beta_252d"] = 1
+        return df
+
+    # Rolling covariance / variance (min 60 days for meaningful estimate)
+    cov = stock_ret.rolling(252, min_periods=60).cov(bench_ret)
+    var = bench_ret.rolling(252, min_periods=60).var()
+
+    # Safe division: avoid div-by-zero when benchmark variance is tiny
+    safe_var = var.where(var.abs() > EPSILON)
+    beta = cov / safe_var
+
+    df["beta_252d"] = beta
+    df["is_missing_beta_252d"] = beta.isna().astype(int)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Recovery time (days from trough to previous peak)
 # ---------------------------------------------------------------------------
 
@@ -707,6 +744,7 @@ _COMPUTE_STAGES = (
     _compute_per_share,
     _compute_technical_indicators,
     _compute_recovery_time,
+    _compute_beta,
 )
 
 # All derived variable names (for inspection / downstream reference)
@@ -737,6 +775,8 @@ DERIVED_VARIABLES: tuple[str, ...] = (
     # Technical indicators
     "sma_50", "sma_200", "rsi_14", "macd", "macd_signal",
     "bollinger_upper", "bollinger_lower",
+    # Beta
+    "beta_252d",
     # Recovery time
     "recovery_time_avg", "recovery_time_max", "n_recovery_episodes",
 )

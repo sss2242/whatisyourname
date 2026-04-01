@@ -196,6 +196,7 @@ def _build_current_state_section(cache: pd.DataFrame | None) -> dict[str, Any]:
             "volatility_21d": _get("volatility_21d"),
             "drawdown_252d": _get("drawdown_252d"),
             "volume": _get("volume"),
+            "beta_252d": _get("beta_252d"),
             "volume_avg_21d": _get("volume_avg_21d"),
             "close": _get("close"),
         },

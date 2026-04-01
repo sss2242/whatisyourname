@@ -1,0 +1,29 @@
+# Market benchmark index tickers for beta computation (yfinance format).
+# Beta_252d = Cov(stock_return, index_return) / Var(index_return)
+# All tickers work with yfinance -- no API key needed.
+
+us_sec_edgar: "^GSPC"           # S&P 500
+uk_companies_house: "^FTSE"     # FTSE 100
+eu_esef: "^STOXX50E"            # Euro Stoxx 50
+fr_esef: "^FCHI"                # CAC 40
+de_esef: "^GDAXI"              # DAX
+jp_jquants: "^N225"             # Nikkei 225
+kr_dart: "^KS11"                # KOSPI
+tw_mops: "^TWII"                # TAIEX
+br_cvm: "^BVSP"                 # Bovespa
+cl_cmf: "^IPSA"                 # IPSA
+ca_sedar: "^GSPTSE"             # S&P/TSX Composite
+au_asx: "^AXJO"                 # S&P/ASX 200
+in_bse: "^BSESN"               # SENSEX
+cn_sse: "000001.SS"             # SSE Composite
+hk_hkex: "^HSI"                 # Hang Seng
+sg_sgx: "^STI"                  # Straits Times
+mx_bmv: "^MXX"                  # IPC Mexico
+za_jse: "^J200.JO"              # JSE Top 40
+ch_six: "^SSMI"                 # SMI
+sa_tadawul: "^TASI.SR"          # TASI
+ae_dfm: "DFMGI.AE"              # DFM General
+nl_esef: "^AEX"                 # AEX
+es_esef: "^IBEX"                # IBEX 35
+it_esef: "FTSEMIB.MI"           # FTSE MIB
+se_esef: "^OMX"                 # OMX Stockholm 30
