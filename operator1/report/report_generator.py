@@ -1166,6 +1166,13 @@ def _build_historical_performance(profile: dict[str, Any]) -> str:
     lines.append(f"- **Annualised Volatility:** {_pct(hist.get('volatility_annualized'))}")
     lines.append(f"- **Sharpe Ratio:** {_fmt(hist.get('sharpe_ratio'))}")
     lines.append(f"- **Maximum Drawdown:** {_pct(hist.get('max_drawdown'))}")
+    _rec_avg = hist.get("recovery_time_avg")
+    _rec_max = hist.get("recovery_time_max")
+    _rec_n = hist.get("n_recovery_episodes", 0)
+    if _rec_avg is not None:
+        lines.append(f"- **Average Recovery Time:** {_rec_avg:.0f} trading days ({_rec_n} episodes)")
+    if _rec_max is not None:
+        lines.append(f"- **Longest Recovery:** {_rec_max:.0f} trading days")
     lines.append(f"- **Up Days:** {_pct(hist.get('up_days_percentage'))}")
     lines.append(f"- **Down Days:** {_pct(hist.get('down_days_percentage'))}")
     lines.append(f"- **Best Day Return:** {_pct(hist.get('best_day_return'))}")

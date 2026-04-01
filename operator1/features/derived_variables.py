@@ -622,6 +622,73 @@ def _compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Recovery time (days from trough to previous peak)
+# ---------------------------------------------------------------------------
+
+
+def _compute_recovery_time(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute average and maximum drawdown recovery time.
+
+    Recovery time = number of trading days from a drawdown trough until
+    the price recovers to the pre-drawdown peak.  Standard risk metric
+    from App core idea Section F.1 Category 3.
+
+    Variables: recovery_time_avg, recovery_time_max, n_recovery_episodes.
+    """
+    close = df.get("close")
+    if close is None or close.isna().all():
+        df["recovery_time_avg"] = np.nan
+        df["recovery_time_max"] = np.nan
+        df["n_recovery_episodes"] = 0
+        return df
+
+    close_clean = close.dropna()
+    if len(close_clean) < 10:
+        df["recovery_time_avg"] = np.nan
+        df["recovery_time_max"] = np.nan
+        df["n_recovery_episodes"] = 0
+        return df
+
+    # Track drawdown episodes: peak -> trough -> recovery
+    running_max = close_clean.expanding().max()
+    in_drawdown = close_clean < running_max
+
+    recovery_times: list[int] = []
+    dd_start_idx: int | None = None
+    peak_value: float = 0.0
+
+    for i in range(len(close_clean)):
+        val = float(close_clean.iloc[i])
+        peak = float(running_max.iloc[i])
+
+        if in_drawdown.iloc[i] and dd_start_idx is None:
+            # Entered a drawdown
+            dd_start_idx = i
+            peak_value = peak
+        elif dd_start_idx is not None and val >= peak_value:
+            # Recovered to pre-drawdown peak
+            recovery_days = i - dd_start_idx
+            if recovery_days > 0:
+                recovery_times.append(recovery_days)
+            dd_start_idx = None
+
+    n_episodes = len(recovery_times)
+    if n_episodes > 0:
+        avg_recovery = float(np.mean(recovery_times))
+        max_recovery = float(np.max(recovery_times))
+    else:
+        avg_recovery = np.nan
+        max_recovery = np.nan
+
+    # Store as scalar columns (same value for all days -- summary metric)
+    df["recovery_time_avg"] = avg_recovery
+    df["recovery_time_max"] = max_recovery
+    df["n_recovery_episodes"] = n_episodes
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -639,6 +706,7 @@ _COMPUTE_STAGES = (
     _compute_volume_avg,
     _compute_per_share,
     _compute_technical_indicators,
+    _compute_recovery_time,
 )
 
 # All derived variable names (for inspection / downstream reference)
@@ -669,6 +737,8 @@ DERIVED_VARIABLES: tuple[str, ...] = (
     # Technical indicators
     "sma_50", "sma_200", "rsi_14", "macd", "macd_signal",
     "bollinger_upper", "bollinger_lower",
+    # Recovery time
+    "recovery_time_avg", "recovery_time_max", "n_recovery_episodes",
 )
 
 

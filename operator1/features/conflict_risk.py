@@ -1016,3 +1016,96 @@ def _apply_time_varying_conflict(
     )
 
     return cache
+
+
+# ---------------------------------------------------------------------------
+# Supply chain stress flag (unified signal)
+# ---------------------------------------------------------------------------
+
+
+def compute_supply_chain_stress(
+    conflict_result=None,
+    linked_caches: dict | None = None,
+    relationships: dict | None = None,
+) -> dict:
+    """Compute a unified supply chain stress flag.
+
+    Combines geopolitical supply chain risk (from conflict assessment),
+    supplier financial health (from linked entity caches), and supplier
+    diversity into a single actionable signal.
+
+    App core idea Section F.1 Category 6: ``supply_chain_stress_flag``.
+
+    Returns dict with ``available``, ``supply_chain_stress_flag``,
+    ``supply_chain_stress_score``, ``stressed_suppliers``, ``stress_sources``.
+    """
+    result = {
+        "available": False,
+        "supply_chain_stress_flag": False,
+        "supply_chain_stress_score": 0.0,
+        "stressed_suppliers": [],
+        "stress_sources": [],
+        "n_suppliers_tracked": 0,
+    }
+
+    scores = []
+
+    # Component 1: Geopolitical supply chain risk
+    geo_score = 0.0
+    if conflict_result is not None:
+        if hasattr(conflict_result, "supply_chain_risk_score"):
+            geo_score = getattr(conflict_result, "supply_chain_risk_score", 0.0) or 0.0
+        if geo_score == 0.0 and hasattr(conflict_result, "conflict_intensity_score"):
+            if conflict_result.conflict_intensity_score > 0.5:
+                geo_score = conflict_result.conflict_intensity_score * 0.5
+        if geo_score > 0.3:
+            result["stress_sources"].append(f"geopolitical_risk ({geo_score:.2f})")
+        scores.append(geo_score)
+
+    # Component 2: Supplier financial health
+    supplier_health_score = 0.0
+    if linked_caches and relationships:
+        supplier_ids = []
+        for group_name in ("suppliers", "logistics"):
+            group = relationships.get(group_name, [])
+            if isinstance(group, list):
+                for ent in group:
+                    eid = ""
+                    if isinstance(ent, dict):
+                        eid = ent.get("isin", "") or ent.get("ticker", "")
+                    elif hasattr(ent, "isin"):
+                        eid = getattr(ent, "isin", "") or getattr(ent, "ticker", "")
+                    if eid:
+                        supplier_ids.append(eid)
+
+        result["n_suppliers_tracked"] = len(supplier_ids)
+        stressed = []
+        for sid in supplier_ids:
+            scache = linked_caches.get(sid)
+            if scache is None or getattr(scache, "empty", True):
+                continue
+            if "fh_composite_score" in scache.columns:
+                fh = scache["fh_composite_score"].dropna()
+                if len(fh) > 0 and float(fh.iloc[-1]) < 30:
+                    stressed.append(sid)
+            elif "company_survival_mode_flag" in scache.columns:
+                sf = scache["company_survival_mode_flag"].dropna()
+                if len(sf) > 0 and int(sf.iloc[-1]) == 1:
+                    stressed.append(sid)
+
+        if stressed:
+            result["stressed_suppliers"] = stressed
+            supplier_health_score = min(1.0, len(stressed) / max(len(supplier_ids), 1))
+            result["stress_sources"].append(
+                f"supplier_distress ({len(stressed)}/{len(supplier_ids)})"
+            )
+        scores.append(supplier_health_score)
+
+    if not scores:
+        return result
+
+    combined = (0.5 * geo_score + 0.5 * supplier_health_score) if len(scores) > 1 else scores[0]
+    result["supply_chain_stress_score"] = round(combined, 3)
+    result["supply_chain_stress_flag"] = combined > 0.4
+    result["available"] = True
+    return result
