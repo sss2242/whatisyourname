@@ -685,6 +685,54 @@ def _build_regime_analysis(profile: dict[str, Any]) -> str:
         lines.append("Market regime classification was not performed for this analysis.")
         lines.append("")
 
+    # Predicted regime shifts (forward-looking)
+    shifts = profile.get("predicted_regime_shifts", {})
+    if shifts.get("available"):
+        lines.append("### Predicted Regime Shifts")
+        lines.append("")
+        lines.append(
+            f"Based on the HMM transition matrix, the probability of the current "
+            f"**{shifts.get('current_regime', 'unknown')}** regime ending within key horizons:"
+        )
+        lines.append("")
+        lines.append("| Horizon | Probability of Regime Change |")
+        lines.append("|---------|------------------------------|")
+        lines.append(f"| 1 week (5 days) | {shifts.get('prob_exit_5d', 0) * 100:.1f}% |")
+        lines.append(f"| 1 month (21 days) | {shifts.get('prob_exit_21d', 0) * 100:.1f}% |")
+        lines.append(f"| 1 quarter (63 days) | {shifts.get('prob_exit_63d', 0) * 100:.1f}% |")
+        lines.append(f"| 1 year (252 days) | {shifts.get('prob_exit_252d', 0) * 100:.1f}% |")
+        lines.append("")
+
+        exp_days = shifts.get("expected_days_to_shift")
+        if exp_days is not None:
+            lines.append(
+                f"**Expected days until regime change:** ~{exp_days:.0f} trading days"
+            )
+
+        next_regime = shifts.get("most_probable_next_regime", "")
+        next_prob = shifts.get("most_probable_next_prob", 0)
+        if next_regime:
+            lines.append(
+                f"**Most likely next regime:** {next_regime} "
+                f"({next_prob * 100:.0f}% of exit probability)"
+            )
+        lines.append("")
+
+        predicted = shifts.get("predicted_shifts", [])
+        if predicted:
+            lines.append("**Dated Transition Forecasts:**")
+            lines.append("")
+            lines.append("| From | To | Probability | Expected Around | Confidence |")
+            lines.append("|------|-----|-------------|-----------------|------------|")
+            for s in predicted[:4]:
+                lines.append(
+                    f"| {s.get('from_regime', '')} | {s.get('to_regime', '')} | "
+                    f"{s.get('probability', 0) * 100:.1f}% | "
+                    f"{s.get('expected_date', 'N/A')} | "
+                    f"{s.get('confidence', 0) * 100:.0f}% |"
+                )
+            lines.append("")
+
     _horizon_labels = {
         "1d": "Next Trading Day",
         "5d": "Next Week (5 trading days)",

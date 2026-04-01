@@ -3206,6 +3206,7 @@ class ForwardPassResult:
     predictions_log: list[dict[str, Any]] = field(default_factory=list)
     total_days: int = 0
     warmup_days: int = 0
+    n_break_resets: int = 0  # structural break model resets (Synergy 2)
     pid_summary: dict[str, Any] = field(default_factory=dict)  # PID controller state
     conformal_calibrator: Any = None  # Trained ConformalCalibrator from the forward pass
 
@@ -3426,9 +3427,50 @@ def run_forward_pass(
     n_days = len(cache)
     result.total_days = n_days - warmup_days - 1
 
+    # Structural break detection: check if cache has a structural_break
+    # column from PELT/BCP.  When a break is detected at day t, re-initialise
+    # all model wrappers on the post-break window so stale parameters from
+    # the pre-break regime don't contaminate predictions.
+    # Source: The_Apps_core_idea.pdf Section E.3 Synergy 2 --
+    #   "When break detected: Kalman reset, LSTM retrain on post-break only,
+    #    survival hierarchy recalibration."
+    _has_structural_break = "structural_break" in cache.columns
+    _break_reinit_window = 30  # minimum post-break days before reinit
+    _n_break_resets = 0
+
     # Forward loop: day warmup_days to n_days - 2 (predict t+1, compare with actual t+1)
     for t in range(warmup_days, n_days - 1):
         regime_t = str(regime_labels.iloc[t]) if t < len(regime_labels) else "unknown"
+
+        # Synergy 2: Structural break -> model reset
+        # When a structural break is detected at day t, re-initialise model
+        # wrappers using only post-break data.  This prevents outdated
+        # parameters from degrading predictions after fundamental regime changes.
+        if (
+            _has_structural_break
+            and t > warmup_days + _break_reinit_window
+            and cache["structural_break"].iloc[t] == 1
+        ):
+            post_break_start = max(0, t - _break_reinit_window)
+            post_break_cache = cache.iloc[post_break_start:t + 1]
+            if len(post_break_cache) >= 10:
+                for var_name_reset in all_vars:
+                    tier_key = f"tier{var_to_tier[var_name_reset]}"
+                    try:
+                        new_wrappers = _init_model_wrappers(
+                            post_break_cache, var_name_reset, tier_key,
+                            tier_variables, all_vars, random_state,
+                        )
+                        if new_wrappers:
+                            model_bank[var_name_reset] = new_wrappers
+                    except Exception:
+                        pass  # keep existing wrappers on failure
+                _n_break_resets += 1
+                logger.info(
+                    "Structural break at day %d: re-initialised %d model banks "
+                    "on %d-day post-break window",
+                    t, len(all_vars), len(post_break_cache),
+                )
 
         for var_name in all_vars:
             tier_num = var_to_tier[var_name]
@@ -3584,6 +3626,12 @@ def run_forward_pass(
         var_name: wrappers[0] if wrappers else BaselineWrapper(np.array([0.0]))
         for var_name, wrappers in model_bank.items()
     }
+    result.n_break_resets = _n_break_resets
+    if _n_break_resets > 0:
+        logger.info(
+            "Forward pass: %d structural break model resets performed",
+            _n_break_resets,
+        )
 
     # Summary
     total_errors = sum(len(v) for v in result.errors_by_tier.values())

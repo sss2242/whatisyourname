@@ -2260,6 +2260,7 @@ Non-interactive examples:
     granger_result = None
     ga_result = None
     ohlc_result = None
+    regime_shift_result = None
     _synergy_meta = {}
     _pattern_drift = 1.0
 
@@ -2279,12 +2280,27 @@ Non-interactive examples:
         # Collect injected feature columns for temporal model learning.
         # Include linked aggregate columns (competitors_avg_*, suppliers_median_*,
         # etc.) so that temporal models can learn from cross-entity signals.
-        # Also include enriched survival timeline columns.
+        #
+        # LOOK-AHEAD GUARD: survival_intensity, regime_confidence, and
+        # regime_transition_prob are EXCLUDED because they are derived from
+        # HMM regime labels fitted on the FULL 2-year cache (Step 5.5).
+        # Including them would let the forward pass "see" future regime
+        # information, violating the no-look-ahead principle (Spec J, 6.1).
+        # The online_change_score (ChangeFinder) IS safe -- it uses only
+        # past data for each score.  stability_score_21d is safe -- it
+        # uses a backward-looking 21-day rolling window on rule-based flags.
         _linked_prefixes = (
             "competitors_", "suppliers_", "customers_",
             "financial_institutions_", "sector_peers_", "industry_peers_",
             "rel_", "valuation_premium_",
         )
+        # Columns derived from full-cache HMM that would cause look-ahead
+        # bias if fed as features to the forward pass temporal models.
+        _hmm_lookahead_cols = {
+            "survival_intensity",    # blends rule-based (clean) + HMM (look-ahead)
+            "regime_confidence",     # from HMM posteriors fitted on full cache
+            "regime_transition_prob", # from enriched timeline using HMM labels
+        }
         _extra_vars = [
             c for c in cache.columns
             if (c.startswith("fh_") or c.startswith("sentiment_")
@@ -2292,13 +2308,13 @@ Non-interactive examples:
                 or c.startswith("inst_")
                 or c.startswith("buying_power_") or c.startswith("catalyst_")
                 or c.startswith("conflict_") or c.startswith("demand_")
-                or c in ("survival_intensity", "regime_confidence",
-                         "regime_transition_prob", "stability_score_21d",
+                or c in ("stability_score_21d",
                          "buying_power_index", "sector_demand_momentum",
                          "catalyst_score", "online_change_score")
                 or any(c.startswith(p) for p in _linked_prefixes))
             and cache[c].dtype in ("float64", "float32", "int64")
             and not c.startswith("is_missing_")
+            and c not in _hmm_lookahead_cols
         ]
         if _extra_vars:
             logger.info("Extra variables for temporal models (%d): %s", len(_extra_vars), _extra_vars[:10])
@@ -2610,6 +2626,46 @@ Non-interactive examples:
             logger.info("Monte Carlo simulation complete")
         except Exception as exc:
             logger.warning("Monte Carlo failed: %s", exc)
+
+        # Predicted regime shifts (Section E.5 from core idea)
+        # Uses the HMM transition matrix from MC to predict when the
+        # current regime is likely to change and to which regime.
+        regime_shift_result = None
+        try:
+            from operator1.models.regime_shift_predictor import predict_regime_shifts
+            _mc_transition = mc_result.transition_matrix if mc_result is not None else None
+            _mc_regime_order = None
+            if mc_result is not None and hasattr(mc_result, "regime_order"):
+                _mc_regime_order = mc_result.regime_order
+            _stab_score = None
+            if "stability_score_21d" in cache.columns:
+                _ss = cache["stability_score_21d"].dropna()
+                if len(_ss) > 0:
+                    _stab_score = float(_ss.iloc[-1])
+            _trans_hl = (
+                _adaptive_model_params.transition_halflife
+                if _adaptive_model_params is not None and _adaptive_model_params.adapted
+                else None
+            )
+            regime_shift_result = predict_regime_shifts(
+                cache,
+                transition_matrix=_mc_transition,
+                regime_order=_mc_regime_order,
+                stability_score=_stab_score,
+                transition_halflife=_trans_hl,
+                reference_date=_backtest_end_date,
+            )
+            if regime_shift_result and regime_shift_result.available:
+                logger.info(
+                    "Regime shift prediction: P(exit 21d)=%.1f%%, P(exit 252d)=%.1f%%, "
+                    "expected_days=%.0f, next=%s",
+                    regime_shift_result.prob_exit_21d * 100,
+                    regime_shift_result.prob_exit_252d * 100,
+                    regime_shift_result.expected_days_to_shift,
+                    regime_shift_result.most_probable_next_regime,
+                )
+        except Exception as exc:
+            logger.warning("Regime shift prediction failed: %s", exc)
 
         # Copula
         try:
@@ -3430,6 +3486,12 @@ Non-interactive examples:
         # Multivariate Monte Carlo (Proposal 3.3)
         if _mv_mc_result is not None and _mv_mc_result.get("available"):
             profile["extended_models"]["multivariate_monte_carlo"] = _mv_mc_result
+
+        # Predicted regime shifts (Section E.5 from core idea)
+        if regime_shift_result is not None and regime_shift_result.available:
+            profile["predicted_regime_shifts"] = regime_shift_result.to_dict()
+        else:
+            profile["predicted_regime_shifts"] = {"available": False}
 
         # Dual regimes
         if dual_regime_result is not None and dual_regime_result.fitted:
