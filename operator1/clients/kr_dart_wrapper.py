@@ -1201,3 +1201,152 @@ class KRDartClient:
                 logger.debug("MarketScreener fallback failed for %s: %s", identifier, exc)
 
         return holders
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch insider/executive disclosure filings from DART.
+
+        Uses two DART endpoints:
+        1. ``/list.json?pblntf_ty=I`` -- insider disclosure filings
+           including ``최대주주등소유주식변동신고서`` (major shareholder
+           ownership change reports, the Korean equivalent of SEC Form 4).
+        2. ``/tesstkAcqsDspsSttus.json`` -- treasury stock acquisition
+           and disposal (company buybacks).
+
+        Returns list of dicts with: insider_name, position,
+        transaction_type, date, shares, description, source.
+        """
+        if not self._api_key:
+            return []
+
+        corp_code = self._resolve_corp_code(identifier)
+        if not corp_code:
+            return []
+
+        transactions: list[dict[str, Any]] = []
+
+        # --- Path 1: Insider disclosure filings (pblntf_ty=I) ---
+        try:
+            r = requests.get(
+                f"{_DART_BASE}/list.json",
+                params={
+                    "crtfc_key": self._api_key,
+                    "corp_code": corp_code,
+                    "bgn_de": str((date.today() - timedelta(days=730)).strftime("%Y%m%d")),
+                    "end_de": date.today().strftime("%Y%m%d"),
+                    "pblntf_ty": "I",  # Insider disclosures
+                    "page_count": "50",
+                },
+                timeout=15,
+            )
+            data = r.json()
+            if data.get("status") == "000":
+                for item in data.get("list", []):
+                    report_nm = item.get("report_nm", "")
+                    rcept_dt = item.get("rcept_dt", "")
+                    flr_nm = item.get("flr_nm", "")
+
+                    # Classify the filing type from Korean report name
+                    tx_type = "disclosure"
+                    if "소유주식변동" in report_nm or "주식등의대량보유" in report_nm:
+                        tx_type = "ownership_change"
+                    elif "주식소각" in report_nm:
+                        tx_type = "share_cancellation"
+                    elif "자기주식" in report_nm:
+                        tx_type = "treasury_stock"
+                    elif "주요사항보고" in report_nm:
+                        tx_type = "material_event"
+                    elif "기업가치" in report_nm:
+                        tx_type = "corporate_value"
+
+                    # Format date as YYYY-MM-DD
+                    tx_date = ""
+                    if len(rcept_dt) == 8:
+                        tx_date = f"{rcept_dt[:4]}-{rcept_dt[4:6]}-{rcept_dt[6:8]}"
+
+                    transactions.append({
+                        "insider_name": flr_nm or "Unknown",
+                        "position": "",
+                        "transaction_type": tx_type,
+                        "date": tx_date,
+                        "shares": 0,
+                        "value": 0.0,
+                        "description": report_nm[:200],
+                        "source": "dart_disclosure",
+                        "rcept_no": item.get("rcept_no", ""),
+                    })
+
+                if transactions:
+                    logger.info(
+                        "KR insider filings for %s: %d from DART list (pblntf_ty=I)",
+                        identifier, len(transactions),
+                    )
+        except Exception as exc:
+            logger.debug("DART insider filings failed for %s: %s", identifier, exc)
+
+        # --- Path 2: Treasury stock changes (buybacks) ---
+        try:
+            for year_offset in range(0, 3):
+                bsns_year = str(date.today().year - year_offset)
+                for reprt_code in ("11011", "11012", "11013", "11014"):
+                    try:
+                        r2 = requests.get(
+                            f"{_DART_BASE}/tesstkAcqsDspsSttus.json",
+                            params={
+                                "crtfc_key": self._api_key,
+                                "corp_code": corp_code,
+                                "bsns_year": bsns_year,
+                                "reprt_code": reprt_code,
+                            },
+                            timeout=15,
+                        )
+                        data2 = r2.json()
+                        if data2.get("status") != "000":
+                            continue
+                        for item in data2.get("list", []):
+                            stock_knd = item.get("stock_knd", "")
+                            acqs_qty = item.get("change_qy_acqs", "-")
+                            dsps_qty = item.get("change_qy_dsps", "-")
+
+                            # Parse acquisition quantity
+                            shares = 0
+                            tx_type_ts = "treasury_acquisition"
+                            try:
+                                acqs_clean = acqs_qty.replace(",", "").replace("-", "0")
+                                dsps_clean = dsps_qty.replace(",", "").replace("-", "0")
+                                acqs_int = int(acqs_clean) if acqs_clean.isdigit() else 0
+                                dsps_int = int(dsps_clean) if dsps_clean.isdigit() else 0
+                                if acqs_int > 0:
+                                    shares = acqs_int
+                                    tx_type_ts = "treasury_acquisition"
+                                elif dsps_int > 0:
+                                    shares = dsps_int
+                                    tx_type_ts = "treasury_disposal"
+                                else:
+                                    continue  # no activity
+                            except (ValueError, TypeError):
+                                continue
+
+                            transactions.append({
+                                "insider_name": item.get("corp_name", ""),
+                                "position": "treasury",
+                                "transaction_type": tx_type_ts,
+                                "date": f"{bsns_year}-12-31",
+                                "shares": shares,
+                                "value": 0.0,
+                                "description": f"{stock_knd} {item.get('acqs_mth1', '')} {item.get('acqs_mth3', '')}".strip()[:200],
+                                "source": "dart_treasury",
+                            })
+                        if data2.get("list"):
+                            break  # got data for this year, move to next
+                    except Exception:
+                        continue
+        except Exception as exc:
+            logger.debug("DART treasury stock failed for %s: %s", identifier, exc)
+
+        if transactions:
+            logger.info(
+                "KR insider transactions for %s: %d total (disclosures + treasury)",
+                identifier, len(transactions),
+            )
+
+        return transactions

@@ -551,24 +551,10 @@ def _select_feature_columns(
     df: pd.DataFrame,
     target_vars: list[str],
 ) -> list[str]:
-    """Select numeric, non-flag columns with decent coverage for features."""
-    candidates = []
-    for col in df.columns:
-        if col in target_vars:
-            continue
-        if col.startswith("is_missing_") or col.startswith("invalid_math_"):
-            continue
-        if col.endswith("_source") or col.endswith("_confidence"):
-            continue
-        if col.endswith("_observed") or col.endswith("_estimated"):
-            continue
-        if col.endswith("_missingness_type"):
-            continue
-        if df[col].dtype not in ("float64", "float32", "int64", "int32"):
-            continue
-        coverage = df[col].notna().mean()
-        if coverage < 0.5:
-            continue
-        candidates.append(col)
+    """Select numeric, non-flag columns with decent coverage for features.
 
-    return candidates[:15]  # Cap features for performance
+    Delegates to the shared ``select_feature_columns`` in the estimation
+    package ``__init__`` to avoid code duplication with hidden_data_estimator.
+    """
+    from operator1.estimation import select_feature_columns
+    return select_feature_columns(df, target_vars)

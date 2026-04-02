@@ -543,6 +543,23 @@ def run_stage1(state: BacktestState) -> None:
         pass
 
     # Estimation
+    # SIX proxy computation (Switzerland only -- must run BEFORE estimation)
+    if state.market_id == "ch_six":
+        try:
+            from operator1.features.six_derived_proxies import (
+                compute_six_proxies, seed_canonical_columns,
+            )
+            state.six_proxy_result = compute_six_proxies(cache, state.target_profile)
+            if state.six_proxy_result.computed:
+                seed_canonical_columns(cache, state.target_profile, state.six_proxy_result)
+                logger.info(
+                    "SIX proxies: %d columns, yield=%.2f%%",
+                    state.six_proxy_result.n_proxies,
+                    (state.six_proxy_result.dividend_yield or 0) * 100,
+                )
+        except Exception as exc:
+            logger.warning("SIX proxy computation failed: %s", exc)
+
     try:
         from operator1.estimation.estimator import run_estimation
         from operator1.config_loader import load_config
@@ -1279,6 +1296,64 @@ def run_stage2(state: BacktestState) -> None:
             )
     except Exception as exc:
         logger.warning("Multi-frequency failed: %s", exc)
+
+    # Step 6.5: Retroactive calibration (Empirical Bayes second-pass priors)
+    try:
+        from operator1.analysis.retroactive_calibration import run_retroactive_calibration
+
+        _entity_groups_for_retro = {}
+        if state.relationships:
+            for grp, ents in state.relationships.items():
+                if isinstance(ents, list):
+                    ids = []
+                    for e in ents:
+                        eid = ""
+                        if isinstance(e, dict):
+                            eid = e.get("isin", "") or e.get("ticker", "")
+                        elif hasattr(e, "isin"):
+                            eid = e.isin or getattr(e, "ticker", "")
+                        if eid:
+                            ids.append(eid)
+                    _entity_groups_for_retro[grp] = ids
+
+        state._retro_params = run_retroactive_calibration(
+            cache=cache,
+            linked_caches=state.linked_caches if state.linked_caches else None,
+            entity_groups=_entity_groups_for_retro if _entity_groups_for_retro else None,
+            walk_forward_result=state.walk_forward_result,
+            forecast_result=state.forecast_result,
+            sobol_result=state.sobol_result,
+            target_profile=state.target_profile,
+        )
+        if state._retro_params.n_calibrated > 0:
+            logger.info(
+                "Retroactive calibration: %d groups calibrated",
+                state._retro_params.n_calibrated,
+            )
+    except Exception as exc:
+        logger.warning("Retroactive calibration failed: %s", exc)
+
+    # Step 6.6: Model diagnostics (expected path vs actual path)
+    try:
+        from operator1.monitoring.model_diagnostics import compute_model_diagnostics
+        _diag = compute_model_diagnostics(
+            cache,
+            forecast_result=state.forecast_result,
+            mc_result=state.mc_result,
+            copula_result=state.copula_result,
+            granger_result=state.granger_result,
+            cycle_result=state.cycle_result,
+            dtw_result=state.dtw_result,
+            conformal_result=state.conformal_result,
+        )
+        if _diag and _diag.available:
+            logger.info(
+                "Model diagnostics: %d/%d on track, overall=%s",
+                _diag.n_models_on_track, _diag.n_models_assessed,
+                _diag.overall_robustness,
+            )
+    except Exception as exc:
+        logger.debug("Model diagnostics failed: %s", exc)
 
     state.cache = cache
     state.save(stage=2)
