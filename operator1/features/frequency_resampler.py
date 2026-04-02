@@ -91,7 +91,9 @@ ANNUAL_ONLY_MARKETS: frozenset[str] = frozenset({
     "au_asx",
     "sg_sgx",
     "za_jse",
-    "ae_dfm",
+    # Note: ae_dfm NOT included -- DFM eFsah provides quarterly financial
+    # statements (e.g. "Financial statements for the 3rd QTR of 2025").
+    # The filing discoverer extracts quarterly data from PDF attachments.
 })
 
 
