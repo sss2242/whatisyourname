@@ -651,7 +651,28 @@ class CHSixClient:
     def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
         return self._fetch_financials(identifier, "cashflow")
 
-    def _fetch_financials(self, identifier: str, statement_type: str) -> pd.DataFrame:
+    def get_quarterly_financials(
+        self, identifier: str,
+    ) -> dict[str, pd.DataFrame]:
+        """Generate quarterly synthetic financials from SIX dividend data.
+
+        Uses the Kalman-smoothed earnings trajectory to produce quarterly
+        data points from annual dividend observations.  For companies
+        that pay semi-annual or quarterly dividends, uses actual dividend
+        events directly at their native frequency.
+
+        Returns dict with keys 'income', 'balance', 'cashflow'.
+        """
+        return {
+            "income": self._fetch_financials(identifier, "income", target_frequency="Q"),
+            "balance": self._fetch_financials(identifier, "balance", target_frequency="Q"),
+            "cashflow": self._fetch_financials(identifier, "cashflow", target_frequency="Q"),
+        }
+
+    def _fetch_financials(
+        self, identifier: str, statement_type: str,
+        target_frequency: str = "A",
+    ) -> pd.DataFrame:
         """Fetch financials via synthetic generation from SIX data.
 
         SIX APIs do not provide financial statement line items directly.
@@ -663,6 +684,16 @@ class CHSixClient:
 
         The remaining 8 fields (receivables, inventory, payables, goodwill,
         intangibles, sga, rd, short_term_debt) are supplemented from yfinance.
+
+        Parameters
+        ----------
+        identifier:
+            SIX ticker or ISIN.
+        statement_type:
+            One of "income", "balance", "cashflow".
+        target_frequency:
+            Target output frequency: "A" (annual, default) or "Q"
+            (quarterly -- uses Kalman-smoothed earnings trajectory).
 
         Path 1: Synthetic financials from SIX data + math (primary)
         Path 2: EU ESEF crossover (fallback, rarely works)
@@ -677,11 +708,13 @@ class CHSixClient:
             if not profile:
                 profile = self.get_profile(identifier)
 
-            synthetics = generate_synthetic_financials(profile)
+            synthetics = generate_synthetic_financials(
+                profile, target_frequency=target_frequency,
+            )
             df = synthetics.get(statement_type, pd.DataFrame())
             if df is not None and not df.empty:
-                logger.info("SIX %s %s: %d rows from synthetic financials",
-                           identifier, statement_type, len(df))
+                logger.info("SIX %s %s (%s): %d rows from synthetic financials",
+                           identifier, statement_type, target_frequency, len(df))
                 return df
         except Exception as exc:
             logger.debug("SIX synthetic financials failed for %s: %s", identifier, exc)

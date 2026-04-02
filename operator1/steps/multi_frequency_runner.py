@@ -22,6 +22,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -433,14 +434,65 @@ def run_multi_frequency_pipeline(
 
     _is_annual_only = is_annual_only_market(market_id)
 
+    # For ch_six at Q frequency: use Kalman-smoothed quarterly synthetic
+    # financials instead of generic annual-to-quarterly interpolation.
+    # The SIX proxy module produces higher-quality quarterly estimates
+    # by leveraging 18 years of dividend history through a state-space model.
+    _six_q_income = None
+    _six_q_balance = None
+    _six_q_cashflow = None
+    if market_id == "ch_six" and _has_raw_statements:
+        try:
+            from operator1.features.six_derived_proxies import generate_synthetic_financials
+            # Get the profile from the raw statement metadata
+            _six_profile_cache = Path("cache/ch_six")
+            _six_ticker = ticker or ""
+            _six_profile = {}
+            _profile_path = _six_profile_cache / _six_ticker.upper() / "profile.json"
+            if _profile_path.exists():
+                import json as _json
+                _six_profile = _json.loads(_profile_path.read_text(encoding="utf-8"))
+            if _six_profile:
+                _six_q = generate_synthetic_financials(_six_profile, target_frequency="Q")
+                _six_q_income = _six_q.get("income")
+                _six_q_balance = _six_q.get("balance")
+                _six_q_cashflow = _six_q.get("cashflow")
+                _n_q = sum(
+                    len(df) for df in [_six_q_income, _six_q_balance, _six_q_cashflow]
+                    if df is not None and not df.empty
+                )
+                if _n_q > 0:
+                    logger.info(
+                        "[Q] SIX Kalman-smoothed quarterly financials: %d records",
+                        _n_q,
+                    )
+        except Exception as _exc:
+            logger.debug("SIX quarterly synthetic generation failed: %s", _exc)
+
     for freq in frequencies:
         # Data source selection per frequency:
         #   Q/A: raw filing data as-is (no interpolation artifacts)
-        #   Q (annual-only markets): interpolate annual filings to quarterly
+        #   Q (ch_six): Kalman-smoothed quarterly from dividend data
+        #   Q (other annual-only markets): interpolate annual filings to quarterly
         #   W/M: raw filing data with native frequency interpolation
         #        (stock=linear, flow=distribute to W/M periods)
         #   D:   use the daily cache directly (already interpolated)
-        if freq in ("Q", "A", "W", "M") and _has_raw_statements:
+
+        # Special case: SIX Q frequency uses Kalman-smoothed quarterly data
+        if freq == "Q" and market_id == "ch_six" and _six_q_income is not None:
+            resampled = build_cache_from_raw_filings(
+                income_df=_six_q_income,
+                balance_df=_six_q_balance,
+                cashflow_df=_six_q_cashflow,
+                quotes_df=quotes_df,
+                frequency="Q",
+                reference_date=reference_date,
+            )
+            logger.info(
+                "[Q] Using SIX Kalman-smoothed quarterly: %d periods",
+                resampled.n_periods,
+            )
+        elif freq in ("Q", "A", "W", "M") and _has_raw_statements:
             # For annual-only markets at Q frequency: interpolate annual -> quarterly
             # instead of using raw Q data (which doesn't exist).
             # build_cache_from_raw_filings with freq="Q" + annual data will
