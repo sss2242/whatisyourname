@@ -2054,6 +2054,47 @@ Non-interactive examples:
             logger.debug("USS controller refresh failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 5j.5: Signal IC measurement
+    # ------------------------------------------------------------------
+    # Computes rolling Spearman IC for all derived signals vs forward
+    # returns. IC-strong signals get priority in the ensemble; weak
+    # signals are pruned from _extra_vars.
+    signal_ic_result = None
+    try:
+        from operator1.analysis.signal_ic import compute_signal_ic, get_ic_weighted_signals
+        signal_ic_result = compute_signal_ic(cache)
+        if signal_ic_result and signal_ic_result.available:
+            logger.info(
+                "Signal IC: %d strong signals (best=%s, IC=%.4f), %d weak",
+                len(signal_ic_result.strong_signals),
+                signal_ic_result.best_signal,
+                signal_ic_result.best_ic,
+                len(signal_ic_result.weak_signals),
+            )
+    except Exception as exc:
+        logger.warning("Signal IC measurement failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 5j.6: Fill actuals from previous prediction log
+    # ------------------------------------------------------------------
+    prediction_log_summary = None
+    try:
+        from operator1.analysis.prediction_log import fill_actuals
+        prediction_log_summary = fill_actuals(
+            ticker=ticker, cache=cache,
+            reference_date=_backtest_end_date,
+        )
+        if prediction_log_summary and prediction_log_summary.get("n_filled", 0) > 0:
+            logger.info(
+                "Prediction log: filled %d actuals, hit_rate=%.1f%%, IC=%.4f",
+                prediction_log_summary["n_filled"],
+                prediction_log_summary["hit_rate"] * 100,
+                prediction_log_summary["realized_ic"],
+            )
+    except Exception as exc:
+        logger.debug("Prediction log fill skipped: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 5.5: Enriched survival timeline (bridge: rule-based + HMM)
     # ------------------------------------------------------------------
     # Runs early regime detection (HMM/GMM/PELT/BCP) and combines it
@@ -2356,6 +2397,13 @@ Non-interactive examples:
             and not c.startswith("is_missing_")
             and c not in _hmm_lookahead_cols
         ]
+        # IC-based signal filtering: prune weak signals before temporal models
+        if signal_ic_result is not None and signal_ic_result.available:
+            try:
+                _extra_vars = get_ic_weighted_signals(signal_ic_result, _extra_vars)
+            except Exception as _ic_exc:
+                logger.debug("IC signal filtering skipped: %s", _ic_exc)
+
         if _extra_vars:
             logger.info("Extra variables for temporal models (%d): %s", len(_extra_vars), _extra_vars[:10])
 
@@ -3196,6 +3244,10 @@ Non-interactive examples:
                 ticker=ticker,
                 reference_date=_backtest_end_date,
                 skip_models=False,
+                income_df=income_df,
+                balance_df=balance_df,
+                cashflow_df=cashflow_df,
+                quotes_df=quotes_df,
             )
 
             # Fuse results across all frequencies
@@ -3728,6 +3780,72 @@ Non-interactive examples:
         else:
             profile["multi_frequency"] = {"available": False}
 
+        # Inject Signal IC results
+        if signal_ic_result is not None and signal_ic_result.available:
+            profile["signal_ic"] = signal_ic_result.to_profile_dict()
+        else:
+            profile["signal_ic"] = {"available": False}
+
+        # Inject prediction log summary (from previous runs)
+        if prediction_log_summary is not None:
+            profile["prediction_log"] = prediction_log_summary
+        else:
+            profile["prediction_log"] = {"n_filled": 0, "total_predictions": 0}
+
+        # Compute position signal (-1 to +1 directional conviction)
+        _position_signal = 0.0
+        try:
+            # Base: return_5d forecast direction + magnitude
+            _return_forecast = 0.0
+            if pred_result is not None and hasattr(pred_result, "predictions"):
+                _r5d = pred_result.predictions.get("return_5d", {}).get("5d")
+                if _r5d is None:
+                    _r5d = pred_result.predictions.get("close", {}).get("5d")
+                if _r5d is not None:
+                    pf = getattr(_r5d, "point_forecast", None)
+                    if pf is not None:
+                        _return_forecast = float(pf)
+
+            # IC confidence multiplier
+            _ic_conf = 1.0
+            if signal_ic_result and signal_ic_result.available:
+                _ic_conf = min(2.0, max(0.5, abs(signal_ic_result.best_ic) * 20))
+
+            # Survival regime multiplier
+            _surv_mult = 1.0
+            if survival_controller is not None:
+                if survival_controller.is_survival:
+                    _surv_mult = 0.3  # dampen during distress
+                # Recovery boost
+                _recovery = survival_controller.detect_recovery_signal()
+                if _recovery.get("active"):
+                    _surv_mult *= _recovery.get("position_signal_boost", 1.0)
+
+            # Combine: forecast * IC confidence * survival multiplier
+            _raw_signal = _return_forecast * _ic_conf * _surv_mult
+            _position_signal = max(-1.0, min(1.0, _raw_signal * 100))  # scale to -1/+1
+
+            # Label
+            if _position_signal > 0.3:
+                _pos_label = "buy"
+            elif _position_signal < -0.3:
+                _pos_label = "sell"
+            else:
+                _pos_label = "hold"
+
+            profile["position_signal"] = {
+                "available": True,
+                "signal": round(_position_signal, 4),
+                "label": _pos_label,
+                "return_forecast": round(_return_forecast, 6),
+                "ic_confidence": round(_ic_conf, 4),
+                "survival_multiplier": round(_surv_mult, 4),
+                "recovery_active": _recovery.get("active", False) if survival_controller else False,
+            }
+        except Exception as _ps_exc:
+            logger.debug("Position signal computation failed: %s", _ps_exc)
+            profile["position_signal"] = {"available": False}
+
         # Save profile -- sanitize dict keys (some model results use tuple keys)
         def _sanitize_keys(obj):
             """Recursively convert non-string dict keys to strings for JSON."""
@@ -3743,6 +3861,28 @@ Non-interactive examples:
         with open(profile_path, "w", encoding="utf-8") as fh:
             json.dump(profile, fh, indent=2, default=str)
         logger.info("Profile saved: %s", profile_path)
+
+        # Store predictions to log for future IC evaluation
+        if pred_result is not None and hasattr(pred_result, "predictions"):
+            try:
+                from operator1.analysis.prediction_log import store_predictions
+                _model_used = {}
+                if forecast_result is not None and hasattr(forecast_result, "model_used"):
+                    _model_used = forecast_result.model_used
+                _surv_regime = "normal"
+                if "survival_regime" in cache.columns:
+                    _sr = cache["survival_regime"].dropna()
+                    if len(_sr) > 0:
+                        _surv_regime = str(_sr.iloc[-1])
+                store_predictions(
+                    ticker=ticker,
+                    predictions=pred_result.predictions,
+                    model_used=_model_used,
+                    survival_regime=_surv_regime,
+                    run_date=_backtest_end_date,
+                )
+            except Exception as _pl_exc:
+                logger.debug("Prediction log storage failed: %s", _pl_exc)
 
         # Validate profile completeness before report generation
         try:

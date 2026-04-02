@@ -28,6 +28,7 @@ import pandas as pd
 
 from operator1.features.frequency_resampler import (
     ResampledCache,
+    build_cache_from_raw_filings,
     get_frequencies_slow_to_fast,
     get_frequency_config,
     resample_cache_to_frequency,
@@ -376,6 +377,10 @@ def run_multi_frequency_pipeline(
     reference_date: date | None = None,
     skip_models: bool = False,
     frequencies: list[str] | None = None,
+    income_df: pd.DataFrame | None = None,
+    balance_df: pd.DataFrame | None = None,
+    cashflow_df: pd.DataFrame | None = None,
+    quotes_df: pd.DataFrame | None = None,
 ) -> MultiFrequencyResult:
     """Run the full pipeline sequentially across multiple frequencies.
 
@@ -398,6 +403,15 @@ def run_multi_frequency_pipeline(
         Skip temporal models at all frequencies.
     frequencies:
         Override frequency list (default: all 5).
+    income_df, balance_df, cashflow_df:
+        Original wide-format statement DataFrames with ``report_date``.
+        When provided, Q and A frequencies use these directly instead
+        of resampling the interpolated daily cache.  This preserves
+        actual reported values without interpolation artifacts.
+    quotes_df:
+        Original daily OHLCV DataFrame.  When provided alongside
+        statement DataFrames, Q/A frequencies resample OHLCV from
+        this source.
     """
     if frequencies is None:
         frequencies = get_frequencies_slow_to_fast()
@@ -410,11 +424,32 @@ def run_multi_frequency_pipeline(
     logger.info("MULTI-FREQUENCY PIPELINE: %d frequencies", len(frequencies))
     logger.info("=" * 60)
 
+    # Check if raw statement data is available for Q/A direct construction
+    _has_raw_statements = any(
+        df is not None and not df.empty
+        for df in [income_df, balance_df, cashflow_df]
+    )
+
     for freq in frequencies:
-        # Resample cache to target frequency
-        resampled = resample_cache_to_frequency(
-            daily_cache, frequency=freq, reference_date=reference_date,
-        )
+        # For Q/A frequencies: use raw filing data directly (no interpolation)
+        # For D/W/M frequencies: resample the daily cache (existing behavior)
+        if freq in ("Q", "A") and _has_raw_statements:
+            resampled = build_cache_from_raw_filings(
+                income_df=income_df,
+                balance_df=balance_df,
+                cashflow_df=cashflow_df,
+                quotes_df=quotes_df,
+                frequency=freq,
+                reference_date=reference_date,
+            )
+            logger.info(
+                "[%s] Using raw filing data (no interpolation): %d periods",
+                freq, resampled.n_periods,
+            )
+        else:
+            resampled = resample_cache_to_frequency(
+                daily_cache, frequency=freq, reference_date=reference_date,
+            )
 
         if resampled.n_periods < 3:
             logger.info(

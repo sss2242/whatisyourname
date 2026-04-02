@@ -408,9 +408,10 @@ class JPJquantsClient:
             if df.empty:
                 return empty
 
-            # Only keep annual/4Q reports
-            # FINS_STATEMENTS uses TypeOfCurrentPeriod (e.g. "FY", "1Q", "2Q", "3Q")
-            # Older format may use CurPerType
+            # Keep ALL period types (FY, 1Q, 2Q, 3Q) for multi-frequency analysis.
+            # Previously filtered to annual-only, but quarterly data is needed for
+            # the quarterly frequency scope in the multi-frequency pipeline.
+            # Tag each row with period_type for downstream identification.
             period_col = None
             for pc in ("TypeOfCurrentPeriod", "CurPerType", "TypeOfDocument"):
                 if pc in df.columns:
@@ -418,10 +419,17 @@ class JPJquantsClient:
                     break
 
             if period_col:
-                annual_mask = df[period_col].astype(str).str.contains("FY|Annual|4Q", case=False, na=True)
-                df_annual = df[annual_mask] if annual_mask.any() else df
+                # Map J-Quants period labels to canonical period_type
+                def _map_period(val):
+                    s = str(val).upper()
+                    if "FY" in s or "ANNUAL" in s or "4Q" in s:
+                        return "annual"
+                    return "quarterly"
+                df["period_type"] = df[period_col].apply(_map_period)
             else:
-                df_annual = df
+                df["period_type"] = "annual"  # conservative default
+
+            df_annual = df  # keep all periods (renamed for backward compat)
 
             # Determine date columns for PIT
             # FINS_STATEMENTS: DisclosedDate, CurrentPeriodEndDate

@@ -321,6 +321,159 @@ def _is_last_period_partial(ref_ts: pd.Timestamp, frequency: str) -> bool:
 # Helper: get all frequencies in execution order (slow to fast)
 # ---------------------------------------------------------------------------
 
+def build_cache_from_raw_filings(
+    income_df: pd.DataFrame | None = None,
+    balance_df: pd.DataFrame | None = None,
+    cashflow_df: pd.DataFrame | None = None,
+    quotes_df: pd.DataFrame | None = None,
+    frequency: str = "Q",
+    reference_date: date | None = None,
+) -> ResampledCache:
+    """Build a Q/A cache directly from raw filing DataFrames.
+
+    For quarterly and annual frequencies, the daily cache's interpolated
+    values are artifacts of the daily pipeline.  This function constructs
+    the cache from the original filing data, preserving the actual
+    reported values without interpolation artifacts.
+
+    OHLCV data is resampled from daily to the target frequency using
+    standard OHLC aggregation (first/max/min/last/sum).
+
+    Parameters
+    ----------
+    income_df, balance_df, cashflow_df:
+        Wide-format statement DataFrames with ``report_date`` column.
+        One row per filing period with actual reported values.
+    quotes_df:
+        Daily OHLCV DataFrame (will be resampled to target frequency).
+    frequency:
+        Target frequency: ``"Q"`` or ``"A"``.
+    reference_date:
+        The "today" date for truncation.
+    """
+    config = FREQUENCY_CONFIG.get(frequency)
+    if config is None or frequency not in ("Q", "A"):
+        raise ValueError(f"build_cache_from_raw_filings only supports Q/A, got: {frequency}")
+
+    resample_rule = config["resample_rule"]
+    lookback_years = config["lookback_years"]
+
+    if reference_date is None:
+        reference_date = date.today()
+    ref_ts = pd.Timestamp(reference_date)
+    start_ts = ref_ts - pd.DateOffset(years=lookback_years)
+
+    parts: list[pd.DataFrame] = []
+
+    # --- OHLCV: resample daily to target frequency ---
+    if quotes_df is not None and not quotes_df.empty:
+        ohlcv = quotes_df.copy()
+        if "date" in ohlcv.columns:
+            ohlcv["date"] = pd.to_datetime(ohlcv["date"])
+            ohlcv = ohlcv.set_index("date").sort_index()
+        # Trim to lookback window
+        ohlcv = ohlcv[(ohlcv.index >= start_ts) & (ohlcv.index <= ref_ts)]
+        if not ohlcv.empty:
+            ohlcv_resampled = _resample_dataframe(ohlcv, resample_rule, ref_ts)
+            if not ohlcv_resampled.empty:
+                parts.append(ohlcv_resampled)
+
+    # --- Financial statements: use raw filing data directly ---
+    for label, stmt_df in [("income", income_df), ("balance", balance_df), ("cashflow", cashflow_df)]:
+        if stmt_df is None or stmt_df.empty:
+            continue
+
+        df = stmt_df.copy()
+
+        # Find the date column
+        date_col = None
+        for dc in ("report_date", "filing_date"):
+            if dc in df.columns:
+                date_col = dc
+                break
+        if date_col is None:
+            continue
+
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.sort_values(date_col).drop_duplicates(subset=[date_col], keep="last")
+
+        # Trim to lookback window
+        df = df[(df[date_col] >= start_ts) & (df[date_col] <= ref_ts)]
+        if df.empty:
+            continue
+
+        # Extract numeric columns only
+        numeric_cols = [
+            c for c in df.select_dtypes(include=["number"]).columns
+            if c != date_col and "date" not in c.lower()
+        ]
+        if not numeric_cols:
+            continue
+
+        # Set report_date as index (these are the ACTUAL filing period dates)
+        stmt_indexed = df.set_index(date_col)[numeric_cols]
+
+        # For the target frequency, just use the raw values as-is
+        # No interpolation, no resampling -- each row IS a Q or A period
+        parts.append(stmt_indexed)
+
+    if not parts:
+        return ResampledCache(
+            frequency=frequency,
+            label=config["label"],
+            lookback_years=lookback_years,
+            cache=pd.DataFrame(),
+            n_periods=0,
+            is_partial_last_period=False,
+            original_daily_rows=0,
+            resampled_rows=0,
+        )
+
+    # Combine OHLCV + statements, aligning by date
+    # Use outer join to preserve all filing dates
+    combined = parts[0]
+    for part in parts[1:]:
+        # Join on index, keeping both date grids
+        combined = combined.join(part, how="outer", rsuffix="_dup")
+        # Drop duplicate columns (first wins)
+        dup_cols = [c for c in combined.columns if c.endswith("_dup")]
+        for dc in dup_cols:
+            orig = dc.replace("_dup", "")
+            if orig in combined.columns:
+                # Fill gaps in original from duplicate
+                combined[orig] = combined[orig].fillna(combined[dc])
+            combined = combined.drop(columns=[dc])
+
+    # Sort by date and drop all-NaN rows
+    combined = combined.sort_index().dropna(how="all")
+
+    is_partial = _is_last_period_partial(ref_ts, frequency)
+    if is_partial and not combined.empty:
+        combined.loc[combined.index[-1], "is_partial_period"] = 1
+    if "is_partial_period" not in combined.columns:
+        combined["is_partial_period"] = 0
+
+    n_daily = len(quotes_df) if quotes_df is not None else 0
+
+    logger.info(
+        "Built %s cache from raw filings: %d periods (%d statements merged, partial_last=%s)",
+        config["label"], len(combined),
+        sum(1 for d in [income_df, balance_df, cashflow_df] if d is not None and not d.empty),
+        is_partial,
+    )
+
+    return ResampledCache(
+        frequency=frequency,
+        label=config["label"],
+        lookback_years=lookback_years,
+        cache=combined,
+        n_periods=len(combined),
+        is_partial_last_period=is_partial,
+        original_daily_rows=n_daily,
+        resampled_rows=len(combined),
+    )
+
+
 def get_frequencies_slow_to_fast() -> list[str]:
     """Return frequency codes in execution order: Annual -> Daily."""
     return ["A", "Q", "M", "W", "D"]

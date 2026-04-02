@@ -87,9 +87,9 @@ class ReportMode(str, Enum):
 # Sections included in each tier.  Section numbers match the fallback
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
-    ReportTier.BASIC: {1, 2, 4, 6, 20},
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20},
-    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005},  # all 22 sections + extended sections + USS + scenarios + diagnostics + structure + calendar + macro + supply chain + synergies + multi-frequency
+    ReportTier.BASIC: {1, 2, 4, 6, 20, 2007},  # + position signal
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20, 2006, 2007},  # + thesis scorecard + position signal
+    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005, 2006, 2007},  # all sections + multi-frequency + thesis scorecard + position signal
 }
 
 
@@ -3541,6 +3541,114 @@ def _build_multi_frequency_section(profile: dict[str, Any]) -> str:
             )
         lines.append("")
 
+def _build_investment_thesis_scorecard(profile: dict[str, Any]) -> str:
+    """Render 5-tier investment thesis scorecard."""
+    lines = []
+    fh = profile.get("financial_health", {})
+    current = profile.get("current_state", {})
+    catalysts = profile.get("product_catalysts", {})
+    sentiment = profile.get("sentiment", {})
+    pos = profile.get("position_signal", {})
+    uss = profile.get("unified_survival_system", {})
+
+    # Tier scores
+    eq_score = 50
+    beneish = fh.get("beneish_m_score")
+    if isinstance(beneish, (int, float)):
+        eq_score = 80 if beneish < -2.22 else 30
+    accruals = current.get("accruals_signal")
+    if isinstance(accruals, (int, float)):
+        eq_score = max(0, min(100, eq_score + int(accruals * 30)))
+
+    cf_score = 50
+    fcf_yield = current.get("fcf_yield")
+    if isinstance(fcf_yield, (int, float)):
+        cf_score = 80 if fcf_yield > 0.05 else 60 if fcf_yield > 0 else 25
+    runway = fh.get("runway_months")
+    if isinstance(runway, (int, float)):
+        cf_score = min(100, cf_score + 15) if runway > 24 else max(0, cf_score - 20) if runway < 6 else cf_score
+
+    bs_score = 50
+    z_score = fh.get("altman_z_score")
+    if isinstance(z_score, (int, float)):
+        bs_score = 85 if z_score > 2.99 else 55 if z_score > 1.81 else 20
+
+    inf_score = 50
+    sue = current.get("sue_score")
+    if isinstance(sue, (int, float)):
+        inf_score = max(0, min(100, 50 + int(sue * 15)))
+    if catalysts.get("available"):
+        inf_score = max(0, min(100, inf_score + int(catalysts.get("catalyst_score", 0) * 20)))
+    recovery = uss.get("recovery_signal", {})
+    if recovery.get("active"):
+        inf_score = min(100, inf_score + 25)
+
+    val_score = 50
+    pe = current.get("pe_ratio_calc")
+    if isinstance(pe, (int, float)):
+        val_score = 75 if 5 < pe < 20 else 50 if pe < 40 else 30
+
+    composite = int(0.25 * eq_score + 0.25 * cf_score + 0.20 * bs_score + 0.15 * inf_score + 0.15 * val_score)
+
+    def _label(s):
+        if s >= 75: return "STRONG"
+        if s >= 55: return "ADEQUATE"
+        if s >= 35: return "WEAK"
+        return "CRITICAL"
+
+    def _bar(s):
+        return "[" + "#" * (s // 10) + "." * (10 - s // 10) + "]"
+
+    lines.append("| Tier | Score | Rating | Visual |")
+    lines.append("|------|-------|--------|--------|")
+    for name, score in [("Earnings Quality", eq_score), ("Cash Flow", cf_score),
+                        ("Balance Sheet", bs_score), ("Inflection / Catalysts", inf_score),
+                        ("Valuation", val_score)]:
+        lines.append(f"| {name} | {score}/100 | {_label(score)} | `{_bar(score)}` |")
+    lines.append(f"| **COMPOSITE** | **{composite}/100** | **{_label(composite)}** | `{_bar(composite)}` |")
+    lines.append("")
+
+    if pos.get("available"):
+        signal = pos.get("signal", 0)
+        label = pos.get("label", "hold").upper()
+        lines.append(f"**Position Signal:** {signal:+.2f} ({label})")
+        if pos.get("recovery_active"):
+            lines.append("  - Recovery signal ACTIVE")
+    return "\n".join(lines) if lines else "*Scorecard not available.*\n"
+
+
+def _build_position_signal_section(profile: dict[str, Any]) -> str:
+    """Render the position signal (-1 to +1 directional conviction)."""
+    pos = profile.get("position_signal", {})
+    if not pos.get("available"):
+        return "*Position signal not available (insufficient prediction data).*\n"
+    signal = pos.get("signal", 0)
+    label = pos.get("label", "hold").upper()
+    lines = []
+    gauge_pos = int((signal + 1) * 25)
+    gauge = "-" * gauge_pos + "|" + "-" * (50 - gauge_pos)
+    lines.append("```")
+    lines.append(f"SELL ----{gauge}---- BUY")
+    lines.append(f"Signal: {signal:+.4f} ({label})")
+    lines.append("```")
+    lines.append("")
+    lines.append("| Component | Value |")
+    lines.append("|-----------|-------|")
+    lines.append(f"| Return Forecast (5d) | {pos.get('return_forecast', 0):+.6f} |")
+    lines.append(f"| IC Confidence | {pos.get('ic_confidence', 1.0):.2f}x |")
+    lines.append(f"| Survival Multiplier | {pos.get('survival_multiplier', 1.0):.2f}x |")
+    if pos.get("recovery_active"):
+        lines.append("| Recovery Signal | ACTIVE (boost applied) |")
+    lines.append("")
+    pl = profile.get("prediction_log", {})
+    total = pl.get("total_predictions", 0)
+    if total > 0:
+        lines.append(f"**Track Record:** {total} predictions logged")
+        n_filled = pl.get("n_filled", 0)
+        if n_filled > 0:
+            lines.append(f"  - {n_filled} evaluated, hit rate={pl.get('hit_rate', 0):.1%}, IC={pl.get('realized_ic', 0):.4f}")
+    lines.append("")
+    lines.append("> *Directional conviction signal, not investment advice.*")
     return "\n".join(lines)
 
 
@@ -3629,6 +3737,8 @@ def _build_fallback_report(
         )),
         21: ("21. Investment Recommendation", _build_investment_recommendation(profile)),
         1998: ("21.5. Model Robustness Diagnostics", _build_model_diagnostics_section(profile)),
+        2006: ("21.12. Investment Thesis Scorecard", _build_investment_thesis_scorecard(profile)),
+        2007: ("21.13. Position Signal & Conviction", _build_position_signal_section(profile)),
         1999: ("21.6. Corporate Structure", _build_corporate_structure_section(profile)),
         2001: ("21.7. Filing Calendar & Data Freshness", _build_filing_calendar_section(profile)),
         2002: ("21.8. Macro Indicator Summary", _build_macro_indicators_section(profile)),

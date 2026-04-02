@@ -620,6 +620,75 @@ class SurvivalRegimeController:
         """Check if early warning indicates approaching survival mode."""
         return self.get_early_warning_latest() >= threshold
 
+    def detect_recovery_signal(self) -> dict[str, Any]:
+        """Detect regime transitions from survival -> normal.
+
+        Companies exiting distress dramatically outperform the market.
+        This method flags such transitions as a high-conviction alpha signal.
+
+        Returns
+        -------
+        dict with recovery signal metadata:
+            - ``active``: True if a survival-to-normal transition detected
+            - ``transition_from``: previous regime (e.g. "company_survival")
+            - ``transition_to``: current regime (e.g. "normal")
+            - ``days_since_recovery``: business days since the transition
+            - ``conviction``: 0-1 score based on recovery speed and depth
+            - ``position_signal_boost``: multiplier for position signal
+        """
+        result = {
+            "active": False,
+            "transition_from": "",
+            "transition_to": "",
+            "days_since_recovery": 0,
+            "conviction": 0.0,
+            "position_signal_boost": 1.0,
+        }
+
+        if self.regime_timeline.empty or len(self.regime_timeline) < 10:
+            return result
+
+        timeline = self.regime_timeline
+        current = str(timeline.iloc[-1])
+
+        # Look for survival -> normal transition in recent history
+        _survival_regimes = {"company_survival", "extreme_survival", "modified_survival"}
+        if current in _survival_regimes:
+            return result  # still in survival, no recovery
+
+        # Scan backward for the most recent survival regime
+        for i in range(len(timeline) - 2, max(len(timeline) - 252, -1), -1):
+            if i < 0:
+                break
+            regime_at_i = str(timeline.iloc[i])
+            if regime_at_i in _survival_regimes:
+                days_since = len(timeline) - 1 - i
+                # Recovery conviction based on how recently the transition happened
+                # Strongest signal: 0-30 days post-recovery
+                # Decays with half-life of 63 days
+                import math
+                decay = math.exp(-0.693 * days_since / 63)
+                conviction = min(1.0, decay)
+
+                # Boost if recovery was from extreme_survival (deeper V)
+                depth_boost = 1.0
+                if regime_at_i == "extreme_survival":
+                    depth_boost = 1.5
+                elif regime_at_i == "company_survival":
+                    depth_boost = 1.2
+
+                result = {
+                    "active": conviction > 0.1,
+                    "transition_from": regime_at_i,
+                    "transition_to": current,
+                    "days_since_recovery": days_since,
+                    "conviction": round(conviction * min(depth_boost, 1.0), 4),
+                    "position_signal_boost": round(1.0 + 0.5 * conviction * depth_boost, 3),
+                }
+                break
+
+        return result
+
     def to_profile_dict(self) -> dict[str, Any]:
         """Export controller state for inclusion in company profile."""
         regime_distribution = {}
@@ -642,6 +711,7 @@ class SurvivalRegimeController:
             "copula_override": self.copula_override,
             "early_warning_latest": self.get_early_warning_latest(),
             "approaching_survival": self.is_approaching_survival(),
+            "recovery_signal": self.detect_recovery_signal(),
             "model_config": {
                 "kalman_process_noise_mult": self.model_config.kalman_process_noise_multiplier,
                 "kalman_obs_noise_mult": self.model_config.kalman_observation_noise_multiplier,

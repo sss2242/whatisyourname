@@ -379,12 +379,13 @@ class TWMopsClient:
         return self._fetch_json_fallback(identifier, statement_type)
 
     def _fetch_xbrl_all(self, identifier: str) -> dict[str, pd.DataFrame]:
-        """Fetch ALL financial statements via 2 XBRL platform calls.
+        """Fetch ALL financial statements via XBRL platform calls.
 
-        Call 1: Current year Q4 -> current year + prior year data
-        Call 2: 2 years ago Q4 -> that year + year before data
+        Fetches all 4 seasons (Q1-Q4) for each year to provide both
+        quarterly and annual data for multi-frequency analysis.
 
-        Result: 3 unique fiscal years of data for all 3 statement types.
+        Call pattern: 3 years x 4 seasons = up to 12 calls (with early
+        exit on empty responses).
         """
         session = self._get_or_create_session()
         current_year = date.today().year
@@ -393,45 +394,51 @@ class TWMopsClient:
             "balance": [], "income": [], "cashflow": [],
         }
 
-        # Make 2 calls: current year and 2 years ago
-        for syear in [current_year, current_year - 2]:
-            url = _XBRL_URL.format(
-                base=_MOPSOV_BASE,
-                co_id=identifier,
-                syear=syear,
-                sseason=4,
-            )
-            try:
-                r = session.get(url, timeout=30)
-                if len(r.content) < 10000:
-                    logger.debug("XBRL response too small for %s/%s: %d bytes", identifier, syear, len(r.content))
-                    continue
-
-                dfs = pd.read_html(StringIO(r.text))
-                if len(dfs) < 3:
-                    continue
-
-                # Parse tables 0 (balance), 1 (income), 2 (cashflow)
-                for table_idx, (stmt_type, field_map) in _TABLE_CONFIG.items():
-                    if table_idx >= len(dfs):
-                        continue
-                    rows = self._parse_xbrl_table(
-                        dfs[table_idx], field_map, identifier, stmt_type,
-                    )
-                    all_rows[stmt_type].extend(rows)
-
-                logger.info(
-                    "XBRL %s/%d: parsed %d balance + %d income + %d cashflow rows",
-                    identifier, syear,
-                    sum(1 for r in all_rows["balance"] if str(syear) in r.get("report_date", "")),
-                    sum(1 for r in all_rows["income"] if str(syear) in r.get("report_date", "")),
-                    sum(1 for r in all_rows["cashflow"] if str(syear) in r.get("report_date", "")),
+        # Fetch all 4 seasons for current year + 2 prior years
+        for syear in [current_year, current_year - 1, current_year - 2]:
+            for sseason in [4, 3, 2, 1]:  # Q4 first (most complete), then Q3, Q2, Q1
+                url = _XBRL_URL.format(
+                    base=_MOPSOV_BASE,
+                    co_id=identifier,
+                    syear=syear,
+                    sseason=sseason,
                 )
+                try:
+                    r = session.get(url, timeout=30)
+                    if len(r.content) < 10000:
+                        logger.debug("XBRL response too small for %s/%s/Q%d: %d bytes", identifier, syear, sseason, len(r.content))
+                        continue
 
-            except Exception as exc:
-                logger.warning("XBRL fetch failed for %s/%s: %s", identifier, syear, exc)
+                    dfs = pd.read_html(StringIO(r.text))
+                    if len(dfs) < 3:
+                        continue
 
-            time.sleep(_REQUEST_DELAY_S)
+                    # Parse tables 0 (balance), 1 (income), 2 (cashflow)
+                    for table_idx, (stmt_type, field_map) in _TABLE_CONFIG.items():
+                        if table_idx >= len(dfs):
+                            continue
+                        rows = self._parse_xbrl_table(
+                            dfs[table_idx], field_map, identifier, stmt_type,
+                        )
+                        all_rows[stmt_type].extend(rows)
+
+                    logger.debug(
+                        "XBRL %s/%d/Q%d: parsed OK",
+                        identifier, syear, sseason,
+                    )
+
+                except Exception as exc:
+                    logger.warning("XBRL fetch failed for %s/%s/Q%d: %s", identifier, syear, sseason, exc)
+
+                time.sleep(_REQUEST_DELAY_S)
+
+        logger.info(
+            "XBRL %s: total %d balance + %d income + %d cashflow rows across all seasons",
+            identifier,
+            len(all_rows["balance"]),
+            len(all_rows["income"]),
+            len(all_rows["cashflow"]),
+        )
 
         # Convert to DataFrames and deduplicate
         result: dict[str, pd.DataFrame] = {}
