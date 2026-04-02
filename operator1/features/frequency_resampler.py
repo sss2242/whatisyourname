@@ -258,9 +258,29 @@ def _resample_dataframe(
         ohlcv_resampled = df[list(ohlcv_agg.keys())].resample(rule).agg(ohlcv_agg)
         parts.append(ohlcv_resampled)
 
-    # Flow variables: sum over period
+    # Flow variables: sum if distributed by interpolator, last if flat-ffilled
     if flow_present:
-        flow_resampled = df[flow_present].resample(rule).sum()
+        # Detect whether flow variables were distributed to daily amounts
+        # (by frequency_interpolator) or are flat forward-filled periodic totals.
+        # If values within a resample period are all identical -> flat ffill -> use last()
+        # If values vary within periods -> distributed -> sum() reconstructs period total
+        _use_sum = False
+        _sample_col = flow_present[0]
+        _sample = df[_sample_col].dropna()
+        if len(_sample) > 5:
+            # Check first non-trivial resample group for value variation
+            _groups = _sample.resample(rule)
+            for _name, _group in _groups:
+                if len(_group) >= 3:
+                    _nunique = _group.nunique()
+                    _use_sum = _nunique > 1  # values vary -> distributed
+                    break
+        if _use_sum:
+            flow_resampled = df[flow_present].resample(rule).sum()
+        else:
+            # Flat forward-fill: each day carries the full periodic total.
+            # Use last() to avoid N-fold inflation.
+            flow_resampled = df[flow_present].resample(rule).last()
         parts.append(flow_resampled)
 
     # Stock/other numeric variables: last value in period

@@ -89,7 +89,7 @@ class ReportMode(str, Enum):
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20},
     ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20},
-    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004},  # all 22 sections + extended sections + USS + scenarios + diagnostics + structure + calendar + macro + supply chain + synergies
+    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005},  # all 22 sections + extended sections + USS + scenarios + diagnostics + structure + calendar + macro + supply chain + synergies + multi-frequency
 }
 
 
@@ -3453,6 +3453,97 @@ def _build_supply_chain_stress_section(profile: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_multi_frequency_section(profile: dict[str, Any]) -> str:
+    """Render multi-frequency analysis results (regime consensus, survival fusion, predictions)."""
+    mf = profile.get("multi_frequency", {})
+    if not mf.get("available"):
+        return "*Multi-frequency analysis not available.*\n"
+
+    lines = []
+    n_freq = mf.get("n_frequencies_used", 0)
+    lines.append(f"**Frequencies Analyzed:** {n_freq}\n")
+
+    # Regime consensus
+    rc = mf.get("regime_consensus", {})
+    if rc:
+        consensus = rc.get("consensus_regime", "unknown")
+        agreement = rc.get("agreement_ratio", 0)
+        freq_regimes = rc.get("frequency_regimes", {})
+        interpretation = rc.get("interpretation", "")
+
+        lines.append("### Regime Consensus\n")
+        lines.append(f"**Consensus:** {consensus} ({agreement:.0%} agreement)\n")
+        if freq_regimes:
+            lines.append("| Frequency | Regime |")
+            lines.append("|-----------|--------|")
+            _freq_labels = {"A": "Annual", "Q": "Quarterly", "M": "Monthly", "W": "Weekly", "D": "Daily"}
+            for f, r in freq_regimes.items():
+                label = _freq_labels.get(f, f)
+                marker = "" if r == consensus else " **"
+                lines.append(f"| {label} | {r}{marker} |")
+            lines.append("")
+        if interpretation:
+            lines.append(f"> {interpretation}\n")
+
+    # Survival fusion
+    sv = mf.get("survival", {})
+    if sv:
+        fused = sv.get("fused_probability", 1.0)
+        harmonic = sv.get("harmonic_mean", 1.0)
+        per_freq = sv.get("per_frequency", {})
+        weakest = sv.get("weakest_frequency", "")
+        interp = sv.get("interpretation", "")
+
+        lines.append("### Survival Probability Fusion\n")
+        lines.append(f"**Fused Probability:** {fused:.1%} (harmonic mean: {harmonic:.1%})\n")
+        if per_freq:
+            lines.append("| Frequency | Survival Probability |")
+            lines.append("|-----------|---------------------|")
+            _freq_labels = {"A": "Annual", "Q": "Quarterly", "M": "Monthly", "W": "Weekly", "D": "Daily"}
+            for f, p in per_freq.items():
+                label = _freq_labels.get(f, f)
+                marker = " (weakest)" if f == weakest else ""
+                lines.append(f"| {label} | {p:.1%}{marker} |")
+            lines.append("")
+        if interp:
+            lines.append(f"> {interp}\n")
+
+    # Cross-frequency predictions
+    preds = mf.get("predictions", [])
+    if preds:
+        lines.append("### Cross-Frequency Predictions\n")
+        lines.append("| Variable | Horizon | Forecast | Confidence | Frequencies |")
+        lines.append("|----------|---------|----------|------------|-------------|")
+        for p in preds[:15]:
+            var = p.get("variable", "")
+            horizon = p.get("horizon", "")
+            pf = p.get("point_forecast")
+            pf_str = f"{pf:.4f}" if pf is not None else "N/A"
+            conf = p.get("confidence", 0)
+            contribs = p.get("contributing_frequencies", {})
+            freq_str = ", ".join(f"{k}({v:.0%})" for k, v in contribs.items())
+            lines.append(f"| {var} | {horizon} | {pf_str} | {conf:.0%} | {freq_str} |")
+        lines.append("")
+
+    # Frequency summary
+    fs = mf.get("frequency_summary", {})
+    if fs:
+        lines.append("### Frequency Pipeline Summary\n")
+        lines.append("| Frequency | Periods | Trend | Regime | Survival | Time |")
+        lines.append("|-----------|---------|-------|--------|----------|------|")
+        for f, data in fs.items():
+            lines.append(
+                f"| {data.get('label', f)} | {data.get('n_periods', 0)} "
+                f"| {data.get('trend_direction', 'N/A')} "
+                f"| {data.get('regime_label', 'N/A')} "
+                f"| {data.get('survival_probability', 0):.1%} "
+                f"| {data.get('elapsed_seconds', 0):.1f}s |"
+            )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def _build_synergies_section(profile: dict[str, Any]) -> str:
     """Render model synergies metadata."""
     syn = profile.get("synergies_applied", {})
@@ -3543,6 +3634,7 @@ def _build_fallback_report(
         2002: ("21.8. Macro Indicator Summary", _build_macro_indicators_section(profile)),
         2003: ("21.9. Supply Chain Stress Assessment", _build_supply_chain_stress_section(profile)),
         2004: ("21.10. Model Synergies Applied", _build_synergies_section(profile)),
+        2005: ("21.11. Multi-Frequency Analysis", _build_multi_frequency_section(profile)),
         22: ("22. Appendix & Methodology", _build_appendix(profile)),
     }
 

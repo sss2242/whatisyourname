@@ -74,6 +74,7 @@ OPTIONAL_PROFILE_KEYS: set[str] = {
     "predicted_regime_shifts",
     "model_diagnostics",
     "supply_chain_stress",
+    "multi_frequency",
 }
 
 
