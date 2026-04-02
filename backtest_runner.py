@@ -812,6 +812,31 @@ def run_stage1(state: BacktestState) -> None:
     except Exception as exc:
         logger.debug("Adaptive windows skipped: %s", exc)
 
+    # Signal IC measurement
+    signal_ic_result = None
+    try:
+        from operator1.analysis.signal_ic import compute_signal_ic, get_ic_weighted_signals
+        signal_ic_result = compute_signal_ic(cache)
+        if signal_ic_result and signal_ic_result.available:
+            logger.info(
+                "Signal IC: %d strong, best=%s (IC=%.4f)",
+                len(signal_ic_result.strong_signals),
+                signal_ic_result.best_signal, signal_ic_result.best_ic,
+            )
+    except Exception as exc:
+        logger.debug("Signal IC skipped: %s", exc)
+
+    # Fill actuals from previous prediction log
+    prediction_log_summary = None
+    try:
+        from operator1.analysis.prediction_log import fill_actuals
+        prediction_log_summary = fill_actuals(
+            ticker=state.company, cache=cache,
+            reference_date=datetime.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None,
+        )
+    except Exception as exc:
+        logger.debug("Prediction log fill skipped: %s", exc)
+
     # Enriched survival timeline
     try:
         from operator1.models.regime_detector import run_early_regime_detection
@@ -1340,10 +1365,83 @@ def run_stage3(state: BacktestState) -> None:
         else:
             profile["multi_frequency"] = {"available": False}
 
+        # Signal IC results
+        if signal_ic_result is not None and signal_ic_result.available:
+            profile["signal_ic"] = signal_ic_result.to_profile_dict()
+        else:
+            profile["signal_ic"] = {"available": False}
+
+        # Prediction log summary
+        if prediction_log_summary is not None:
+            profile["prediction_log"] = prediction_log_summary
+        else:
+            profile["prediction_log"] = {"n_filled": 0, "total_predictions": 0}
+
+        # Position signal
+        try:
+            _position_signal = 0.0
+            _return_forecast = 0.0
+            if state.pred_result is not None and hasattr(state.pred_result, "predictions"):
+                _r5d = state.pred_result.predictions.get("return_5d", {}).get("5d")
+                if _r5d is None:
+                    _r5d = state.pred_result.predictions.get("close", {}).get("5d")
+                if _r5d is not None:
+                    pf = getattr(_r5d, "point_forecast", None)
+                    if pf is not None:
+                        _return_forecast = float(pf)
+            _ic_conf = 1.0
+            if signal_ic_result and signal_ic_result.available:
+                _ic_conf = min(2.0, max(0.5, abs(signal_ic_result.best_ic) * 20))
+            _surv_mult = 1.0
+            _recovery_active = False
+            if state.survival_controller is not None:
+                if state.survival_controller.is_survival:
+                    _surv_mult = 0.3
+                _recovery = state.survival_controller.detect_recovery_signal()
+                if _recovery.get("active"):
+                    _surv_mult *= _recovery.get("position_signal_boost", 1.0)
+                    _recovery_active = True
+            _raw = _return_forecast * _ic_conf * _surv_mult
+            _position_signal = max(-1.0, min(1.0, _raw * 100))
+            _pos_label = "buy" if _position_signal > 0.3 else "sell" if _position_signal < -0.3 else "hold"
+            profile["position_signal"] = {
+                "available": True,
+                "signal": round(_position_signal, 4),
+                "label": _pos_label,
+                "return_forecast": round(_return_forecast, 6),
+                "ic_confidence": round(_ic_conf, 4),
+                "survival_multiplier": round(_surv_mult, 4),
+                "recovery_active": _recovery_active,
+            }
+        except Exception:
+            profile["position_signal"] = {"available": False}
+
         profile = _sanitize(profile)
         with open(profile_path, "w") as f:
             json.dump(profile, f, indent=2, default=str)
         logger.info("Profile saved: %s", profile_path)
+
+        # Store predictions to log
+        if state.pred_result is not None and hasattr(state.pred_result, "predictions"):
+            try:
+                from operator1.analysis.prediction_log import store_predictions
+                _model_used = {}
+                if state.forecast_result is not None and hasattr(state.forecast_result, "model_used"):
+                    _model_used = state.forecast_result.model_used
+                _surv_regime = "normal"
+                if "survival_regime" in cache.columns:
+                    _sr = cache["survival_regime"].dropna()
+                    if len(_sr) > 0:
+                        _surv_regime = str(_sr.iloc[-1])
+                store_predictions(
+                    ticker=state.company,
+                    predictions=state.pred_result.predictions,
+                    model_used=_model_used,
+                    survival_regime=_surv_regime,
+                    run_date=datetime.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None,
+                )
+            except Exception:
+                pass
     except Exception as exc:
         logger.error("Profile build failed: %s", exc)
         import traceback
