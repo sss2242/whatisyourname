@@ -726,6 +726,83 @@ def _compute_recovery_time(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Earnings quality and alpha signals (Sloan 1996, Foster/Olsen/Shevlin 1984)
+# ---------------------------------------------------------------------------
+
+
+def _compute_earnings_quality_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute accruals quality, SUE, and PEAD signals.
+
+    Accruals (Sloan 1996):
+        accruals = (net_income - operating_cash_flow) / total_assets
+        High accruals = low earnings quality (future underperformance).
+        accruals_signal = -accruals (lower = better, positive = buy signal).
+
+    SUE -- Standardized Unexpected Earnings (Foster/Olsen/Shevlin 1984):
+        eps_surprise = eps_ttm - eps_ttm.shift(4_quarters)
+        sue_score = eps_surprise / rolling_std(eps_surprise)
+        Positive SUE = beat expectations -> drift up (PEAD).
+
+    PEAD -- Post-Earnings Announcement Drift (Bernard & Thomas 1989):
+        pead_signal = sue_score * alpha_decay(days_since_filing)
+        Strongest 0-30 days post-filing, decays exponentially.
+    """
+    eps = 1e-9
+
+    # --- Accruals signal (Sloan 1996) ---
+    ni = df.get("net_income")
+    ocf = df.get("operating_cash_flow")
+    ta = df.get("total_assets")
+    if ni is not None and ocf is not None and ta is not None:
+        safe_ta = ta.where(ta.abs() > eps)
+        accruals = (ni - ocf) / safe_ta
+        df["accruals"] = accruals
+        df["accruals_signal"] = -accruals  # lower accruals = higher quality = buy
+    else:
+        df["accruals"] = float("nan")
+        df["accruals_signal"] = float("nan")
+
+    # --- SUE score ---
+    # Use EPS TTM (or net_income_ttm as proxy) shifted by ~252 days (4 quarters)
+    eps_col = df.get("eps_calc")
+    if eps_col is None:
+        eps_col = df.get("net_income_ttm_asof")
+    if eps_col is not None and eps_col.notna().sum() >= 10:
+        eps_surprise = eps_col - eps_col.shift(252)
+        surprise_std = eps_surprise.rolling(504, min_periods=60).std()
+        safe_std = surprise_std.where(surprise_std.abs() > eps)
+        sue = eps_surprise / safe_std
+        df["eps_surprise_proxy"] = eps_surprise
+        df["sue_score"] = sue
+    else:
+        df["eps_surprise_proxy"] = float("nan")
+        df["sue_score"] = float("nan")
+
+    # --- PEAD signal (decay-weighted SUE) ---
+    # Decay based on distance from nearest filing date change
+    sue = df.get("sue_score")
+    if sue is not None and sue.notna().any():
+        # Estimate days since last filing change
+        # Use revenue changes as proxy for filing dates
+        revenue = df.get("revenue")
+        if revenue is not None:
+            filing_change = (revenue.diff().abs() > eps).astype(int)
+            days_since_filing = filing_change.groupby(
+                filing_change.cumsum()
+            ).cumcount()
+        else:
+            days_since_filing = pd.Series(30, index=df.index)  # default 30 days
+
+        # Exponential decay: half-life of 30 business days
+        decay = np.exp(-0.693 * days_since_filing / 30)
+        df["pead_signal"] = sue * decay
+    else:
+        df["pead_signal"] = float("nan")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -745,6 +822,7 @@ _COMPUTE_STAGES = (
     _compute_technical_indicators,
     _compute_recovery_time,
     _compute_beta,
+    _compute_earnings_quality_signals,
 )
 
 # All derived variable names (for inspection / downstream reference)
@@ -779,6 +857,8 @@ DERIVED_VARIABLES: tuple[str, ...] = (
     "beta_252d",
     # Recovery time
     "recovery_time_avg", "recovery_time_max", "n_recovery_episodes",
+    # Earnings quality & alpha signals
+    "accruals", "accruals_signal", "eps_surprise_proxy", "sue_score", "pead_signal",
 )
 
 

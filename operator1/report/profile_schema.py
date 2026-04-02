@@ -75,6 +75,9 @@ OPTIONAL_PROFILE_KEYS: set[str] = {
     "model_diagnostics",
     "supply_chain_stress",
     "multi_frequency",
+    "signal_ic",
+    "prediction_log",
+    "position_signal",
 }
 
 
