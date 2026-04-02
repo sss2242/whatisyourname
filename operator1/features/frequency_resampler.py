@@ -90,10 +90,11 @@ ANNUAL_ONLY_MARKETS: frozenset[str] = frozenset({
     # Tier 2 markets with annual-only filing discovery
     "au_asx",
     "sg_sgx",
-    "za_jse",
+    # Note: za_jse NOT included -- JSE SENS provides semi-annual (interim)
+    # and quarterly financial filings (e.g. "Six Months Ended", "Three Months
+    # Ended"). detect_native_filing_frequency() handles the Q->S auto-switch.
     # Note: ae_dfm NOT included -- DFM eFsah provides quarterly financial
     # statements (e.g. "Financial statements for the 3rd QTR of 2025").
-    # The filing discoverer extracts quarterly data from PDF attachments.
 })
 
 
