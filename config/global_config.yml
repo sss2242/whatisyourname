@@ -64,5 +64,25 @@ filing_extraction_max_filings: 8     # max filings to extract per ticker
 filing_extraction_stage_size: 2      # filings per stage
 filing_extraction_stage_pause_s: 15  # seconds pause between stages
 
+# ---------------------------------------------------------------------------
+# Prediction Contract
+# ---------------------------------------------------------------------------
+# Declares what the system is trying to predict and how to evaluate it.
+# primary_target: The main prediction target (return_5d recommended).
+# secondary_targets: Additional targets for multi-horizon coverage.
+# evaluation_metric: How to score prediction quality (spearman_ic, rmse, mae).
+prediction_contract:
+  primary_target: "return_5d"
+  secondary_targets: ["return_21d", "return_1d"]
+  evaluation_metric: "spearman_ic"
+  # Signal decay rates (fraction per day) by signal speed category
+  signal_decay:
+    slow: 0.003       # fundamentals (Altman Z, balance sheet ratios): ~0.3%/day
+    medium: 0.05      # momentum (EPS revision, PEAD): ~5%/day
+    fast: 0.30        # technicals (RSI, MACD, patterns): ~30%/day
+  # IC thresholds for signal inclusion
+  ic_inclusion_threshold: 0.02   # minimum |IC| to include signal in ensemble
+  icir_inclusion_threshold: 0.3  # minimum |ICIR| to include signal
+
 # Logging
 log_level: INFO

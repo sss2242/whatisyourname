@@ -103,6 +103,11 @@ class BacktestState:
         self._adaptive_model_params = None
         self._adaptive_tier3 = None
         self._ohlcv_source_label: str = ""
+        # Raw statement DataFrames (for multi-frequency Q/A direct construction)
+        self._income_df: pd.DataFrame = pd.DataFrame()
+        self._balance_df: pd.DataFrame = pd.DataFrame()
+        self._cashflow_df: pd.DataFrame = pd.DataFrame()
+        self._quotes_df: pd.DataFrame = pd.DataFrame()
 
         # USS (Unified Survival System) outputs
         self.survival_controller = None
@@ -406,6 +411,12 @@ def run_stage1(state: BacktestState) -> None:
     except Exception as exc:
         logger.warning("Pivot failed: %s", exc)
 
+    # Save raw statement DataFrames for multi-frequency Q/A direct construction
+    state._income_df = income_df
+    state._balance_df = balance_df
+    state._cashflow_df = cashflow_df
+    state._quotes_df = quotes_df
+
     # Build cache
     if not quotes_df.empty:
         if "date" in quotes_df.columns:
@@ -532,6 +543,23 @@ def run_stage1(state: BacktestState) -> None:
         pass
 
     # Estimation
+    # SIX proxy computation (Switzerland only -- must run BEFORE estimation)
+    if state.market_id == "ch_six":
+        try:
+            from operator1.features.six_derived_proxies import (
+                compute_six_proxies, seed_canonical_columns,
+            )
+            state.six_proxy_result = compute_six_proxies(cache, state.target_profile)
+            if state.six_proxy_result.computed:
+                seed_canonical_columns(cache, state.target_profile, state.six_proxy_result)
+                logger.info(
+                    "SIX proxies: %d columns, yield=%.2f%%",
+                    state.six_proxy_result.n_proxies,
+                    (state.six_proxy_result.dividend_yield or 0) * 100,
+                )
+        except Exception as exc:
+            logger.warning("SIX proxy computation failed: %s", exc)
+
     try:
         from operator1.estimation.estimator import run_estimation
         from operator1.config_loader import load_config
@@ -811,6 +839,31 @@ def run_stage1(state: BacktestState) -> None:
         logger.info("Adaptive windows computed")
     except Exception as exc:
         logger.debug("Adaptive windows skipped: %s", exc)
+
+    # Signal IC measurement
+    signal_ic_result = None
+    try:
+        from operator1.analysis.signal_ic import compute_signal_ic, get_ic_weighted_signals
+        signal_ic_result = compute_signal_ic(cache)
+        if signal_ic_result and signal_ic_result.available:
+            logger.info(
+                "Signal IC: %d strong, best=%s (IC=%.4f)",
+                len(signal_ic_result.strong_signals),
+                signal_ic_result.best_signal, signal_ic_result.best_ic,
+            )
+    except Exception as exc:
+        logger.debug("Signal IC skipped: %s", exc)
+
+    # Fill actuals from previous prediction log
+    prediction_log_summary = None
+    try:
+        from operator1.analysis.prediction_log import fill_actuals
+        prediction_log_summary = fill_actuals(
+            ticker=state.company, cache=cache,
+            reference_date=datetime.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None,
+        )
+    except Exception as exc:
+        logger.debug("Prediction log fill skipped: %s", exc)
 
     # Enriched survival timeline
     try:
@@ -1229,6 +1282,10 @@ def run_stage2(state: BacktestState) -> None:
             daily_cache=cache, secrets=state._secrets,
             market_id=state.market_id, ticker=state.company,
             reference_date=_bt_end,
+            income_df=state._income_df if not state._income_df.empty else None,
+            balance_df=state._balance_df if not state._balance_df.empty else None,
+            cashflow_df=state._cashflow_df if not state._cashflow_df.empty else None,
+            quotes_df=state._quotes_df if not state._quotes_df.empty else None,
         )
         if _mf and _mf.results:
             state.multi_frequency_result = fuse_multi_frequency_results(_mf)
@@ -1239,6 +1296,64 @@ def run_stage2(state: BacktestState) -> None:
             )
     except Exception as exc:
         logger.warning("Multi-frequency failed: %s", exc)
+
+    # Step 6.5: Retroactive calibration (Empirical Bayes second-pass priors)
+    try:
+        from operator1.analysis.retroactive_calibration import run_retroactive_calibration
+
+        _entity_groups_for_retro = {}
+        if state.relationships:
+            for grp, ents in state.relationships.items():
+                if isinstance(ents, list):
+                    ids = []
+                    for e in ents:
+                        eid = ""
+                        if isinstance(e, dict):
+                            eid = e.get("isin", "") or e.get("ticker", "")
+                        elif hasattr(e, "isin"):
+                            eid = e.isin or getattr(e, "ticker", "")
+                        if eid:
+                            ids.append(eid)
+                    _entity_groups_for_retro[grp] = ids
+
+        state._retro_params = run_retroactive_calibration(
+            cache=cache,
+            linked_caches=state.linked_caches if state.linked_caches else None,
+            entity_groups=_entity_groups_for_retro if _entity_groups_for_retro else None,
+            walk_forward_result=state.walk_forward_result,
+            forecast_result=state.forecast_result,
+            sobol_result=state.sobol_result,
+            target_profile=state.target_profile,
+        )
+        if state._retro_params.n_calibrated > 0:
+            logger.info(
+                "Retroactive calibration: %d groups calibrated",
+                state._retro_params.n_calibrated,
+            )
+    except Exception as exc:
+        logger.warning("Retroactive calibration failed: %s", exc)
+
+    # Step 6.6: Model diagnostics (expected path vs actual path)
+    try:
+        from operator1.monitoring.model_diagnostics import compute_model_diagnostics
+        _diag = compute_model_diagnostics(
+            cache,
+            forecast_result=state.forecast_result,
+            mc_result=state.mc_result,
+            copula_result=state.copula_result,
+            granger_result=state.granger_result,
+            cycle_result=state.cycle_result,
+            dtw_result=state.dtw_result,
+            conformal_result=state.conformal_result,
+        )
+        if _diag and _diag.available:
+            logger.info(
+                "Model diagnostics: %d/%d on track, overall=%s",
+                _diag.n_models_on_track, _diag.n_models_assessed,
+                _diag.overall_robustness,
+            )
+    except Exception as exc:
+        logger.debug("Model diagnostics failed: %s", exc)
 
     state.cache = cache
     state.save(stage=2)
@@ -1340,10 +1455,83 @@ def run_stage3(state: BacktestState) -> None:
         else:
             profile["multi_frequency"] = {"available": False}
 
+        # Signal IC results
+        if signal_ic_result is not None and signal_ic_result.available:
+            profile["signal_ic"] = signal_ic_result.to_profile_dict()
+        else:
+            profile["signal_ic"] = {"available": False}
+
+        # Prediction log summary
+        if prediction_log_summary is not None:
+            profile["prediction_log"] = prediction_log_summary
+        else:
+            profile["prediction_log"] = {"n_filled": 0, "total_predictions": 0}
+
+        # Position signal
+        try:
+            _position_signal = 0.0
+            _return_forecast = 0.0
+            if state.pred_result is not None and hasattr(state.pred_result, "predictions"):
+                _r5d = state.pred_result.predictions.get("return_5d", {}).get("5d")
+                if _r5d is None:
+                    _r5d = state.pred_result.predictions.get("close", {}).get("5d")
+                if _r5d is not None:
+                    pf = getattr(_r5d, "point_forecast", None)
+                    if pf is not None:
+                        _return_forecast = float(pf)
+            _ic_conf = 1.0
+            if signal_ic_result and signal_ic_result.available:
+                _ic_conf = min(2.0, max(0.5, abs(signal_ic_result.best_ic) * 20))
+            _surv_mult = 1.0
+            _recovery_active = False
+            if state.survival_controller is not None:
+                if state.survival_controller.is_survival:
+                    _surv_mult = 0.3
+                _recovery = state.survival_controller.detect_recovery_signal()
+                if _recovery.get("active"):
+                    _surv_mult *= _recovery.get("position_signal_boost", 1.0)
+                    _recovery_active = True
+            _raw = _return_forecast * _ic_conf * _surv_mult
+            _position_signal = max(-1.0, min(1.0, _raw * 100))
+            _pos_label = "buy" if _position_signal > 0.3 else "sell" if _position_signal < -0.3 else "hold"
+            profile["position_signal"] = {
+                "available": True,
+                "signal": round(_position_signal, 4),
+                "label": _pos_label,
+                "return_forecast": round(_return_forecast, 6),
+                "ic_confidence": round(_ic_conf, 4),
+                "survival_multiplier": round(_surv_mult, 4),
+                "recovery_active": _recovery_active,
+            }
+        except Exception:
+            profile["position_signal"] = {"available": False}
+
         profile = _sanitize(profile)
         with open(profile_path, "w") as f:
             json.dump(profile, f, indent=2, default=str)
         logger.info("Profile saved: %s", profile_path)
+
+        # Store predictions to log
+        if state.pred_result is not None and hasattr(state.pred_result, "predictions"):
+            try:
+                from operator1.analysis.prediction_log import store_predictions
+                _model_used = {}
+                if state.forecast_result is not None and hasattr(state.forecast_result, "model_used"):
+                    _model_used = state.forecast_result.model_used
+                _surv_regime = "normal"
+                if "survival_regime" in cache.columns:
+                    _sr = cache["survival_regime"].dropna()
+                    if len(_sr) > 0:
+                        _surv_regime = str(_sr.iloc[-1])
+                store_predictions(
+                    ticker=state.company,
+                    predictions=state.pred_result.predictions,
+                    model_used=_model_used,
+                    survival_regime=_surv_regime,
+                    run_date=datetime.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None,
+                )
+            except Exception:
+                pass
     except Exception as exc:
         logger.error("Profile build failed: %s", exc)
         import traceback

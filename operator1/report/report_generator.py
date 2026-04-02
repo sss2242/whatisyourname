@@ -90,6 +90,9 @@ TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20},
     ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20},
     ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005},  # all 22 sections + extended sections + USS + scenarios + diagnostics + structure + calendar + macro + supply chain + synergies + multi-frequency
+    ReportTier.BASIC: {1, 2, 4, 6, 20, 2007},  # + position signal
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20, 2006, 2007, 2008},  # + thesis scorecard + position signal + signal IC
+    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008},  # all sections + multi-frequency + thesis scorecard + position signal + signal IC
 }
 
 
@@ -3541,6 +3544,184 @@ def _build_multi_frequency_section(profile: dict[str, Any]) -> str:
             )
         lines.append("")
 
+def _build_investment_thesis_scorecard(profile: dict[str, Any]) -> str:
+    """Render 5-tier investment thesis scorecard."""
+    lines = []
+    fh = profile.get("financial_health", {})
+    current = profile.get("current_state", {})
+    catalysts = profile.get("product_catalysts", {})
+    sentiment = profile.get("sentiment", {})
+    pos = profile.get("position_signal", {})
+    uss = profile.get("unified_survival_system", {})
+
+    # Tier scores
+    eq_score = 50
+    beneish = fh.get("beneish_m_score")
+    if isinstance(beneish, (int, float)):
+        eq_score = 80 if beneish < -2.22 else 30
+    accruals = current.get("accruals_signal")
+    if isinstance(accruals, (int, float)):
+        eq_score = max(0, min(100, eq_score + int(accruals * 30)))
+
+    cf_score = 50
+    fcf_yield = current.get("fcf_yield")
+    if isinstance(fcf_yield, (int, float)):
+        cf_score = 80 if fcf_yield > 0.05 else 60 if fcf_yield > 0 else 25
+    runway = fh.get("runway_months")
+    if isinstance(runway, (int, float)):
+        cf_score = min(100, cf_score + 15) if runway > 24 else max(0, cf_score - 20) if runway < 6 else cf_score
+
+    bs_score = 50
+    z_score = fh.get("altman_z_score")
+    if isinstance(z_score, (int, float)):
+        bs_score = 85 if z_score > 2.99 else 55 if z_score > 1.81 else 20
+
+    inf_score = 50
+    sue = current.get("sue_score")
+    if isinstance(sue, (int, float)):
+        inf_score = max(0, min(100, 50 + int(sue * 15)))
+    if catalysts.get("available"):
+        inf_score = max(0, min(100, inf_score + int(catalysts.get("catalyst_score", 0) * 20)))
+    recovery = uss.get("recovery_signal", {})
+    if recovery.get("active"):
+        inf_score = min(100, inf_score + 25)
+
+    val_score = 50
+    pe = current.get("pe_ratio_calc")
+    if isinstance(pe, (int, float)):
+        val_score = 75 if 5 < pe < 20 else 50 if pe < 40 else 30
+
+    composite = int(0.25 * eq_score + 0.25 * cf_score + 0.20 * bs_score + 0.15 * inf_score + 0.15 * val_score)
+
+    def _label(s):
+        if s >= 75: return "STRONG"
+        if s >= 55: return "ADEQUATE"
+        if s >= 35: return "WEAK"
+        return "CRITICAL"
+
+    def _bar(s):
+        return "[" + "#" * (s // 10) + "." * (10 - s // 10) + "]"
+
+    lines.append("| Tier | Score | Rating | Visual |")
+    lines.append("|------|-------|--------|--------|")
+    for name, score in [("Earnings Quality", eq_score), ("Cash Flow", cf_score),
+                        ("Balance Sheet", bs_score), ("Inflection / Catalysts", inf_score),
+                        ("Valuation", val_score)]:
+        lines.append(f"| {name} | {score}/100 | {_label(score)} | `{_bar(score)}` |")
+    lines.append(f"| **COMPOSITE** | **{composite}/100** | **{_label(composite)}** | `{_bar(composite)}` |")
+    lines.append("")
+
+    if pos.get("available"):
+        signal = pos.get("signal", 0)
+        label = pos.get("label", "hold").upper()
+        lines.append(f"**Position Signal:** {signal:+.2f} ({label})")
+        if pos.get("recovery_active"):
+            lines.append("  - Recovery signal ACTIVE")
+    return "\n".join(lines) if lines else "*Scorecard not available.*\n"
+
+
+def _build_signal_ic_section(profile: dict[str, Any]) -> str:
+    """Render the Signal IC (Information Coefficient) analysis section.
+
+    Displays which signals are predictive vs noise, the IC matrix across
+    horizons, and the ICIR-based signal classification.
+    """
+    ic_data = profile.get("signal_ic", {})
+    if not ic_data.get("available"):
+        return "*Signal IC analysis not available (insufficient data for IC computation).*\n"
+
+    lines: list[str] = []
+
+    n_signals = ic_data.get("n_signals", 0)
+    n_obs = ic_data.get("n_observations", 0)
+    best_signal = ic_data.get("best_signal", "N/A")
+    best_ic = ic_data.get("best_ic", 0)
+    strong = ic_data.get("strong_signals", [])
+    weak = ic_data.get("weak_signals", [])
+
+    lines.append(f"**Signals analyzed:** {n_signals} | **Observations:** {n_obs}")
+    lines.append(f"**Best signal:** `{best_signal}` (IC = {best_ic:.4f})")
+    lines.append("")
+
+    # Strong vs weak classification
+    if strong:
+        lines.append(f"**Predictive signals ({len(strong)}):** {', '.join(f'`{s}`' for s in strong[:10])}")
+    if weak:
+        lines.append(f"**Weak/noisy signals ({len(weak)}):** {', '.join(f'`{s}`' for s in weak[:10])}")
+    lines.append("")
+
+    # IC matrix table
+    ic_matrix = ic_data.get("ic_matrix", {})
+    if ic_matrix:
+        # Get all horizons from first entry
+        sample_key = next(iter(ic_matrix))
+        horizons = sorted(ic_matrix[sample_key].keys()) if isinstance(ic_matrix[sample_key], dict) else []
+
+        if horizons:
+            header = "| Signal | " + " | ".join(f"IC ({h})" for h in horizons) + " | Speed |"
+            sep = "|---|" + "|".join("---:" for _ in horizons) + "|---|"
+            lines.append(header)
+            lines.append(sep)
+
+            speed_map = ic_data.get("signal_speed", {})
+            # Sort by absolute IC of first horizon
+            sorted_signals = sorted(
+                ic_matrix.items(),
+                key=lambda x: abs(list(x[1].values())[0]) if isinstance(x[1], dict) and x[1] else 0,
+                reverse=True,
+            )
+            for sig_name, horizons_dict in sorted_signals[:15]:
+                if not isinstance(horizons_dict, dict):
+                    continue
+                vals = " | ".join(f"{horizons_dict.get(h, 0):.4f}" for h in horizons)
+                speed = speed_map.get(sig_name, "")
+                lines.append(f"| `{sig_name}` | {vals} | {speed} |")
+            lines.append("")
+
+    # Interpretation
+    lines.append("**Interpretation:**")
+    lines.append(f"- Signals with |ICIR| above threshold are classified as **predictive** and receive priority in the ensemble")
+    lines.append(f"- **{len(weak)}** weak signals were pruned from temporal model features to reduce overfitting")
+    if best_ic > 0:
+        lines.append(f"- Positive IC for `{best_signal}` indicates it has genuine forward-return predictive power")
+    elif best_ic < 0:
+        lines.append(f"- Negative IC for `{best_signal}` indicates contrarian signal (high values predict lower returns)")
+
+    return "\n".join(lines) + "\n"
+
+
+def _build_position_signal_section(profile: dict[str, Any]) -> str:
+    """Render the position signal (-1 to +1 directional conviction)."""
+    pos = profile.get("position_signal", {})
+    if not pos.get("available"):
+        return "*Position signal not available (insufficient prediction data).*\n"
+    signal = pos.get("signal", 0)
+    label = pos.get("label", "hold").upper()
+    lines = []
+    gauge_pos = int((signal + 1) * 25)
+    gauge = "-" * gauge_pos + "|" + "-" * (50 - gauge_pos)
+    lines.append("```")
+    lines.append(f"SELL ----{gauge}---- BUY")
+    lines.append(f"Signal: {signal:+.4f} ({label})")
+    lines.append("```")
+    lines.append("")
+    lines.append("| Component | Value |")
+    lines.append("|-----------|-------|")
+    lines.append(f"| Return Forecast (5d) | {pos.get('return_forecast', 0):+.6f} |")
+    lines.append(f"| IC Confidence | {pos.get('ic_confidence', 1.0):.2f}x |")
+    lines.append(f"| Survival Multiplier | {pos.get('survival_multiplier', 1.0):.2f}x |")
+    if pos.get("recovery_active"):
+        lines.append("| Recovery Signal | ACTIVE (boost applied) |")
+    lines.append("")
+    pl = profile.get("prediction_log", {})
+    total = pl.get("total_predictions", 0)
+    if total > 0:
+        lines.append(f"**Track Record:** {total} predictions logged")
+        n_filled = pl.get("n_filled", 0)
+        if n_filled > 0:
+            lines.append(f"  - {n_filled} evaluated, hit rate={pl.get('hit_rate', 0):.1%}, IC={pl.get('realized_ic', 0):.4f}")
+    lines.append("")
+    lines.append("> *Directional conviction signal, not investment advice.*")
     return "\n".join(lines)
 
 
@@ -3629,6 +3810,9 @@ def _build_fallback_report(
         )),
         21: ("21. Investment Recommendation", _build_investment_recommendation(profile)),
         1998: ("21.5. Model Robustness Diagnostics", _build_model_diagnostics_section(profile)),
+        2006: ("21.12. Investment Thesis Scorecard", _build_investment_thesis_scorecard(profile)),
+        2007: ("21.13. Position Signal & Conviction", _build_position_signal_section(profile)),
+        2008: ("21.14. Signal IC Analysis", _build_signal_ic_section(profile)),
         1999: ("21.6. Corporate Structure", _build_corporate_structure_section(profile)),
         2001: ("21.7. Filing Calendar & Data Freshness", _build_filing_calendar_section(profile)),
         2002: ("21.8. Macro Indicator Summary", _build_macro_indicators_section(profile)),
