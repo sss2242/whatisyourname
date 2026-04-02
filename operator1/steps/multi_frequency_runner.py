@@ -74,7 +74,6 @@ class FrequencyResult:
     survival_regime: str = "normal"
     trend_direction: str = "flat"
     forecast_summary: dict[str, Any] = field(default_factory=dict)
-    model_metrics_summary: dict[str, Any] = field(default_factory=dict)
     walk_forward_mae: float | None = None
 
     # Context to pass to next frequency
@@ -259,6 +258,33 @@ def run_single_frequency_pipeline(
         except Exception as exc:
             logger.debug("[%s] Forecasting skipped: %s", freq, exc)
 
+    # Step 4b: Walk-forward evaluation (need at least 30 periods)
+    if resampled.n_periods >= 30 and not skip_models and forecast_summary:
+        try:
+            from operator1.models.walk_forward import run_walk_forward
+            from operator1.analysis.survival_timeline import compute_survival_timeline
+            _wf_tl = compute_survival_timeline(cache)
+            _wf_modes = (
+                _wf_tl.timeline["survival_mode"]
+                if hasattr(_wf_tl, "timeline")
+                and isinstance(_wf_tl.timeline, pd.DataFrame)
+                and "survival_mode" in _wf_tl.timeline.columns
+                else None
+            )
+            _wf_switches = (
+                _wf_tl.timeline["switch_point"]
+                if hasattr(_wf_tl, "timeline")
+                and isinstance(_wf_tl.timeline, pd.DataFrame)
+                and "switch_point" in _wf_tl.timeline.columns
+                else None
+            )
+            _wf_result = run_walk_forward(cache, _wf_modes, _wf_switches)
+            if _wf_result and _wf_result.fitted and not pd.isna(_wf_result.overall_mae):
+                walk_forward_mae = _wf_result.overall_mae
+                logger.info("[%s] Walk-forward MAE: %.6f", freq, walk_forward_mae)
+        except Exception as exc:
+            logger.debug("[%s] Walk-forward skipped: %s", freq, exc)
+
     # Step 5: Monte Carlo (need at least 15 periods)
     mc_survival = None
     if resampled.n_periods >= 15 and not skip_models:
@@ -273,9 +299,9 @@ def run_single_frequency_pipeline(
         except Exception as exc:
             logger.debug("[%s] Monte Carlo skipped: %s", freq, exc)
 
-    # Apply prior context constraints
+    # Log prior context disagreements (informational only)
     if prior_context is not None:
-        _apply_prior_context(cache, prior_context, freq)
+        _log_prior_context_disagreements(cache, prior_context, freq)
 
     # Extract summary for context passing
     trend = _extract_trend_direction(cache)
@@ -317,22 +343,16 @@ def run_single_frequency_pipeline(
     return result
 
 
-def _apply_prior_context(
+def _log_prior_context_disagreements(
     cache: pd.DataFrame,
     ctx: FrequencyContext,
     current_freq: str,
 ) -> None:
-    """Apply constraints from a slower frequency to the current cache.
+    """Log disagreements between slower-frequency context and current cache.
 
-    Only single-value summaries are injected -- no time series.
-    This prevents look-ahead from slower-frequency full-history fits.
+    Does NOT inject columns into the cache -- the FrequencyContext summary
+    values are the cascading mechanism, not per-row cache columns.
     """
-    # Inject prior context as constant columns for downstream models
-    cache[f"prior_{ctx.frequency}_trend"] = ctx.trend_direction
-    cache[f"prior_{ctx.frequency}_regime"] = ctx.secular_regime
-    cache[f"prior_{ctx.frequency}_survival"] = ctx.survival_probability_latest
-
-    # Log if there's a disagreement between frequencies
     if "company_survival_mode_flag" in cache.columns:
         current_survival = cache["company_survival_mode_flag"].iloc[-1] if len(cache) > 0 else 0
         if current_survival == 0 and ctx.survival_probability_latest < 0.5:

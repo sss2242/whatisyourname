@@ -136,6 +136,9 @@ class BacktestState:
         self._mv_mc_result = None
         self._extra_vars: list = []
 
+        # Stage 2.5 outputs
+        self.multi_frequency_result = None
+
         # Stage 3 outputs
         self.profile: dict = {}
         self.predictions_summary: dict = {}
@@ -1217,6 +1220,26 @@ def run_stage2(state: BacktestState) -> None:
     except Exception as exc:
         logger.debug("USS integration skipped: %s", exc)
 
+    # Multi-frequency forecasting
+    try:
+        from operator1.steps.multi_frequency_runner import run_multi_frequency_pipeline
+        from operator1.models.frequency_fusion import fuse_multi_frequency_results
+        _bt_end = datetime.strptime(state.end_date, "%Y-%m-%d").date()
+        _mf = run_multi_frequency_pipeline(
+            daily_cache=cache, secrets=state._secrets,
+            market_id=state.market_id, ticker=state.company,
+            reference_date=_bt_end,
+        )
+        if _mf and _mf.results:
+            state.multi_frequency_result = fuse_multi_frequency_results(_mf)
+            logger.info(
+                "Multi-frequency: %d frequencies, survival=%.1f%%",
+                state.multi_frequency_result.n_frequencies_used,
+                state.multi_frequency_result.survival.fused_probability * 100,
+            )
+    except Exception as exc:
+        logger.warning("Multi-frequency failed: %s", exc)
+
     state.cache = cache
     state.save(stage=2)
     logger.info("STAGE 2 COMPLETE")
@@ -1308,6 +1331,14 @@ def run_stage3(state: BacktestState) -> None:
             profile["scenario_analysis"] = state.scenario_result.to_dict()
         else:
             profile["scenario_analysis"] = {"available": False}
+
+        # Multi-frequency fusion
+        if (state.multi_frequency_result is not None
+                and hasattr(state.multi_frequency_result, "available")
+                and state.multi_frequency_result.available):
+            profile["multi_frequency"] = state.multi_frequency_result.to_profile_dict()
+        else:
+            profile["multi_frequency"] = {"available": False}
 
         profile = _sanitize(profile)
         with open(profile_path, "w") as f:
