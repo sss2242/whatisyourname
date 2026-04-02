@@ -88,8 +88,8 @@ class ReportMode(str, Enum):
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20, 2007},  # + position signal
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20, 2006, 2007},  # + thesis scorecard + position signal
-    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005, 2006, 2007},  # all sections + multi-frequency + thesis scorecard + position signal
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20, 2006, 2007, 2008},  # + thesis scorecard + position signal + signal IC
+    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008},  # all sections + multi-frequency + thesis scorecard + position signal + signal IC
 }
 
 
@@ -3617,6 +3617,76 @@ def _build_investment_thesis_scorecard(profile: dict[str, Any]) -> str:
     return "\n".join(lines) if lines else "*Scorecard not available.*\n"
 
 
+def _build_signal_ic_section(profile: dict[str, Any]) -> str:
+    """Render the Signal IC (Information Coefficient) analysis section.
+
+    Displays which signals are predictive vs noise, the IC matrix across
+    horizons, and the ICIR-based signal classification.
+    """
+    ic_data = profile.get("signal_ic", {})
+    if not ic_data.get("available"):
+        return "*Signal IC analysis not available (insufficient data for IC computation).*\n"
+
+    lines: list[str] = []
+
+    n_signals = ic_data.get("n_signals", 0)
+    n_obs = ic_data.get("n_observations", 0)
+    best_signal = ic_data.get("best_signal", "N/A")
+    best_ic = ic_data.get("best_ic", 0)
+    strong = ic_data.get("strong_signals", [])
+    weak = ic_data.get("weak_signals", [])
+
+    lines.append(f"**Signals analyzed:** {n_signals} | **Observations:** {n_obs}")
+    lines.append(f"**Best signal:** `{best_signal}` (IC = {best_ic:.4f})")
+    lines.append("")
+
+    # Strong vs weak classification
+    if strong:
+        lines.append(f"**Predictive signals ({len(strong)}):** {', '.join(f'`{s}`' for s in strong[:10])}")
+    if weak:
+        lines.append(f"**Weak/noisy signals ({len(weak)}):** {', '.join(f'`{s}`' for s in weak[:10])}")
+    lines.append("")
+
+    # IC matrix table
+    ic_matrix = ic_data.get("ic_matrix", {})
+    if ic_matrix:
+        # Get all horizons from first entry
+        sample_key = next(iter(ic_matrix))
+        horizons = sorted(ic_matrix[sample_key].keys()) if isinstance(ic_matrix[sample_key], dict) else []
+
+        if horizons:
+            header = "| Signal | " + " | ".join(f"IC ({h})" for h in horizons) + " | Speed |"
+            sep = "|---|" + "|".join("---:" for _ in horizons) + "|---|"
+            lines.append(header)
+            lines.append(sep)
+
+            speed_map = ic_data.get("signal_speed", {})
+            # Sort by absolute IC of first horizon
+            sorted_signals = sorted(
+                ic_matrix.items(),
+                key=lambda x: abs(list(x[1].values())[0]) if isinstance(x[1], dict) and x[1] else 0,
+                reverse=True,
+            )
+            for sig_name, horizons_dict in sorted_signals[:15]:
+                if not isinstance(horizons_dict, dict):
+                    continue
+                vals = " | ".join(f"{horizons_dict.get(h, 0):.4f}" for h in horizons)
+                speed = speed_map.get(sig_name, "")
+                lines.append(f"| `{sig_name}` | {vals} | {speed} |")
+            lines.append("")
+
+    # Interpretation
+    lines.append("**Interpretation:**")
+    lines.append(f"- Signals with |ICIR| above threshold are classified as **predictive** and receive priority in the ensemble")
+    lines.append(f"- **{len(weak)}** weak signals were pruned from temporal model features to reduce overfitting")
+    if best_ic > 0:
+        lines.append(f"- Positive IC for `{best_signal}` indicates it has genuine forward-return predictive power")
+    elif best_ic < 0:
+        lines.append(f"- Negative IC for `{best_signal}` indicates contrarian signal (high values predict lower returns)")
+
+    return "\n".join(lines) + "\n"
+
+
 def _build_position_signal_section(profile: dict[str, Any]) -> str:
     """Render the position signal (-1 to +1 directional conviction)."""
     pos = profile.get("position_signal", {})
@@ -3739,6 +3809,7 @@ def _build_fallback_report(
         1998: ("21.5. Model Robustness Diagnostics", _build_model_diagnostics_section(profile)),
         2006: ("21.12. Investment Thesis Scorecard", _build_investment_thesis_scorecard(profile)),
         2007: ("21.13. Position Signal & Conviction", _build_position_signal_section(profile)),
+        2008: ("21.14. Signal IC Analysis", _build_signal_ic_section(profile)),
         1999: ("21.6. Corporate Structure", _build_corporate_structure_section(profile)),
         2001: ("21.7. Filing Calendar & Data Freshness", _build_filing_calendar_section(profile)),
         2002: ("21.8. Macro Indicator Summary", _build_macro_indicators_section(profile)),

@@ -911,3 +911,143 @@ class UKCompaniesHouseClient:
             "inst_top5_concentration": round(hhi, 4),
             "inst_holder_count": len(holders),
         }])
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch insider transactions for a UK company via yfinance.
+
+        Companies House does not provide PDMR insider dealing data (that
+        is the FCA's domain, and the FCA API is not publicly accessible).
+        yfinance aggregates insider transaction data from multiple sources
+        and returns buy/sell activity with names, dates, shares, and values.
+
+        Falls back to Companies House officer appointment/resignation
+        events if yfinance returns no insider data.
+        """
+        transactions: list[dict[str, Any]] = []
+
+        # --- Path 1: yfinance insider transactions ---
+        try:
+            import yfinance as yf
+
+            # Resolve ticker: use identifier directly if it has .L suffix,
+            # otherwise look up from profile or append .L
+            yf_ticker = identifier
+            if not yf_ticker.endswith(".L"):
+                # Try to resolve from profile cache
+                profile = self._profile_cache.get(identifier, {})
+                ticker = profile.get("ticker", "")
+                if ticker:
+                    yf_ticker = f"{ticker}.L"
+                else:
+                    yf_ticker = f"{identifier}.L"
+
+            t = yf.Ticker(yf_ticker)
+            df = t.insider_transactions
+            if df is not None and not df.empty:
+                for _, row in df.iterrows():
+                    insider_name = str(row.get("Insider", "")).strip()
+                    if not insider_name:
+                        continue
+
+                    text = str(row.get("Text", ""))
+                    shares = 0
+                    try:
+                        shares = int(row.get("Shares", 0))
+                    except (ValueError, TypeError):
+                        pass
+
+                    value = 0.0
+                    try:
+                        value = float(row.get("Value", 0))
+                    except (ValueError, TypeError):
+                        pass
+
+                    tx_date = ""
+                    try:
+                        tx_date = str(row.get("Start Date", ""))
+                    except Exception:
+                        pass
+
+                    # Classify transaction type from text field
+                    text_lower = text.lower()
+                    if "sold" in text_lower or "sale" in text_lower:
+                        tx_type = "sale"
+                    elif "bought" in text_lower or "purchase" in text_lower:
+                        tx_type = "purchase"
+                    elif "option" in text_lower or "exercise" in text_lower:
+                        tx_type = "option_exercise"
+                    else:
+                        tx_type = "other"
+
+                    transactions.append({
+                        "insider_name": insider_name,
+                        "position": str(row.get("Position", "")),
+                        "transaction_type": tx_type,
+                        "date": tx_date,
+                        "shares": shares,
+                        "value": value,
+                        "description": text[:200] if text else "",
+                        "source": "yfinance",
+                    })
+
+                if transactions:
+                    logger.info(
+                        "UK insider transactions for %s: %d from yfinance",
+                        identifier, len(transactions),
+                    )
+                    return transactions
+
+        except Exception as exc:
+            logger.debug("yfinance insider transactions failed for %s: %s", identifier, exc)
+
+        # --- Path 2: Companies House officer changes (fallback) ---
+        try:
+            company_number = self._resolve_company_number(identifier)
+            if company_number:
+                officers = self._get_officers(company_number)
+                for o in officers:
+                    appointed = o.get("appointed_on", "")
+                    resigned = o.get("resigned_on", "")
+                    name = o.get("name", "")
+                    role = o.get("officer_role", "")
+
+                    if appointed and appointed >= "2022-01-01":
+                        transactions.append({
+                            "insider_name": name,
+                            "position": role,
+                            "transaction_type": "board_appointment",
+                            "date": appointed,
+                            "shares": 0,
+                            "value": 0.0,
+                            "description": f"Appointed as {role}",
+                            "source": "companies_house",
+                        })
+                    if resigned and resigned >= "2022-01-01":
+                        transactions.append({
+                            "insider_name": name,
+                            "position": role,
+                            "transaction_type": "board_resignation",
+                            "date": resigned,
+                            "shares": 0,
+                            "value": 0.0,
+                            "description": f"Resigned as {role}",
+                            "source": "companies_house",
+                        })
+
+                if transactions:
+                    logger.info(
+                        "UK insider transactions for %s: %d officer changes from CH",
+                        identifier, len(transactions),
+                    )
+        except Exception as exc:
+            logger.debug("CH officer changes failed for %s: %s", identifier, exc)
+
+        return transactions
+
+    def _get_officers(self, company_number: str) -> list[dict]:
+        """Fetch officer list from Companies House."""
+        try:
+            data = self._ch_get(f"/company/{company_number}/officers")
+            return data.get("items", []) if isinstance(data, dict) else []
+        except Exception:
+            return []

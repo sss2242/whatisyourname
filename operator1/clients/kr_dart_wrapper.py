@@ -1201,3 +1201,17 @@ class KRDartClient:
                 logger.debug("MarketScreener fallback failed for %s: %s", identifier, exc)
 
         return holders
+
+    def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
+        """Fetch insider/executive share transactions from DART.
+
+        DART does not expose a dedicated insider trading endpoint like
+        SEC Form 4.  Returns an empty list for now.  When DART adds
+        executive shareholding change reports (``exctStockChg``), this
+        method can be extended.
+
+        The ``hasattr()`` guard in ``main.py`` already handles the
+        absence gracefully, but having the stub satisfies the
+        ``PITClient`` protocol contract.
+        """
+        return []
