@@ -87,6 +87,9 @@ class ReportMode(str, Enum):
 # Sections included in each tier.  Section numbers match the fallback
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
+    ReportTier.BASIC: {1, 2, 4, 6, 20},
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20},
+    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005},  # all 22 sections + extended sections + USS + scenarios + diagnostics + structure + calendar + macro + supply chain + synergies + multi-frequency
     ReportTier.BASIC: {1, 2, 4, 6, 20, 2007},  # + position signal
     ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20, 2006, 2007, 2008},  # + thesis scorecard + position signal + signal IC
     ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008},  # all sections + multi-frequency + thesis scorecard + position signal + signal IC
