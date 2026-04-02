@@ -103,6 +103,11 @@ class BacktestState:
         self._adaptive_model_params = None
         self._adaptive_tier3 = None
         self._ohlcv_source_label: str = ""
+        # Raw statement DataFrames (for multi-frequency Q/A direct construction)
+        self._income_df: pd.DataFrame = pd.DataFrame()
+        self._balance_df: pd.DataFrame = pd.DataFrame()
+        self._cashflow_df: pd.DataFrame = pd.DataFrame()
+        self._quotes_df: pd.DataFrame = pd.DataFrame()
 
         # USS (Unified Survival System) outputs
         self.survival_controller = None
@@ -405,6 +410,12 @@ def run_stage1(state: BacktestState) -> None:
                     logger.info("Pivoted %s: %d x %d", label, len(wide), len(wide.columns))
     except Exception as exc:
         logger.warning("Pivot failed: %s", exc)
+
+    # Save raw statement DataFrames for multi-frequency Q/A direct construction
+    state._income_df = income_df
+    state._balance_df = balance_df
+    state._cashflow_df = cashflow_df
+    state._quotes_df = quotes_df
 
     # Build cache
     if not quotes_df.empty:
@@ -1254,6 +1265,10 @@ def run_stage2(state: BacktestState) -> None:
             daily_cache=cache, secrets=state._secrets,
             market_id=state.market_id, ticker=state.company,
             reference_date=_bt_end,
+            income_df=state._income_df if not state._income_df.empty else None,
+            balance_df=state._balance_df if not state._balance_df.empty else None,
+            cashflow_df=state._cashflow_df if not state._cashflow_df.empty else None,
+            quotes_df=state._quotes_df if not state._quotes_df.empty else None,
         )
         if _mf and _mf.results:
             state.multi_frequency_result = fuse_multi_frequency_results(_mf)

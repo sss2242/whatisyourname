@@ -3244,6 +3244,10 @@ Non-interactive examples:
                 ticker=ticker,
                 reference_date=_backtest_end_date,
                 skip_models=False,
+                income_df=income_df,
+                balance_df=balance_df,
+                cashflow_df=cashflow_df,
+                quotes_df=quotes_df,
             )
 
             # Fuse results across all frequencies
