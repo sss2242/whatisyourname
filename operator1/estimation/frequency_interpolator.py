@@ -1,20 +1,27 @@
-"""Frequency-aware interpolation of periodic filings to daily cache.
+"""Frequency-aware interpolation of periodic filings to any target frequency.
 
 Financial filings arrive periodically -- quarterly, semi-annually, or
 annually.  The naive approach (flat forward-fill) creates step functions
 where 90-365 days have identical values.  This module creates smooth
-daily trajectories that respect the nature of each variable:
+trajectories that respect the nature of each variable:
 
 **Stock variables** (balance sheet snapshots):
     Linear interpolation between filing values.  Total assets don't jump
     on filing day -- they change gradually as the company operates.
 
 **Flow variables** (income/cash flow period totals):
-    Distribute the period total across the business days in the period.
-    $100M quarterly revenue becomes ~$1.1M/day across 63 business days.
+    Distribute the period total across the periods in the target frequency.
+    $100M quarterly revenue becomes ~$1.1M/day (daily), ~$7.7M/week
+    (weekly), or ~$33M/month (monthly).
 
-Top-level entry point:
+Supports three target frequencies:
+    - **Daily** (``"D"``): business-day granularity (default, backward compat)
+    - **Weekly** (``"W"``): week-ending-Friday granularity
+    - **Monthly** (``"M"``): month-end granularity
+
+Top-level entry points:
     ``interpolate_statement_to_daily(stmt_df, daily_index, market_id)``
+    ``interpolate_statement_to_frequency(stmt_df, target_index, target_freq, market_id)``
 """
 
 from __future__ import annotations
@@ -248,6 +255,137 @@ def _distribute_flow(
     return result
 
 
+def _interpolate_stock_to_index(
+    filing_values: pd.Series,
+    target_index: pd.DatetimeIndex,
+) -> pd.Series:
+    """Linear interpolation for stock variables onto any target index.
+
+    Generalised version of ``_interpolate_stock()`` that works with
+    daily, weekly, or monthly target indices.  Between two filings the
+    value transitions linearly; before the first and after the last
+    filing, values are flat-extrapolated.
+
+    Parameters
+    ----------
+    filing_values:
+        Series indexed by filing/report dates with the periodic values.
+    target_index:
+        Target DatetimeIndex at any frequency.
+
+    Returns
+    -------
+    Series with linearly interpolated values at the target frequency.
+    """
+    if filing_values.empty or filing_values.dropna().empty:
+        return pd.Series(np.nan, index=target_index, dtype=float)
+
+    clean = filing_values.dropna().sort_index()
+
+    if len(clean) == 1:
+        return pd.Series(float(clean.iloc[0]), index=target_index, dtype=float)
+
+    # Place filing values on the target index, then interpolate
+    combined = pd.Series(np.nan, index=target_index, dtype=float)
+
+    for dt, val in clean.items():
+        if dt in combined.index:
+            combined.loc[dt] = val
+        else:
+            idx_pos = combined.index.searchsorted(dt)
+            if idx_pos < len(combined.index):
+                combined.iloc[idx_pos] = val
+            elif len(combined.index) > 0:
+                combined.iloc[-1] = val
+
+    combined = combined.interpolate(method="time", limit_direction="both")
+    combined = combined.ffill().bfill()
+    return combined
+
+
+def _distribute_flow_to_index(
+    filing_values: pd.Series,
+    filing_dates: list[pd.Timestamp],
+    target_index: pd.DatetimeIndex,
+    target_freq: str = "D",
+) -> pd.Series:
+    """Distribute flow variable period totals across target-frequency periods.
+
+    Generalised version of ``_distribute_flow()`` that works with daily,
+    weekly, or monthly target indices.
+
+    For daily targets, each quarterly/annual total is spread evenly
+    across the business days in the period.  For weekly targets, the
+    total is spread across weeks.  For monthly targets, across months.
+
+    Parameters
+    ----------
+    filing_values:
+        Series indexed by report dates with the period totals.
+    filing_dates:
+        Sorted list of report dates (period end dates).
+    target_index:
+        Target DatetimeIndex at the desired frequency.
+    target_freq:
+        ``"D"`` (daily), ``"W"`` (weekly), or ``"M"`` (monthly).
+
+    Returns
+    -------
+    Series at target frequency with period totals distributed.
+    """
+    if filing_values.empty or filing_values.dropna().empty:
+        return pd.Series(np.nan, index=target_index, dtype=float)
+
+    clean = filing_values.dropna().sort_index()
+    sorted_dates = sorted(clean.index)
+
+    result = pd.Series(np.nan, index=target_index, dtype=float)
+
+    for i, period_end in enumerate(sorted_dates):
+        # Determine period start
+        if i == 0:
+            if len(sorted_dates) >= 2:
+                gap = (sorted_dates[1] - sorted_dates[0]).days
+            else:
+                gap = 90
+            period_start = period_end - pd.Timedelta(days=gap)
+        else:
+            period_start = sorted_dates[i - 1] + pd.Timedelta(days=1)
+
+        # Count target-frequency periods in this filing period
+        period_mask = (target_index >= period_start) & (target_index <= period_end)
+        n_periods = period_mask.sum()
+
+        if n_periods == 0:
+            continue
+
+        period_total = float(clean.iloc[i])
+        per_period_amount = period_total / n_periods
+        result.loc[period_mask] = per_period_amount
+
+    # Carry forward the last rate after the final filing
+    last_date = sorted_dates[-1]
+    after_mask = target_index > last_date
+    if after_mask.any() and result.notna().any():
+        last_rate = result.dropna().iloc[-1]
+        result.loc[after_mask] = last_rate
+
+    # Fill before the first period
+    first_end = sorted_dates[0]
+    if len(sorted_dates) >= 2:
+        gap = (sorted_dates[1] - sorted_dates[0]).days
+    else:
+        gap = 90
+    estimated_start = first_end - pd.Timedelta(days=gap)
+    before_mask = (target_index <= estimated_start) & result.isna()
+    if before_mask.any() and result.notna().any():
+        first_rate = result.dropna().iloc[0]
+        result.loc[before_mask] = first_rate
+
+    result = result.ffill().bfill()
+    return result
+
+
 def _compute_interpolation_confidence(
     daily_index: pd.DatetimeIndex,
     filing_dates: list[pd.Timestamp],
@@ -309,6 +447,103 @@ def _compute_interpolation_confidence(
 # Public API
 # ---------------------------------------------------------------------------
 
+def interpolate_statement_to_frequency(
+    stmt_indexed: pd.DataFrame,
+    target_index: pd.DatetimeIndex,
+    target_freq: str = "D",
+    market_id: str = "",
+    frequency: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Interpolate periodic financial statement data to any target frequency.
+
+    Generalised interpolation that works at daily, weekly, or monthly
+    granularity.  Respects the nature of each variable:
+
+    - **Stock variables**: linear interpolation between filings
+    - **Flow variables**: distribute period totals across target-frequency
+      periods (business days for D, weeks for W, months for M)
+    - **Unknown variables**: linear interpolation (conservative default)
+
+    Parameters
+    ----------
+    stmt_indexed:
+        Financial statement DataFrame indexed by report_date with
+        one row per filing period and columns for each financial field.
+    target_index:
+        Target DatetimeIndex at the desired frequency.  For daily this
+        is a business-day index; for weekly it is a week-ending-Friday
+        index; for monthly it is a month-end index.
+    target_freq:
+        Target frequency code: ``"D"`` (daily, default), ``"W"``
+        (weekly), or ``"M"`` (monthly).
+    market_id:
+        Market identifier (used for frequency lookup if not detected).
+    frequency:
+        Override filing frequency ("quarterly", "semiannual", "annual").
+        If None, detected from filing dates.
+
+    Returns
+    -------
+    (interpolated_df, confidence_df)
+        interpolated_df: Values at the target frequency with smooth
+        trajectories.
+        confidence_df: Per-column confidence scores for each period.
+    """
+    if stmt_indexed.empty:
+        return (
+            pd.DataFrame(index=target_index),
+            pd.DataFrame(index=target_index),
+        )
+
+    # Detect filing frequency
+    filing_dates = sorted(stmt_indexed.index.tolist())
+    if frequency is None:
+        frequency = detect_frequency_from_dates(filing_dates)
+
+    freq_label = {"D": "daily", "W": "weekly", "M": "monthly"}.get(target_freq, target_freq)
+    logger.info(
+        "Interpolating %d filing periods (%s frequency) to %d %s rows",
+        len(filing_dates), frequency, len(target_index), freq_label,
+    )
+
+    result = pd.DataFrame(index=target_index)
+    confidence = pd.DataFrame(index=target_index)
+
+    for col in stmt_indexed.columns:
+        col_values = stmt_indexed[col].dropna()
+        if col_values.empty:
+            result[col] = np.nan
+            confidence[col] = 0.0
+            continue
+
+        var_type = classify_variable(col)
+
+        if var_type == "flow":
+            result[col] = _distribute_flow_to_index(
+                col_values, filing_dates, target_index, target_freq,
+            )
+        else:
+            # Stock or unknown: linear interpolation
+            result[col] = _interpolate_stock_to_index(
+                col_values, target_index,
+            )
+
+        confidence[col] = _compute_interpolation_confidence(
+            target_index, filing_dates, frequency,
+            variable_type=var_type if var_type != "unknown" else "stock",
+        )
+
+    n_stock = sum(1 for c in stmt_indexed.columns if classify_variable(c) == "stock")
+    n_flow = sum(1 for c in stmt_indexed.columns if classify_variable(c) == "flow")
+    n_other = len(stmt_indexed.columns) - n_stock - n_flow
+    logger.info(
+        "  Interpolated (%s): %d stock (linear), %d flow (distributed), %d other",
+        freq_label, n_stock, n_flow, n_other,
+    )
+
+    return result, confidence
+
+
 def interpolate_statement_to_daily(
     stmt_indexed: pd.DataFrame,
     daily_index: pd.DatetimeIndex,
@@ -317,11 +552,9 @@ def interpolate_statement_to_daily(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Interpolate periodic financial statement data to daily frequency.
 
-    Replaces the naive flat forward-fill with frequency-aware
-    interpolation that respects the nature of each variable:
-    - Stock variables: linear interpolation between filings
-    - Flow variables: distribute period totals across business days
-    - Unknown variables: linear interpolation (conservative default)
+    Convenience wrapper around ``interpolate_statement_to_frequency()``
+    for backward compatibility.  Equivalent to calling
+    ``interpolate_statement_to_frequency(stmt_indexed, daily_index, "D")``.
 
     Parameters
     ----------
@@ -342,54 +575,10 @@ def interpolate_statement_to_daily(
         interpolated_df: Daily values with smooth trajectories.
         confidence_df: Per-column confidence scores for each daily value.
     """
-    if stmt_indexed.empty:
-        return (
-            pd.DataFrame(index=daily_index),
-            pd.DataFrame(index=daily_index),
-        )
-
-    # Detect filing frequency
-    filing_dates = sorted(stmt_indexed.index.tolist())
-    if frequency is None:
-        frequency = detect_frequency_from_dates(filing_dates)
-    logger.info(
-        "Interpolating %d filing periods (%s frequency) to %d daily rows",
-        len(filing_dates), frequency, len(daily_index),
+    return interpolate_statement_to_frequency(
+        stmt_indexed=stmt_indexed,
+        target_index=daily_index,
+        target_freq="D",
+        market_id=market_id,
+        frequency=frequency,
     )
-
-    result = pd.DataFrame(index=daily_index)
-    confidence = pd.DataFrame(index=daily_index)
-
-    for col in stmt_indexed.columns:
-        col_values = stmt_indexed[col].dropna()
-        if col_values.empty:
-            result[col] = np.nan
-            confidence[col] = 0.0
-            continue
-
-        var_type = classify_variable(col)
-
-        if var_type == "flow":
-            result[col] = _distribute_flow(
-                col_values, filing_dates, daily_index,
-            )
-        else:
-            # Stock or unknown: linear interpolation
-            result[col] = _interpolate_stock(
-                col_values, daily_index,
-            )
-
-        confidence[col] = _compute_interpolation_confidence(
-            daily_index, filing_dates, frequency,
-            variable_type=var_type if var_type != "unknown" else "stock",
-        )
-
-    n_stock = sum(1 for c in stmt_indexed.columns if classify_variable(c) == "stock")
-    n_flow = sum(1 for c in stmt_indexed.columns if classify_variable(c) == "flow")
-    n_other = len(stmt_indexed.columns) - n_stock - n_flow
-    logger.info(
-        "  Interpolated: %d stock (linear), %d flow (distributed), %d other",
-        n_stock, n_flow, n_other,
-    )
-
-    return result, confidence

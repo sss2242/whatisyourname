@@ -431,9 +431,12 @@ def run_multi_frequency_pipeline(
     )
 
     for freq in frequencies:
-        # For Q/A frequencies: use raw filing data directly (no interpolation)
-        # For D/W/M frequencies: resample the daily cache (existing behavior)
-        if freq in ("Q", "A") and _has_raw_statements:
+        # Data source selection per frequency:
+        #   Q/A: raw filing data as-is (no interpolation artifacts)
+        #   W/M: raw filing data with native frequency interpolation
+        #        (stock=linear, flow=distribute to W/M periods)
+        #   D:   use the daily cache directly (already interpolated)
+        if freq in ("Q", "A", "W", "M") and _has_raw_statements:
             resampled = build_cache_from_raw_filings(
                 income_df=income_df,
                 balance_df=balance_df,
@@ -442,9 +445,10 @@ def run_multi_frequency_pipeline(
                 frequency=freq,
                 reference_date=reference_date,
             )
+            _method = "raw filings" if freq in ("Q", "A") else "native interpolation"
             logger.info(
-                "[%s] Using raw filing data (no interpolation): %d periods",
-                freq, resampled.n_periods,
+                "[%s] Using %s: %d periods",
+                freq, _method, resampled.n_periods,
             )
         else:
             resampled = resample_cache_to_frequency(

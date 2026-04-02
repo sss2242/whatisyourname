@@ -329,15 +329,17 @@ def build_cache_from_raw_filings(
     frequency: str = "Q",
     reference_date: date | None = None,
 ) -> ResampledCache:
-    """Build a Q/A cache directly from raw filing DataFrames.
+    """Build a cache at any frequency directly from raw filing DataFrames.
 
-    For quarterly and annual frequencies, the daily cache's interpolated
-    values are artifacts of the daily pipeline.  This function constructs
-    the cache from the original filing data, preserving the actual
-    reported values without interpolation artifacts.
+    For quarterly and annual frequencies, filing data is used as-is
+    (one row per filing period with actual reported values).
 
-    OHLCV data is resampled from daily to the target frequency using
-    standard OHLC aggregation (first/max/min/last/sum).
+    For weekly and monthly frequencies, raw filing data is interpolated
+    to the target frequency using the frequency-aware interpolator,
+    producing smooth trajectories without daily-then-resample artifacts.
+
+    OHLCV data is always resampled from daily to the target frequency
+    using standard OHLC aggregation (first/max/min/last/sum).
 
     Parameters
     ----------
@@ -347,13 +349,13 @@ def build_cache_from_raw_filings(
     quotes_df:
         Daily OHLCV DataFrame (will be resampled to target frequency).
     frequency:
-        Target frequency: ``"Q"`` or ``"A"``.
+        Target frequency: ``"Q"``, ``"A"``, ``"W"``, or ``"M"``.
     reference_date:
         The "today" date for truncation.
     """
     config = FREQUENCY_CONFIG.get(frequency)
-    if config is None or frequency not in ("Q", "A"):
-        raise ValueError(f"build_cache_from_raw_filings only supports Q/A, got: {frequency}")
+    if config is None or frequency not in ("Q", "A", "W", "M"):
+        raise ValueError(f"build_cache_from_raw_filings supports Q/A/W/M, got: {frequency}")
 
     resample_rule = config["resample_rule"]
     lookback_years = config["lookback_years"]
@@ -378,7 +380,16 @@ def build_cache_from_raw_filings(
             if not ohlcv_resampled.empty:
                 parts.append(ohlcv_resampled)
 
-    # --- Financial statements: use raw filing data directly ---
+    # --- Financial statements ---
+    # For Q/A frequencies: use raw filing data as-is (each row IS a period)
+    # For W/M frequencies: interpolate raw filings to native frequency index
+    _needs_interpolation = frequency in ("W", "M")
+
+    # Build the target-frequency index for interpolation (W/M only)
+    _target_index = None
+    if _needs_interpolation:
+        _target_index = pd.date_range(start_ts, ref_ts, freq=resample_rule)
+
     for label, stmt_df in [("income", income_df), ("balance", balance_df), ("cashflow", cashflow_df)]:
         if stmt_df is None or stmt_df.empty:
             continue
@@ -413,9 +424,35 @@ def build_cache_from_raw_filings(
         # Set report_date as index (these are the ACTUAL filing period dates)
         stmt_indexed = df.set_index(date_col)[numeric_cols]
 
-        # For the target frequency, just use the raw values as-is
-        # No interpolation, no resampling -- each row IS a Q or A period
-        parts.append(stmt_indexed)
+        if _needs_interpolation and _target_index is not None and len(_target_index) >= 2:
+            # W/M: interpolate raw filings to native frequency index
+            # using the frequency-aware interpolator (stock=linear, flow=distribute)
+            try:
+                from operator1.estimation.frequency_interpolator import (
+                    interpolate_statement_to_frequency,
+                )
+                interpolated, _conf = interpolate_statement_to_frequency(
+                    stmt_indexed,
+                    target_index=_target_index,
+                    target_freq=frequency,
+                )
+                if not interpolated.empty:
+                    parts.append(interpolated)
+                    logger.info(
+                        "[%s] Interpolated %s to %s: %d periods",
+                        frequency, label, config["label"], len(interpolated),
+                    )
+                    continue
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Interpolation of %s failed, falling back to raw: %s",
+                    frequency, label, exc,
+                )
+            # Fallback: use raw filing data (sparse at W/M frequency)
+            parts.append(stmt_indexed)
+        else:
+            # Q/A: use raw values as-is -- each row IS a Q or A period
+            parts.append(stmt_indexed)
 
     if not parts:
         return ResampledCache(
