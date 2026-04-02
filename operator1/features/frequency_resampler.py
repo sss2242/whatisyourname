@@ -588,7 +588,7 @@ def detect_native_filing_frequency(
     balance_df: pd.DataFrame | None = None,
     cashflow_df: pd.DataFrame | None = None,
 ) -> str:
-    """Detect the native filing frequency from raw statement DataFrames.
+    """Detect the dominant filing frequency from raw statement DataFrames.
 
     Examines the median gap between filing dates to classify:
     - ``"Q"`` (quarterly): median gap < 120 days
@@ -598,7 +598,7 @@ def detect_native_filing_frequency(
 
     Returns
     -------
-    Frequency code: ``"Q"``, ``"S"``, ``"A"``, or ``"unknown"``.
+    Dominant frequency code: ``"Q"``, ``"S"``, ``"A"``, or ``"unknown"``.
     """
     all_dates: list[pd.Timestamp] = []
     for df in [income_df, balance_df, cashflow_df]:
@@ -621,6 +621,52 @@ def detect_native_filing_frequency(
         return "S"
     else:
         return "A"
+
+
+def detect_all_filing_frequencies(
+    income_df: pd.DataFrame | None = None,
+    balance_df: pd.DataFrame | None = None,
+    cashflow_df: pd.DataFrame | None = None,
+) -> set[str]:
+    """Detect ALL filing frequencies present in the raw statement data.
+
+    Unlike ``detect_native_filing_frequency()`` which returns only the
+    dominant frequency, this function detects every frequency band that
+    has at least 2 filing gaps.  Useful for markets like JSE where a
+    company may file both semi-annually (full results) and quarterly
+    (business metrics).
+
+    Returns
+    -------
+    Set of frequency codes present: subset of ``{"Q", "S", "A"}``.
+    """
+    all_dates: list[pd.Timestamp] = []
+    for df in [income_df, balance_df, cashflow_df]:
+        if df is not None and not df.empty:
+            for dc in ("report_date", "filing_date"):
+                if dc in df.columns:
+                    all_dates.extend(pd.to_datetime(df[dc]).dropna().tolist())
+                    break
+
+    if len(all_dates) < 2:
+        return set()
+
+    sorted_dates = sorted(set(all_dates))
+    gaps = [(sorted_dates[i + 1] - sorted_dates[i]).days for i in range(len(sorted_dates) - 1)]
+
+    frequencies: set[str] = set()
+    q_count = sum(1 for g in gaps if g < 120)
+    s_count = sum(1 for g in gaps if 120 <= g < 250)
+    a_count = sum(1 for g in gaps if g >= 250)
+
+    if q_count >= 2:
+        frequencies.add("Q")
+    if s_count >= 2:
+        frequencies.add("S")
+    if a_count >= 1:
+        frequencies.add("A")
+
+    return frequencies
 
 
 def get_frequencies_slow_to_fast() -> list[str]:

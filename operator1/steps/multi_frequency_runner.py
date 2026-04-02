@@ -30,6 +30,7 @@ import pandas as pd
 from operator1.features.frequency_resampler import (
     ResampledCache,
     build_cache_from_raw_filings,
+    detect_all_filing_frequencies,
     detect_native_filing_frequency,
     get_frequencies_slow_to_fast,
     get_frequency_config,
@@ -435,16 +436,29 @@ def run_multi_frequency_pipeline(
 
     _is_annual_only = is_annual_only_market(market_id)
 
-    # Auto-switch Q -> S when the wrapper provides semi-annual filings.
-    # Detect the native filing frequency from the raw statement data and
-    # replace Q with S in the frequency list if filings are semi-annual.
+    # Detect ALL filing frequencies present in the raw data.
+    # If both Q and S exist (e.g. JSE Sasol: quarterly metrics + semi-annual results),
+    # run BOTH Q and S pipelines. If only S exists, replace Q with S.
     if _has_raw_statements and "Q" in frequencies:
+        _all_freqs = detect_all_filing_frequencies(income_df, balance_df, cashflow_df)
         _native_freq = detect_native_filing_frequency(income_df, balance_df, cashflow_df)
-        if _native_freq == "S":
-            # Replace Q with S in the frequency list (preserve order)
+
+        if "Q" in _all_freqs and "S" in _all_freqs:
+            # Both quarterly and semi-annual filings exist.
+            # Keep Q in the list AND add S (run both pipelines).
+            if "S" not in frequencies:
+                # Insert S after Q in the frequency list (between Q and M)
+                q_idx = frequencies.index("Q")
+                frequencies.insert(q_idx + 1, "S")
+            logger.info(
+                "Both Q and S filings detected -- running both pipelines"
+            )
+        elif _native_freq == "S" and "Q" not in _all_freqs:
+            # Only semi-annual filings exist, no quarterly.
+            # Replace Q with S in the frequency list.
             frequencies = [("S" if f == "Q" else f) for f in frequencies]
             logger.info(
-                "Auto-switch: Q -> S (semi-annual filings detected, median gap 120-250d)"
+                "Auto-switch: Q -> S (semi-annual filings only, median gap 120-250d)"
             )
         elif _native_freq == "A" and not _is_annual_only:
             # Data is annual but market is not in the annual-only registry.
