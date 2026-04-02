@@ -30,6 +30,7 @@ import pandas as pd
 from operator1.features.frequency_resampler import (
     ResampledCache,
     build_cache_from_raw_filings,
+    detect_native_filing_frequency,
     get_frequencies_slow_to_fast,
     get_frequency_config,
     is_annual_only_market,
@@ -434,6 +435,27 @@ def run_multi_frequency_pipeline(
 
     _is_annual_only = is_annual_only_market(market_id)
 
+    # Auto-switch Q -> S when the wrapper provides semi-annual filings.
+    # Detect the native filing frequency from the raw statement data and
+    # replace Q with S in the frequency list if filings are semi-annual.
+    if _has_raw_statements and "Q" in frequencies:
+        _native_freq = detect_native_filing_frequency(income_df, balance_df, cashflow_df)
+        if _native_freq == "S":
+            # Replace Q with S in the frequency list (preserve order)
+            frequencies = [("S" if f == "Q" else f) for f in frequencies]
+            logger.info(
+                "Auto-switch: Q -> S (semi-annual filings detected, median gap 120-250d)"
+            )
+        elif _native_freq == "A" and not _is_annual_only:
+            # Data is annual but market is not in the annual-only registry.
+            # This can happen when a company only files annually even though
+            # other companies in the same market file quarterly.
+            logger.info(
+                "Filing data is annual for this company (but market %s is not annual-only). "
+                "Q frequency will interpolate annual -> quarterly.",
+                market_id,
+            )
+
     # For ch_six at Q frequency: use Kalman-smoothed quarterly synthetic
     # financials instead of generic annual-to-quarterly interpolation.
     # The SIX proxy module produces higher-quality quarterly estimates
@@ -492,7 +514,7 @@ def run_multi_frequency_pipeline(
                 "[Q] Using SIX Kalman-smoothed quarterly: %d periods",
                 resampled.n_periods,
             )
-        elif freq in ("Q", "A", "W", "M") and _has_raw_statements:
+        elif freq in ("Q", "A", "W", "M", "S") and _has_raw_statements:
             # For annual-only markets at Q frequency: interpolate annual -> quarterly
             # instead of using raw Q data (which doesn't exist).
             # build_cache_from_raw_filings with freq="Q" + annual data will
@@ -512,7 +534,7 @@ def run_multi_frequency_pipeline(
             )
             if freq == "Q" and _is_annual_only:
                 _method = "annual-to-quarterly interpolation"
-            elif freq in ("Q", "A"):
+            elif freq in ("Q", "A", "S"):
                 _method = "raw filings"
             else:
                 _method = "native interpolation"

@@ -55,6 +55,12 @@ FREQUENCY_CONFIG: dict[str, dict[str, Any]] = {
         "lookback_years": 6,
         "resample_rule": "QE",
     },
+    "S": {
+        "label": "Semi-Annual",
+        "pd_freq": "2QE",     # every 2 quarter ends (6-month period)
+        "lookback_years": 7,
+        "resample_rule": "2QE",
+    },
     "A": {
         "label": "Annual",
         "pd_freq": "YE",      # year end
@@ -384,8 +390,8 @@ def build_cache_from_raw_filings(
         The "today" date for truncation.
     """
     config = FREQUENCY_CONFIG.get(frequency)
-    if config is None or frequency not in ("Q", "A", "W", "M"):
-        raise ValueError(f"build_cache_from_raw_filings supports Q/A/W/M, got: {frequency}")
+    if config is None or frequency not in ("Q", "A", "W", "M", "S"):
+        raise ValueError(f"build_cache_from_raw_filings supports Q/A/W/M/S, got: {frequency}")
 
     resample_rule = config["resample_rule"]
     lookback_years = config["lookback_years"]
@@ -572,6 +578,46 @@ def build_cache_from_raw_filings(
         original_daily_rows=n_daily,
         resampled_rows=len(combined),
     )
+
+
+def detect_native_filing_frequency(
+    income_df: pd.DataFrame | None = None,
+    balance_df: pd.DataFrame | None = None,
+    cashflow_df: pd.DataFrame | None = None,
+) -> str:
+    """Detect the native filing frequency from raw statement DataFrames.
+
+    Examines the median gap between filing dates to classify:
+    - ``"Q"`` (quarterly): median gap < 120 days
+    - ``"S"`` (semi-annual): median gap 120-250 days
+    - ``"A"`` (annual): median gap > 250 days
+    - ``"unknown"``: insufficient data
+
+    Returns
+    -------
+    Frequency code: ``"Q"``, ``"S"``, ``"A"``, or ``"unknown"``.
+    """
+    all_dates: list[pd.Timestamp] = []
+    for df in [income_df, balance_df, cashflow_df]:
+        if df is not None and not df.empty:
+            for dc in ("report_date", "filing_date"):
+                if dc in df.columns:
+                    all_dates.extend(pd.to_datetime(df[dc]).dropna().tolist())
+                    break
+
+    if len(all_dates) < 2:
+        return "unknown"
+
+    sorted_dates = sorted(set(all_dates))
+    gaps = [(sorted_dates[i + 1] - sorted_dates[i]).days for i in range(len(sorted_dates) - 1)]
+    median_gap = float(np.median(gaps))
+
+    if median_gap < 120:
+        return "Q"
+    elif median_gap < 250:
+        return "S"
+    else:
+        return "A"
 
 
 def get_frequencies_slow_to_fast() -> list[str]:
