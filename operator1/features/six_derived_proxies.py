@@ -3630,8 +3630,357 @@ _DEFAULT_RATIOS: dict[str, float] = {
 }
 
 
+def _generate_quarterly_from_dividends(
+    dividends: pd.Series,
+    div_freq: str,
+    lintner_eps: pd.Series,
+    shares: float,
+    sector: str,
+    ratios: dict[str, float],
+    closing_date: str,
+    profile: dict[str, Any],
+    avg_price: float | None,
+    buyback_yield: float,
+    share_capital: float,
+    payout_ratio: float,
+) -> dict[str, pd.DataFrame]:
+    """Generate quarterly synthetic financials using Kalman-smoothed earnings.
+
+    For annual dividend payers (the majority of SIX companies), the
+    Kalman filter's local-level state-space model produces a smoothed
+    earnings trajectory. This trajectory is sampled at quarterly
+    intervals to generate quarterly data points that respect the
+    annual observations.
+
+    For semi-annual or quarterly payers, the actual dividend events
+    are used directly at their native frequency.
+
+    Parameters
+    ----------
+    dividends:
+        Full dividend series (newest-first), 18+ years.
+    div_freq:
+        Detected dividend frequency ("annual", "semiannual", "quarterly").
+    lintner_eps:
+        Lintner-estimated earnings per share (annual, newest-first).
+    shares:
+        Shares outstanding.
+    sector:
+        Company sector string.
+    ratios:
+        Sector-calibrated financial ratios.
+    closing_date:
+        Annual closing date from SIX (YYYYMMDD format).
+    profile:
+        Full SIX profile dict.
+    avg_price:
+        Average share price for buyback computation.
+    buyback_yield:
+        Annual buyback yield.
+    share_capital:
+        Reported share capital from SIX.
+    payout_ratio:
+        Estimated payout ratio.
+
+    Returns
+    -------
+    Dict with 'income', 'balance', 'cashflow' DataFrames at quarterly frequency.
+    """
+    result: dict[str, pd.DataFrame] = {
+        "income": pd.DataFrame(),
+        "balance": pd.DataFrame(),
+        "cashflow": pd.DataFrame(),
+    }
+
+    income_records: list[dict] = []
+    balance_records: list[dict] = []
+    cashflow_records: list[dict] = []
+
+    if div_freq in ("quarterly", "semiannual"):
+        # --- NATIVE SUB-ANNUAL DIVIDENDS ---
+        # Use actual dividend events directly. Each event maps to one
+        # quarter (or half-year -> two quarters).
+        recent = dividends.head(20)  # ~5yr quarterly or ~10yr semi-annual
+
+        cumulative_retained = share_capital * 2
+        for i, (ex_date, div_per_share) in enumerate(recent.items()):
+            div_per_share = float(div_per_share)
+
+            # Map to quarter-end report date
+            q_month = ((ex_date.month - 1) // 3) * 3 + 3
+            q_year = ex_date.year if ex_date.month <= 3 else ex_date.year
+            # Ex-date is typically after quarter-end, so map to prior quarter
+            report_date = pd.Timestamp(f"{q_year}-{q_month:02d}-{[31,30,30,31][q_month//3 - 1]:02d}")
+            if report_date >= ex_date:
+                report_date = report_date - pd.DateOffset(months=3)
+            filing_date = ex_date
+
+            # Scale Lintner EPS to quarterly
+            # Find nearest annual Lintner estimate
+            if i < len(lintner_eps):
+                annual_eps = float(lintner_eps.iloc[min(i, len(lintner_eps) - 1)])
+            else:
+                annual_eps = float(lintner_eps.iloc[-1])
+
+            # Quarterly fraction: for semi-annual payers, each payment covers 2 quarters
+            if div_freq == "semiannual":
+                quarterly_eps = annual_eps / 2.0
+                quarterly_div = div_per_share  # each payment IS for a half-year
+            else:
+                quarterly_eps = annual_eps / 4.0
+                quarterly_div = div_per_share
+
+            net_income = quarterly_eps * shares
+            total_dividends = quarterly_div * shares
+
+            decomp = _dupont_decompose(net_income, 0, sector, ratios)
+            # Scale decomposed values to quarterly (DuPont assumes annual)
+            scale = 0.25 if div_freq == "quarterly" else 0.50
+            for key in decomp:
+                if key not in ("total_assets", "total_liabilities", "total_equity",
+                               "current_assets", "current_liabilities",
+                               "cash_and_equivalents", "long_term_debt",
+                               "short_term_debt", "receivables", "inventory",
+                               "payables", "goodwill", "intangible_assets"):
+                    # Flow variables: scale to period
+                    decomp[key] = decomp[key] * scale
+
+            _append_records(
+                income_records, balance_records, cashflow_records,
+                decomp=decomp, net_income=net_income,
+                report_date=report_date, filing_date=filing_date,
+                shares=shares, profile=profile,
+                total_dividends=total_dividends,
+                buyback_yield=buyback_yield, avg_price=avg_price or 0,
+                cumulative_retained=cumulative_retained,
+                share_capital=share_capital, payout_ratio=payout_ratio,
+                source=f"six_{div_freq}",
+            )
+            retained_this_year = net_income * max(0, 1 - payout_ratio)
+            cumulative_retained += retained_this_year
+
+    else:
+        # --- ANNUAL DIVIDENDS -> QUARTERLY VIA KALMAN ---
+        # Use the Kalman filter's smoothed state to produce quarterly
+        # earnings estimates. The Kalman state evolves as a random walk
+        # with annual observations, and we sample it at quarterly intervals.
+        kalman_eps, kalman_stds = _kalman_earnings_estimate(
+            dividends, payout_prior=payout_ratio,
+        )
+
+        if kalman_eps.empty or kalman_eps.isna().all():
+            # Fallback: simple linear interpolation of Lintner annual -> quarterly
+            kalman_eps = lintner_eps
+
+        # Generate quarterly dates covering the same period as dividends
+        sorted_divs = dividends.sort_index()
+        if len(sorted_divs) < 2:
+            return result
+
+        first_date = sorted_divs.index[0]
+        last_date = sorted_divs.index[-1]
+        quarterly_dates = pd.date_range(
+            start=first_date - pd.DateOffset(months=3),
+            end=last_date + pd.DateOffset(months=3),
+            freq="QE",
+        )
+
+        # Interpolate Kalman EPS to quarterly dates
+        kalman_sorted = kalman_eps.sort_index()
+        # Reindex to quarterly dates with linear interpolation
+        combined_idx = kalman_sorted.index.union(quarterly_dates).sort_values()
+        kalman_interp = kalman_sorted.reindex(combined_idx).interpolate(method="time")
+        kalman_quarterly = kalman_interp.reindex(quarterly_dates, method="nearest")
+
+        # Keep only recent 6 years (24 quarters)
+        kalman_quarterly = kalman_quarterly.tail(24)
+
+        cumulative_retained = share_capital * 2
+        for q_date in kalman_quarterly.index:
+            q_eps = float(kalman_quarterly.loc[q_date])
+            if pd.isna(q_eps) or q_eps <= 0:
+                continue
+
+            # Quarterly earnings = annual EPS / 4 (Kalman gives annual-rate EPS)
+            quarterly_eps = q_eps / 4.0
+            net_income = quarterly_eps * shares
+
+            report_date = q_date
+            # Filing date: ~2 months after quarter end
+            filing_date = q_date + pd.DateOffset(months=2)
+
+            # Quarterly dividend: annual dividend / 4
+            latest_annual_div = float(dividends.iloc[0]) if len(dividends) > 0 else 0
+            quarterly_div = latest_annual_div / 4.0
+            total_dividends = quarterly_div * shares
+
+            decomp = _dupont_decompose(net_income, 0, sector, ratios)
+            # Scale flow variables to quarterly
+            for key in decomp:
+                if key not in ("total_assets", "total_liabilities", "total_equity",
+                               "current_assets", "current_liabilities",
+                               "cash_and_equivalents", "long_term_debt",
+                               "short_term_debt", "receivables", "inventory",
+                               "payables", "goodwill", "intangible_assets"):
+                    decomp[key] = decomp[key] * 0.25
+
+            _append_records(
+                income_records, balance_records, cashflow_records,
+                decomp=decomp, net_income=net_income,
+                report_date=report_date, filing_date=filing_date,
+                shares=shares, profile=profile,
+                total_dividends=total_dividends,
+                buyback_yield=buyback_yield, avg_price=avg_price or 0,
+                cumulative_retained=cumulative_retained,
+                share_capital=share_capital, payout_ratio=payout_ratio,
+                source="six_kalman_quarterly",
+            )
+            retained_this_year = net_income * max(0, 1 - payout_ratio)
+            cumulative_retained += retained_this_year
+
+    # Build DataFrames
+    for key, records in [("income", income_records), ("balance", balance_records), ("cashflow", cashflow_records)]:
+        if records:
+            df = pd.DataFrame(records)
+            df["report_date"] = pd.to_datetime(df["report_date"])
+            df["filing_date"] = pd.to_datetime(df["filing_date"])
+            df = df.sort_values("report_date")
+            result[key] = df
+
+    return result
+
+
+def _append_records(
+    income_records: list[dict],
+    balance_records: list[dict],
+    cashflow_records: list[dict],
+    *,
+    decomp: dict[str, float],
+    net_income: float,
+    report_date: pd.Timestamp,
+    filing_date: pd.Timestamp,
+    shares: float,
+    profile: dict[str, Any],
+    total_dividends: float,
+    buyback_yield: float,
+    avg_price: float,
+    cumulative_retained: float,
+    share_capital: float,
+    payout_ratio: float,
+    source: str,
+) -> None:
+    """Append income, balance, cashflow records for one period."""
+    # EPS
+    eps_basic = net_income / shares if shares > 0 else 0
+    conditional_shares = 0
+    nominal = profile.get("nominal_value", 0.10)
+    cond_cap = profile.get("conditional_capital", 0) or 0
+    try:
+        conditional_shares = float(cond_cap) / max(float(nominal), 0.01)
+    except (TypeError, ValueError):
+        pass
+    eps_diluted = net_income / (shares + conditional_shares) if conditional_shares > 0 else eps_basic * 0.99
+
+    # Income statement
+    income_fields = [
+        "revenue", "cost_of_revenue", "gross_profit", "operating_income",
+        "net_income", "ebit", "taxes", "interest_expense",
+        "sga_expenses", "rd_expenses",
+    ]
+    for name in income_fields:
+        income_records.append({
+            "canonical_name": name, "value": decomp.get(name, 0),
+            "report_date": report_date, "filing_date": filing_date,
+            "source": source,
+        })
+    for name, value in [("eps_basic", eps_basic), ("eps_diluted", eps_diluted)]:
+        income_records.append({
+            "canonical_name": name, "value": value,
+            "report_date": report_date, "filing_date": filing_date,
+            "source": source,
+        })
+
+    # Balance sheet
+    payout = total_dividends / max(net_income, 1) if net_income > 0 else 0.7
+    retained_this_period = net_income * max(0, 1 - payout)
+    total_equity = max(share_capital + cumulative_retained + retained_this_period, decomp.get("total_equity", 0))
+
+    balance_fields = [
+        "total_assets", "total_liabilities", "current_assets",
+        "current_liabilities", "cash_and_equivalents", "long_term_debt",
+        "short_term_debt", "goodwill", "intangible_assets",
+        "receivables", "inventory", "payables",
+    ]
+    for name in balance_fields:
+        balance_records.append({
+            "canonical_name": name, "value": decomp.get(name, 0),
+            "report_date": report_date, "filing_date": filing_date,
+            "source": source,
+        })
+    balance_records.append({
+        "canonical_name": "total_equity", "value": total_equity,
+        "report_date": report_date, "filing_date": filing_date,
+        "source": source,
+    })
+    balance_records.append({
+        "canonical_name": "retained_earnings", "value": cumulative_retained + retained_this_period,
+        "report_date": report_date, "filing_date": filing_date,
+        "source": source,
+    })
+
+    # Cash flow
+    total_buyback_value = buyback_yield * shares * avg_price if avg_price > 0 else 0
+    financing_cf = -(total_dividends + total_buyback_value)
+    for name in ["operating_cash_flow", "investing_cf", "capex", "free_cash_flow"]:
+        cashflow_records.append({
+            "canonical_name": name, "value": decomp.get(name, 0),
+            "report_date": report_date, "filing_date": filing_date,
+            "source": source,
+        })
+    cashflow_records.append({
+        "canonical_name": "dividends_paid", "value": -total_dividends,
+        "report_date": report_date, "filing_date": filing_date,
+        "source": source,
+    })
+    cashflow_records.append({
+        "canonical_name": "financing_cf", "value": financing_cf,
+        "report_date": report_date, "filing_date": filing_date,
+        "source": source,
+    })
+
+
+def detect_dividend_frequency(dividends: pd.Series) -> str:
+    """Detect whether dividend payments are annual, semi-annual, or quarterly.
+
+    Parameters
+    ----------
+    dividends:
+        Series indexed by ex-dividend date, values are dividend amounts.
+        Sorted newest-first.
+
+    Returns
+    -------
+    One of: ``"annual"``, ``"semiannual"``, ``"quarterly"``, ``"unknown"``.
+    """
+    if len(dividends) < 3:
+        return "unknown"
+
+    dates = sorted(dividends.index)
+    gaps = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
+    median_gap = float(np.median(gaps))
+
+    if median_gap < 120:
+        return "quarterly"
+    elif median_gap < 250:
+        return "semiannual"
+    elif median_gap < 500:
+        return "annual"
+    return "unknown"
+
+
 def generate_synthetic_financials(
     profile: dict[str, Any],
+    target_frequency: str = "A",
 ) -> dict[str, pd.DataFrame]:
     """Generate synthetic financial statements from SIX dividend + capital data.
 
@@ -3640,10 +3989,22 @@ def generate_synthetic_financials(
     capital structure, and buyback notices to derive 22 financial fields
     via mathematical relationships.
 
-    For the 8 fields that cannot be derived from SIX data (receivables,
-    inventory, payables, goodwill, intangibles, sga, rd, short_term_debt),
-    yfinance is used as a supplement. These fields are tagged with
-    source='yfinance_supplement'.
+    Parameters
+    ----------
+    profile:
+        SIX company profile dict (from ``CHSixClient.get_profile()``).
+    target_frequency:
+        Target frequency for the synthetic statements:
+
+        - ``"A"`` (default): Annual statements -- one row per fiscal year,
+          derived from Lintner model + DuPont decomposition.  This is the
+          original behavior.
+        - ``"Q"``: Quarterly statements -- uses Kalman filter smoothed
+          state to produce quarterly earnings estimates between annual
+          dividend events.  For annual dividend payers, the Kalman state
+          evolves quarterly (random walk) with annual observations.
+          For semi-annual or quarterly payers, uses actual dividend events
+          directly at their native frequency.
 
     Returns
     -------
@@ -3707,11 +4068,43 @@ def generate_synthetic_financials(
 
     logger.debug("Lintner EPS (floored): %s", lintner_eps.head().to_dict())
 
-    # Build annual records from dividend history (most recent years)
+    # Build records from dividend history
     income_records: list[dict] = []
     balance_records: list[dict] = []
     cashflow_records: list[dict] = []
 
+    # --- Q-OPTIMIZED PATH ---
+    # When target_frequency is "Q", generate quarterly data points
+    # instead of annual, using Kalman-smoothed earnings trajectory.
+    div_freq = detect_dividend_frequency(dividends)
+
+    if target_frequency == "Q":
+        _q_result = _generate_quarterly_from_dividends(
+            dividends=dividends,
+            div_freq=div_freq,
+            lintner_eps=lintner_eps,
+            shares=shares,
+            sector=sector,
+            ratios=ratios,
+            closing_date=closing_date,
+            profile=profile,
+            avg_price=avg_price,
+            buyback_yield=buyback_yield,
+            share_capital=share_capital,
+            payout_ratio=payout,
+        )
+        if _q_result and any(not df.empty for df in _q_result.values()):
+            n_qi = len(_q_result.get("income", pd.DataFrame()))
+            n_qb = len(_q_result.get("balance", pd.DataFrame()))
+            n_qc = len(_q_result.get("cashflow", pd.DataFrame()))
+            logger.info(
+                "SIX quarterly synthetic: income=%d, balance=%d, cashflow=%d "
+                "(div_freq=%s, sector=%s)",
+                n_qi, n_qb, n_qc, div_freq, sector or "default",
+            )
+            return _q_result
+
+    # --- ANNUAL PATH (original behavior) ---
     # Use up to 5 most recent dividends (covering 5 years)
     recent_divs = dividends.head(5)
 

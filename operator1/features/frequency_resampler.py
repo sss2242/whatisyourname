@@ -55,6 +55,12 @@ FREQUENCY_CONFIG: dict[str, dict[str, Any]] = {
         "lookback_years": 6,
         "resample_rule": "QE",
     },
+    "S": {
+        "label": "Semi-Annual",
+        "pd_freq": "2QE",     # every 2 quarter ends (6-month period)
+        "lookback_years": 7,
+        "resample_rule": "2QE",
+    },
     "A": {
         "label": "Annual",
         "pd_freq": "YE",      # year end
@@ -62,6 +68,39 @@ FREQUENCY_CONFIG: dict[str, dict[str, Any]] = {
         "resample_rule": "YE",
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Annual-only market registry
+# ---------------------------------------------------------------------------
+# Markets where the PIT wrapper only provides annual financial statements.
+# For these markets, the Q frequency run is fed by interpolating annual
+# filings to quarterly granularity (stock=linear, flow=distribute to quarters)
+# instead of being skipped entirely.
+
+ANNUAL_ONLY_MARKETS: frozenset[str] = frozenset({
+    # EU ESEF markets (ESEF regulation mandates annual XBRL only)
+    "eu_esef", "fr_esef", "de_esef", "nl_esef", "es_esef", "it_esef", "se_esef",
+    # UK Companies House (most companies file annual accounts only)
+    "uk_companies_house",
+    # Switzerland (synthetic financials from SIX data, annual)
+    "ch_six",
+    # Chile (US ADR 20-F annual filings)
+    "cl_cmf",
+    # Tier 2 markets with annual-only filing discovery
+    "au_asx",
+    "sg_sgx",
+    # Note: za_jse NOT included -- JSE SENS provides semi-annual (interim)
+    # and quarterly financial filings (e.g. "Six Months Ended", "Three Months
+    # Ended"). detect_native_filing_frequency() handles the Q->S auto-switch.
+    # Note: ae_dfm NOT included -- DFM eFsah provides quarterly financial
+    # statements (e.g. "Financial statements for the 3rd QTR of 2025").
+})
+
+
+def is_annual_only_market(market_id: str) -> bool:
+    """Check if a market only provides annual financial statements."""
+    return market_id in ANNUAL_ONLY_MARKETS
 
 
 # OHLCV columns that need special aggregation rules
@@ -329,15 +368,17 @@ def build_cache_from_raw_filings(
     frequency: str = "Q",
     reference_date: date | None = None,
 ) -> ResampledCache:
-    """Build a Q/A cache directly from raw filing DataFrames.
+    """Build a cache at any frequency directly from raw filing DataFrames.
 
-    For quarterly and annual frequencies, the daily cache's interpolated
-    values are artifacts of the daily pipeline.  This function constructs
-    the cache from the original filing data, preserving the actual
-    reported values without interpolation artifacts.
+    For quarterly and annual frequencies, filing data is used as-is
+    (one row per filing period with actual reported values).
 
-    OHLCV data is resampled from daily to the target frequency using
-    standard OHLC aggregation (first/max/min/last/sum).
+    For weekly and monthly frequencies, raw filing data is interpolated
+    to the target frequency using the frequency-aware interpolator,
+    producing smooth trajectories without daily-then-resample artifacts.
+
+    OHLCV data is always resampled from daily to the target frequency
+    using standard OHLC aggregation (first/max/min/last/sum).
 
     Parameters
     ----------
@@ -347,13 +388,13 @@ def build_cache_from_raw_filings(
     quotes_df:
         Daily OHLCV DataFrame (will be resampled to target frequency).
     frequency:
-        Target frequency: ``"Q"`` or ``"A"``.
+        Target frequency: ``"Q"``, ``"A"``, ``"W"``, or ``"M"``.
     reference_date:
         The "today" date for truncation.
     """
     config = FREQUENCY_CONFIG.get(frequency)
-    if config is None or frequency not in ("Q", "A"):
-        raise ValueError(f"build_cache_from_raw_filings only supports Q/A, got: {frequency}")
+    if config is None or frequency not in ("Q", "A", "W", "M", "S"):
+        raise ValueError(f"build_cache_from_raw_filings supports Q/A/W/M/S, got: {frequency}")
 
     resample_rule = config["resample_rule"]
     lookback_years = config["lookback_years"]
@@ -378,7 +419,49 @@ def build_cache_from_raw_filings(
             if not ohlcv_resampled.empty:
                 parts.append(ohlcv_resampled)
 
-    # --- Financial statements: use raw filing data directly ---
+    # --- Financial statements ---
+    # For A: use raw filing data as-is (each row IS an annual period)
+    # For Q: use raw filing data as-is IF quarterly filings exist,
+    #        OR interpolate annual filings to quarterly if the data is
+    #        annual-only (detected by median filing gap > 250 days).
+    # For W/M: always interpolate raw filings to native frequency index.
+    _needs_interpolation = frequency in ("W", "M")
+
+    # For Q frequency: detect if raw data is actually annual-spaced.
+    # If so, interpolate annual -> quarterly rather than leaving sparse gaps.
+    if frequency == "Q":
+        _all_filing_dates: list[pd.Timestamp] = []
+        for _sdf in [income_df, balance_df, cashflow_df]:
+            if _sdf is not None and not _sdf.empty:
+                for _dc in ("report_date", "filing_date"):
+                    if _dc in _sdf.columns:
+                        _all_filing_dates.extend(pd.to_datetime(_sdf[_dc]).dropna().tolist())
+                        break
+        if len(_all_filing_dates) >= 2:
+            _sorted = sorted(set(_all_filing_dates))
+            _gaps = [(_sorted[i + 1] - _sorted[i]).days for i in range(len(_sorted) - 1)]
+            _median_gap = float(np.median(_gaps)) if _gaps else 0
+            if _median_gap > 250:
+                _needs_interpolation = True
+                logger.info(
+                    "[Q] Raw filings have annual spacing (median gap=%.0fd) -- "
+                    "interpolating annual to quarterly",
+                    _median_gap,
+                )
+            else:
+                # Data is already at quarterly (or higher) frequency.
+                # No interpolation needed -- use raw values as-is.
+                logger.info(
+                    "[Q] Raw filings already at sub-annual spacing (median gap=%.0fd) -- "
+                    "using as-is, no annual-to-Q interpolation",
+                    _median_gap,
+                )
+
+    # Build the target-frequency index for interpolation (W/M/Q-from-annual)
+    _target_index = None
+    if _needs_interpolation:
+        _target_index = pd.date_range(start_ts, ref_ts, freq=resample_rule)
+
     for label, stmt_df in [("income", income_df), ("balance", balance_df), ("cashflow", cashflow_df)]:
         if stmt_df is None or stmt_df.empty:
             continue
@@ -413,9 +496,35 @@ def build_cache_from_raw_filings(
         # Set report_date as index (these are the ACTUAL filing period dates)
         stmt_indexed = df.set_index(date_col)[numeric_cols]
 
-        # For the target frequency, just use the raw values as-is
-        # No interpolation, no resampling -- each row IS a Q or A period
-        parts.append(stmt_indexed)
+        if _needs_interpolation and _target_index is not None and len(_target_index) >= 2:
+            # W/M: interpolate raw filings to native frequency index
+            # using the frequency-aware interpolator (stock=linear, flow=distribute)
+            try:
+                from operator1.estimation.frequency_interpolator import (
+                    interpolate_statement_to_frequency,
+                )
+                interpolated, _conf = interpolate_statement_to_frequency(
+                    stmt_indexed,
+                    target_index=_target_index,
+                    target_freq=frequency,
+                )
+                if not interpolated.empty:
+                    parts.append(interpolated)
+                    logger.info(
+                        "[%s] Interpolated %s to %s: %d periods",
+                        frequency, label, config["label"], len(interpolated),
+                    )
+                    continue
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Interpolation of %s failed, falling back to raw: %s",
+                    frequency, label, exc,
+                )
+            # Fallback: use raw filing data (sparse at W/M frequency)
+            parts.append(stmt_indexed)
+        else:
+            # Q/A: use raw values as-is -- each row IS a Q or A period
+            parts.append(stmt_indexed)
 
     if not parts:
         return ResampledCache(
@@ -472,6 +581,92 @@ def build_cache_from_raw_filings(
         original_daily_rows=n_daily,
         resampled_rows=len(combined),
     )
+
+
+def detect_native_filing_frequency(
+    income_df: pd.DataFrame | None = None,
+    balance_df: pd.DataFrame | None = None,
+    cashflow_df: pd.DataFrame | None = None,
+) -> str:
+    """Detect the dominant filing frequency from raw statement DataFrames.
+
+    Examines the median gap between filing dates to classify:
+    - ``"Q"`` (quarterly): median gap < 120 days
+    - ``"S"`` (semi-annual): median gap 120-250 days
+    - ``"A"`` (annual): median gap > 250 days
+    - ``"unknown"``: insufficient data
+
+    Returns
+    -------
+    Dominant frequency code: ``"Q"``, ``"S"``, ``"A"``, or ``"unknown"``.
+    """
+    all_dates: list[pd.Timestamp] = []
+    for df in [income_df, balance_df, cashflow_df]:
+        if df is not None and not df.empty:
+            for dc in ("report_date", "filing_date"):
+                if dc in df.columns:
+                    all_dates.extend(pd.to_datetime(df[dc]).dropna().tolist())
+                    break
+
+    if len(all_dates) < 2:
+        return "unknown"
+
+    sorted_dates = sorted(set(all_dates))
+    gaps = [(sorted_dates[i + 1] - sorted_dates[i]).days for i in range(len(sorted_dates) - 1)]
+    median_gap = float(np.median(gaps))
+
+    if median_gap < 120:
+        return "Q"
+    elif median_gap < 250:
+        return "S"
+    else:
+        return "A"
+
+
+def detect_all_filing_frequencies(
+    income_df: pd.DataFrame | None = None,
+    balance_df: pd.DataFrame | None = None,
+    cashflow_df: pd.DataFrame | None = None,
+) -> set[str]:
+    """Detect ALL filing frequencies present in the raw statement data.
+
+    Unlike ``detect_native_filing_frequency()`` which returns only the
+    dominant frequency, this function detects every frequency band that
+    has at least 2 filing gaps.  Useful for markets like JSE where a
+    company may file both semi-annually (full results) and quarterly
+    (business metrics).
+
+    Returns
+    -------
+    Set of frequency codes present: subset of ``{"Q", "S", "A"}``.
+    """
+    all_dates: list[pd.Timestamp] = []
+    for df in [income_df, balance_df, cashflow_df]:
+        if df is not None and not df.empty:
+            for dc in ("report_date", "filing_date"):
+                if dc in df.columns:
+                    all_dates.extend(pd.to_datetime(df[dc]).dropna().tolist())
+                    break
+
+    if len(all_dates) < 2:
+        return set()
+
+    sorted_dates = sorted(set(all_dates))
+    gaps = [(sorted_dates[i + 1] - sorted_dates[i]).days for i in range(len(sorted_dates) - 1)]
+
+    frequencies: set[str] = set()
+    q_count = sum(1 for g in gaps if g < 120)
+    s_count = sum(1 for g in gaps if 120 <= g < 250)
+    a_count = sum(1 for g in gaps if g >= 250)
+
+    if q_count >= 2:
+        frequencies.add("Q")
+    if s_count >= 2:
+        frequencies.add("S")
+    if a_count >= 1:
+        frequencies.add("A")
+
+    return frequencies
 
 
 def get_frequencies_slow_to_fast() -> list[str]:
