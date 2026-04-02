@@ -64,6 +64,36 @@ FREQUENCY_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Annual-only market registry
+# ---------------------------------------------------------------------------
+# Markets where the PIT wrapper only provides annual financial statements.
+# For these markets, the Q frequency run is fed by interpolating annual
+# filings to quarterly granularity (stock=linear, flow=distribute to quarters)
+# instead of being skipped entirely.
+
+ANNUAL_ONLY_MARKETS: frozenset[str] = frozenset({
+    # EU ESEF markets (ESEF regulation mandates annual XBRL only)
+    "eu_esef", "fr_esef", "de_esef", "nl_esef", "es_esef", "it_esef", "se_esef",
+    # UK Companies House (most companies file annual accounts only)
+    "uk_companies_house",
+    # Switzerland (synthetic financials from SIX data, annual)
+    "ch_six",
+    # Chile (US ADR 20-F annual filings)
+    "cl_cmf",
+    # Tier 2 markets with annual-only filing discovery
+    "au_asx",
+    "sg_sgx",
+    "za_jse",
+    "ae_dfm",
+})
+
+
+def is_annual_only_market(market_id: str) -> bool:
+    """Check if a market only provides annual financial statements."""
+    return market_id in ANNUAL_ONLY_MARKETS
+
+
 # OHLCV columns that need special aggregation rules
 _OHLCV_COLS = {"open", "high", "low", "close", "volume", "adjusted_close", "vwap"}
 
@@ -381,11 +411,36 @@ def build_cache_from_raw_filings(
                 parts.append(ohlcv_resampled)
 
     # --- Financial statements ---
-    # For Q/A frequencies: use raw filing data as-is (each row IS a period)
-    # For W/M frequencies: interpolate raw filings to native frequency index
+    # For A: use raw filing data as-is (each row IS an annual period)
+    # For Q: use raw filing data as-is IF quarterly filings exist,
+    #        OR interpolate annual filings to quarterly if the data is
+    #        annual-only (detected by median filing gap > 250 days).
+    # For W/M: always interpolate raw filings to native frequency index.
     _needs_interpolation = frequency in ("W", "M")
 
-    # Build the target-frequency index for interpolation (W/M only)
+    # For Q frequency: detect if raw data is actually annual-spaced.
+    # If so, interpolate annual -> quarterly rather than leaving sparse gaps.
+    if frequency == "Q":
+        _all_filing_dates: list[pd.Timestamp] = []
+        for _sdf in [income_df, balance_df, cashflow_df]:
+            if _sdf is not None and not _sdf.empty:
+                for _dc in ("report_date", "filing_date"):
+                    if _dc in _sdf.columns:
+                        _all_filing_dates.extend(pd.to_datetime(_sdf[_dc]).dropna().tolist())
+                        break
+        if len(_all_filing_dates) >= 2:
+            _sorted = sorted(set(_all_filing_dates))
+            _gaps = [(_sorted[i + 1] - _sorted[i]).days for i in range(len(_sorted) - 1)]
+            _median_gap = float(np.median(_gaps)) if _gaps else 0
+            if _median_gap > 250:
+                _needs_interpolation = True
+                logger.info(
+                    "[Q] Raw filings have annual spacing (median gap=%.0fd) -- "
+                    "interpolating annual to quarterly",
+                    _median_gap,
+                )
+
+    # Build the target-frequency index for interpolation (W/M/Q-from-annual)
     _target_index = None
     if _needs_interpolation:
         _target_index = pd.date_range(start_ts, ref_ts, freq=resample_rule)

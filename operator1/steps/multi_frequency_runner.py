@@ -31,6 +31,7 @@ from operator1.features.frequency_resampler import (
     build_cache_from_raw_filings,
     get_frequencies_slow_to_fast,
     get_frequency_config,
+    is_annual_only_market,
     resample_cache_to_frequency,
 )
 
@@ -430,13 +431,25 @@ def run_multi_frequency_pipeline(
         for df in [income_df, balance_df, cashflow_df]
     )
 
+    _is_annual_only = is_annual_only_market(market_id)
+
     for freq in frequencies:
         # Data source selection per frequency:
         #   Q/A: raw filing data as-is (no interpolation artifacts)
+        #   Q (annual-only markets): interpolate annual filings to quarterly
         #   W/M: raw filing data with native frequency interpolation
         #        (stock=linear, flow=distribute to W/M periods)
         #   D:   use the daily cache directly (already interpolated)
         if freq in ("Q", "A", "W", "M") and _has_raw_statements:
+            # For annual-only markets at Q frequency: interpolate annual -> quarterly
+            # instead of using raw Q data (which doesn't exist).
+            # build_cache_from_raw_filings with freq="Q" + annual data will
+            # produce interpolated quarterly values via the frequency interpolator.
+            if freq == "Q" and _is_annual_only:
+                logger.info(
+                    "[Q] Annual-only market (%s) -- interpolating annual filings to quarterly",
+                    market_id,
+                )
             resampled = build_cache_from_raw_filings(
                 income_df=income_df,
                 balance_df=balance_df,
@@ -445,7 +458,12 @@ def run_multi_frequency_pipeline(
                 frequency=freq,
                 reference_date=reference_date,
             )
-            _method = "raw filings" if freq in ("Q", "A") else "native interpolation"
+            if freq == "Q" and _is_annual_only:
+                _method = "annual-to-quarterly interpolation"
+            elif freq in ("Q", "A"):
+                _method = "raw filings"
+            else:
+                _method = "native interpolation"
             logger.info(
                 "[%s] Using %s: %d periods",
                 freq, _method, resampled.n_periods,
