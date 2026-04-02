@@ -439,6 +439,14 @@ def build_cache_from_raw_filings(
                     "interpolating annual to quarterly",
                     _median_gap,
                 )
+            else:
+                # Data is already at quarterly (or higher) frequency.
+                # No interpolation needed -- use raw values as-is.
+                logger.info(
+                    "[Q] Raw filings already at sub-annual spacing (median gap=%.0fd) -- "
+                    "using as-is, no annual-to-Q interpolation",
+                    _median_gap,
+                )
 
     # Build the target-frequency index for interpolation (W/M/Q-from-annual)
     _target_index = None
