@@ -1,0 +1,150 @@
+# Hedge Fund Analysis Weights
+# All weights are tweakable from the dashboard Scoring Weights panel.
+
+# ---------------------------------------------------------------------------
+# Tier 1: Earnings Forensics
+# ---------------------------------------------------------------------------
+earnings_quality:
+  fcf_quality:
+    ocf_ni_ratio_weight: 0.40
+    accruals_weight: 0.30
+    fcf_trend_weight: 0.20
+    capex_volatility_weight: 0.10
+  accruals_forensics:
+    sloan_weight: 0.30
+    jones_weight: 0.25
+    ni_ocf_divergence_weight: 0.20
+    working_capital_weight: 0.15
+    one_time_charges_weight: 0.10
+  earnings_smoothing:
+    beneish_weight: 0.25
+    vol_ratio_weight: 0.25
+    benford_weight: 0.20
+    surprise_pattern_weight: 0.15
+    restatement_weight: 0.15
+
+# ---------------------------------------------------------------------------
+# Tier 2: Cash Flow Stress Test
+# ---------------------------------------------------------------------------
+cash_flow:
+  dividend_burn:
+    div_fcf_weight: 0.40
+    debt_service_weight: 0.30
+    wc_drain_weight: 0.20
+    earnings_vol_weight: 0.10
+  return_spread:
+    # No component weights -- single spread computation
+    narrowing_threshold_bps: -50  # spread narrowing below this = alert
+  operating_leverage:
+    # No component weights -- DOL/DFL are pure formulas
+    high_leverage_threshold: 3.0   # DOL > 3 = high sensitivity
+
+# ---------------------------------------------------------------------------
+# Tier 3: Balance Sheet Risk
+# ---------------------------------------------------------------------------
+balance_sheet:
+  obs_risk:
+    goodwill_weight: 0.35
+    intangibles_weight: 0.25
+    sga_anomaly_weight: 0.20
+    keyword_weight: 0.10
+    policy_change_weight: 0.10
+  asset_quality:
+    dso_change_weight: 0.30
+    inventory_days_weight: 0.25
+    capitalization_weight: 0.20
+    allowance_weight: 0.15
+    impairment_weight: 0.10
+  leverage_stress:
+    revenue_miss_pct: 0.15         # -15% revenue shock
+    margin_miss_bps: 200           # -200bps margin compression
+    systemic_revenue_pct: 0.25     # -25% revenue (systemic)
+    systemic_margin_bps: 400       # -400bps margin (systemic)
+    systemic_rate_bps: 200         # +200bps interest rate
+    covenant_threshold: 5.5        # debt/EBITDA covenant level
+
+# ---------------------------------------------------------------------------
+# Tier 4: Inflection Detection
+# ---------------------------------------------------------------------------
+inflection:
+  momentum:
+    revenue_accel_weight: 0.40
+    margin_trend_weight: 0.30
+    fcf_conversion_weight: 0.20
+    roic_trajectory_weight: 0.10
+  growth_quality:
+    organic_fraction_weight: 0.50
+    margin_adjusted_weight: 0.25
+    incremental_roic_weight: 0.15
+    concentration_weight: 0.10
+  earnings_surprise:
+    historical_sue_weight: 0.40
+    dol_sensitivity_weight: 0.25
+    sentiment_drift_weight: 0.20
+    secular_bias_weight: 0.15
+
+# ---------------------------------------------------------------------------
+# Tier 5: Valuation Engine
+# ---------------------------------------------------------------------------
+valuation:
+  dcf:
+    explicit_period_years: 5
+    terminal_growth_mean: 0.025
+    terminal_growth_std: 0.005
+    wacc_mean: 0.09
+    wacc_std: 0.01
+    n_simulations: 10000
+  valuation_quality:
+    fcf_quality_weight: 0.25
+    accruals_inverse_weight: 0.20
+    asset_quality_inverse_weight: 0.15
+    leverage_stress_inverse_weight: 0.15
+    return_spread_weight: 0.10
+    dividend_burn_inverse_weight: 0.10
+    obs_risk_inverse_weight: 0.05
+  peg:
+    quality_multiplier_floor: 0.5
+    quality_multiplier_ceiling: 1.5
+
+# ---------------------------------------------------------------------------
+# Position Sizing
+# ---------------------------------------------------------------------------
+position_sizing:
+  kelly_fraction: 0.25             # quarter-Kelly for conservatism
+  survival_multipliers:
+    normal: 1.0
+    modified_survival: 0.5
+    company_survival: 0.0
+    extreme_survival: -0.5
+  recovery_multiplier: 1.5
+  support_resistance_lookback_days: 63
+
+# ---------------------------------------------------------------------------
+# Thesis Scorecard
+# ---------------------------------------------------------------------------
+thesis_scorecard:
+  tier_weights:
+    earnings_quality: 0.25
+    cash_flow: 0.20
+    balance_sheet: 0.20
+    inflection: 0.20
+    valuation: 0.15
+  grade_thresholds:
+    a_plus: 85
+    a: 75
+    b_plus: 65
+    b: 55
+    c_plus: 45
+    c: 35
+    d: 25
+    # Below 25 = F
+
+# ---------------------------------------------------------------------------
+# Data windows (filing periods to use)
+# ---------------------------------------------------------------------------
+data_windows:
+  quarterly_lookback: 8            # 8 quarters for most metrics
+  annual_lookback: 5               # 5 annual reports for regression/Benford
+  daily_price_lookback: 63         # 63 trading days for price signals
+  benford_min_samples: 30          # minimum data points for Benford test
+  jones_min_annual: 5              # minimum annual points for Modified Jones
