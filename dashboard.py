@@ -414,6 +414,145 @@ def render_home():
                       "", "shield")
                 _card("Regime", survival.get("survival_regime", "unknown"), "", "timeline")
 
+            # Position Signal card
+            pos = profile.get("position_signal", {})
+            if pos.get("available"):
+                with ui.row().classes("gap-4 mt-2"):
+                    _signal_val = pos.get("signal", 0)
+                    _signal_label = pos.get("label", "hold").upper()
+                    _signal_color = "green" if _signal_val > 0.3 else "red" if _signal_val < -0.3 else "orange"
+                    _card("Position Signal", f"{_signal_val:+.2f} ({_signal_label})", "", "trending_up")
+
+            # USS + Scenario row
+            uss = profile.get("unified_survival_system", {})
+            scenario = profile.get("scenario_analysis", {})
+            if uss.get("available") or scenario.get("available"):
+                ui.separator()
+                ui.label("Unified Survival System").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    if uss.get("available"):
+                        _uss_regime = uss.get("current_regime", "unknown")
+                        _card("USS Regime", _uss_regime.replace("_", " ").title(), "", "shield")
+                    if scenario.get("available"):
+                        _orderly = scenario.get("orderly", {})
+                        _catastrophic = scenario.get("catastrophic", {})
+                        _card("Orderly Surv", f"{_orderly.get('survival_prob_252d', 0):.0%}", "252d", "check_circle")
+                        _card("Catastrophic", f"{_catastrophic.get('survival_prob_252d', 0):.0%}", "252d", "dangerous")
+
+            # Predicted regime shifts
+            shifts = profile.get("predicted_regime_shifts", {})
+            if shifts.get("available"):
+                ui.separator()
+                ui.label("Regime Shift Prediction").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("P(Exit 21d)", f"{shifts.get('prob_exit_21d', 0):.0%}", "", "swap_horiz")
+                    _card("P(Exit 252d)", f"{shifts.get('prob_exit_252d', 0):.0%}", "", "swap_horiz")
+                    _card("Expected Days", f"{shifts.get('expected_days_to_shift', 0):.0f}", f"Next: {shifts.get('most_probable_next_regime', '?')}", "schedule")
+
+            # Multi-frequency fusion
+            mf = profile.get("multi_frequency", {})
+            if mf.get("available"):
+                _rc = mf.get("regime_consensus", {})
+                _sv = mf.get("survival", {})
+                ui.separator()
+                ui.label("Multi-Frequency Fusion").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("Consensus", _rc.get("consensus_regime", "?"), f"{_rc.get('agreement_ratio', 0):.0%} agreement", "merge_type")
+                    _card("Fused Survival", f"{_sv.get('fused_probability', 0):.0%}", f"Weakest: {_sv.get('weakest_frequency', '?')}", "link")
+
+            # Signal IC
+            sig_ic = profile.get("signal_ic", {})
+            if sig_ic.get("available"):
+                ui.separator()
+                ui.label("Signal Quality").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("Best Signal", sig_ic.get("best_signal", "?"), f"IC={sig_ic.get('best_ic', 0):.4f}", "trending_up")
+                    _card("Strong Signals", str(len(sig_ic.get("strong_signals", []))), f"Weak: {len(sig_ic.get('weak_signals', []))}", "filter_alt")
+
+            # Model Diagnostics
+            diag = profile.get("model_diagnostics", {})
+            if diag.get("available"):
+                ui.separator()
+                ui.label("Model Diagnostics").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("On Track", f"{diag.get('n_models_on_track', 0)}/{diag.get('n_models_assessed', 0)}", diag.get("overall_robustness", ""), "verified")
+
+            # Filing Calendar
+            fc = profile.get("filing_calendar", {})
+            if fc.get("available"):
+                ui.separator()
+                ui.label("Filing Calendar").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("Coverage", f"{fc.get('coverage_ratio', 0):.0%}", f"{fc.get('actual_filings_2yr', 0)}/{fc.get('expected_filings_2yr', 0)} filings", "calendar_month")
+                    _stale_icon = "warning" if fc.get("is_stale") else "check"
+                    _card("Staleness", f"{fc.get('latest_filing_age_days', 0)}d", "STALE" if fc.get("is_stale") else "Fresh", _stale_icon)
+
+            # Macro Indicators
+            macro_ind = profile.get("macro_indicators", {})
+            if macro_ind:
+                ui.separator()
+                ui.label("Macro Indicators").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4 flex-wrap"):
+                    for ind_name, ind_data in list(macro_ind.items())[:5]:
+                        if isinstance(ind_data, dict):
+                            _card(ind_name.replace("_", " ").title(),
+                                  f"{ind_data.get('latest_value', 0):.2f}",
+                                  ind_data.get("latest_date", ""), "analytics")
+
+            # Market Buying Power + Product Catalysts + Supply Chain
+            bp = profile.get("market_buying_power", {})
+            cats = profile.get("product_catalysts", {})
+            scs = profile.get("supply_chain_stress", {})
+            if bp.get("available") or cats.get("available") or scs.get("available"):
+                ui.separator()
+                ui.label("Market Context").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    if bp.get("available"):
+                        _card("Buying Power", f"{bp.get('buying_power_index', 0):.0f}", bp.get("demand_risk_flag", ""), "shopping_cart")
+                    if cats.get("available"):
+                        _card("Catalyst", f"{cats.get('catalyst_score', 0):.2f}", cats.get("catalyst_type", ""), "rocket_launch")
+                    if scs.get("available"):
+                        _stress_flag = "YES" if scs.get("supply_chain_stress_flag") else "NO"
+                        _card("Supply Chain Stress", _stress_flag, f"Score: {scs.get('supply_chain_stress_score', 0):.2f}", "local_shipping")
+
+            # Institutional holders summary
+            inst = profile.get("institutional_holders", {})
+            if inst.get("available"):
+                ui.separator()
+                ui.label("Institutional Holders").classes("text-lg font-bold mt-3")
+                ui.label(f"{inst.get('total_holders', 0)} holders tracked").classes("text-sm text-gray-400")
+
+            # Corporate Structure
+            corp = profile.get("corporate_structure", {})
+            if corp.get("available"):
+                ui.separator()
+                ui.label("Corporate Structure (GLEIF)").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("Parents", str(corp.get("n_parents", 0)), "", "account_tree")
+                    _card("Subsidiaries", str(corp.get("n_subsidiaries", 0)),
+                          f"{len(corp.get('subsidiaries_countries', []))} countries", "account_tree")
+
+            # OHLC Predictions
+            ohlc = profile.get("ohlc_predictions", {})
+            if ohlc.get("available") and ohlc.get("next_day"):
+                nd = ohlc["next_day"]
+                ui.separator()
+                ui.label("OHLC Predictions (Next Day)").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    for field in ["open", "high", "low", "close"]:
+                        val = nd.get(field)
+                        if val is not None:
+                            _card(field.upper(), f"{val:.2f}", "", "candlestick_chart")
+
+            # Prediction Log (historical accuracy)
+            plog = profile.get("prediction_log", {})
+            if plog.get("n_filled", 0) > 0:
+                ui.separator()
+                ui.label("Prediction Track Record").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("Hit Rate", f"{plog.get('hit_rate', 0):.0%}", f"{plog.get('n_filled', 0)} predictions evaluated", "fact_check")
+                    _card("Realized IC", f"{plog.get('realized_ic', 0):.4f}", "", "analytics")
+
             # Extended models summary
             ext = profile.get("extended_models", {})
             if ext:
