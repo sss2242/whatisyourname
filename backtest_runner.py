@@ -93,6 +93,8 @@ class BacktestState:
         self.six_proxy_result = None
         self.target_holders: list = []
         self.target_insiders: list = []
+        self.signal_ic_result = None
+        self.prediction_log_summary = None
         self.linked_agg_df = None
         self.linked_conflict = None
         self.enriched_timeline_result = None
@@ -841,24 +843,22 @@ def run_stage1(state: BacktestState) -> None:
         logger.debug("Adaptive windows skipped: %s", exc)
 
     # Signal IC measurement
-    signal_ic_result = None
     try:
         from operator1.analysis.signal_ic import compute_signal_ic, get_ic_weighted_signals
-        signal_ic_result = compute_signal_ic(cache)
-        if signal_ic_result and signal_ic_result.available:
+        state.signal_ic_result = compute_signal_ic(cache)
+        if state.signal_ic_result and state.signal_ic_result.available:
             logger.info(
                 "Signal IC: %d strong, best=%s (IC=%.4f)",
-                len(signal_ic_result.strong_signals),
-                signal_ic_result.best_signal, signal_ic_result.best_ic,
+                len(state.signal_ic_result.strong_signals),
+                state.signal_ic_result.best_signal, state.signal_ic_result.best_ic,
             )
     except Exception as exc:
         logger.debug("Signal IC skipped: %s", exc)
 
     # Fill actuals from previous prediction log
-    prediction_log_summary = None
     try:
         from operator1.analysis.prediction_log import fill_actuals
-        prediction_log_summary = fill_actuals(
+        state.prediction_log_summary = fill_actuals(
             ticker=state.company, cache=cache,
             reference_date=datetime.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None,
         )
@@ -1456,14 +1456,14 @@ def run_stage3(state: BacktestState) -> None:
             profile["multi_frequency"] = {"available": False}
 
         # Signal IC results
-        if signal_ic_result is not None and signal_ic_result.available:
-            profile["signal_ic"] = signal_ic_result.to_profile_dict()
+        if state.signal_ic_result is not None and state.signal_ic_result.available:
+            profile["signal_ic"] = state.signal_ic_result.to_profile_dict()
         else:
             profile["signal_ic"] = {"available": False}
 
         # Prediction log summary
-        if prediction_log_summary is not None:
-            profile["prediction_log"] = prediction_log_summary
+        if state.prediction_log_summary is not None:
+            profile["prediction_log"] = state.prediction_log_summary
         else:
             profile["prediction_log"] = {"n_filled": 0, "total_predictions": 0}
 
@@ -1480,8 +1480,8 @@ def run_stage3(state: BacktestState) -> None:
                     if pf is not None:
                         _return_forecast = float(pf)
             _ic_conf = 1.0
-            if signal_ic_result and signal_ic_result.available:
-                _ic_conf = min(2.0, max(0.5, abs(signal_ic_result.best_ic) * 20))
+            if state.signal_ic_result and state.signal_ic_result.available:
+                _ic_conf = min(2.0, max(0.5, abs(state.signal_ic_result.best_ic) * 20))
             _surv_mult = 1.0
             _recovery_active = False
             if state.survival_controller is not None:
