@@ -350,6 +350,14 @@ def _is_last_period_partial(ref_ts: pd.Timestamp, frequency: str) -> bool:
     elif frequency == "Q":
         quarter_end = ref_ts + pd.offsets.QuarterEnd(0)
         return ref_ts.date() < quarter_end.date()
+    elif frequency == "S":
+        # Semi-annual: periods end at Jun 30 and Dec 31.
+        # Check if we are before the next semi-annual boundary.
+        if ref_ts.month <= 6:
+            period_end = pd.Timestamp(ref_ts.year, 6, 30)
+        else:
+            period_end = pd.Timestamp(ref_ts.year, 12, 31)
+        return ref_ts.date() < period_end.date()
     elif frequency == "A":
         year_end = pd.Timestamp(ref_ts.year, 12, 31)
         return ref_ts.date() < year_end.date()
