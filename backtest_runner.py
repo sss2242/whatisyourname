@@ -93,6 +93,8 @@ class BacktestState:
         self.six_proxy_result = None
         self.target_holders: list = []
         self.target_insiders: list = []
+        self.signal_ic_result = None
+        self.prediction_log_summary = None
         self.linked_agg_df = None
         self.linked_conflict = None
         self.enriched_timeline_result = None
@@ -841,24 +843,22 @@ def run_stage1(state: BacktestState) -> None:
         logger.debug("Adaptive windows skipped: %s", exc)
 
     # Signal IC measurement
-    signal_ic_result = None
     try:
         from operator1.analysis.signal_ic import compute_signal_ic, get_ic_weighted_signals
-        signal_ic_result = compute_signal_ic(cache)
-        if signal_ic_result and signal_ic_result.available:
+        state.signal_ic_result = compute_signal_ic(cache)
+        if state.signal_ic_result and state.signal_ic_result.available:
             logger.info(
                 "Signal IC: %d strong, best=%s (IC=%.4f)",
-                len(signal_ic_result.strong_signals),
-                signal_ic_result.best_signal, signal_ic_result.best_ic,
+                len(state.signal_ic_result.strong_signals),
+                state.signal_ic_result.best_signal, state.signal_ic_result.best_ic,
             )
     except Exception as exc:
         logger.debug("Signal IC skipped: %s", exc)
 
     # Fill actuals from previous prediction log
-    prediction_log_summary = None
     try:
         from operator1.analysis.prediction_log import fill_actuals
-        prediction_log_summary = fill_actuals(
+        state.prediction_log_summary = fill_actuals(
             ticker=state.company, cache=cache,
             reference_date=datetime.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None,
         )
@@ -1388,7 +1388,7 @@ def run_stage3(state: BacktestState) -> None:
         if isinstance(obj, dict): return obj
         if hasattr(obj, "__dataclass_fields__"):
             try: return asdict(obj)
-            except: pass
+            except Exception: pass
         if hasattr(obj, "__dict__"): return obj.__dict__.copy()
         return None
 
@@ -1456,14 +1456,14 @@ def run_stage3(state: BacktestState) -> None:
             profile["multi_frequency"] = {"available": False}
 
         # Signal IC results
-        if signal_ic_result is not None and signal_ic_result.available:
-            profile["signal_ic"] = signal_ic_result.to_profile_dict()
+        if state.signal_ic_result is not None and state.signal_ic_result.available:
+            profile["signal_ic"] = state.signal_ic_result.to_profile_dict()
         else:
             profile["signal_ic"] = {"available": False}
 
         # Prediction log summary
-        if prediction_log_summary is not None:
-            profile["prediction_log"] = prediction_log_summary
+        if state.prediction_log_summary is not None:
+            profile["prediction_log"] = state.prediction_log_summary
         else:
             profile["prediction_log"] = {"n_filled": 0, "total_predictions": 0}
 
@@ -1480,8 +1480,8 @@ def run_stage3(state: BacktestState) -> None:
                     if pf is not None:
                         _return_forecast = float(pf)
             _ic_conf = 1.0
-            if signal_ic_result and signal_ic_result.available:
-                _ic_conf = min(2.0, max(0.5, abs(signal_ic_result.best_ic) * 20))
+            if state.signal_ic_result and state.signal_ic_result.available:
+                _ic_conf = min(2.0, max(0.5, abs(state.signal_ic_result.best_ic) * 20))
             _surv_mult = 1.0
             _recovery_active = False
             if state.survival_controller is not None:
@@ -1544,6 +1544,29 @@ def run_stage3(state: BacktestState) -> None:
     with open(preds_path, "w") as f:
         json.dump(preds_summary, f, indent=2, default=str)
     logger.info("Predictions saved: %s", preds_path)
+
+    # Report generation (optional, requires LLM client)
+    try:
+        from operator1.report.report_generator import generate_all_reports
+        from operator1.clients.llm_factory import create_llm_client
+
+        llm_client = create_llm_client(state._secrets) if state._secrets else None
+        report_dir = Path(state.run_dir) / "report"
+        all_reports = generate_all_reports(
+            profile=state.profile,
+            llm_client=llm_client,
+            cache=state.cache,
+            output_dir=report_dir,
+            generate_pdf=False,
+        )
+        for tier_name, report_output in all_reports.items():
+            logger.info(
+                "  %s report: %s",
+                tier_name.capitalize(),
+                report_output.get("markdown_path"),
+            )
+    except Exception as exc:
+        logger.info("Report generation skipped: %s", exc)
 
     state.save(stage=3)
     logger.info("STAGE 3 COMPLETE")

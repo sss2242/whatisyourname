@@ -446,12 +446,12 @@ def run_multi_frequency_pipeline(
         if "Q" in _all_freqs and "S" in _all_freqs:
             # Both quarterly and semi-annual filings exist.
             # Keep Q in the list AND add S (run both pipelines).
+            # S goes BEFORE Q in slow-to-fast order (6-month > 3-month).
             if "S" not in frequencies:
-                # Insert S after Q in the frequency list (between Q and M)
                 q_idx = frequencies.index("Q")
-                frequencies.insert(q_idx + 1, "S")
+                frequencies.insert(q_idx, "S")  # insert S before Q
             logger.info(
-                "Both Q and S filings detected -- running both pipelines"
+                "Both Q and S filings detected -- running both pipelines (order: A,S,Q,M,W,D)"
             )
         elif _native_freq == "S" and "Q" not in _all_freqs:
             # Only semi-annual filings exist, no quarterly.

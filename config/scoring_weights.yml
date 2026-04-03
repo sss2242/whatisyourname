@@ -1,0 +1,313 @@
+# Scoring Weights Configuration -- All Tweakable Parameters
+# Edit this file to adjust model behavior without changing code.
+# Reload in the dashboard via the Scoring Weights tab.
+
+# ---------------------------------------------------------------------------
+# Survival Mode Thresholds
+# ---------------------------------------------------------------------------
+survival_thresholds:
+  current_ratio: 1.0          # below this = liquidity crisis
+  debt_to_equity: 3.0         # above this = leverage crisis
+  fcf_yield: 0.0              # below this = cash burn
+  drawdown_252d: -0.40        # below this = market crash
+  conflict_intensity: 0.70    # above this = geopolitical crisis
+  inst_flow_momentum: -0.15   # below this = institutional exodus
+
+# Survival probability blend (sigmoid vs Cox PH)
+survival_blend:
+  sigmoid_weight: 0.4
+  cox_weight: 0.6
+
+# ---------------------------------------------------------------------------
+# Hierarchy Tier Weights (per regime)
+# ---------------------------------------------------------------------------
+hierarchy_weights:
+  normal:            [20, 20, 20, 20, 20]
+  company_survival:  [50, 30, 15, 4, 1]
+  modified_survival: [40, 35, 20, 4, 1]
+  extreme_survival:  [60, 30, 10, 0, 0]
+
+# Vanity adjustment: shift this % from T4/T5 to T1 in survival
+vanity_weight_shift_pct: 5
+
+# ---------------------------------------------------------------------------
+# Financial Health Scoring
+# ---------------------------------------------------------------------------
+financial_health:
+  altman_safe_zone: 2.99
+  altman_distress_zone: 1.81
+  beneish_threshold: -2.22
+  pe_cap_method: "consensus"   # "consensus", "lognormal", "tukey", "mad"
+  ev_cap_method: "consensus"
+
+# ---------------------------------------------------------------------------
+# Conflict Risk Scoring Weights
+# ---------------------------------------------------------------------------
+conflict_weights:
+  event_score: 0.40
+  fatality_score: 0.20
+  flag_score: 0.25
+  news_score: 0.15
+
+conflict_propagation:
+  suppliers:
+    supply_chain: 1.0
+    revenue: 0.3
+    competitive: 0.0
+  customers:
+    supply_chain: 0.3
+    revenue: 1.0
+    competitive: 0.0
+  competitors:
+    supply_chain: 0.0
+    revenue: 0.0
+    competitive: 1.0
+  financial_institutions:
+    supply_chain: 0.5
+    revenue: 0.2
+    competitive: 0.0
+  logistics:
+    supply_chain: 0.8
+    revenue: 0.1
+    competitive: 0.0
+
+# ---------------------------------------------------------------------------
+# Fuzzy Protection Parameters
+# ---------------------------------------------------------------------------
+fuzzy_protection:
+  strategic_sectors:
+    - defense
+    - energy
+    - banking
+    - telecommunications
+    - utilities
+    - insurance
+  gdp_significance_threshold: 0.001   # market_cap / GDP
+  defuzzification_method: "centroid"   # "centroid" or "bisector"
+
+# ---------------------------------------------------------------------------
+# Vanity Component Weights (must sum to 1.0)
+# ---------------------------------------------------------------------------
+vanity_weights:
+  rnd_mismatch: 0.15
+  sga_bloat: 0.25
+  capital_misallocation: 0.30
+  competitive_decay: 0.15
+  sentiment_gap: 0.15
+
+vanity_labels:
+  disciplined: 20
+  moderate: 40
+  wasteful: 70
+  reckless: 100
+
+# ---------------------------------------------------------------------------
+# Plane-Aware Model Weight Adjustments
+# Multipliers on base weight of 1.0.
+# ---------------------------------------------------------------------------
+plane_weights:
+  supply:
+    forecasting: 1.0
+    monte_carlo: 1.3
+    transformer: 0.8
+    cycle_decomposition: 1.8
+    pattern_detector: 0.7
+    copula: 1.2
+    particle_filter: 1.4
+    dtw_analogs: 1.0
+    granger_causality: 1.0
+    transfer_entropy: 1.0
+  manufacturing:
+    forecasting: 1.4
+    monte_carlo: 1.0
+    transformer: 1.0
+    cycle_decomposition: 1.2
+    pattern_detector: 1.0
+    copula: 0.8
+    particle_filter: 1.0
+    dtw_analogs: 1.1
+    granger_causality: 1.5
+    transfer_entropy: 1.3
+  consumption:
+    forecasting: 1.1
+    monte_carlo: 1.0
+    transformer: 1.4
+    cycle_decomposition: 1.0
+    pattern_detector: 1.5
+    copula: 1.0
+    particle_filter: 0.7
+    dtw_analogs: 1.3
+    granger_causality: 0.8
+    transfer_entropy: 1.0
+  logistics:
+    forecasting: 1.1
+    monte_carlo: 1.5
+    transformer: 0.9
+    cycle_decomposition: 1.2
+    pattern_detector: 0.8
+    copula: 1.0
+    particle_filter: 1.4
+    dtw_analogs: 1.0
+    granger_causality: 1.0
+    transfer_entropy: 1.0
+  finance:
+    forecasting: 1.0
+    monte_carlo: 1.3
+    transformer: 1.0
+    cycle_decomposition: 0.7
+    pattern_detector: 0.8
+    copula: 1.8
+    particle_filter: 1.0
+    dtw_analogs: 1.0
+    granger_causality: 1.5
+    transfer_entropy: 1.4
+
+# ---------------------------------------------------------------------------
+# Graph Risk Edge Weights
+# ---------------------------------------------------------------------------
+graph_edge_weights:
+  parent_companies: 2.8
+  subsidiaries: 2.3
+  suppliers: 1.2
+  financial_institutions: 1.3
+  customers: 1.1
+  competitors: 1.0
+  logistics: 0.8
+  regulators: 0.5
+
+# ---------------------------------------------------------------------------
+# Monte Carlo Parameters
+# ---------------------------------------------------------------------------
+monte_carlo:
+  n_paths: 10000
+  importance_tilt: 1.5
+  horizons: [90, 252]
+
+monte_carlo_survival_overrides:
+  company_survival:
+    n_paths: 20000
+    importance_tilt: 2.0
+    correlation_override: 0.85
+  extreme_survival:
+    n_paths: 30000
+    importance_tilt: 3.0
+    correlation_override: 0.90
+
+# Scenario engine (USS)
+scenario_engine:
+  orderly:
+    revenue_shift: -0.15
+    daily_drift: -0.001
+    returns_percentile_range: [25, 75]
+  muddle_through:
+    revenue_shift: 0.0
+    daily_drift: 0.0
+    returns_percentile_range: [0, 100]
+  catastrophic:
+    revenue_shift: -0.40
+    daily_drift: -0.003
+    returns_percentile_range: [0, 10]
+
+# ---------------------------------------------------------------------------
+# Ensemble Aggregation
+# ---------------------------------------------------------------------------
+ensemble:
+  min_rmse_for_weighting: 1.0e-10
+  z_score_90: 1.645
+  survival_risk_multiplier: 2.0
+  transition_blend_halflife: 21
+  fixed_share_parameter: 0.05
+  fixed_share_eta: 0.1
+
+# Model-regime affinity (rows = models, columns = regimes)
+model_regime_affinity:
+  kalman:    { bull: 1.0, bear: 0.6, high_vol: 0.5, low_vol: 1.2 }
+  garch:     { bull: 0.7, bear: 1.0, high_vol: 1.3, low_vol: 0.6 }
+  var:       { bull: 1.0, bear: 0.8, high_vol: 0.7, low_vol: 1.1 }
+  lstm:      { bull: 0.9, bear: 0.9, high_vol: 0.8, low_vol: 1.0 }
+  tree:      { bull: 0.8, bear: 1.1, high_vol: 1.2, low_vol: 0.9 }
+  baseline:  { bull: 1.0, bear: 1.0, high_vol: 1.0, low_vol: 1.0 }
+
+# ---------------------------------------------------------------------------
+# Conformal Prediction
+# ---------------------------------------------------------------------------
+conformal:
+  target_coverage: 0.90
+  pid_kp: 0.01
+  pid_ki: 0.001
+  pid_kd: 0.005
+  copula_tail_amplification: 0.5
+
+# ---------------------------------------------------------------------------
+# Frequency Fusion Horizon Weights
+# Each row: horizon -> {frequency: weight}
+# ---------------------------------------------------------------------------
+frequency_fusion:
+  "1d":  { D: 1.0 }
+  "5d":  { D: 0.7, W: 0.3 }
+  "1w":  { D: 0.4, W: 0.6 }
+  "21d": { D: 0.3, W: 0.4, M: 0.3 }
+  "1m":  { W: 0.3, M: 0.7 }
+  "3m":  { W: 0.15, M: 0.35, Q: 0.50 }
+  "6m":  { M: 0.25, Q: 0.50, A: 0.25 }
+  "1y":  { M: 0.15, Q: 0.35, A: 0.50 }
+  "2y":  { Q: 0.30, A: 0.70 }
+
+# ---------------------------------------------------------------------------
+# USS Dimension Parameters
+# ---------------------------------------------------------------------------
+uss_model_switching:
+  normal:
+    kalman_noise_mult: 1.0
+    lstm_lookback: 60
+    mc_paths: 10000
+    tree_max_depth: 10
+  company_survival:
+    kalman_noise_mult: 3.0
+    lstm_lookback: 10
+    mc_paths: 20000
+    tree_max_depth: 5
+  extreme_survival:
+    kalman_noise_mult: 5.0
+    lstm_lookback: 5
+    mc_paths: 30000
+    tree_max_depth: 3
+
+uss_horizons:
+  normal: ["1d", "5d", "21d", "252d"]
+  company_survival: ["1d", "5d", "21d"]
+  extreme_survival: ["1d", "5d"]
+
+uss_forecast_bounds:
+  company_survival:
+    revenue_cap_mult: 1.0
+    debt_floor_mult: 1.0
+    cash_burn_mult: 1.0
+  extreme_survival:
+    revenue_cap_mult: 0.85
+    debt_floor_mult: 1.15
+    cash_burn_mult: 1.5
+
+# ---------------------------------------------------------------------------
+# Signal IC Filtering
+# ---------------------------------------------------------------------------
+signal_filtering:
+  ic_inclusion_threshold: 0.02
+  icir_inclusion_threshold: 0.3
+  decay_slow: 0.003
+  decay_medium: 0.05
+  decay_fast: 0.30
+
+# ---------------------------------------------------------------------------
+# Forecasting Model Minimum Data
+# ---------------------------------------------------------------------------
+forecasting_min_data:
+  kalman: 30
+  garch: 50
+  var: 50
+  ar1: 20
+  lstm: 200
+  gbm_lr: 50
+  tree: 30
+  autoarima: 30
+  dynamic_factor: 50

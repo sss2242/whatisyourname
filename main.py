@@ -1705,7 +1705,6 @@ Non-interactive examples:
 
                     # Compute derived variables
                     if "close" in _ent_cache.columns and _ent_cache["close"].notna().sum() > 5:
-                        from operator1.features.derived_variables import compute_derived_variables
                         _ent_cache = compute_derived_variables(_ent_cache)
 
                     return ent_id, _ent_cache
@@ -1858,10 +1857,7 @@ Non-interactive examples:
     # conflict zones, which creates supply chain / revenue exposure risk.
     if conflict_result is not None and relationships:
         try:
-            from operator1.features.conflict_risk import (
-                assess_linked_entity_conflict,
-                inject_conflict_risk_into_cache,
-            )
+            from operator1.features.conflict_risk import assess_linked_entity_conflict
             linked_conflict = assess_linked_entity_conflict(
                 linked_entities=relationships,
                 target_conflict=conflict_result,
@@ -2043,7 +2039,6 @@ Non-interactive examples:
     # Refresh USS controller after adaptive thresholds recalibrate survival
     if survival_controller is not None:
         try:
-            from operator1.analysis.survival_regime_controller import SurvivalRegimeController
             survival_controller = SurvivalRegimeController.from_cache(cache)
             logger.info(
                 "USS controller refreshed: regime=%s, survival=%s",
@@ -3413,7 +3408,6 @@ Non-interactive examples:
 
         # Inject economic plane classification
         try:
-            from operator1.analysis.economic_planes import classify_economic_plane
             plane_info = classify_economic_plane(
                 sector=target_profile.get("sector"),
                 industry=target_profile.get("industry"),

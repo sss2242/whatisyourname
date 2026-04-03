@@ -848,7 +848,30 @@ def main() -> int:
     skip_models = not _yes_no(
         "Run temporal models? (forecasting, burn-out)", default=True
     )
+    skip_report = not _yes_no(
+        "Generate reports? (Basic + Pro + Premium)", default=True
+    )
     gen_pdf = _yes_no("Generate PDF report? (requires pandoc)", default=False)
+
+    # Advanced options (collapsed by default)
+    years = 2.0
+    end_date = ""
+    pit_mode = "report_date"
+    output_dir = "cache"
+    verbose = False
+
+    if _yes_no("Show advanced options?", default=False):
+        _years_str = _prompt("Lookback window in years", "2.0")
+        try:
+            years = float(_years_str)
+        except ValueError:
+            years = 2.0
+        end_date = _prompt("End date for backtesting (YYYY-MM-DD, empty=today)", "")
+        pit_mode = _prompt("PIT alignment mode (report_date or filing_date)", "report_date")
+        if pit_mode not in ("report_date", "filing_date"):
+            pit_mode = "report_date"
+        output_dir = _prompt("Output directory", "cache")
+        verbose = _yes_no("Verbose debug logging?", default=False)
 
     # ------------------------------------------------------------------
     # Step 9: Confirmation & Run
@@ -865,7 +888,13 @@ def main() -> int:
         print(f"  Macro source:     {macro.api_name}")
     print(f"  Linked entities:  {'Yes' if not skip_linked else 'Skip'}")
     print(f"  Temporal models:  {'Yes' if not skip_models else 'Skip'}")
+    print(f"  Reports:          {'Yes' if not skip_report else 'Skip'}")
     print(f"  PDF output:       {'Yes' if gen_pdf else 'No'}")
+    print(f"  Lookback:         {years} years")
+    if end_date:
+        print(f"  End date:         {end_date} (backtest mode)")
+    print(f"  PIT mode:         {pit_mode}")
+    print(f"  Output dir:       {output_dir}")
     llm_model = keys.get("_llm_model", "")
     _provider_labels = {"gemini": "Gemini", "claude": "Claude", "openrouter": "OpenRouter"}
     if llm_provider in _provider_labels:
@@ -892,13 +921,22 @@ def main() -> int:
         sys.executable, "main.py",
         "--market", market_id,
         "--company", company,
+        "--years", str(years),
+        "--pit-mode", pit_mode,
+        "--output-dir", output_dir,
     ]
     if skip_linked:
         cmd.append("--skip-linked")
     if skip_models:
         cmd.append("--skip-models")
+    if skip_report:
+        cmd.append("--skip-report")
     if gen_pdf:
         cmd.append("--pdf")
+    if end_date:
+        cmd.extend(["--end-date", end_date])
+    if verbose:
+        cmd.append("--verbose")
     if llm_provider:
         cmd.extend(["--llm-provider", llm_provider])
     llm_model = keys.get("_llm_model", "")

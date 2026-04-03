@@ -359,6 +359,7 @@ def create_main_layout():
         tab_home = ui.tab("Home", icon="home")
         tab_analyze = ui.tab("New Analysis", icon="search")
         tab_report = ui.tab("Report", icon="description")
+        tab_weights = ui.tab("Scoring Weights", icon="tune")
         tab_health = ui.tab("Health", icon="monitor_heart")
         tab_models = ui.tab("Model Tests", icon="science")
         tab_config = ui.tab("Settings", icon="settings")
@@ -370,6 +371,8 @@ def create_main_layout():
             render_analyze()
         with ui.tab_panel(tab_report).classes("p-6"):
             render_report()
+        with ui.tab_panel(tab_weights).classes("p-6"):
+            render_scoring_weights()
         with ui.tab_panel(tab_health).classes("p-6"):
             render_health()
         with ui.tab_panel(tab_models).classes("p-6"):
@@ -410,6 +413,145 @@ def render_home():
                 _card("Survival Prob", f"{mc.get('survival_probability_mean', 0):.0%}" if mc.get('survival_probability_mean') else "N/A",
                       "", "shield")
                 _card("Regime", survival.get("survival_regime", "unknown"), "", "timeline")
+
+            # Position Signal card
+            pos = profile.get("position_signal", {})
+            if pos.get("available"):
+                with ui.row().classes("gap-4 mt-2"):
+                    _signal_val = pos.get("signal", 0)
+                    _signal_label = pos.get("label", "hold").upper()
+                    _signal_color = "green" if _signal_val > 0.3 else "red" if _signal_val < -0.3 else "orange"
+                    _card("Position Signal", f"{_signal_val:+.2f} ({_signal_label})", "", "trending_up")
+
+            # USS + Scenario row
+            uss = profile.get("unified_survival_system", {})
+            scenario = profile.get("scenario_analysis", {})
+            if uss.get("available") or scenario.get("available"):
+                ui.separator()
+                ui.label("Unified Survival System").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    if uss.get("available"):
+                        _uss_regime = uss.get("current_regime", "unknown")
+                        _card("USS Regime", _uss_regime.replace("_", " ").title(), "", "shield")
+                    if scenario.get("available"):
+                        _orderly = scenario.get("orderly", {})
+                        _catastrophic = scenario.get("catastrophic", {})
+                        _card("Orderly Surv", f"{_orderly.get('survival_prob_252d', 0):.0%}", "252d", "check_circle")
+                        _card("Catastrophic", f"{_catastrophic.get('survival_prob_252d', 0):.0%}", "252d", "dangerous")
+
+            # Predicted regime shifts
+            shifts = profile.get("predicted_regime_shifts", {})
+            if shifts.get("available"):
+                ui.separator()
+                ui.label("Regime Shift Prediction").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("P(Exit 21d)", f"{shifts.get('prob_exit_21d', 0):.0%}", "", "swap_horiz")
+                    _card("P(Exit 252d)", f"{shifts.get('prob_exit_252d', 0):.0%}", "", "swap_horiz")
+                    _card("Expected Days", f"{shifts.get('expected_days_to_shift', 0):.0f}", f"Next: {shifts.get('most_probable_next_regime', '?')}", "schedule")
+
+            # Multi-frequency fusion
+            mf = profile.get("multi_frequency", {})
+            if mf.get("available"):
+                _rc = mf.get("regime_consensus", {})
+                _sv = mf.get("survival", {})
+                ui.separator()
+                ui.label("Multi-Frequency Fusion").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("Consensus", _rc.get("consensus_regime", "?"), f"{_rc.get('agreement_ratio', 0):.0%} agreement", "merge_type")
+                    _card("Fused Survival", f"{_sv.get('fused_probability', 0):.0%}", f"Weakest: {_sv.get('weakest_frequency', '?')}", "link")
+
+            # Signal IC
+            sig_ic = profile.get("signal_ic", {})
+            if sig_ic.get("available"):
+                ui.separator()
+                ui.label("Signal Quality").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("Best Signal", sig_ic.get("best_signal", "?"), f"IC={sig_ic.get('best_ic', 0):.4f}", "trending_up")
+                    _card("Strong Signals", str(len(sig_ic.get("strong_signals", []))), f"Weak: {len(sig_ic.get('weak_signals', []))}", "filter_alt")
+
+            # Model Diagnostics
+            diag = profile.get("model_diagnostics", {})
+            if diag.get("available"):
+                ui.separator()
+                ui.label("Model Diagnostics").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("On Track", f"{diag.get('n_models_on_track', 0)}/{diag.get('n_models_assessed', 0)}", diag.get("overall_robustness", ""), "verified")
+
+            # Filing Calendar
+            fc = profile.get("filing_calendar", {})
+            if fc.get("available"):
+                ui.separator()
+                ui.label("Filing Calendar").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("Coverage", f"{fc.get('coverage_ratio', 0):.0%}", f"{fc.get('actual_filings_2yr', 0)}/{fc.get('expected_filings_2yr', 0)} filings", "calendar_month")
+                    _stale_icon = "warning" if fc.get("is_stale") else "check"
+                    _card("Staleness", f"{fc.get('latest_filing_age_days', 0)}d", "STALE" if fc.get("is_stale") else "Fresh", _stale_icon)
+
+            # Macro Indicators
+            macro_ind = profile.get("macro_indicators", {})
+            if macro_ind:
+                ui.separator()
+                ui.label("Macro Indicators").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4 flex-wrap"):
+                    for ind_name, ind_data in list(macro_ind.items())[:5]:
+                        if isinstance(ind_data, dict):
+                            _card(ind_name.replace("_", " ").title(),
+                                  f"{ind_data.get('latest_value', 0):.2f}",
+                                  ind_data.get("latest_date", ""), "analytics")
+
+            # Market Buying Power + Product Catalysts + Supply Chain
+            bp = profile.get("market_buying_power", {})
+            cats = profile.get("product_catalysts", {})
+            scs = profile.get("supply_chain_stress", {})
+            if bp.get("available") or cats.get("available") or scs.get("available"):
+                ui.separator()
+                ui.label("Market Context").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    if bp.get("available"):
+                        _card("Buying Power", f"{bp.get('buying_power_index', 0):.0f}", bp.get("demand_risk_flag", ""), "shopping_cart")
+                    if cats.get("available"):
+                        _card("Catalyst", f"{cats.get('catalyst_score', 0):.2f}", cats.get("catalyst_type", ""), "rocket_launch")
+                    if scs.get("available"):
+                        _stress_flag = "YES" if scs.get("supply_chain_stress_flag") else "NO"
+                        _card("Supply Chain Stress", _stress_flag, f"Score: {scs.get('supply_chain_stress_score', 0):.2f}", "local_shipping")
+
+            # Institutional holders summary
+            inst = profile.get("institutional_holders", {})
+            if inst.get("available"):
+                ui.separator()
+                ui.label("Institutional Holders").classes("text-lg font-bold mt-3")
+                ui.label(f"{inst.get('total_holders', 0)} holders tracked").classes("text-sm text-gray-400")
+
+            # Corporate Structure
+            corp = profile.get("corporate_structure", {})
+            if corp.get("available"):
+                ui.separator()
+                ui.label("Corporate Structure (GLEIF)").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("Parents", str(corp.get("n_parents", 0)), "", "account_tree")
+                    _card("Subsidiaries", str(corp.get("n_subsidiaries", 0)),
+                          f"{len(corp.get('subsidiaries_countries', []))} countries", "account_tree")
+
+            # OHLC Predictions
+            ohlc = profile.get("ohlc_predictions", {})
+            if ohlc.get("available") and ohlc.get("next_day"):
+                nd = ohlc["next_day"]
+                ui.separator()
+                ui.label("OHLC Predictions (Next Day)").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    for field in ["open", "high", "low", "close"]:
+                        val = nd.get(field)
+                        if val is not None:
+                            _card(field.upper(), f"{val:.2f}", "", "candlestick_chart")
+
+            # Prediction Log (historical accuracy)
+            plog = profile.get("prediction_log", {})
+            if plog.get("n_filled", 0) > 0:
+                ui.separator()
+                ui.label("Prediction Track Record").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("Hit Rate", f"{plog.get('hit_rate', 0):.0%}", f"{plog.get('n_filled', 0)} predictions evaluated", "fact_check")
+                    _card("Realized IC", f"{plog.get('realized_ic', 0):.4f}", "", "analytics")
 
             # Extended models summary
             ext = profile.get("extended_models", {})
@@ -585,6 +727,35 @@ def render_analyze():
                   value=state.gen_pdf,
                   on_change=lambda e: setattr(state, "gen_pdf", e.value))
 
+    # Advanced options (expandable)
+    _adv = {"years": 2.0, "end_date": "", "pit_mode": "report_date", "output_dir": "cache", "verbose": False, "skip_report": False}
+
+    with ui.expansion("Advanced Options", icon="settings").classes("w-full mt-2"):
+        with ui.column().classes("gap-3 p-2"):
+            with ui.row().classes("items-center gap-4"):
+                ui.label("Lookback years").classes("w-40 text-sm")
+                ui.number(value=_adv["years"], step=0.5, format="%.1f",
+                          on_change=lambda e: _adv.update({"years": e.value})).classes("w-24")
+            with ui.row().classes("items-center gap-4"):
+                ui.label("End date (backtest)").classes("w-40 text-sm")
+                ui.input(value="", placeholder="YYYY-MM-DD (empty = today)",
+                         on_change=lambda e: _adv.update({"end_date": e.value})).classes("w-48")
+            with ui.row().classes("items-center gap-4"):
+                ui.label("PIT alignment").classes("w-40 text-sm")
+                ui.select(options={"report_date": "Report Date (default)", "filing_date": "Filing Date (strict PIT)"},
+                          value="report_date",
+                          on_change=lambda e: _adv.update({"pit_mode": e.value})).classes("w-48")
+            with ui.row().classes("items-center gap-4"):
+                ui.label("Output directory").classes("w-40 text-sm")
+                ui.input(value="cache",
+                         on_change=lambda e: _adv.update({"output_dir": e.value})).classes("w-48")
+            ui.switch("Skip report generation",
+                      value=False,
+                      on_change=lambda e: _adv.update({"skip_report": e.value}))
+            ui.switch("Verbose debug logging",
+                      value=False,
+                      on_change=lambda e: _adv.update({"verbose": e.value}))
+
     ui.separator()
 
     # Run button
@@ -605,13 +776,22 @@ def render_analyze():
             sys.executable, "main.py",
             "--market", state.market_id,
             "--company", state.company,
+            "--years", str(_adv.get("years", 2.0)),
+            "--pit-mode", _adv.get("pit_mode", "report_date"),
+            "--output-dir", _adv.get("output_dir", "cache"),
         ]
         if state.skip_linked:
             cmd.append("--skip-linked")
         if state.skip_models:
             cmd.append("--skip-models")
+        if _adv.get("skip_report"):
+            cmd.append("--skip-report")
         if state.gen_pdf:
             cmd.append("--pdf")
+        if _adv.get("end_date"):
+            cmd.extend(["--end-date", _adv["end_date"]])
+        if _adv.get("verbose"):
+            cmd.append("--verbose")
         if state.llm_provider:
             cmd.extend(["--llm-provider", state.llm_provider])
 
@@ -736,6 +916,49 @@ def render_report():
                                     for k, v in list(tier_data.items())[:4]:
                                         if v is not None:
                                             ui.label(f"{k}: {v:,.2f}" if isinstance(v, float) else f"{k}: {v}").classes("text-xs text-gray-400")
+
+                    # Key results summary cards
+                    survival = profile.get("survival", {})
+                    mc = profile.get("monte_carlo", {})
+                    fh = profile.get("financial_health", {})
+                    pos = profile.get("position_signal", {})
+
+                    ui.label("Key Results").classes("text-lg mt-4")
+                    with ui.row().classes("gap-4 flex-wrap"):
+                        if fh.get("latest_composite") is not None:
+                            _card("Health Score", f"{fh['latest_composite']:.0f}/100", fh.get("latest_label", ""), "favorite")
+                        if mc.get("survival_probability_mean"):
+                            _card("Survival", f"{mc['survival_probability_mean']:.0%}", "", "shield")
+                        _card("Regime", survival.get("survival_regime", "unknown"), "", "timeline")
+                        if pos.get("available"):
+                            _card("Signal", f"{pos.get('signal', 0):+.2f} ({pos.get('label', 'hold').upper()})", "", "trending_up")
+
+                    # USS + regime shift + diagnostics
+                    uss = profile.get("unified_survival_system", {})
+                    shifts = profile.get("predicted_regime_shifts", {})
+                    diag = profile.get("model_diagnostics", {})
+                    mf = profile.get("multi_frequency", {})
+                    sig = profile.get("signal_ic", {})
+
+                    _extra_cards = []
+                    if uss.get("available"):
+                        _extra_cards.append(("USS Regime", uss.get("current_regime", "?").replace("_", " ").title(), "", "shield"))
+                    if shifts.get("available"):
+                        _extra_cards.append(("P(Exit 21d)", f"{shifts.get('prob_exit_21d', 0):.0%}", "", "swap_horiz"))
+                    if diag.get("available"):
+                        _extra_cards.append(("Models OK", f"{diag.get('n_models_on_track', 0)}/{diag.get('n_models_assessed', 0)}", "", "verified"))
+                    if mf.get("available"):
+                        _rc = mf.get("regime_consensus", {})
+                        _extra_cards.append(("Freq Consensus", _rc.get("consensus_regime", "?"), f"{_rc.get('agreement_ratio', 0):.0%}", "merge_type"))
+                    if sig.get("available"):
+                        _extra_cards.append(("Best Signal", sig.get("best_signal", "?"), f"IC={sig.get('best_ic', 0):.4f}", "trending_up"))
+
+                    if _extra_cards:
+                        ui.label("Advanced Analytics").classes("text-lg mt-4")
+                        with ui.row().classes("gap-4 flex-wrap"):
+                            for title, value, sub, icon in _extra_cards:
+                                _card(title, value, sub, icon)
+
                 except Exception:
                     pass
 
@@ -860,6 +1083,404 @@ def render_report():
 
 # ---------------------------------------------------------------------------
 # Page: Health Monitor
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Page: Scoring Weights
+# ---------------------------------------------------------------------------
+
+def render_scoring_weights():
+    """Scoring weights panel -- view and edit all tweakable model parameters."""
+    from operator1.scoring_weights import (
+        get_scoring_weights,
+        save_scoring_weights,
+        reload_scoring_weights,
+    )
+
+    ui.label("Scoring Weights").classes("text-2xl font-bold")
+    ui.label(
+        "All tweakable model parameters in one place. "
+        "Edit values and click Save to update config/scoring_weights.yml."
+    ).classes("text-gray-400 mb-4")
+
+    sw = get_scoring_weights()
+
+    # Status bar
+    status_label = ui.label("").classes("text-sm mb-4")
+    config_path = Path("config/scoring_weights.yml")
+    if config_path.exists():
+        import os
+        mtime = os.path.getmtime(config_path)
+        from datetime import datetime, timezone
+        mtime_str = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        status_label.text = f"Loaded from config/scoring_weights.yml (last modified: {mtime_str})"
+        status_label.classes(replace="text-sm mb-4 monokai-green")
+    else:
+        status_label.text = "Config file not found -- using defaults"
+        status_label.classes(replace="text-sm mb-4 monokai-coral")
+
+    # Container for all weight sections
+    weight_inputs: dict[str, Any] = {}
+
+    with ui.tabs().classes("w-full") as weight_tabs:
+        wt_survival = ui.tab("Survival", icon="warning")
+        wt_hierarchy = ui.tab("Hierarchy", icon="layers")
+        wt_fh = ui.tab("Financial Health", icon="assessment")
+        wt_conflict = ui.tab("Conflict", icon="public")
+        wt_vanity = ui.tab("Vanity", icon="trending_down")
+        wt_planes = ui.tab("Plane Weights", icon="category")
+        wt_graph = ui.tab("Graph Risk", icon="hub")
+        wt_mc = ui.tab("Monte Carlo", icon="casino")
+        wt_ensemble = ui.tab("Ensemble", icon="merge_type")
+        wt_conformal = ui.tab("Conformal", icon="show_chart")
+        wt_freq = ui.tab("Frequency", icon="speed")
+        wt_uss = ui.tab("USS", icon="shield")
+
+    with ui.tab_panels(weight_tabs, value=wt_survival).classes("w-full"):
+
+        # --- Survival Thresholds ---
+        with ui.tab_panel(wt_survival):
+            ui.label("Survival Mode Thresholds").classes("text-lg font-bold mb-2")
+            ui.label("Company enters survival mode when ANY threshold is breached.").classes("text-gray-400 text-sm mb-3")
+            thresholds = sw.get("survival_thresholds", {})
+            _thresh_desc = {
+                "current_ratio": ("Current Ratio <", "Liquidity crisis"),
+                "debt_to_equity": ("Debt/Equity >", "Leverage crisis"),
+                "fcf_yield": ("FCF Yield <", "Cash burn"),
+                "drawdown_252d": ("Drawdown 252d <", "Market crash"),
+                "conflict_intensity": ("Conflict Intensity >", "Geopolitical crisis"),
+                "inst_flow_momentum": ("Inst. Flow Momentum <", "Institutional exodus"),
+            }
+            for key, default in [("current_ratio", 1.0), ("debt_to_equity", 3.0), ("fcf_yield", 0.0),
+                                 ("drawdown_252d", -0.40), ("conflict_intensity", 0.70), ("inst_flow_momentum", -0.15)]:
+                desc = _thresh_desc.get(key, (key, ""))
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(f"{desc[0]}").classes("w-48 text-sm")
+                    inp = ui.number(
+                        value=thresholds.get(key, default),
+                        step=0.05,
+                        format="%.3f",
+                    ).classes("w-32")
+                    ui.label(desc[1]).classes("text-xs text-gray-500")
+                    weight_inputs[f"survival_thresholds.{key}"] = inp
+
+            ui.separator().classes("my-4")
+            ui.label("Survival Probability Blend").classes("text-md font-bold mb-2")
+            blend = sw.get("survival_blend", {})
+            with ui.row().classes("items-center gap-4"):
+                ui.label("Sigmoid weight").classes("w-48 text-sm")
+                inp_sig = ui.number(value=blend.get("sigmoid_weight", 0.4), step=0.05, format="%.2f").classes("w-32")
+                weight_inputs["survival_blend.sigmoid_weight"] = inp_sig
+            with ui.row().classes("items-center gap-4"):
+                ui.label("Cox PH weight").classes("w-48 text-sm")
+                inp_cox = ui.number(value=blend.get("cox_weight", 0.6), step=0.05, format="%.2f").classes("w-32")
+                weight_inputs["survival_blend.cox_weight"] = inp_cox
+
+        # --- Hierarchy Weights ---
+        with ui.tab_panel(wt_hierarchy):
+            ui.label("Hierarchy Tier Weights").classes("text-lg font-bold mb-2")
+            ui.label("Per-regime weights for 5 tiers (Liquidity, Solvency, Stability, Profitability, Growth).").classes("text-gray-400 text-sm mb-3")
+            hw = sw.get("hierarchy_weights", {})
+            tier_names = ["T1 Liquidity", "T2 Solvency", "T3 Stability", "T4 Profitability", "T5 Growth"]
+            for regime in ["normal", "company_survival", "modified_survival", "extreme_survival"]:
+                ui.label(regime.replace("_", " ").title()).classes("text-md font-bold mt-3 mb-1 monokai-purple")
+                vals = hw.get(regime, [20, 20, 20, 20, 20])
+                with ui.row().classes("gap-3"):
+                    for i, tname in enumerate(tier_names):
+                        with ui.column().classes("items-center"):
+                            ui.label(tname).classes("text-xs text-gray-400")
+                            inp = ui.number(
+                                value=vals[i] if i < len(vals) else 20,
+                                step=1,
+                                format="%.0f",
+                            ).classes("w-20")
+                            weight_inputs[f"hierarchy_weights.{regime}.{i}"] = inp
+
+        # --- Financial Health ---
+        with ui.tab_panel(wt_fh):
+            ui.label("Financial Health Scoring").classes("text-lg font-bold mb-2")
+            fh = sw.get("financial_health", {})
+            for key, default, label in [
+                ("altman_safe_zone", 2.99, "Altman Z safe zone (above)"),
+                ("altman_distress_zone", 1.81, "Altman Z distress zone (below)"),
+                ("beneish_threshold", -2.22, "Beneish M threshold (above = manipulator)"),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-64 text-sm")
+                    inp = ui.number(value=fh.get(key, default), step=0.01, format="%.2f").classes("w-32")
+                    weight_inputs[f"financial_health.{key}"] = inp
+
+        # --- Conflict ---
+        with ui.tab_panel(wt_conflict):
+            ui.label("Conflict Risk Weights").classes("text-lg font-bold mb-2")
+            ui.label("Component weights for conflict intensity formula (should sum to 1.0).").classes("text-gray-400 text-sm mb-3")
+            cw = sw.get("conflict_weights", {})
+            for key, default, label in [
+                ("event_score", 0.40, "Event score (UCDP armed conflict events)"),
+                ("fatality_score", 0.20, "Fatality score (conflict deaths)"),
+                ("flag_score", 0.25, "Flag score (WB FCS + sanctions + wars)"),
+                ("news_score", 0.15, "News score (GDELT real-time)"),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-64 text-sm")
+                    inp = ui.number(value=cw.get(key, default), step=0.05, format="%.2f").classes("w-32")
+                    weight_inputs[f"conflict_weights.{key}"] = inp
+
+        # --- Vanity ---
+        with ui.tab_panel(wt_vanity):
+            ui.label("Vanity Component Weights").classes("text-lg font-bold mb-2")
+            ui.label("Capital allocation quality scoring (should sum to 1.0).").classes("text-gray-400 text-sm mb-3")
+            vw = sw.get("vanity_weights", {})
+            for key, default, label in [
+                ("rnd_mismatch", 0.15, "R&D Mismatch"),
+                ("sga_bloat", 0.25, "SGA Bloat"),
+                ("capital_misallocation", 0.30, "Capital Misallocation"),
+                ("competitive_decay", 0.15, "Competitive Decay"),
+                ("sentiment_gap", 0.15, "Sentiment Gap"),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-48 text-sm")
+                    inp = ui.number(value=vw.get(key, default), step=0.05, format="%.2f").classes("w-32")
+                    weight_inputs[f"vanity_weights.{key}"] = inp
+
+        # --- Plane Weights ---
+        with ui.tab_panel(wt_planes):
+            ui.label("Plane-Aware Model Weight Adjustments").classes("text-lg font-bold mb-2")
+            ui.label("Multipliers on base weight of 1.0 per economic plane.").classes("text-gray-400 text-sm mb-3")
+            pw = sw.get("plane_weights", {})
+            models = ["forecasting", "monte_carlo", "transformer", "cycle_decomposition",
+                       "pattern_detector", "copula", "particle_filter", "dtw_analogs",
+                       "granger_causality", "transfer_entropy"]
+            for plane in ["supply", "manufacturing", "consumption", "logistics", "finance"]:
+                ui.label(plane.title()).classes("text-md font-bold mt-3 mb-1 monokai-purple")
+                plane_vals = pw.get(plane, {})
+                with ui.row().classes("flex-wrap gap-3"):
+                    for model in models:
+                        with ui.column().classes("items-center"):
+                            ui.label(model.replace("_", " ").title()[:12]).classes("text-xs text-gray-400")
+                            inp = ui.number(
+                                value=plane_vals.get(model, 1.0),
+                                step=0.1,
+                                format="%.1f",
+                            ).classes("w-16")
+                            weight_inputs[f"plane_weights.{plane}.{model}"] = inp
+
+        # --- Graph Risk ---
+        with ui.tab_panel(wt_graph):
+            ui.label("Graph Risk Edge Weights").classes("text-lg font-bold mb-2")
+            ui.label("Higher weight = stronger contagion channel.").classes("text-gray-400 text-sm mb-3")
+            gw = sw.get("graph_edge_weights", {})
+            for key, default, label in [
+                ("parent_companies", 2.8, "Parent companies"),
+                ("subsidiaries", 2.3, "Subsidiaries"),
+                ("suppliers", 1.2, "Suppliers"),
+                ("financial_institutions", 1.3, "Financial institutions"),
+                ("customers", 1.1, "Customers"),
+                ("competitors", 1.0, "Competitors"),
+                ("logistics", 0.8, "Logistics"),
+                ("regulators", 0.5, "Regulators"),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-48 text-sm")
+                    inp = ui.number(value=gw.get(key, default), step=0.1, format="%.1f").classes("w-32")
+                    weight_inputs[f"graph_edge_weights.{key}"] = inp
+
+        # --- Monte Carlo ---
+        with ui.tab_panel(wt_mc):
+            ui.label("Monte Carlo Parameters").classes("text-lg font-bold mb-2")
+            mc = sw.get("monte_carlo", {})
+            for key, default, label, step in [
+                ("n_paths", 10000, "Number of simulation paths", 1000),
+                ("importance_tilt", 1.5, "Importance sampling tilt", 0.1),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-48 text-sm")
+                    inp = ui.number(value=mc.get(key, default), step=step).classes("w-32")
+                    weight_inputs[f"monte_carlo.{key}"] = inp
+
+            ui.separator().classes("my-3")
+            ui.label("Scenario Engine (USS)").classes("text-md font-bold mb-2")
+            se = sw.get("scenario_engine", {})
+            for scenario in ["orderly", "muddle_through", "catastrophic"]:
+                sc = se.get(scenario, {})
+                ui.label(scenario.replace("_", " ").title()).classes("text-sm font-bold mt-2 monokai-purple")
+                with ui.row().classes("gap-3"):
+                    for key, default, label in [
+                        ("revenue_shift", 0.0, "Revenue shift"),
+                        ("daily_drift", 0.0, "Daily drift"),
+                    ]:
+                        with ui.column().classes("items-center"):
+                            ui.label(label).classes("text-xs text-gray-400")
+                            inp = ui.number(value=sc.get(key, default), step=0.01, format="%.3f").classes("w-24")
+                            weight_inputs[f"scenario_engine.{scenario}.{key}"] = inp
+
+        # --- Ensemble ---
+        with ui.tab_panel(wt_ensemble):
+            ui.label("Ensemble Aggregation").classes("text-lg font-bold mb-2")
+            ens = sw.get("ensemble", {})
+            for key, default, label, step, fmt in [
+                ("z_score_90", 1.645, "Z-score (90% CI)", 0.01, "%.3f"),
+                ("survival_risk_multiplier", 2.0, "Survival risk multiplier", 0.1, "%.1f"),
+                ("transition_blend_halflife", 21, "Transition blend halflife (days)", 1, "%.0f"),
+                ("fixed_share_parameter", 0.05, "FixedShare share parameter", 0.01, "%.3f"),
+                ("fixed_share_eta", 0.1, "FixedShare learning rate (eta)", 0.01, "%.3f"),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-56 text-sm")
+                    inp = ui.number(value=ens.get(key, default), step=step, format=fmt).classes("w-32")
+                    weight_inputs[f"ensemble.{key}"] = inp
+
+        # --- Conformal ---
+        with ui.tab_panel(wt_conformal):
+            ui.label("Conformal Prediction PID").classes("text-lg font-bold mb-2")
+            conf = sw.get("conformal", {})
+            for key, default, label in [
+                ("target_coverage", 0.90, "Target coverage"),
+                ("pid_kp", 0.01, "PID Kp (proportional)"),
+                ("pid_ki", 0.001, "PID Ki (integral)"),
+                ("pid_kd", 0.005, "PID Kd (derivative)"),
+                ("copula_tail_amplification", 0.5, "Copula tail amplification"),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-48 text-sm")
+                    inp = ui.number(value=conf.get(key, default), step=0.001, format="%.4f").classes("w-32")
+                    weight_inputs[f"conformal.{key}"] = inp
+
+        # --- Frequency Fusion ---
+        with ui.tab_panel(wt_freq):
+            ui.label("Frequency Fusion Horizon Weights").classes("text-lg font-bold mb-2")
+            ui.label("Contribution of each frequency to each prediction horizon.").classes("text-gray-400 text-sm mb-3")
+            ff = sw.get("frequency_fusion", {})
+            freq_labels = ["D", "W", "M", "Q", "A"]
+            for horizon in ["1d", "5d", "1w", "21d", "1m", "3m", "6m", "1y", "2y"]:
+                hw_data = ff.get(horizon, {})
+                ui.label(horizon).classes("text-sm font-bold mt-2 monokai-purple")
+                with ui.row().classes("gap-3"):
+                    for freq in freq_labels:
+                        val = hw_data.get(freq, 0.0)
+                        if val > 0 or freq in hw_data:
+                            with ui.column().classes("items-center"):
+                                ui.label(freq).classes("text-xs text-gray-400")
+                                inp = ui.number(value=val, step=0.05, format="%.2f").classes("w-16")
+                                weight_inputs[f"frequency_fusion.{horizon}.{freq}"] = inp
+
+        # --- USS ---
+        with ui.tab_panel(wt_uss):
+            ui.label("USS Dimension Parameters").classes("text-lg font-bold mb-2")
+            ui.label("Model switching parameters per survival regime.").classes("text-gray-400 text-sm mb-3")
+            uss_ms = sw.get("uss_model_switching", {})
+            for regime in ["normal", "company_survival", "extreme_survival"]:
+                params = uss_ms.get(regime, {})
+                ui.label(regime.replace("_", " ").title()).classes("text-md font-bold mt-3 mb-1 monokai-purple")
+                with ui.row().classes("gap-3"):
+                    for key, default, label in [
+                        ("kalman_noise_mult", 1.0, "Kalman noise"),
+                        ("lstm_lookback", 60, "LSTM lookback"),
+                        ("mc_paths", 10000, "MC paths"),
+                        ("tree_max_depth", 10, "Tree depth"),
+                    ]:
+                        with ui.column().classes("items-center"):
+                            ui.label(label).classes("text-xs text-gray-400")
+                            inp = ui.number(value=params.get(key, default), step=1).classes("w-24")
+                            weight_inputs[f"uss_model_switching.{regime}.{key}"] = inp
+
+    # --- Save / Reset buttons ---
+    ui.separator().classes("my-4")
+
+    save_status = ui.label("").classes("text-sm")
+
+    def _collect_and_save():
+        """Collect all input values and save to YAML."""
+        updated = get_scoring_weights().copy()
+
+        for dotted_key, inp in weight_inputs.items():
+            parts = dotted_key.split(".")
+            val = inp.value
+            if val is None:
+                continue
+
+            # Navigate to the right nested dict
+            current = updated
+            for part in parts[:-1]:
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+
+            last_key = parts[-1]
+
+            # Handle hierarchy_weights which are lists indexed by position
+            if "hierarchy_weights" in dotted_key and last_key.isdigit():
+                idx = int(last_key)
+                regime_key = parts[-2]
+                if regime_key not in updated.get("hierarchy_weights", {}):
+                    updated.setdefault("hierarchy_weights", {})[regime_key] = [20, 20, 20, 20, 20]
+                lst = updated["hierarchy_weights"][regime_key]
+                while len(lst) <= idx:
+                    lst.append(20)
+                lst[idx] = int(val)
+                continue
+
+            # Handle frequency_fusion which has nested freq keys
+            if "frequency_fusion" in dotted_key and len(parts) == 3:
+                horizon = parts[1]
+                freq = parts[2]
+                updated.setdefault("frequency_fusion", {}).setdefault(horizon, {})[freq] = float(val)
+                continue
+
+            # Handle plane_weights which are 3-deep
+            if "plane_weights" in dotted_key and len(parts) == 3:
+                plane = parts[1]
+                model = parts[2]
+                updated.setdefault("plane_weights", {}).setdefault(plane, {})[model] = float(val)
+                continue
+
+            # Handle uss_model_switching which are 3-deep
+            if "uss_model_switching" in dotted_key and len(parts) == 3:
+                regime = parts[1]
+                param = parts[2]
+                updated.setdefault("uss_model_switching", {}).setdefault(regime, {})[param] = (
+                    int(val) if param in ("lstm_lookback", "mc_paths", "tree_max_depth") else float(val)
+                )
+                continue
+
+            # Handle scenario_engine which are 3-deep
+            if "scenario_engine" in dotted_key and len(parts) == 3:
+                scenario = parts[1]
+                param = parts[2]
+                updated.setdefault("scenario_engine", {}).setdefault(scenario, {})[param] = float(val)
+                continue
+
+            # Standard 2-level nesting
+            try:
+                # Try int first for whole numbers
+                if isinstance(val, float) and val == int(val) and last_key in ("n_paths",):
+                    current[last_key] = int(val)
+                else:
+                    current[last_key] = float(val)
+            except (TypeError, ValueError):
+                current[last_key] = val
+
+        save_scoring_weights(updated)
+        reload_scoring_weights()
+        save_status.text = "Saved to config/scoring_weights.yml"
+        save_status.classes(replace="text-sm monokai-green")
+        ui.notify("Scoring weights saved", type="positive", position="top")
+
+    def _reset_defaults():
+        """Reset to defaults by deleting cache and reloading."""
+        reload_scoring_weights()
+        save_status.text = "Reloaded from disk"
+        save_status.classes(replace="text-sm monokai-amber")
+        ui.notify("Weights reloaded from disk (refresh page to see changes)", type="info", position="top")
+
+    with ui.row().classes("gap-4"):
+        ui.button("Save All Weights", icon="save", on_click=_collect_and_save).props("color=primary")
+        ui.button("Reload from Disk", icon="refresh", on_click=_reset_defaults).props("color=grey outline")
+        save_status
+
+
+# ---------------------------------------------------------------------------
+# Page: Health
 # ---------------------------------------------------------------------------
 
 def render_health():
