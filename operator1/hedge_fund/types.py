@@ -412,6 +412,9 @@ class HedgeFundResult:
     # Advanced methods (15 additional techniques)
     advanced: dict[str, Any] = field(default_factory=dict)
 
+    # Cross-pipeline fusion (8 methods combining HF + multi-freq)
+    fusion: dict[str, Any] = field(default_factory=dict)
+
     def to_profile_dict(self) -> dict[str, Any]:
         """Convert to JSON-serializable dict for profile storage."""
         from dataclasses import asdict

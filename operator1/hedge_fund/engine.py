@@ -1163,6 +1163,55 @@ def run_hedge_fund_analysis(
     except Exception as exc:
         logger.debug("Advanced HF methods failed: %s", exc)
 
+    # --- Cross-Pipeline Fusion (8 methods) ---
+    fusion_result = None
+    try:
+        from operator1.hedge_fund.fusion import run_fusion
+        _hf_profile = hf.to_profile_dict()
+        _main_signal = 0.0
+        if forecast_result is not None and hasattr(forecast_result, "forecasts"):
+            r5d = forecast_result.forecasts.get("return_5d", {})
+            if isinstance(r5d, dict):
+                val = r5d.get("5d")
+                if val is not None and isinstance(val, (int, float)):
+                    _main_signal = float(val) * 100  # scale to -1/+1 range
+
+        fusion_result = run_fusion(
+            hf_profile=_hf_profile,
+            main_position_signal=max(-1, min(1, _main_signal)),
+            multi_frequency_result=multi_frequency_result,
+            signal_ic_result=signal_ic_result,
+            filing_calendar_result=filing_calendar_result,
+            survival_controller=survival_controller,
+            cache=cache,
+        )
+        if fusion_result.available:
+            hf.fusion = {
+                "available": True,
+                "fused_signal": fusion_result.fused_signal,
+                "fused_label": fusion_result.fused_label,
+                "fused_conviction": fusion_result.fused_conviction,
+                "anomaly_overrides": fusion_result.anomaly_overrides,
+                "anomaly_frozen": fusion_result.anomaly_frozen,
+                "freq_disagreement": fusion_result.freq_disagreement_score,
+                "meta_ensemble_agreement": fusion_result.meta_ensemble_agreement,
+                "catalyst_regime": fusion_result.catalyst_weight_regime,
+                "early_warnings": fusion_result.early_warnings,
+                "belief_posterior": fusion_result.belief_network_posterior,
+                "action": fusion_result.action,
+                "primary_risk": fusion_result.primary_risk,
+                "next_catalyst": fusion_result.next_catalyst,
+            }
+            logger.info(
+                "  Fusion: signal=%+.2f (%s), conviction=%.0f%%, posterior=%.1f%%, warnings=%d",
+                fusion_result.fused_signal, fusion_result.fused_label,
+                fusion_result.fused_conviction * 100,
+                fusion_result.belief_network_posterior * 100,
+                len(fusion_result.early_warnings),
+            )
+    except Exception as exc:
+        logger.debug("Cross-pipeline fusion failed: %s", exc)
+
     elapsed = time.time() - t0
     hf.available = True
 
