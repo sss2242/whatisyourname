@@ -727,6 +727,35 @@ def render_analyze():
                   value=state.gen_pdf,
                   on_change=lambda e: setattr(state, "gen_pdf", e.value))
 
+    # Advanced options (expandable)
+    _adv = {"years": 2.0, "end_date": "", "pit_mode": "report_date", "output_dir": "cache", "verbose": False, "skip_report": False}
+
+    with ui.expansion("Advanced Options", icon="settings").classes("w-full mt-2"):
+        with ui.column().classes("gap-3 p-2"):
+            with ui.row().classes("items-center gap-4"):
+                ui.label("Lookback years").classes("w-40 text-sm")
+                ui.number(value=_adv["years"], step=0.5, format="%.1f",
+                          on_change=lambda e: _adv.update({"years": e.value})).classes("w-24")
+            with ui.row().classes("items-center gap-4"):
+                ui.label("End date (backtest)").classes("w-40 text-sm")
+                ui.input(value="", placeholder="YYYY-MM-DD (empty = today)",
+                         on_change=lambda e: _adv.update({"end_date": e.value})).classes("w-48")
+            with ui.row().classes("items-center gap-4"):
+                ui.label("PIT alignment").classes("w-40 text-sm")
+                ui.select(options={"report_date": "Report Date (default)", "filing_date": "Filing Date (strict PIT)"},
+                          value="report_date",
+                          on_change=lambda e: _adv.update({"pit_mode": e.value})).classes("w-48")
+            with ui.row().classes("items-center gap-4"):
+                ui.label("Output directory").classes("w-40 text-sm")
+                ui.input(value="cache",
+                         on_change=lambda e: _adv.update({"output_dir": e.value})).classes("w-48")
+            ui.switch("Skip report generation",
+                      value=False,
+                      on_change=lambda e: _adv.update({"skip_report": e.value}))
+            ui.switch("Verbose debug logging",
+                      value=False,
+                      on_change=lambda e: _adv.update({"verbose": e.value}))
+
     ui.separator()
 
     # Run button
@@ -747,13 +776,22 @@ def render_analyze():
             sys.executable, "main.py",
             "--market", state.market_id,
             "--company", state.company,
+            "--years", str(_adv.get("years", 2.0)),
+            "--pit-mode", _adv.get("pit_mode", "report_date"),
+            "--output-dir", _adv.get("output_dir", "cache"),
         ]
         if state.skip_linked:
             cmd.append("--skip-linked")
         if state.skip_models:
             cmd.append("--skip-models")
+        if _adv.get("skip_report"):
+            cmd.append("--skip-report")
         if state.gen_pdf:
             cmd.append("--pdf")
+        if _adv.get("end_date"):
+            cmd.extend(["--end-date", _adv["end_date"]])
+        if _adv.get("verbose"):
+            cmd.append("--verbose")
         if state.llm_provider:
             cmd.extend(["--llm-provider", state.llm_provider])
 
