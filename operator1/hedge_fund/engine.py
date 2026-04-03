@@ -1061,7 +1061,7 @@ def run_hedge_fund_analysis(
         logger.info("HF Analysis skipped: no income statement data")
         return hf
 
-    logger.info("Running Hedge Fund Analysis (15 metrics + scorecard)...")
+    logger.info("Running Hedge Fund Analysis (15 metrics + 15 advanced methods + scorecard)...")
 
     # --- Tier 1: Earnings Forensics ---
     from operator1.hedge_fund.fcf_quality import compute_fcf_quality
@@ -1136,6 +1136,31 @@ def run_hedge_fund_analysis(
         hf, cache, signal_ic_result, survival_controller,
         forecast_result, filing_calendar_result,
     )
+
+    # --- Advanced Methods (15 additional techniques) ---
+    try:
+        from operator1.hedge_fund.advanced_methods import run_advanced_methods
+        _adv = run_advanced_methods(
+            income_df=income_df,
+            balance_df=balance_df,
+            cashflow_df=cashflow_df,
+            cache=cache,
+            linked_caches=linked_caches,
+            macro_data=macro_data,
+            peer_ranking_result=peer_ranking_result,
+        )
+        if _adv.available:
+            hf.advanced = _adv  # type: ignore[attr-defined]
+            logger.info(
+                "  Advanced: Piotroski=%d/9, Z''=%s (%s), OU_hl=%s days, Torpedo=%d%%",
+                _adv.piotroski_f_score,
+                f"{_adv.altman_z_double_prime:.2f}" if _adv.altman_z_double_prime else "N/A",
+                _adv.altman_z_dp_zone,
+                f"{_adv.ou_mean_reversion.get('half_life_days', 'N/A')}",
+                _adv.earnings_torpedo.get("torpedo_risk", 0),
+            )
+    except Exception as exc:
+        logger.debug("Advanced HF methods failed: %s", exc)
 
     elapsed = time.time() - t0
     hf.available = True
