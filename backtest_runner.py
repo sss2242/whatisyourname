@@ -1545,6 +1545,29 @@ def run_stage3(state: BacktestState) -> None:
         json.dump(preds_summary, f, indent=2, default=str)
     logger.info("Predictions saved: %s", preds_path)
 
+    # Report generation (optional, requires LLM client)
+    try:
+        from operator1.report.report_generator import generate_all_reports
+        from operator1.clients.llm_factory import create_llm_client
+
+        llm_client = create_llm_client(state._secrets) if state._secrets else None
+        report_dir = Path(state.run_dir) / "report"
+        all_reports = generate_all_reports(
+            profile=state.profile,
+            llm_client=llm_client,
+            cache=state.cache,
+            output_dir=report_dir,
+            generate_pdf=False,
+        )
+        for tier_name, report_output in all_reports.items():
+            logger.info(
+                "  %s report: %s",
+                tier_name.capitalize(),
+                report_output.get("markdown_path"),
+            )
+    except Exception as exc:
+        logger.info("Report generation skipped: %s", exc)
+
     state.save(stage=3)
     logger.info("STAGE 3 COMPLETE")
 
