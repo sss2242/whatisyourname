@@ -878,6 +878,49 @@ def render_report():
                                     for k, v in list(tier_data.items())[:4]:
                                         if v is not None:
                                             ui.label(f"{k}: {v:,.2f}" if isinstance(v, float) else f"{k}: {v}").classes("text-xs text-gray-400")
+
+                    # Key results summary cards
+                    survival = profile.get("survival", {})
+                    mc = profile.get("monte_carlo", {})
+                    fh = profile.get("financial_health", {})
+                    pos = profile.get("position_signal", {})
+
+                    ui.label("Key Results").classes("text-lg mt-4")
+                    with ui.row().classes("gap-4 flex-wrap"):
+                        if fh.get("latest_composite") is not None:
+                            _card("Health Score", f"{fh['latest_composite']:.0f}/100", fh.get("latest_label", ""), "favorite")
+                        if mc.get("survival_probability_mean"):
+                            _card("Survival", f"{mc['survival_probability_mean']:.0%}", "", "shield")
+                        _card("Regime", survival.get("survival_regime", "unknown"), "", "timeline")
+                        if pos.get("available"):
+                            _card("Signal", f"{pos.get('signal', 0):+.2f} ({pos.get('label', 'hold').upper()})", "", "trending_up")
+
+                    # USS + regime shift + diagnostics
+                    uss = profile.get("unified_survival_system", {})
+                    shifts = profile.get("predicted_regime_shifts", {})
+                    diag = profile.get("model_diagnostics", {})
+                    mf = profile.get("multi_frequency", {})
+                    sig = profile.get("signal_ic", {})
+
+                    _extra_cards = []
+                    if uss.get("available"):
+                        _extra_cards.append(("USS Regime", uss.get("current_regime", "?").replace("_", " ").title(), "", "shield"))
+                    if shifts.get("available"):
+                        _extra_cards.append(("P(Exit 21d)", f"{shifts.get('prob_exit_21d', 0):.0%}", "", "swap_horiz"))
+                    if diag.get("available"):
+                        _extra_cards.append(("Models OK", f"{diag.get('n_models_on_track', 0)}/{diag.get('n_models_assessed', 0)}", "", "verified"))
+                    if mf.get("available"):
+                        _rc = mf.get("regime_consensus", {})
+                        _extra_cards.append(("Freq Consensus", _rc.get("consensus_regime", "?"), f"{_rc.get('agreement_ratio', 0):.0%}", "merge_type"))
+                    if sig.get("available"):
+                        _extra_cards.append(("Best Signal", sig.get("best_signal", "?"), f"IC={sig.get('best_ic', 0):.4f}", "trending_up"))
+
+                    if _extra_cards:
+                        ui.label("Advanced Analytics").classes("text-lg mt-4")
+                        with ui.row().classes("gap-4 flex-wrap"):
+                            for title, value, sub, icon in _extra_cards:
+                                _card(title, value, sub, icon)
+
                 except Exception:
                     pass
 
