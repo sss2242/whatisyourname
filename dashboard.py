@@ -359,6 +359,7 @@ def create_main_layout():
         tab_home = ui.tab("Home", icon="home")
         tab_analyze = ui.tab("New Analysis", icon="search")
         tab_report = ui.tab("Report", icon="description")
+        tab_weights = ui.tab("Scoring Weights", icon="tune")
         tab_health = ui.tab("Health", icon="monitor_heart")
         tab_models = ui.tab("Model Tests", icon="science")
         tab_config = ui.tab("Settings", icon="settings")
@@ -370,6 +371,8 @@ def create_main_layout():
             render_analyze()
         with ui.tab_panel(tab_report).classes("p-6"):
             render_report()
+        with ui.tab_panel(tab_weights).classes("p-6"):
+            render_scoring_weights()
         with ui.tab_panel(tab_health).classes("p-6"):
             render_health()
         with ui.tab_panel(tab_models).classes("p-6"):
@@ -860,6 +863,404 @@ def render_report():
 
 # ---------------------------------------------------------------------------
 # Page: Health Monitor
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Page: Scoring Weights
+# ---------------------------------------------------------------------------
+
+def render_scoring_weights():
+    """Scoring weights panel -- view and edit all tweakable model parameters."""
+    from operator1.scoring_weights import (
+        get_scoring_weights,
+        save_scoring_weights,
+        reload_scoring_weights,
+    )
+
+    ui.label("Scoring Weights").classes("text-2xl font-bold")
+    ui.label(
+        "All tweakable model parameters in one place. "
+        "Edit values and click Save to update config/scoring_weights.yml."
+    ).classes("text-gray-400 mb-4")
+
+    sw = get_scoring_weights()
+
+    # Status bar
+    status_label = ui.label("").classes("text-sm mb-4")
+    config_path = Path("config/scoring_weights.yml")
+    if config_path.exists():
+        import os
+        mtime = os.path.getmtime(config_path)
+        from datetime import datetime, timezone
+        mtime_str = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        status_label.text = f"Loaded from config/scoring_weights.yml (last modified: {mtime_str})"
+        status_label.classes(replace="text-sm mb-4 monokai-green")
+    else:
+        status_label.text = "Config file not found -- using defaults"
+        status_label.classes(replace="text-sm mb-4 monokai-coral")
+
+    # Container for all weight sections
+    weight_inputs: dict[str, Any] = {}
+
+    with ui.tabs().classes("w-full") as weight_tabs:
+        wt_survival = ui.tab("Survival", icon="warning")
+        wt_hierarchy = ui.tab("Hierarchy", icon="layers")
+        wt_fh = ui.tab("Financial Health", icon="assessment")
+        wt_conflict = ui.tab("Conflict", icon="public")
+        wt_vanity = ui.tab("Vanity", icon="trending_down")
+        wt_planes = ui.tab("Plane Weights", icon="category")
+        wt_graph = ui.tab("Graph Risk", icon="hub")
+        wt_mc = ui.tab("Monte Carlo", icon="casino")
+        wt_ensemble = ui.tab("Ensemble", icon="merge_type")
+        wt_conformal = ui.tab("Conformal", icon="show_chart")
+        wt_freq = ui.tab("Frequency", icon="speed")
+        wt_uss = ui.tab("USS", icon="shield")
+
+    with ui.tab_panels(weight_tabs, value=wt_survival).classes("w-full"):
+
+        # --- Survival Thresholds ---
+        with ui.tab_panel(wt_survival):
+            ui.label("Survival Mode Thresholds").classes("text-lg font-bold mb-2")
+            ui.label("Company enters survival mode when ANY threshold is breached.").classes("text-gray-400 text-sm mb-3")
+            thresholds = sw.get("survival_thresholds", {})
+            _thresh_desc = {
+                "current_ratio": ("Current Ratio <", "Liquidity crisis"),
+                "debt_to_equity": ("Debt/Equity >", "Leverage crisis"),
+                "fcf_yield": ("FCF Yield <", "Cash burn"),
+                "drawdown_252d": ("Drawdown 252d <", "Market crash"),
+                "conflict_intensity": ("Conflict Intensity >", "Geopolitical crisis"),
+                "inst_flow_momentum": ("Inst. Flow Momentum <", "Institutional exodus"),
+            }
+            for key, default in [("current_ratio", 1.0), ("debt_to_equity", 3.0), ("fcf_yield", 0.0),
+                                 ("drawdown_252d", -0.40), ("conflict_intensity", 0.70), ("inst_flow_momentum", -0.15)]:
+                desc = _thresh_desc.get(key, (key, ""))
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(f"{desc[0]}").classes("w-48 text-sm")
+                    inp = ui.number(
+                        value=thresholds.get(key, default),
+                        step=0.05,
+                        format="%.3f",
+                    ).classes("w-32")
+                    ui.label(desc[1]).classes("text-xs text-gray-500")
+                    weight_inputs[f"survival_thresholds.{key}"] = inp
+
+            ui.separator().classes("my-4")
+            ui.label("Survival Probability Blend").classes("text-md font-bold mb-2")
+            blend = sw.get("survival_blend", {})
+            with ui.row().classes("items-center gap-4"):
+                ui.label("Sigmoid weight").classes("w-48 text-sm")
+                inp_sig = ui.number(value=blend.get("sigmoid_weight", 0.4), step=0.05, format="%.2f").classes("w-32")
+                weight_inputs["survival_blend.sigmoid_weight"] = inp_sig
+            with ui.row().classes("items-center gap-4"):
+                ui.label("Cox PH weight").classes("w-48 text-sm")
+                inp_cox = ui.number(value=blend.get("cox_weight", 0.6), step=0.05, format="%.2f").classes("w-32")
+                weight_inputs["survival_blend.cox_weight"] = inp_cox
+
+        # --- Hierarchy Weights ---
+        with ui.tab_panel(wt_hierarchy):
+            ui.label("Hierarchy Tier Weights").classes("text-lg font-bold mb-2")
+            ui.label("Per-regime weights for 5 tiers (Liquidity, Solvency, Stability, Profitability, Growth).").classes("text-gray-400 text-sm mb-3")
+            hw = sw.get("hierarchy_weights", {})
+            tier_names = ["T1 Liquidity", "T2 Solvency", "T3 Stability", "T4 Profitability", "T5 Growth"]
+            for regime in ["normal", "company_survival", "modified_survival", "extreme_survival"]:
+                ui.label(regime.replace("_", " ").title()).classes("text-md font-bold mt-3 mb-1 monokai-purple")
+                vals = hw.get(regime, [20, 20, 20, 20, 20])
+                with ui.row().classes("gap-3"):
+                    for i, tname in enumerate(tier_names):
+                        with ui.column().classes("items-center"):
+                            ui.label(tname).classes("text-xs text-gray-400")
+                            inp = ui.number(
+                                value=vals[i] if i < len(vals) else 20,
+                                step=1,
+                                format="%.0f",
+                            ).classes("w-20")
+                            weight_inputs[f"hierarchy_weights.{regime}.{i}"] = inp
+
+        # --- Financial Health ---
+        with ui.tab_panel(wt_fh):
+            ui.label("Financial Health Scoring").classes("text-lg font-bold mb-2")
+            fh = sw.get("financial_health", {})
+            for key, default, label in [
+                ("altman_safe_zone", 2.99, "Altman Z safe zone (above)"),
+                ("altman_distress_zone", 1.81, "Altman Z distress zone (below)"),
+                ("beneish_threshold", -2.22, "Beneish M threshold (above = manipulator)"),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-64 text-sm")
+                    inp = ui.number(value=fh.get(key, default), step=0.01, format="%.2f").classes("w-32")
+                    weight_inputs[f"financial_health.{key}"] = inp
+
+        # --- Conflict ---
+        with ui.tab_panel(wt_conflict):
+            ui.label("Conflict Risk Weights").classes("text-lg font-bold mb-2")
+            ui.label("Component weights for conflict intensity formula (should sum to 1.0).").classes("text-gray-400 text-sm mb-3")
+            cw = sw.get("conflict_weights", {})
+            for key, default, label in [
+                ("event_score", 0.40, "Event score (UCDP armed conflict events)"),
+                ("fatality_score", 0.20, "Fatality score (conflict deaths)"),
+                ("flag_score", 0.25, "Flag score (WB FCS + sanctions + wars)"),
+                ("news_score", 0.15, "News score (GDELT real-time)"),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-64 text-sm")
+                    inp = ui.number(value=cw.get(key, default), step=0.05, format="%.2f").classes("w-32")
+                    weight_inputs[f"conflict_weights.{key}"] = inp
+
+        # --- Vanity ---
+        with ui.tab_panel(wt_vanity):
+            ui.label("Vanity Component Weights").classes("text-lg font-bold mb-2")
+            ui.label("Capital allocation quality scoring (should sum to 1.0).").classes("text-gray-400 text-sm mb-3")
+            vw = sw.get("vanity_weights", {})
+            for key, default, label in [
+                ("rnd_mismatch", 0.15, "R&D Mismatch"),
+                ("sga_bloat", 0.25, "SGA Bloat"),
+                ("capital_misallocation", 0.30, "Capital Misallocation"),
+                ("competitive_decay", 0.15, "Competitive Decay"),
+                ("sentiment_gap", 0.15, "Sentiment Gap"),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-48 text-sm")
+                    inp = ui.number(value=vw.get(key, default), step=0.05, format="%.2f").classes("w-32")
+                    weight_inputs[f"vanity_weights.{key}"] = inp
+
+        # --- Plane Weights ---
+        with ui.tab_panel(wt_planes):
+            ui.label("Plane-Aware Model Weight Adjustments").classes("text-lg font-bold mb-2")
+            ui.label("Multipliers on base weight of 1.0 per economic plane.").classes("text-gray-400 text-sm mb-3")
+            pw = sw.get("plane_weights", {})
+            models = ["forecasting", "monte_carlo", "transformer", "cycle_decomposition",
+                       "pattern_detector", "copula", "particle_filter", "dtw_analogs",
+                       "granger_causality", "transfer_entropy"]
+            for plane in ["supply", "manufacturing", "consumption", "logistics", "finance"]:
+                ui.label(plane.title()).classes("text-md font-bold mt-3 mb-1 monokai-purple")
+                plane_vals = pw.get(plane, {})
+                with ui.row().classes("flex-wrap gap-3"):
+                    for model in models:
+                        with ui.column().classes("items-center"):
+                            ui.label(model.replace("_", " ").title()[:12]).classes("text-xs text-gray-400")
+                            inp = ui.number(
+                                value=plane_vals.get(model, 1.0),
+                                step=0.1,
+                                format="%.1f",
+                            ).classes("w-16")
+                            weight_inputs[f"plane_weights.{plane}.{model}"] = inp
+
+        # --- Graph Risk ---
+        with ui.tab_panel(wt_graph):
+            ui.label("Graph Risk Edge Weights").classes("text-lg font-bold mb-2")
+            ui.label("Higher weight = stronger contagion channel.").classes("text-gray-400 text-sm mb-3")
+            gw = sw.get("graph_edge_weights", {})
+            for key, default, label in [
+                ("parent_companies", 2.8, "Parent companies"),
+                ("subsidiaries", 2.3, "Subsidiaries"),
+                ("suppliers", 1.2, "Suppliers"),
+                ("financial_institutions", 1.3, "Financial institutions"),
+                ("customers", 1.1, "Customers"),
+                ("competitors", 1.0, "Competitors"),
+                ("logistics", 0.8, "Logistics"),
+                ("regulators", 0.5, "Regulators"),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-48 text-sm")
+                    inp = ui.number(value=gw.get(key, default), step=0.1, format="%.1f").classes("w-32")
+                    weight_inputs[f"graph_edge_weights.{key}"] = inp
+
+        # --- Monte Carlo ---
+        with ui.tab_panel(wt_mc):
+            ui.label("Monte Carlo Parameters").classes("text-lg font-bold mb-2")
+            mc = sw.get("monte_carlo", {})
+            for key, default, label, step in [
+                ("n_paths", 10000, "Number of simulation paths", 1000),
+                ("importance_tilt", 1.5, "Importance sampling tilt", 0.1),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-48 text-sm")
+                    inp = ui.number(value=mc.get(key, default), step=step).classes("w-32")
+                    weight_inputs[f"monte_carlo.{key}"] = inp
+
+            ui.separator().classes("my-3")
+            ui.label("Scenario Engine (USS)").classes("text-md font-bold mb-2")
+            se = sw.get("scenario_engine", {})
+            for scenario in ["orderly", "muddle_through", "catastrophic"]:
+                sc = se.get(scenario, {})
+                ui.label(scenario.replace("_", " ").title()).classes("text-sm font-bold mt-2 monokai-purple")
+                with ui.row().classes("gap-3"):
+                    for key, default, label in [
+                        ("revenue_shift", 0.0, "Revenue shift"),
+                        ("daily_drift", 0.0, "Daily drift"),
+                    ]:
+                        with ui.column().classes("items-center"):
+                            ui.label(label).classes("text-xs text-gray-400")
+                            inp = ui.number(value=sc.get(key, default), step=0.01, format="%.3f").classes("w-24")
+                            weight_inputs[f"scenario_engine.{scenario}.{key}"] = inp
+
+        # --- Ensemble ---
+        with ui.tab_panel(wt_ensemble):
+            ui.label("Ensemble Aggregation").classes("text-lg font-bold mb-2")
+            ens = sw.get("ensemble", {})
+            for key, default, label, step, fmt in [
+                ("z_score_90", 1.645, "Z-score (90% CI)", 0.01, "%.3f"),
+                ("survival_risk_multiplier", 2.0, "Survival risk multiplier", 0.1, "%.1f"),
+                ("transition_blend_halflife", 21, "Transition blend halflife (days)", 1, "%.0f"),
+                ("fixed_share_parameter", 0.05, "FixedShare share parameter", 0.01, "%.3f"),
+                ("fixed_share_eta", 0.1, "FixedShare learning rate (eta)", 0.01, "%.3f"),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-56 text-sm")
+                    inp = ui.number(value=ens.get(key, default), step=step, format=fmt).classes("w-32")
+                    weight_inputs[f"ensemble.{key}"] = inp
+
+        # --- Conformal ---
+        with ui.tab_panel(wt_conformal):
+            ui.label("Conformal Prediction PID").classes("text-lg font-bold mb-2")
+            conf = sw.get("conformal", {})
+            for key, default, label in [
+                ("target_coverage", 0.90, "Target coverage"),
+                ("pid_kp", 0.01, "PID Kp (proportional)"),
+                ("pid_ki", 0.001, "PID Ki (integral)"),
+                ("pid_kd", 0.005, "PID Kd (derivative)"),
+                ("copula_tail_amplification", 0.5, "Copula tail amplification"),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-48 text-sm")
+                    inp = ui.number(value=conf.get(key, default), step=0.001, format="%.4f").classes("w-32")
+                    weight_inputs[f"conformal.{key}"] = inp
+
+        # --- Frequency Fusion ---
+        with ui.tab_panel(wt_freq):
+            ui.label("Frequency Fusion Horizon Weights").classes("text-lg font-bold mb-2")
+            ui.label("Contribution of each frequency to each prediction horizon.").classes("text-gray-400 text-sm mb-3")
+            ff = sw.get("frequency_fusion", {})
+            freq_labels = ["D", "W", "M", "Q", "A"]
+            for horizon in ["1d", "5d", "1w", "21d", "1m", "3m", "6m", "1y", "2y"]:
+                hw_data = ff.get(horizon, {})
+                ui.label(horizon).classes("text-sm font-bold mt-2 monokai-purple")
+                with ui.row().classes("gap-3"):
+                    for freq in freq_labels:
+                        val = hw_data.get(freq, 0.0)
+                        if val > 0 or freq in hw_data:
+                            with ui.column().classes("items-center"):
+                                ui.label(freq).classes("text-xs text-gray-400")
+                                inp = ui.number(value=val, step=0.05, format="%.2f").classes("w-16")
+                                weight_inputs[f"frequency_fusion.{horizon}.{freq}"] = inp
+
+        # --- USS ---
+        with ui.tab_panel(wt_uss):
+            ui.label("USS Dimension Parameters").classes("text-lg font-bold mb-2")
+            ui.label("Model switching parameters per survival regime.").classes("text-gray-400 text-sm mb-3")
+            uss_ms = sw.get("uss_model_switching", {})
+            for regime in ["normal", "company_survival", "extreme_survival"]:
+                params = uss_ms.get(regime, {})
+                ui.label(regime.replace("_", " ").title()).classes("text-md font-bold mt-3 mb-1 monokai-purple")
+                with ui.row().classes("gap-3"):
+                    for key, default, label in [
+                        ("kalman_noise_mult", 1.0, "Kalman noise"),
+                        ("lstm_lookback", 60, "LSTM lookback"),
+                        ("mc_paths", 10000, "MC paths"),
+                        ("tree_max_depth", 10, "Tree depth"),
+                    ]:
+                        with ui.column().classes("items-center"):
+                            ui.label(label).classes("text-xs text-gray-400")
+                            inp = ui.number(value=params.get(key, default), step=1).classes("w-24")
+                            weight_inputs[f"uss_model_switching.{regime}.{key}"] = inp
+
+    # --- Save / Reset buttons ---
+    ui.separator().classes("my-4")
+
+    save_status = ui.label("").classes("text-sm")
+
+    def _collect_and_save():
+        """Collect all input values and save to YAML."""
+        updated = get_scoring_weights().copy()
+
+        for dotted_key, inp in weight_inputs.items():
+            parts = dotted_key.split(".")
+            val = inp.value
+            if val is None:
+                continue
+
+            # Navigate to the right nested dict
+            current = updated
+            for part in parts[:-1]:
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+
+            last_key = parts[-1]
+
+            # Handle hierarchy_weights which are lists indexed by position
+            if "hierarchy_weights" in dotted_key and last_key.isdigit():
+                idx = int(last_key)
+                regime_key = parts[-2]
+                if regime_key not in updated.get("hierarchy_weights", {}):
+                    updated.setdefault("hierarchy_weights", {})[regime_key] = [20, 20, 20, 20, 20]
+                lst = updated["hierarchy_weights"][regime_key]
+                while len(lst) <= idx:
+                    lst.append(20)
+                lst[idx] = int(val)
+                continue
+
+            # Handle frequency_fusion which has nested freq keys
+            if "frequency_fusion" in dotted_key and len(parts) == 3:
+                horizon = parts[1]
+                freq = parts[2]
+                updated.setdefault("frequency_fusion", {}).setdefault(horizon, {})[freq] = float(val)
+                continue
+
+            # Handle plane_weights which are 3-deep
+            if "plane_weights" in dotted_key and len(parts) == 3:
+                plane = parts[1]
+                model = parts[2]
+                updated.setdefault("plane_weights", {}).setdefault(plane, {})[model] = float(val)
+                continue
+
+            # Handle uss_model_switching which are 3-deep
+            if "uss_model_switching" in dotted_key and len(parts) == 3:
+                regime = parts[1]
+                param = parts[2]
+                updated.setdefault("uss_model_switching", {}).setdefault(regime, {})[param] = (
+                    int(val) if param in ("lstm_lookback", "mc_paths", "tree_max_depth") else float(val)
+                )
+                continue
+
+            # Handle scenario_engine which are 3-deep
+            if "scenario_engine" in dotted_key and len(parts) == 3:
+                scenario = parts[1]
+                param = parts[2]
+                updated.setdefault("scenario_engine", {}).setdefault(scenario, {})[param] = float(val)
+                continue
+
+            # Standard 2-level nesting
+            try:
+                # Try int first for whole numbers
+                if isinstance(val, float) and val == int(val) and last_key in ("n_paths",):
+                    current[last_key] = int(val)
+                else:
+                    current[last_key] = float(val)
+            except (TypeError, ValueError):
+                current[last_key] = val
+
+        save_scoring_weights(updated)
+        reload_scoring_weights()
+        save_status.text = "Saved to config/scoring_weights.yml"
+        save_status.classes(replace="text-sm monokai-green")
+        ui.notify("Scoring weights saved", type="positive", position="top")
+
+    def _reset_defaults():
+        """Reset to defaults by deleting cache and reloading."""
+        reload_scoring_weights()
+        save_status.text = "Reloaded from disk"
+        save_status.classes(replace="text-sm monokai-amber")
+        ui.notify("Weights reloaded from disk (refresh page to see changes)", type="info", position="top")
+
+    with ui.row().classes("gap-4"):
+        ui.button("Save All Weights", icon="save", on_click=_collect_and_save).props("color=primary")
+        ui.button("Reload from Disk", icon="refresh", on_click=_reset_defaults).props("color=grey outline")
+        save_status
+
+
+# ---------------------------------------------------------------------------
+# Page: Health
 # ---------------------------------------------------------------------------
 
 def render_health():
