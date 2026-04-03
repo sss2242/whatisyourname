@@ -1352,6 +1352,413 @@ DSRI, GMI, AQI, SGI, DEPI, SGAI, LVGI, TATA. M > -2.22 = likely manipulator.
 
 ---
 
+## Layer 4: Hedge Fund Analysis (NEW)
+
+18 modules in `operator1/hedge_fund/` that run as a parallel analytical track. While the existing pipeline answers "What state is this company in?", the HF pipeline answers "Can I make money on this, when, and how much?" Primary data source: raw quarterly statement DataFrames (8-24 rows), NOT the 504-row daily cache.
+
+---
+
+### 4.1 FCF Quality Scoring
+
+**File:** `operator1/hedge_fund/fcf_quality.py` (~200 lines)
+**Pipeline step:** Step 6-HF-a
+**Profile key:** `hedge_fund.fcf_quality`
+
+**Purpose:** Measures whether reported earnings are backed by real cash generation. Degrades 2-4 quarters before blowups.
+
+**Formula:** `FCF_Quality = 0.40 * OCF_NI_Ratio_8Q + 0.30 * (1 - |Accruals|) + 0.20 * FCF_Trend + 0.10 * (1 - CapEx_Vol)`
+
+**Negative NI handling:** When NI is negative, OCF/NI ratio is meaningless. Scores based on whether OCF is at least positive (35/100) or both negative (5/100).
+
+**Input:** Raw `income_df`, `cashflow_df`, `balance_df` (8 quarterly filings each)
+**Output:** `FCFQualityResult` with score 0-100, degradation_flag, narrative
+
+---
+
+### 4.2 Accruals Forensics
+
+**File:** `operator1/hedge_fund/accruals_forensics.py` (~350 lines)
+**Pipeline step:** Step 6-HF-b
+**Profile key:** `hedge_fund.accruals_forensic`
+
+**Purpose:** Detects earnings manipulation via 5-component composite.
+
+**Components:**
+1. **Sloan Accruals** (30%): `(NI - OCF) / Total_Assets` -- high absolute value = earnings not backed by cash
+2. **Modified Jones Model** (25%): OLS regression: `Total_Accruals/TA_lag = a*(1/TA_lag) + b*(delta_REV - delta_REC)/TA_lag`. Residuals = discretionary accruals = manipulation signal
+3. **NI-OCF Divergence Trend** (20%): Slope of (NI - OCF) over 8 quarters. Positive slope = NI growing faster than cash
+4. **Working Capital Anomalies** (15%): Coefficient of variation of WC changes. High CV = unexplained swings
+5. **Cash Conversion Efficiency** (10%): `OCF / (Revenue - COGS)` trend. Declining = stop converting sales to cash
+
+**Input:** Raw `income_df`, `balance_df`, `cashflow_df` (8Q + 5A for Jones regression)
+**Output:** `AccrualsForensicResult` with red_flag_score 0-100, discretionary_accruals, cce_trend
+
+---
+
+### 4.3 Earnings Smoothing Detector
+
+**File:** `operator1/hedge_fund/earnings_smoothing.py` (~300 lines)
+**Pipeline step:** Step 6-HF-c
+**Profile key:** `hedge_fund.smoothing`
+
+**Purpose:** Extends Beneish M-Score with additional smoothing detection.
+
+**Components:**
+1. **Beneish M-Score Probability** (25%): From existing `financial_health.py` (M > -2.22 = likely manipulator)
+2. **Earnings Vol / Cash Flow Vol Ratio** (25%): NI should be AT LEAST as volatile as OCF. Ratio < 0.5 = suspicious smoothing
+3. **Benford's Law Digit Analysis** (20%): Chi-squared test of first-digit distribution of reported revenue against Benford expected distribution. Needs 30+ data points
+4. **Sequential Surprise Pattern** (15%): Count consecutive EPS beats. 6+ consecutive = statistically unlikely without smoothing
+5. **Restatement Risk Proxy** (15%): Rate of accruals growth as proxy for restatement likelihood
+
+**Input:** Raw `income_df`, `cashflow_df`, `fh_result` (for Beneish)
+**Output:** `SmoothingResult` with smoothing_index 0-100, benford_deviation, earnings_vol_ratio
+
+---
+
+### 4.4 Dividend Burn Risk
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_compute_dividend_burn`)
+**Pipeline step:** Step 6-HF-d
+**Profile key:** `hedge_fund.dividend_burn`
+
+**Purpose:** Predicts dividend sustainability. Fires 2-4 quarters before cuts.
+
+**Formula:** `Risk = 0.40 * (Divs/FCF) + 0.30 * (Debt_Service/FCF) + 0.20 * WC_Drain + 0.10 * Earnings_Vol`
+
+**Negative FCF handling:** When FCF < 0 and dividends > 0, automatic 95/100 risk score (paying from debt/asset liquidation).
+
+**Input:** Raw `cashflow_df`, `income_df`, `balance_df` (8Q)
+**Output:** `DividendBurnResult` with risk_score 0-100, coverage_ratio, months_to_cut
+
+---
+
+### 4.5 CROA vs ROIC Spread
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_compute_return_spread`)
+**Pipeline step:** Step 6-HF-e
+**Profile key:** `hedge_fund.return_spread`
+
+**Purpose:** Compares cash returns (CROA = OCF/Total_Assets) vs accounting returns (ROIC = NOPAT/Invested_Capital). Divergence signals accrual inflation.
+
+**Input:** Raw `income_df`, `balance_df`, `cashflow_df` (latest filing)
+**Output:** `ReturnSpreadResult` with croa, roic, spread_bps, quality_label
+
+---
+
+### 4.6 Operating Leverage
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_compute_operating_leverage`)
+**Pipeline step:** Step 6-HF-f
+**Profile key:** `hedge_fund.operating_leverage`
+
+**Purpose:** Measures earnings sensitivity to revenue changes.
+
+**Formulas:** `DOL = %delta_EBIT / %delta_Revenue`, `DFL = %delta_EPS / %delta_EBIT`, `DTL = DOL * DFL`
+
+**Classification:** |DOL| > 5 = extreme, > 3 = high, > 1.5 = moderate, else low
+
+**Input:** Raw `income_df` (8Q, Q/Q percentage changes)
+**Output:** `OperatingLeverageResult` with dol, dfl, dtl, earnings_sensitivity
+
+---
+
+### 4.7 Off-Balance-Sheet Risk
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_compute_obs_risk`)
+**Pipeline step:** Step 6-HF-g
+**Profile key:** `hedge_fund.obs_risk`
+
+**Purpose:** Scores hidden liabilities from goodwill/intangibles ratio + SGA anomaly proxy.
+
+**Formula:** `OBS_Risk = 0.35 * (Goodwill/TA) + 0.25 * (Intangibles/TA) + 0.20 * SGA_Anomaly + 0.10 * Keyword_Score + 0.10 * Policy_Change`
+
+**Input:** Raw `balance_df`, `income_df` (latest 4-8 filings)
+**Output:** `OBSRiskResult` with risk_score 0-100, goodwill_to_assets, sga_anomaly
+
+---
+
+### 4.8 Asset Quality Deterioration
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_compute_asset_quality`)
+**Pipeline step:** Step 6-HF-h
+**Profile key:** `hedge_fund.asset_quality`
+
+**Purpose:** Detects when balance sheet asset quality is degrading.
+
+**Key metrics:** DSO (Days Sales Outstanding) = `receivables / (revenue/90)`, Inventory Days = `inventory / (COGS/90)`. Rising DSO = revenue quality issue. Rising inventory = obsolescence risk.
+
+**Input:** Raw `income_df`, `balance_df` (8Q, Q/Q deltas)
+**Output:** `AssetQualityResult` with deterioration_score 0-100, dso, dso_change_pct, inventory_days
+
+---
+
+### 4.9 Leverage Stress Scenario Engine
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_compute_leverage_stress`)
+**Pipeline step:** Step 6-HF-i
+**Profile key:** `hedge_fund.leverage_stress`
+
+**Purpose:** Tests whether current leverage is survivable under 3 scenarios.
+
+**Scenarios:**
+1. **Base case:** Current trajectory
+2. **Revenue miss:** -15% revenue, -200bps margin compression
+3. **Systemic crisis:** -25% revenue, -400bps margin, +200bps interest rate
+
+**Negative EBITDA handling:** Automatic covenant breach + distress classification.
+
+**Covenant check:** Debt/EBITDA > 5.5x = covenant breach flag
+
+**Input:** Raw `income_df`, `balance_df`, `mc_result` (for probability weighting)
+**Output:** `LeverageStressResult` with 3 scenario objects, refinancing_risk flag
+
+---
+
+### 4.10 Momentum Composite
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_compute_momentum`)
+**Pipeline step:** Step 6-HF-j
+**Profile key:** `hedge_fund.momentum`
+
+**Purpose:** Multi-dimensional fundamental momentum.
+
+**Formula:** `Momentum = 0.40 * Revenue_Accel + 0.30 * Margin_Slope + 0.20 * FCF_Conv + 0.10 * ROIC_Traj`
+
+Where revenue acceleration = 2nd derivative (change in growth rate).
+
+**Input:** Raw `income_df`, `cashflow_df` (8Q), daily cache (63d for price momentum divergence)
+**Output:** `MomentumCompositeResult` with score 0-100, inflection_detected flag
+
+---
+
+### 4.11 Growth Quality
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_compute_growth_quality`)
+**Pipeline step:** Step 6-HF-k
+**Profile key:** `hedge_fund.growth_quality`
+
+**Purpose:** Decomposes growth into organic vs inorganic (M&A).
+
+**M&A detection:** Goodwill/intangible jumps in balance sheet = acquisition signal.
+
+**Formula:** `Quality = 0.50 * Organic_Fraction + 0.25 * Margin_Adjusted + 0.15 * Incremental_ROIC + 0.10 * Concentration`
+
+**Input:** Raw `income_df`, `balance_df` (8Q)
+**Output:** `GrowthQualityResult` with score 0-100, organic_fraction, incremental_roic
+
+---
+
+### 4.12 Earnings Surprise Probability
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_compute_earnings_surprise`)
+**Pipeline step:** Step 6-HF-l
+**Profile key:** `hedge_fund.earnings_surprise`
+
+**Purpose:** Estimates P(beat), P(miss), P(inline) for next earnings.
+
+**Method:** Historical SUE (Standardized Unexpected Earnings) distribution over 8Q. P(miss) = CDF at -1.5 sigma. Adjusted by recent trend.
+
+**Input:** Raw `income_df` (8Q EPS), `filing_calendar_result` (days to next filing)
+**Output:** `SurpriseResult` with p_beat, p_miss, p_inline, days_to_next_filing
+
+---
+
+### 4.13 DCF Monte Carlo Valuation
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_compute_dcf`)
+**Pipeline step:** Step 6-HF-m
+**Profile key:** `hedge_fund.dcf`
+
+**Purpose:** Probabilistic DCF with 10K simulations and regime-specific growth.
+
+**Method:** For each simulation: sample growth from regime distribution, sample WACC from N(0.09, 0.01), compute 5-year explicit FCF + terminal value. Discount and subtract net debt.
+
+**Integration:** Uses `mc_result.regime_distributions` for growth assumptions. Annual frequency forecast bounds from `multi_frequency_result` constrain terminal growth.
+
+**Input:** Raw `cashflow_df`, `balance_df` (latest), `mc_result`, `target_profile`, cache (close price)
+**Output:** `DCFResult` with intrinsic_p10/p25/p50/p75/p90, upside_pct, risk_reward_ratio
+
+---
+
+### 4.14 Valuation-Quality Matrix
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_compute_valuation_quality`)
+**Pipeline step:** Step 6-HF-n
+**Profile key:** `hedge_fund.valuation_quality`
+
+**Purpose:** Maps company on 2D plane: X = Quality (composite of HF Tiers 1-3), Y = Valuation (PE rank vs peers). Identifies mispricings.
+
+**Quadrants:** undervalued (cheap + quality), fair (quality + fair price), overvalued (expensive + quality), value_trap (cheap + low quality)
+
+**Input:** All HF Tier 1-3 results, `peer_ranking_result`, cache (PE, EV/EBITDA)
+**Output:** `ValuationQualityResult` with quality_score, valuation_percentile, quadrant
+
+---
+
+### 4.15 PEG Composite
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_compute_peg`)
+**Pipeline step:** Step 6-HF-o
+**Profile key:** `hedge_fund.peg_composite`
+
+**Purpose:** Quality-adjusted PEG + FCF yield vs debt cost spread.
+
+**Formulas:** `PEG_Adjusted = (PE / Growth%) / Quality_Multiplier`, `FCF_Spread = FCF_Yield - Debt_Cost` (bps)
+
+**Input:** Raw `income_df` (4Q for growth), cache (PE, FCF yield), HF-5.2 quality_score
+**Output:** `PEGCompositeResult` with peg_adjusted, fcf_spread_bps, cheap_flag
+
+---
+
+### 4.16 Investment Thesis Scorecard
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_build_scorecard`)
+**Pipeline step:** Step 6-HF-q
+**Profile key:** `hedge_fund.scorecard`
+
+**Purpose:** Synthesizes all 15 HF metrics into a 5-tier scorecard with investment grade.
+
+**Grading:** Weighted composite: Earnings Quality 25% + Cash Flow 20% + Balance Sheet 20% + Inflection 20% + Valuation 15%. A+ (>85) through F (<25).
+
+**Distress override:** When covenant breach or FCF quality < 30, grade capped at D regardless of other tier scores.
+
+**Output:** `ThesisScorecard` with 5 TierScore objects, investment_grade (A+ to F), conviction (0-10)
+
+---
+
+### 4.17 Position Signal Engine
+
+**File:** `operator1/hedge_fund/engine.py` (inline, `_compute_position_signal`)
+**Pipeline step:** Step 6-HF-r
+**Profile key:** `hedge_fund.position`
+
+**Purpose:** Converts thesis scorecard into actionable signal with sizing guidance.
+
+**Formula:** `signal = alpha * quality_mult * survival_mult * decay_mult * conviction`
+
+Where alpha comes from `forecast_result.return_5d` (primary) or scorecard grade (fallback: A+=0.08, D=-0.04, F=-0.08).
+
+**Survival-aware sizing:** Normal=1.0x, Modified=0.5x, Company_Survival=0.0x, Extreme=-0.5x, Recovery=1.5x.
+
+**Entry/stop/target:** Derived from 63-day price support/resistance levels in the daily cache.
+
+**Output:** `PositionSignalResult` with signal (-1 to +1), label, conviction, entry/stop/target prices
+
+---
+
+### 4.18 Orchestrator
+
+**File:** `operator1/hedge_fund/engine.py` (`run_hedge_fund_analysis`)
+**Pipeline step:** Step 6-HF
+**Profile key:** `hedge_fund`
+
+**Purpose:** Runs all 15 HF metrics in dependency order, builds scorecard, computes position signal. Single entry point called from main.py.
+
+**Input:** Raw statement DFs + cache + all upstream model results
+**Output:** `HedgeFundResult` with all 15 metric results + scorecard + position signal
+
+---
+
+## Layer 5: Multi-Frequency Pipeline
+
+3 modules that run the analytical pipeline at 5 frequencies (Annual -> Daily) with cascading context, then fuse the results.
+
+---
+
+### 5.1 Frequency Resampler
+
+**File:** `operator1/features/frequency_resampler.py` (688 lines)
+**Pipeline step:** Step 6.7 (pre-processing)
+**Profile key:** Consumed by multi_frequency_runner
+
+**Purpose:** Resamples the daily cache to lower frequencies (Weekly, Monthly, Quarterly, Semi-Annual, Annual) while preserving PIT constraints.
+
+**Frequency configuration:**
+
+| Freq | Label | Resample Rule | Lookback |
+|------|-------|---------------|----------|
+| D | Daily | None (native) | 2 years |
+| W | Weekly | W-FRI | 3 years |
+| M | Monthly | ME | 5 years |
+| Q | Quarterly | QE | 6 years |
+| S | Semi-Annual | 2QE | 7 years |
+| A | Annual | YE | 8 years |
+
+**OHLCV resampling:** Open=first, High=max, Low=min, Close=last, Volume=sum.
+**Statement resampling:** Stock variables (balance sheet) = last, Flow variables (income/cashflow) = sum.
+**No-look-ahead:** Last period truncated to current date. Incomplete periods flagged.
+
+**Direct construction from raw filings:** `build_cache_from_raw_filings()` constructs Q/A caches directly from raw statement DataFrames without going through daily forward-fill, avoiding interpolation artifacts.
+
+**Input:** Daily cache or raw statement DFs, target frequency
+**Output:** `ResampledCache` with resampled DataFrame + metadata
+
+---
+
+### 5.2 Multi-Frequency Runner
+
+**File:** `operator1/steps/multi_frequency_runner.py` (606 lines)
+**Pipeline step:** Step 6.7
+**Profile key:** `multi_frequency` (via fusion)
+
+**Purpose:** Runs the full analytical pipeline (derived variables, survival mode, regime detection, forecasting, Monte Carlo) at each frequency in slow-to-fast order. Each frequency passes context to the next.
+
+**Execution order:** Annual -> Quarterly -> Monthly -> Weekly -> Daily
+
+**Cascading context** (`FrequencyContext`): Each frequency passes to the next:
+- `trend_direction`: "up", "down", "flat"
+- `secular_regime`: "bull", "bear", "sideways", "recovery"
+- `survival_probability_latest`: 0-1
+- `forecast_bounds`: Per-variable (min, max) from historical range at this frequency
+
+**Per-frequency pipeline:** For each `ResampledCache`:
+1. `compute_derived_variables(cache)`
+2. `compute_company_survival_flag(cache)` + `compute_survival_probability(cache)`
+3. `detect_regimes_and_breaks(cache)`
+4. `run_forecasting(cache)` (if not skip_models)
+5. `run_monte_carlo(cache)` (if not skip_models)
+6. Extract summary context for next frequency
+
+**Input:** Daily cache, secrets, market_id, ticker, raw statement DFs
+**Output:** `MultiFrequencyResult` with per-frequency `FrequencyResult` objects
+
+---
+
+### 5.3 Frequency Fusion
+
+**File:** `operator1/models/frequency_fusion.py` (426 lines)
+**Pipeline step:** Step 6.7 (post-processing)
+**Profile key:** `multi_frequency`
+
+**Purpose:** Reconciles predictions, regimes, and survival probabilities from 5 frequency pipelines into a single coherent output.
+
+**Horizon-to-frequency weights:** Each prediction horizon is dominated by the frequency most informative at that timescale:
+
+| Horizon | D | W | M | Q | A |
+|---------|---|---|---|---|---|
+| 1d | 1.0 | | | | |
+| 5d | 0.7 | 0.3 | | | |
+| 21d | 0.3 | 0.4 | 0.3 | | |
+| 3m | | 0.15 | 0.35 | 0.50 | |
+| 1y | | | 0.15 | 0.35 | 0.50 |
+| 2y | | | | 0.30 | 0.70 |
+
+**Fusion methods:**
+1. **Regime consensus:** Majority vote across frequencies + disagreement detection. Agreement ratio = fraction of frequencies that agree on regime label.
+2. **Survival probability:** Harmonic mean (weakest-link principle). One frequency showing distress dominates the fused probability.
+3. **Prediction reconciliation:** Inverse-variance weighted average of per-frequency forecasts at each horizon.
+
+**Output:** `FusedMultiFreqResult` with:
+- `regime_consensus`: Consensus regime + agreement ratio + per-frequency regimes
+- `survival`: Fused probability + per-frequency probabilities + weakest frequency
+- `predictions`: Per-horizon fused forecasts with contributing frequencies
+- `n_frequencies_used`, `available` flag
+
+**Input:** `MultiFrequencyResult` from runner
+**Output:** `FusedMultiFreqResult` stored in `profile["multi_frequency"]`
+
+---
+
 ## Execution Order
 
 ```
@@ -1410,7 +1817,26 @@ Step 6:    [TEMPORAL MODELS -- skip if --skip-models]
 Step 6-USS: forecast bounding + scenario engine
 Step 6.5:  retroactive_calibration
 Step 6.6:  model_diagnostics (expected path vs actual path)
-Step 7:    profile_builder
+Step 6.7:  multi_frequency_runner -> frequency_fusion
+Step 6-HF: [HEDGE FUND ANALYSIS -- parallel to Step 6]
+  6-HF-a: fcf_quality (Tier 1)
+  6-HF-b: accruals_forensics (Tier 1)
+  6-HF-c: earnings_smoothing (Tier 1)
+  6-HF-d: dividend_burn (Tier 2)
+  6-HF-e: return_spread (Tier 2)
+  6-HF-f: operating_leverage (Tier 2)
+  6-HF-g: obs_risk (Tier 3)
+  6-HF-h: asset_quality (Tier 3)
+  6-HF-i: leverage_stress (Tier 3, uses mc_result)
+  6-HF-j: momentum_composite (Tier 4)
+  6-HF-k: growth_quality (Tier 4)
+  6-HF-l: earnings_surprise (Tier 4, uses filing_calendar)
+  6-HF-m: dcf_valuation (Tier 5, uses mc_result + multi_freq)
+  6-HF-n: valuation_quality (Tier 5, uses peer_ranking)
+  6-HF-o: peg_composite (Tier 5)
+  6-HF-q: thesis_scorecard (synthesize all 15)
+  6-HF-r: position_signal (final actionable output)
+Step 7:    profile_builder (+ hedge_fund section injection)
 Step 8:    report_generator + triage_card (USS)
 ```
 
@@ -1425,6 +1851,8 @@ Step 8:    report_generator + triage_card (USS)
 | Temporal | 25 | ~18,200 | Regime, forecasting, MC, uncertainty, aggregation, regime shift prediction |
 | USS | 2 | ~1,040 | Unified Survival System (controller + scenario engine) |
 | Monitoring/Diagnostics | 1 | ~875 | Model expected path vs actual path diagnostics |
-| **Total** | **50** | **~36,615** | |
+| **Hedge Fund** | **7** | **~3,500** | **Investment thesis: earnings forensics, cash flow stress, balance sheet risk, inflection, valuation, scorecard, position signal** |
+| **Multi-Frequency** | **3** | **~1,720** | **5-frequency pipeline (A/Q/M/W/D) with cascading context + cross-frequency fusion** |
+| **Total** | **60** | **~41,835** | |
 
-All 50 modules wired in main.py. All results stored in profile_builder. All sections rendered in report_generator.
+All 60 modules wired in main.py. All results stored in profile_builder. HF results in `profile["hedge_fund"]`. Multi-frequency results in `profile["multi_frequency"]`.

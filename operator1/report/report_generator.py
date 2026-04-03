@@ -92,7 +92,7 @@ TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005},  # all 22 sections + extended sections + USS + scenarios + diagnostics + structure + calendar + macro + supply chain + synergies + multi-frequency
     ReportTier.BASIC: {1, 2, 4, 6, 20, 2007},  # + position signal
     ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20, 2006, 2007, 2008},  # + thesis scorecard + position signal + signal IC
-    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008},  # all sections + multi-frequency + thesis scorecard + position signal + signal IC
+    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2023, 2024, 2025, 2026, 2027, 2028, 2029},  # all sections + multi-frequency + thesis scorecard + position signal + signal IC + hedge fund analysis
 }
 
 
@@ -3757,6 +3757,230 @@ def _build_synergies_section(profile: dict[str, Any]) -> str:
     return "\n".join(lines) if lines else "*No synergies were applied.*\n"
 
 
+# ---------------------------------------------------------------------------
+# Hedge Fund Analysis sections (23-29)
+# ---------------------------------------------------------------------------
+
+def _build_hf_earnings_quality(profile: dict[str, Any]) -> str:
+    """Section 23: HF Earnings Quality (Tier 1)."""
+    hf = profile.get("hedge_fund", {})
+    if not hf.get("available"):
+        return "*Hedge fund analysis not available.*\n"
+    lines = ["Forensic earnings quality assessment using FCF quality scoring, accruals analysis, and smoothing detection.\n"]
+    fcf = hf.get("fcf_quality", {})
+    if fcf.get("available"):
+        lines.append(f"**FCF Quality Score:** {fcf.get('score', 'N/A'):.0f}/100 ({fcf.get('label', '')})")
+        if fcf.get("narrative"):
+            lines.append(f"> {fcf['narrative']}")
+    acc = hf.get("accruals_forensic", {})
+    if acc.get("available"):
+        lines.append(f"\n**Accruals Red Flag:** {acc.get('red_flag_score', 'N/A'):.0f}/100 ({acc.get('label', '')})")
+        if acc.get("narrative"):
+            lines.append(f"> {acc['narrative']}")
+    sm = hf.get("smoothing", {})
+    if sm.get("available"):
+        lines.append(f"\n**Smoothing Index:** {sm.get('smoothing_index', 'N/A'):.0f}/100 ({sm.get('label', '')})")
+        if sm.get("narrative"):
+            lines.append(f"> {sm['narrative']}")
+    # Advanced: Piotroski + Forensic CF
+    adv = hf.get("advanced", {})
+    if adv.get("available"):
+        lines.append(f"\n**Piotroski F-Score:** {adv.get('piotroski_f_score', 'N/A')}/9 ({adv.get('piotroski_label', '')})")
+        fc = adv.get("forensic_cashflow", {})
+        if fc.get("available") and fc.get("flags"):
+            lines.append(f"**Forensic Cash Flow Flags:** {len(fc['flags'])} detected")
+            for f in fc["flags"][:3]:
+                lines.append(f"  - [{f.get('severity','?')}] {f.get('type','')}: {f.get('detail','')}")
+    return "\n".join(lines) + "\n"
+
+
+def _build_hf_cash_flow(profile: dict[str, Any]) -> str:
+    """Section 24: HF Cash Flow Stress Test (Tier 2)."""
+    hf = profile.get("hedge_fund", {})
+    if not hf.get("available"):
+        return "*Hedge fund analysis not available.*\n"
+    lines = ["Cash flow sustainability and stress testing.\n"]
+    db = hf.get("dividend_burn", {})
+    if db.get("available"):
+        lines.append(f"**Dividend Burn Risk:** {db.get('risk_score', 'N/A'):.0f}/100 ({db.get('label', '')})")
+    rs = hf.get("return_spread", {})
+    if rs.get("available"):
+        spread = rs.get("spread_bps")
+        lines.append(f"**CROA vs ROIC Spread:** {spread:.0f} bps ({rs.get('quality_label', '')})" if spread else "**CROA vs ROIC:** N/A")
+    ol = hf.get("operating_leverage", {})
+    if ol.get("available"):
+        lines.append(f"**Operating Leverage (DOL):** {ol.get('dol', 'N/A')}, sensitivity={ol.get('earnings_sensitivity', '')}")
+    return "\n".join(lines) + "\n"
+
+
+def _build_hf_balance_sheet(profile: dict[str, Any]) -> str:
+    """Section 25: HF Balance Sheet Risk (Tier 3)."""
+    hf = profile.get("hedge_fund", {})
+    if not hf.get("available"):
+        return "*Hedge fund analysis not available.*\n"
+    lines = ["Balance sheet hidden risks and leverage stress scenarios.\n"]
+    obs = hf.get("obs_risk", {})
+    if obs.get("available"):
+        lines.append(f"**Off-Balance-Sheet Risk:** {obs.get('risk_score', 'N/A'):.0f}/100 ({obs.get('label', '')})")
+    aq = hf.get("asset_quality", {})
+    if aq.get("available"):
+        lines.append(f"**Asset Quality Deterioration:** {aq.get('deterioration_score', 'N/A'):.0f}/100 ({aq.get('label', '')})")
+        if aq.get("dso"):
+            lines.append(f"  DSO: {aq['dso']:.0f} days (change: {aq.get('dso_change_pct', 0):+.1f}%)")
+    ls = hf.get("leverage_stress", {})
+    if ls.get("available"):
+        lines.append("\n**Leverage Stress Scenarios:**\n")
+        lines.append("| Scenario | Debt/EBITDA | Coverage | Covenant |")
+        lines.append("|----------|-----------|---------|----------|")
+        for sc_name in ("base_case", "revenue_miss", "systemic_crisis"):
+            sc = ls.get(sc_name, {})
+            de = sc.get("debt_to_ebitda")
+            ic = sc.get("interest_coverage")
+            cb = "BREACH" if sc.get("covenant_breach") else "OK"
+            lines.append(f"| {sc_name.replace('_', ' ').title()} | {f'{de:.1f}x' if de else 'N/A'} | {f'{ic:.1f}x' if ic else 'N/A'} | {cb} |")
+    # Advanced: Altman Z''
+    adv = hf.get("advanced", {})
+    if adv.get("available") and adv.get("altman_z_double_prime"):
+        lines.append(f"\n**Altman Z'' (non-US):** {adv['altman_z_double_prime']:.2f} ({adv.get('altman_z_dp_zone', '')})")
+    return "\n".join(lines) + "\n"
+
+
+def _build_hf_inflection(profile: dict[str, Any]) -> str:
+    """Section 26: HF Inflection Detection (Tier 4)."""
+    hf = profile.get("hedge_fund", {})
+    if not hf.get("available"):
+        return "*Hedge fund analysis not available.*\n"
+    lines = ["Momentum, growth quality, and earnings surprise probability.\n"]
+    mom = hf.get("momentum", {})
+    if mom.get("available"):
+        lines.append(f"**Momentum Score:** {mom.get('score', 'N/A'):.0f}/100 ({mom.get('label', '')})")
+        if mom.get("inflection_detected"):
+            lines.append("> **Inflection detected:** momentum is reversing")
+    gq = hf.get("growth_quality", {})
+    if gq.get("available"):
+        lines.append(f"**Growth Quality:** {gq.get('score', 'N/A'):.0f}/100 ({gq.get('label', '')})")
+        if gq.get("organic_fraction") is not None:
+            lines.append(f"  Organic fraction: {gq['organic_fraction']:.0%}")
+    es = hf.get("earnings_surprise", {})
+    if es.get("available"):
+        lines.append(f"\n**Earnings Surprise Probability:**")
+        lines.append(f"  P(beat)={es.get('p_beat', 0):.0%}, P(miss)={es.get('p_miss', 0):.0%}, P(inline)={es.get('p_inline', 0):.0%}")
+        lines.append(f"  Direction: {es.get('expected_direction', 'neutral')}")
+        if es.get("days_to_next_filing"):
+            lines.append(f"  Next filing in ~{es['days_to_next_filing']} days")
+    # Advanced: Torpedo, Capital Cycle
+    adv = hf.get("advanced", {})
+    if adv.get("available"):
+        torp = adv.get("earnings_torpedo", {})
+        if torp.get("torpedo_risk", 0) > 25:
+            lines.append(f"\n**Earnings Torpedo Risk:** {torp['torpedo_risk']}%")
+            for f in torp.get("flags", []):
+                lines.append(f"  - {f}")
+        cc = adv.get("capital_cycle", {})
+        if cc.get("available"):
+            lines.append(f"**Capital Cycle Position:** {cc.get('cycle_position', 'unknown')}")
+    return "\n".join(lines) + "\n"
+
+
+def _build_hf_valuation(profile: dict[str, Any]) -> str:
+    """Section 27: HF Valuation Engine (Tier 5)."""
+    hf = profile.get("hedge_fund", {})
+    if not hf.get("available"):
+        return "*Hedge fund analysis not available.*\n"
+    lines = ["DCF Monte Carlo valuation, quality-value matrix, and PEG composite.\n"]
+    dcf = hf.get("dcf", {})
+    if dcf.get("available"):
+        lines.append("**DCF Monte Carlo Intrinsic Value:**\n")
+        lines.append("| Percentile | Value |")
+        lines.append("|-----------|-------|")
+        for p in ("intrinsic_p10", "intrinsic_p25", "intrinsic_p50", "intrinsic_p75", "intrinsic_p90"):
+            val = dcf.get(p)
+            label = p.replace("intrinsic_", "").upper()
+            lines.append(f"| {label} | {'${:.2f}'.format(val) if val else 'N/A'} |")
+        if dcf.get("current_price"):
+            lines.append(f"\n**Current Price:** ${dcf['current_price']:.2f}")
+        if dcf.get("upside_pct") is not None:
+            lines.append(f"**Upside/Downside:** {dcf['upside_pct']:+.1f}%")
+    vq = hf.get("valuation_quality", {})
+    if vq.get("available"):
+        lines.append(f"\n**Valuation-Quality Matrix:** {vq.get('quadrant', '').replace('_', ' ').title()}")
+        lines.append(f"  Quality Score: {vq.get('quality_score', 0):.0f}/100")
+    peg = hf.get("peg_composite", {})
+    if peg.get("available"):
+        if peg.get("peg_adjusted"):
+            lines.append(f"**Quality-Adjusted PEG:** {peg['peg_adjusted']:.1f}x")
+        if peg.get("fcf_spread_bps"):
+            lines.append(f"**FCF Yield vs Debt Cost:** {peg['fcf_spread_bps']:.0f} bps ({'deleverageable' if peg.get('cheap_flag') else 'tight'})")
+    # Advanced: ICC, OU
+    adv = hf.get("advanced", {})
+    if adv.get("available"):
+        if adv.get("implied_cost_of_capital"):
+            lines.append(f"\n**Implied Cost of Capital:** {adv['implied_cost_of_capital']:.1%}")
+        ou = adv.get("ou_mean_reversion", {})
+        if ou.get("available") and ou.get("mean_reverting"):
+            lines.append(f"**Mean Reversion Half-Life:** {ou.get('half_life_days', 'N/A')} days (deviation: {ou.get('current_deviation_pct', 0):+.1f}%)")
+    return "\n".join(lines) + "\n"
+
+
+def _build_hf_scorecard(profile: dict[str, Any]) -> str:
+    """Section 28: HF Investment Thesis Scorecard."""
+    hf = profile.get("hedge_fund", {})
+    if not hf.get("available"):
+        return "*Hedge fund analysis not available.*\n"
+    sc = hf.get("scorecard", {})
+    if not sc.get("available"):
+        return "*Scorecard not available.*\n"
+    lines = ["5-tier investment thesis scorecard.\n"]
+    lines.append(f"**Investment Grade: {sc.get('investment_grade', 'N/A')}** | Conviction: {sc.get('conviction', 0)}/10\n")
+    lines.append("| Tier | Score | Label |")
+    lines.append("|------|-------|-------|")
+    for tier_key in ("earnings_quality", "cash_flow", "balance_sheet", "inflection", "valuation"):
+        t = sc.get(tier_key, {})
+        name = tier_key.replace("_", " ").title()
+        score = t.get("score", 50)
+        label = t.get("label", "fair")
+        lines.append(f"| {name} | {score:.0f}/100 | {label} |")
+    return "\n".join(lines) + "\n"
+
+
+def _build_hf_position(profile: dict[str, Any]) -> str:
+    """Section 29: HF Position Signal & Sizing."""
+    hf = profile.get("hedge_fund", {})
+    if not hf.get("available"):
+        return "*Hedge fund analysis not available.*\n"
+    pos = hf.get("position", {})
+    if not pos.get("available"):
+        return "*Position signal not available.*\n"
+    lines = ["Actionable position signal with sizing guidance.\n"]
+    signal = pos.get("signal", 0)
+    label = pos.get("label", "hold").upper()
+    lines.append(f"**Signal: {signal:+.3f} ({label})**\n")
+    lines.append(f"- Conviction: {pos.get('conviction', 0):.2f}")
+    lines.append(f"- Quality multiplier: {pos.get('quality_multiplier', 1):.2f}x")
+    lines.append(f"- Survival multiplier: {pos.get('survival_multiplier', 1):.2f}x")
+    if pos.get("entry_price"):
+        lines.append(f"\n**Levels:**")
+        lines.append(f"- Entry: ${pos['entry_price']:.2f}")
+        lines.append(f"- Stop: ${pos.get('stop_price', 0):.2f}")
+        lines.append(f"- Target: ${pos.get('target_price', 0):.2f}")
+        if pos.get("risk_reward_ratio"):
+            lines.append(f"- Risk/Reward: {pos['risk_reward_ratio']:.1f}:1")
+    # Advanced methods summary
+    adv = hf.get("advanced", {})
+    if adv.get("available"):
+        lines.append("\n**Advanced Signals:**")
+        vol = adv.get("garch_vol_term_structure", {})
+        if vol.get("inverted"):
+            lines.append("- Vol term structure INVERTED (precedes large moves)")
+        vrp = adv.get("vrp_proxy", {})
+        if vrp.get("available"):
+            lines.append(f"- VRP regime: {vrp.get('regime', 'unknown')}")
+        ca = adv.get("cross_asset_regime", {})
+        if ca.get("available"):
+            lines.append(f"- Cross-asset macro: {ca.get('regime', 'unknown')}")
+    return "\n".join(lines) + "\n"
+
+
 def _build_fallback_report(
     profile: dict[str, Any],
     tier: ReportTier = ReportTier.PREMIUM,
@@ -3819,6 +4043,14 @@ def _build_fallback_report(
         2003: ("21.9. Supply Chain Stress Assessment", _build_supply_chain_stress_section(profile)),
         2004: ("21.10. Model Synergies Applied", _build_synergies_section(profile)),
         2005: ("21.11. Multi-Frequency Analysis", _build_multi_frequency_section(profile)),
+        # Hedge Fund Analysis sections (23-29)
+        2023: ("23. Hedge Fund Thesis: Earnings Quality", _build_hf_earnings_quality(profile)),
+        2024: ("24. Hedge Fund Thesis: Cash Flow Stress", _build_hf_cash_flow(profile)),
+        2025: ("25. Hedge Fund Thesis: Balance Sheet Risk", _build_hf_balance_sheet(profile)),
+        2026: ("26. Hedge Fund Thesis: Inflection Detection", _build_hf_inflection(profile)),
+        2027: ("27. Hedge Fund Thesis: Valuation", _build_hf_valuation(profile)),
+        2028: ("28. Investment Thesis Scorecard (HF)", _build_hf_scorecard(profile)),
+        2029: ("29. Position Signal & Sizing (HF)", _build_hf_position(profile)),
         22: ("22. Appendix & Methodology", _build_appendix(profile)),
     }
 

@@ -553,6 +553,38 @@ def render_home():
                     _card("Hit Rate", f"{plog.get('hit_rate', 0):.0%}", f"{plog.get('n_filled', 0)} predictions evaluated", "fact_check")
                     _card("Realized IC", f"{plog.get('realized_ic', 0):.4f}", "", "analytics")
 
+            # Hedge Fund Thesis (if available)
+            hf = profile.get("hedge_fund", {})
+            if hf.get("available"):
+                ui.separator()
+                ui.label("Hedge Fund Thesis").classes("text-lg font-bold mt-3")
+                sc = hf.get("scorecard", {})
+                pos = hf.get("position", {})
+                with ui.row().classes("gap-4"):
+                    if sc.get("available"):
+                        _card("Grade", sc.get("investment_grade", "N/A"), f"Conviction {sc.get('conviction', 0)}/10", "school")
+                    if pos.get("available"):
+                        _sig = pos.get("signal", 0)
+                        _lbl = pos.get("label", "hold").upper()
+                        _card("HF Signal", f"{_sig:+.2f} ({_lbl})", "", "trending_up")
+                    dcf = hf.get("dcf", {})
+                    if dcf.get("available") and dcf.get("intrinsic_p50"):
+                        _card("Intrinsic", f"${dcf['intrinsic_p50']:.2f}", f"vs ${dcf.get('current_price', 0):.2f}" if dcf.get("current_price") else "", "calculate")
+                    vq = hf.get("valuation_quality", {})
+                    if vq.get("available"):
+                        _card("Quality", f"{vq.get('quality_score', 0):.0f}/100", vq.get("quadrant", "").replace("_", " ").title(), "diamond")
+                # Advanced methods row
+                adv = hf.get("advanced", {})
+                if adv.get("available"):
+                    with ui.row().classes("gap-4 mt-2"):
+                        _card("Piotroski", f"{adv.get('piotroski_f_score', 0)}/9", adv.get("piotroski_label", ""), "checklist")
+                        z_dp = adv.get("altman_z_double_prime")
+                        if z_dp:
+                            _card("Altman Z''", f"{z_dp:.2f}", adv.get("altman_z_dp_zone", ""), "assessment")
+                        torp = adv.get("earnings_torpedo", {})
+                        if torp.get("torpedo_risk", 0) > 25:
+                            _card("Torpedo Risk", f"{torp['torpedo_risk']}%", f"{len(torp.get('flags', []))} flags", "warning")
+
             # Extended models summary
             ext = profile.get("extended_models", {})
             if ext:
