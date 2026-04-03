@@ -1388,7 +1388,7 @@ def run_stage3(state: BacktestState) -> None:
         if isinstance(obj, dict): return obj
         if hasattr(obj, "__dataclass_fields__"):
             try: return asdict(obj)
-            except: pass
+            except Exception: pass
         if hasattr(obj, "__dict__"): return obj.__dict__.copy()
         return None
 
