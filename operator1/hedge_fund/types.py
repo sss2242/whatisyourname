@@ -409,6 +409,9 @@ class HedgeFundResult:
     scorecard: ThesisScorecard = field(default_factory=ThesisScorecard)
     position: PositionSignalResult = field(default_factory=PositionSignalResult)
 
+    # Advanced methods (15 additional techniques)
+    advanced: dict[str, Any] = field(default_factory=dict)
+
     def to_profile_dict(self) -> dict[str, Any]:
         """Convert to JSON-serializable dict for profile storage."""
         from dataclasses import asdict

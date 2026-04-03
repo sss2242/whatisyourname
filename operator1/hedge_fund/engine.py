@@ -1150,7 +1150,8 @@ def run_hedge_fund_analysis(
             peer_ranking_result=peer_ranking_result,
         )
         if _adv.available:
-            hf.advanced = _adv  # type: ignore[attr-defined]
+            from dataclasses import asdict as _asdict_adv
+            hf.advanced = _asdict_adv(_adv)
             logger.info(
                 "  Advanced: Piotroski=%d/9, Z''=%s (%s), OU_hl=%s days, Torpedo=%d%%",
                 _adv.piotroski_f_score,
