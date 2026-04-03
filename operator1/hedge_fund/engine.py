@@ -90,6 +90,10 @@ def _compute_dividend_burn(
         if len(div_coverage) > 0:
             result.dividend_fcf_coverage = float(div_coverage.mean())
 
+        # B2 FIX: Check for dividends paid from negative FCF
+        mean_fcf = float(fcf.mean())
+        mean_div = float(div_abs.mean())
+
         # Debt service coverage
         ie_common = ie.reindex(common).fillna(0)
         debt_service = ie_common + div_abs
@@ -110,8 +114,16 @@ def _compute_dividend_burn(
 
         # Composite risk score
         w = get_hf_weight("cash_flow.dividend_burn", {})
-        div_score = min(100, (result.dividend_fcf_coverage or 0) * 60) if result.dividend_fcf_coverage else 50
-        ds_score = min(100, (result.debt_service_coverage or 0) * 50) if result.debt_service_coverage else 50
+        # B2 FIX: negative FCF + positive dividends = automatic high risk
+        if mean_fcf < 0 and mean_div > 0:
+            div_score = 95.0  # paying dividends from debt/asset liquidation
+        elif result.dividend_fcf_coverage is not None and result.dividend_fcf_coverage > 1.5:
+            div_score = min(100, result.dividend_fcf_coverage * 40)
+        elif result.dividend_fcf_coverage is not None:
+            div_score = min(100, max(0, result.dividend_fcf_coverage * 60))
+        else:
+            div_score = 50
+        ds_score = min(100, max(0, (result.debt_service_coverage or 0) * 50)) if result.debt_service_coverage else 50
         wc_score = 70 if result.working_capital_drain else 30
         vol_score = 50  # placeholder
 
@@ -332,12 +344,32 @@ def _compute_leverage_stress(
         rev = extract_latest_value(income_df, "revenue")
         margin = safe_divide(ebitda, rev) if ebitda and rev else None
 
-        if not all([debt, ebitda, rev]) or abs(ebitda) < 1e-6:
+        if not all([debt, rev]):
+            return result
+        if ebitda is None:
             return result
 
         covenant = cfg.get("covenant_threshold", 5.5)
 
-        # Base case
+        # B3 FIX: negative EBITDA = automatic distress
+        if ebitda <= 0:
+            base = StressScenario(
+                name="base_case", debt_to_ebitda=None,
+                interest_coverage=safe_divide(ebit, ie) if ebit and ie else None,
+                covenant_breach=True,
+            )
+            cash_val = extract_latest_value(balance_df, "cash_and_equivalents") or 0
+            if abs(ebitda) > 1e-6:
+                base.cash_runway_months = safe_divide(cash_val, abs(ebitda) / 12)
+            result.base_case = base
+            result.revenue_miss = StressScenario(name="revenue_miss", covenant_breach=True)
+            result.systemic_crisis = StressScenario(name="systemic_crisis", covenant_breach=True)
+            result.refinancing_risk = True
+            result.narrative = f"Negative EBITDA ({ebitda:.0f}): automatic distress"
+            result.available = True
+            return result
+
+        # Base case (positive EBITDA path)
         base = StressScenario(name="base_case")
         base.debt_to_ebitda = safe_divide(debt, ebitda)
         base.interest_coverage = safe_divide(ebit, ie) if ebit and ie else None
@@ -874,6 +906,18 @@ def _build_scorecard(hf: HedgeFundResult) -> ThesisScorecard:
     else: sc.investment_grade = "F"
 
     sc.conviction = min(10, max(0, int(overall / 10)))
+
+    # B4 FIX: Distress override -- cap grade when company is clearly distressed
+    _in_distress = (
+        (hf.leverage_stress.available and hf.leverage_stress.base_case.covenant_breach)
+        or hf.fcf_quality.score < 30
+        or hf.dividend_burn.risk_score > 80
+    )
+    if _in_distress:
+        if sc.investment_grade in ("A+", "A", "B+", "B"):
+            sc.investment_grade = "D"
+            sc.conviction = min(sc.conviction, 2)
+
     sc.available = True
     return sc
 
@@ -892,7 +936,7 @@ def _compute_position_signal(
         if not hf.scorecard.available:
             return result
 
-        # Alpha base from forecast
+        # Alpha base from forecast OR fallback from scorecard
         alpha = 0.0
         if forecast_result is not None and hasattr(forecast_result, "forecasts"):
             r5d = forecast_result.forecasts.get("return_5d", {})
@@ -900,6 +944,14 @@ def _compute_position_signal(
                 val = r5d.get("5d")
                 if val is not None:
                     alpha = float(val) if isinstance(val, (int, float)) else 0.0
+
+        # B5 FIX: Fallback alpha from scorecard grade when no forecast
+        if abs(alpha) < 1e-8 and hf.scorecard.available:
+            _grade_alpha = {
+                "A+": 0.08, "A": 0.06, "B+": 0.03, "B": 0.01,
+                "C+": -0.005, "C": -0.015, "D": -0.04, "F": -0.08,
+            }
+            alpha = _grade_alpha.get(hf.scorecard.investment_grade, 0.0)
 
         # Quality multiplier from scorecard
         q_mult = max(0.6, min(2.0, hf.scorecard.earnings_quality.score / 50))
@@ -1016,7 +1068,7 @@ def run_hedge_fund_analysis(
     from operator1.hedge_fund.accruals_forensics import compute_accruals_forensics
     from operator1.hedge_fund.earnings_smoothing import compute_earnings_smoothing
 
-    hf.fcf_quality = compute_fcf_quality(income_df, cashflow_df, cache)
+    hf.fcf_quality = compute_fcf_quality(income_df, cashflow_df, balance_df, cache)
     hf.accruals_forensic = compute_accruals_forensics(income_df, balance_df, cashflow_df, cache)
     hf.smoothing = compute_earnings_smoothing(income_df, cashflow_df, cache, fh_result)
 

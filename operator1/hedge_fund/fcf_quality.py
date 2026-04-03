@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 def compute_fcf_quality(
     income_df: pd.DataFrame,
     cashflow_df: pd.DataFrame,
+    balance_df: pd.DataFrame | None = None,
     cache: pd.DataFrame | None = None,
 ) -> FCFQualityResult:
     """Compute FCF quality score from raw quarterly filings.
@@ -44,6 +45,8 @@ def compute_fcf_quality(
         Raw income statement DataFrame (one row per filing period).
     cashflow_df:
         Raw cash flow statement DataFrame (one row per filing period).
+    balance_df:
+        Raw balance sheet DataFrame (for total_assets in accruals fallback).
     cache:
         Daily cache (optional, for pre-computed accruals column).
 
@@ -71,22 +74,31 @@ def compute_fcf_quality(
             if len(common) >= 2:
                 ocf_vals = ocf_series.loc[common]
                 ni_vals = ni_series.loc[common]
-                # Compute ratio per quarter, then average
-                safe_ni = ni_vals.where(ni_vals.abs() > 1e-6)
-                ratios = ocf_vals / safe_ni
-                ratios = ratios.dropna()
-                if len(ratios) > 0:
-                    mean_ratio = float(ratios.mean())
-                    result.ocf_ni_ratio_8q = mean_ratio
-                    # Score: 100 when ratio is in [0.8, 1.2], degrades outside
-                    if 0.8 <= mean_ratio <= 1.2:
-                        ocf_ni_score = 100.0
-                    elif mean_ratio > 1.2:
-                        # Too high can mean revenue deferrals
-                        ocf_ni_score = max(0, 100 - (mean_ratio - 1.2) * 150)
+                mean_ni = float(ni_vals.mean())
+                mean_ocf = float(ocf_vals.mean())
+
+                # B1 FIX: Handle negative NI separately
+                if mean_ni < 0:
+                    # Loss-making: OCF/NI ratio is meaningless (neg/neg = pos)
+                    if mean_ocf > 0:
+                        ocf_ni_score = 35.0  # losing money but generating cash
                     else:
-                        # Below 0.8: earnings not backed by cash
-                        ocf_ni_score = max(0, mean_ratio / 0.8 * 100)
+                        ocf_ni_score = 5.0   # losing money AND burning cash
+                    result.ocf_ni_ratio_8q = None  # ratio not meaningful
+                else:
+                    # Normal path: positive NI
+                    safe_ni = ni_vals.where(ni_vals.abs() > 1e-6)
+                    ratios = ocf_vals / safe_ni
+                    ratios = ratios.dropna()
+                    if len(ratios) > 0:
+                        mean_ratio = float(ratios.mean())
+                        result.ocf_ni_ratio_8q = mean_ratio
+                        if 0.8 <= mean_ratio <= 1.2:
+                            ocf_ni_score = 100.0
+                        elif mean_ratio > 1.2:
+                            ocf_ni_score = max(0, 100 - (mean_ratio - 1.2) * 150)
+                        else:
+                            ocf_ni_score = max(0, mean_ratio / 0.8 * 100)
 
         # --- Component 2: Accruals (lower absolute value = better) ---
         accruals_score = 50.0
@@ -98,16 +110,11 @@ def compute_fcf_quality(
                 accruals_val = float(accruals_series.iloc[-1])
         # Fallback: compute from raw DFs
         if accruals_val is None and len(ni_series) >= 2 and len(ocf_series) >= 2:
-            ta_series = extract_quarterly_series(
-                income_df if "total_assets" in (income_df.columns if income_df is not None else [])
-                else pd.DataFrame(),
-                "total_assets", n_periods,
-            )
-            # Try balance_df for total_assets
-            if ta_series.empty:
-                # Will be caught by the score remaining at 50
-                pass
-            else:
+            # D1 FIX: total_assets comes from balance_df, not income_df
+            ta_series = pd.Series(dtype=float)
+            if balance_df is not None and not balance_df.empty:
+                ta_series = extract_quarterly_series(balance_df, "total_assets", n_periods)
+            if not ta_series.empty:
                 common_all = ocf_series.index.intersection(ni_series.index).intersection(ta_series.index)
                 if len(common_all) >= 1:
                     ni_last = float(ni_series.loc[common_all].iloc[-1])

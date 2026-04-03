@@ -3260,6 +3260,38 @@ Non-interactive examples:
             logger.warning("Multi-frequency pipeline failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 6-HF: Hedge Fund Normal Analysis
+    # ------------------------------------------------------------------
+    # Parallel analytical track: 15 investment-grade metrics across 5 tiers.
+    # Reads from raw statement DFs (not the daily cache) for most metrics.
+    hf_result = None
+    if not args.skip_models:
+        try:
+            from operator1.hedge_fund.engine import run_hedge_fund_analysis
+
+            hf_result = run_hedge_fund_analysis(
+                income_df=income_df,
+                balance_df=balance_df,
+                cashflow_df=cashflow_df,
+                cache=cache,
+                target_profile=target_profile,
+                forecast_result=forecast_result,
+                mc_result=mc_result,
+                scenario_result=scenario_result,
+                multi_frequency_result=multi_frequency_result,
+                signal_ic_result=signal_ic_result,
+                filing_calendar_result=filing_calendar_result,
+                fh_result=fh_result,
+                peer_ranking_result=peer_ranking_result,
+                sentiment_result=sentiment_result,
+                survival_controller=survival_controller,
+                linked_caches=linked_caches,
+                macro_data=macro_data,
+            )
+        except Exception as exc:
+            logger.warning("Hedge Fund Analysis failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 7: Build company profile
     # ------------------------------------------------------------------
     # Item 5: When --skip-models is used, the following variables are None:
@@ -3839,6 +3871,12 @@ Non-interactive examples:
         except Exception as _ps_exc:
             logger.debug("Position signal computation failed: %s", _ps_exc)
             profile["position_signal"] = {"available": False}
+
+        # W2: Inject Hedge Fund Analysis results into profile
+        if hf_result is not None and hf_result.available:
+            profile["hedge_fund"] = hf_result.to_profile_dict()
+        else:
+            profile["hedge_fund"] = {"available": False}
 
         # Save profile -- sanitize dict keys (some model results use tuple keys)
         def _sanitize_keys(obj):
