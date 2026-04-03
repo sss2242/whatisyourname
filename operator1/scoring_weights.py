@@ -232,3 +232,16 @@ def get_frequency_fusion_weights() -> dict[str, dict[str, float]]:
 def get_uss_params(regime: str) -> dict[str, Any]:
     """Return USS dimension parameters for a regime."""
     return get_weight(f"uss_model_switching.{regime}", {})
+
+
+def get_hedge_fund_weights() -> dict[str, Any]:
+    """Return hedge fund analysis weights from config/hedge_fund_weights.yml.
+
+    Separate config file from the main scoring_weights.yml.
+    Loaded via the hedge_fund.helpers module.
+    """
+    try:
+        from operator1.hedge_fund.helpers import load_hf_config
+        return load_hf_config()
+    except ImportError:
+        return {}

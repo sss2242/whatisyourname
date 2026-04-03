@@ -78,6 +78,7 @@ OPTIONAL_PROFILE_KEYS: set[str] = {
     "signal_ic",
     "prediction_log",
     "position_signal",
+    "hedge_fund",
 }
 
 

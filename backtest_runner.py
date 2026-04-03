@@ -1409,6 +1409,35 @@ def run_stage3(state: BacktestState) -> None:
         except Exception:
             pass
 
+    # Hedge Fund Analysis (before profile build)
+    hf_result = None
+    try:
+        from operator1.hedge_fund.engine import run_hedge_fund_analysis
+        hf_result = run_hedge_fund_analysis(
+            income_df=state._income_df,
+            balance_df=state._balance_df,
+            cashflow_df=state._cashflow_df,
+            cache=cache,
+            target_profile=state.target_profile,
+            forecast_result=state.forecast_result,
+            mc_result=state.mc_result,
+            scenario_result=state.scenario_result,
+            multi_frequency_result=state.multi_frequency_result,
+            signal_ic_result=state.signal_ic_result,
+            filing_calendar_result=state.filing_calendar_result,
+            fh_result=state.fh_result,
+            peer_ranking_result=state.peer_ranking_result if isinstance(state.peer_ranking_result, dict) else None,
+            sentiment_result=state.sentiment_result,
+            survival_controller=state.survival_controller,
+            linked_caches=state.linked_caches,
+            macro_data=state.macro_data,
+        )
+        if hf_result and hf_result.available:
+            logger.info("HF Analysis: grade=%s, signal=%+.2f",
+                        hf_result.scorecard.investment_grade, hf_result.position.signal)
+    except Exception as exc:
+        logger.debug("HF analysis skipped: %s", exc)
+
     try:
         profile = build_company_profile(
             verified_target=state.target_profile,
@@ -1442,6 +1471,12 @@ def run_stage3(state: BacktestState) -> None:
             profile["unified_survival_system"] = state.survival_controller.to_profile_dict()
         else:
             profile["unified_survival_system"] = {"available": False}
+
+        # Hedge Fund Analysis
+        if hf_result is not None and hf_result.available:
+            profile["hedge_fund"] = hf_result.to_profile_dict()
+        else:
+            profile["hedge_fund"] = {"available": False}
         if state.scenario_result is not None and state.scenario_result.available:
             profile["scenario_analysis"] = state.scenario_result.to_dict()
         else:
