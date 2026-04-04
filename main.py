@@ -1352,7 +1352,7 @@ Non-interactive examples:
                 _sig = cache["survival_probability"]
                 _cox = cache["cox_survival_score"].fillna(_sig)
                 # Blend weights from scoring_weights config (overridden by
-                # adaptive_model_params in Step 5k if data is sufficient)
+                # adaptive_model_params in Step 5k unless use_adaptive=False)
                 try:
                     from operator1.scoring_weights import get_weight as _gw
                     _w_sig = float(_gw("survival_blend.sigmoid_weight", 0.4))
