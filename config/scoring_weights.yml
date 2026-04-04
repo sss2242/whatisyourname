@@ -15,6 +15,7 @@ survival_thresholds:
 
 # Survival probability blend (sigmoid vs Cox PH)
 survival_blend:
+  use_adaptive: true  # true = inverse-variance blend (Cochrane 1954), false = use manual weights below
   sigmoid_weight: 0.4
   cox_weight: 0.6
 
@@ -179,6 +180,7 @@ graph_edge_weights:
 # Monte Carlo Parameters
 # ---------------------------------------------------------------------------
 monte_carlo:
+  use_adaptive: true  # true = precision-targeted path count (Glasserman 2003), false = use manual values below
   n_paths: 10000
   importance_tilt: 1.5
   horizons: [90, 252]
@@ -232,6 +234,7 @@ model_regime_affinity:
 # Conformal Prediction
 # ---------------------------------------------------------------------------
 conformal:
+  use_adaptive_pid: true  # true = PID gains from error ACF half-life (Dahlin 1968), false = use manual Kp/Ki/Kd below
   target_coverage: 0.90
   pid_kp: 0.01
   pid_ki: 0.001

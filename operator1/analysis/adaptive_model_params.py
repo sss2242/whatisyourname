@@ -200,6 +200,10 @@ def compute_blend_weights(
     Uses rolling prediction variance against actual survival mode flags
     (Cochrane 1954 inverse-variance combination).
 
+    When ``scoring_weights.yml`` has ``survival_blend.use_adaptive: false``,
+    this function returns the manual weights from config without computing
+    the inverse-variance blend.
+
     Parameters
     ----------
     sig_series:
@@ -216,6 +220,17 @@ def compute_blend_weights(
     (w_sig, w_cox)
         Weights summing to 1.0. Falls back to (0.4, 0.6) if insufficient data.
     """
+    # Check if user disabled adaptive blend via dashboard toggle
+    try:
+        from operator1.scoring_weights import get_weight
+        use_adaptive = get_weight("survival_blend.use_adaptive", True)
+        if not use_adaptive:
+            w_sig = float(get_weight("survival_blend.sigmoid_weight", 0.4))
+            w_cox = float(get_weight("survival_blend.cox_weight", 0.6))
+            return w_sig, w_cox
+    except Exception:
+        pass
+
     if len(sig_series) < lookback or len(cox_series) < lookback:
         return 0.4, 0.6  # original defaults
 
@@ -613,6 +628,9 @@ def compute_adaptive_mc_params(
     IS tilt: adaptive exponential tilting proportional to event rarity
     (Bucklew 2004).
 
+    When ``scoring_weights.yml`` has ``monte_carlo.use_adaptive: false``,
+    returns the manual values from config without computing adaptive params.
+
     Parameters
     ----------
     cache:
@@ -628,6 +646,17 @@ def compute_adaptive_mc_params(
     (n_paths, is_tilt)
         n_paths in [1000, 50000], is_tilt in [0.5, 5.0].
     """
+    # Check if user disabled adaptive MC via dashboard toggle
+    try:
+        from operator1.scoring_weights import get_weight
+        use_adaptive = get_weight("monte_carlo.use_adaptive", True)
+        if not use_adaptive:
+            n = int(get_weight("monte_carlo.n_paths", 10000))
+            tilt = float(get_weight("monte_carlo.importance_tilt", 1.5))
+            return n, tilt
+    except Exception:
+        pass
+
     # Get preliminary survival probability
     if preliminary_survival is None:
         surv_col = cache.get("survival_probability")

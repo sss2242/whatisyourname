@@ -46,7 +46,19 @@ logger = logging.getLogger(__name__)
 # Default configuration (overridden by config/survival_hierarchy.yml)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_WEIGHTS: dict[str, float] = {
+def _load_vanity_weights() -> dict[str, float]:
+    """Load vanity component weights from scoring_weights config."""
+    try:
+        from operator1.scoring_weights import get_weight
+        configured = get_weight("vanity_weights", None)
+        if configured and isinstance(configured, dict):
+            return {k: float(v) for k, v in configured.items()}
+    except Exception:
+        pass
+    return _FALLBACK_WEIGHTS
+
+
+_FALLBACK_WEIGHTS: dict[str, float] = {
     "rnd_mismatch": 0.15,
     "sga_bloat": 0.25,
     "capital_misallocation": 0.30,
@@ -564,7 +576,7 @@ def compute_vanity_score(
         - Plus all legacy vanity columns.
     """
     cfg = config or {}
-    weights = cfg.get("weights", _DEFAULT_WEIGHTS)
+    weights = cfg.get("weights", _load_vanity_weights())
     labels = cfg.get("labels", _DEFAULT_LABELS)
     short_window = cfg.get("trend_window_short", _TREND_WINDOW_SHORT)
     long_window = cfg.get("trend_window_long", _TREND_WINDOW_LONG)

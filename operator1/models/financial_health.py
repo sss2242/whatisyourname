@@ -43,6 +43,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from operator1.scoring_weights import get_weight
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -98,8 +100,24 @@ _Z_COEFF = {
     "x4_market_cap_tl": 0.6,
     "x5_revenue_ta": 1.0,
 }
-_Z_SAFE_THRESHOLD = 2.99
-_Z_DISTRESS_THRESHOLD = 1.81
+def _z_safe_threshold() -> float:
+    try:
+        from operator1.scoring_weights import get_weight
+        return float(get_weight("financial_health.altman_safe_zone", 2.99))
+    except Exception:
+        return 2.99
+
+
+def _z_distress_threshold() -> float:
+    try:
+        from operator1.scoring_weights import get_weight
+        return float(get_weight("financial_health.altman_distress_zone", 1.81))
+    except Exception:
+        return 1.81
+
+
+_Z_SAFE_THRESHOLD = 2.99      # kept for backward compat; use _z_safe_threshold()
+_Z_DISTRESS_THRESHOLD = 1.81  # kept for backward compat; use _z_distress_threshold()
 
 # Beneish M-Score coefficients (Beneish 1999)
 _M_INTERCEPT = -4.84
@@ -730,7 +748,7 @@ def compute_beneish_m_score(df: pd.DataFrame) -> BeneishMResult:
 
     if m_score > -1.78:
         result.verdict = "likely"
-    elif m_score > -2.22:
+    elif m_score > get_weight("financial_health.beneish_threshold", -2.22):
         result.verdict = "possible"
     else:
         result.verdict = "unlikely"

@@ -1199,6 +1199,13 @@ def render_scoring_weights():
             ui.separator().classes("my-4")
             ui.label("Survival Probability Blend").classes("text-md font-bold mb-2")
             blend = sw.get("survival_blend", {})
+            _blend_adaptive = {"active": blend.get("use_adaptive", True)}
+            ui.switch(
+                "Use adaptive blend (inverse-variance, Cochrane 1954)",
+                value=_blend_adaptive["active"],
+                on_change=lambda e: _blend_adaptive.update({"active": e.value}),
+            ).classes("mb-2")
+            ui.label("When adaptive is ON, these values are initial defaults only -- the pipeline recalibrates from data.").classes("text-xs text-gray-500 mb-2")
             with ui.row().classes("items-center gap-4"):
                 ui.label("Sigmoid weight").classes("w-48 text-sm")
                 inp_sig = ui.number(value=blend.get("sigmoid_weight", 0.4), step=0.05, format="%.2f").classes("w-32")
@@ -1321,6 +1328,13 @@ def render_scoring_weights():
         with ui.tab_panel(wt_mc):
             ui.label("Monte Carlo Parameters").classes("text-lg font-bold mb-2")
             mc = sw.get("monte_carlo", {})
+            _mc_adaptive = {"active": mc.get("use_adaptive", True)}
+            ui.switch(
+                "Use adaptive MC (precision-targeted path count, Glasserman 2003)",
+                value=_mc_adaptive["active"],
+                on_change=lambda e: _mc_adaptive.update({"active": e.value}),
+            ).classes("mb-2")
+            ui.label("When adaptive is ON, n_paths and importance_tilt are computed from data precision requirements.").classes("text-xs text-gray-500 mb-2")
             for key, default, label, step in [
                 ("n_paths", 10000, "Number of simulation paths", 1000),
                 ("importance_tilt", 1.5, "Importance sampling tilt", 0.1),
@@ -1366,6 +1380,13 @@ def render_scoring_weights():
         with ui.tab_panel(wt_conformal):
             ui.label("Conformal Prediction PID").classes("text-lg font-bold mb-2")
             conf = sw.get("conformal", {})
+            _conf_adaptive = {"active": conf.get("use_adaptive_pid", True)}
+            ui.switch(
+                "Use adaptive PID gains (Dahlin tuning from error ACF half-life)",
+                value=_conf_adaptive["active"],
+                on_change=lambda e: _conf_adaptive.update({"active": e.value}),
+            ).classes("mb-2")
+            ui.label("When adaptive is ON, PID gains (Kp/Ki/Kd) are derived from data. Target coverage is always tweakable.").classes("text-xs text-gray-500 mb-2")
             for key, default, label in [
                 ("target_coverage", 0.90, "Target coverage"),
                 ("pid_kp", 0.01, "PID Kp (proportional)"),

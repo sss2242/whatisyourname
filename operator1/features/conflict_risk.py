@@ -31,6 +31,8 @@ from typing import Any
 
 import requests
 
+from operator1.scoring_weights import get_weight
+
 logger = logging.getLogger(__name__)
 
 
@@ -596,12 +598,16 @@ def _compute_intensity_score(
     else:
         news_score = min(0.5 + (news_mentions - 10) / 80.0, 1.0)
 
-    # Weighted combination
+    # Weighted combination (configurable via scoring_weights.yml conflict_weights)
+    _w_event = get_weight("conflict_weights.event_score", 0.40)
+    _w_fatality = get_weight("conflict_weights.fatality_score", 0.20)
+    _w_flag = get_weight("conflict_weights.flag_score", 0.25)
+    _w_news = get_weight("conflict_weights.news_score", 0.15)
     intensity = (
-        0.40 * event_score
-        + 0.20 * fatality_score
-        + 0.25 * flag_score
-        + 0.15 * news_score
+        _w_event * event_score
+        + _w_fatality * fatality_score
+        + _w_flag * flag_score
+        + _w_news * news_score
     )
 
     return round(min(max(intensity, 0.0), 1.0), 3)

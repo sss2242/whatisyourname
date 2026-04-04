@@ -341,8 +341,13 @@ def fit_kalman_per_regime(
     if regime_labels is None or len(regime_labels) != len(series):
         return fit_kalman(series, n_forecast)
 
-    # Identify regimes with sufficient data
-    unique_regimes = [r for r in np.unique(regime_labels) if not (isinstance(r, float) and np.isnan(r))]
+    # Identify regimes with sufficient data.
+    # Filter out None/NaN before np.unique to avoid TypeError when
+    # regime_labels contains mixed str + None (first few days before HMM warmup).
+    _clean_labels = pd.Series(regime_labels).dropna().values
+    if len(_clean_labels) == 0:
+        return fit_kalman(series, n_forecast)
+    unique_regimes = [r for r in np.unique(_clean_labels) if not (isinstance(r, float) and np.isnan(r))]
     regime_data = {}
     for r in unique_regimes:
         mask = regime_labels == r
