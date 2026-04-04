@@ -19,6 +19,8 @@ from typing import Any
 
 import numpy as np
 
+from operator1.scoring_weights import get_weight
+
 logger = logging.getLogger(__name__)
 
 
@@ -29,7 +31,11 @@ logger = logging.getLogger(__name__)
 # For each prediction horizon, which frequencies contribute and with what
 # base weight.  Faster frequencies dominate short horizons, slower
 # frequencies dominate long horizons.
-_HORIZON_WEIGHTS: dict[str, dict[str, float]] = {
+#
+# These defaults can be overridden via config/scoring_weights.yml section
+# ``frequency_fusion``.  The dashboard Scoring Weights > Frequency tab
+# edits these values.
+_DEFAULT_HORIZON_WEIGHTS: dict[str, dict[str, float]] = {
     "1d":  {"D": 1.0},
     "5d":  {"D": 0.7, "W": 0.3},
     "1w":  {"D": 0.4, "W": 0.6},
@@ -40,6 +46,19 @@ _HORIZON_WEIGHTS: dict[str, dict[str, float]] = {
     "1y":  {"M": 0.15, "Q": 0.35, "A": 0.50},
     "2y":  {"Q": 0.30, "A": 0.70},
 }
+
+
+def _get_horizon_weights() -> dict[str, dict[str, float]]:
+    """Load horizon weights from scoring_weights config, falling back to defaults."""
+    configured = get_weight("frequency_fusion", None)
+    if configured and isinstance(configured, dict):
+        # Merge configured values over defaults
+        merged = dict(_DEFAULT_HORIZON_WEIGHTS)
+        for horizon, freq_weights in configured.items():
+            if isinstance(freq_weights, dict):
+                merged[horizon] = {k: float(v) for k, v in freq_weights.items() if v}
+        return merged
+    return _DEFAULT_HORIZON_WEIGHTS
 
 
 # ---------------------------------------------------------------------------
@@ -315,8 +334,9 @@ def fuse_predictions(
             if not freq_values:
                 continue
 
-            # Get base weights for this horizon
-            base_weights = _HORIZON_WEIGHTS.get(horizon, {})
+            # Get base weights for this horizon (from config or defaults)
+            hw = _get_horizon_weights()
+            base_weights = hw.get(horizon, {})
             if not base_weights:
                 # Use equal weights if horizon not in table
                 base_weights = {f: 1.0 for f in freq_values}

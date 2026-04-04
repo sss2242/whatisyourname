@@ -1351,8 +1351,16 @@ Non-interactive examples:
                 # Blend sigmoid + Cox for combined probability
                 _sig = cache["survival_probability"]
                 _cox = cache["cox_survival_score"].fillna(_sig)
-                cache["survival_probability"] = 0.4 * _sig + 0.6 * _cox
-                logger.info("Cox PH survival score computed and blended")
+                # Blend weights from scoring_weights config (overridden by
+                # adaptive_model_params in Step 5k if data is sufficient)
+                try:
+                    from operator1.scoring_weights import get_weight as _gw
+                    _w_sig = float(_gw("survival_blend.sigmoid_weight", 0.4))
+                    _w_cox = float(_gw("survival_blend.cox_weight", 0.6))
+                except Exception:
+                    _w_sig, _w_cox = 0.4, 0.6
+                cache["survival_probability"] = _w_sig * _sig + _w_cox * _cox
+                logger.info("Cox PH survival score computed and blended (w_sig=%.2f, w_cox=%.2f)", _w_sig, _w_cox)
         except Exception as _exc:
             logger.debug("Cox PH survival score skipped: %s", _exc)
         cache = compute_hierarchy_weights(cache)

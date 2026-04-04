@@ -535,18 +535,34 @@ def compute_graph_risk_metrics(
         # Corporate structure edges (parent/subsidiary) get higher default
         # weights than business relationships -- controlling ownership is
         # the strongest contagion channel.
-        _CORPORATE_STRUCTURE_WEIGHTS: dict[str, float] = {
-            "parent_companies": 2.8,   # parent distress strongly impacts subsidiary
-            "subsidiaries": 2.3,       # subsidiary distress moderately impacts parent
-        }
-        _DEFAULT_GROUP_WEIGHTS: dict[str, float] = {
-            "competitors": 1.0,
-            "suppliers": 1.2,
-            "customers": 1.1,
-            "financial_institutions": 1.3,
-            "logistics": 0.8,
-            "regulators": 0.5,
-        }
+        # Edge weights configurable via scoring_weights.yml graph_edge_weights
+        try:
+            from operator1.scoring_weights import get_weight as _gw
+            _CORPORATE_STRUCTURE_WEIGHTS: dict[str, float] = {
+                "parent_companies": float(_gw("graph_edge_weights.parent_companies", 2.8)),
+                "subsidiaries": float(_gw("graph_edge_weights.subsidiaries", 2.3)),
+            }
+            _DEFAULT_GROUP_WEIGHTS: dict[str, float] = {
+                "competitors": float(_gw("graph_edge_weights.competitors", 1.0)),
+                "suppliers": float(_gw("graph_edge_weights.suppliers", 1.2)),
+                "customers": float(_gw("graph_edge_weights.customers", 1.1)),
+                "financial_institutions": float(_gw("graph_edge_weights.financial_institutions", 1.3)),
+                "logistics": float(_gw("graph_edge_weights.logistics", 0.8)),
+                "regulators": float(_gw("graph_edge_weights.regulators", 0.5)),
+            }
+        except Exception:
+            _CORPORATE_STRUCTURE_WEIGHTS = {
+                "parent_companies": 2.8,
+                "subsidiaries": 2.3,
+            }
+            _DEFAULT_GROUP_WEIGHTS = {
+                "competitors": 1.0,
+                "suppliers": 1.2,
+                "customers": 1.1,
+                "financial_institutions": 1.3,
+                "logistics": 0.8,
+                "regulators": 0.5,
+            }
         node_weights: dict[int, float] = {}
         if edge_weights:
             for i, nd in enumerate(nodes):

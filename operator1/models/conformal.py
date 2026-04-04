@@ -622,13 +622,20 @@ class ConformalPIDCalibrator:
 
     def __init__(
         self,
-        target_coverage: float = 0.90,
+        target_coverage: float | None = None,
         kp: float = 0.05,
         ki: float = 0.005,
         kd: float = 0.01,
         min_samples: int = 20,
         max_window: int = 300,
     ) -> None:
+        # Load from scoring_weights config if not explicitly provided
+        if target_coverage is None:
+            try:
+                from operator1.scoring_weights import get_weight
+                target_coverage = float(get_weight("conformal.target_coverage", 0.90))
+            except Exception:
+                target_coverage = 0.90
         self._target = target_coverage
         self._alpha = 1.0 - target_coverage
         self._kp = kp

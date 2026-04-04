@@ -387,20 +387,20 @@ def _distribute_flow_to_index(
 
 
 def _compute_interpolation_confidence(
-    daily_index: pd.DatetimeIndex,
+    target_index: pd.DatetimeIndex,
     filing_dates: list[pd.Timestamp],
     frequency: str,
     variable_type: str,
 ) -> pd.Series:
-    """Compute per-day interpolation confidence.
+    """Compute per-period interpolation confidence.
 
-    Higher confidence for days closer to a filing.
+    Higher confidence for periods closer to a filing.
     Lower confidence for annual filers and flow variables.
 
     Parameters
     ----------
-    daily_index:
-        Target daily index.
+    target_index:
+        Target index at any frequency (daily, weekly, monthly).
     filing_dates:
         Sorted list of filing dates.
     frequency:
@@ -413,17 +413,17 @@ def _compute_interpolation_confidence(
     Series of confidence scores in [0, 1].
     """
     if not filing_dates:
-        return pd.Series(0.3, index=daily_index, dtype=float)
+        return pd.Series(0.3, index=target_index, dtype=float)
 
     config = _FREQ_CONFIG.get(frequency, _FREQ_CONFIG["unknown"])
     base_conf = config["confidence_base"]
     max_gap_days = config["period_days"] // 2  # half-period is max distance
 
-    # Compute distance to nearest filing for each daily date
+    # Compute distance to nearest filing for each target-frequency date
     filing_ts = pd.DatetimeIndex(sorted(filing_dates))
-    distances = pd.Series(0, index=daily_index, dtype=float)
+    distances = pd.Series(0, index=target_index, dtype=float)
 
-    for i, day in enumerate(daily_index):
+    for i, day in enumerate(target_index):
         # Binary search for nearest filing
         pos = filing_ts.searchsorted(day)
         candidates = []
