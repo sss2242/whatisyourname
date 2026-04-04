@@ -213,6 +213,111 @@ class BacktestState:
 
         logger.info("State saved to %s (stage %d)", run_dir, stage)
 
+    def save_sub(self, sub_stage: str) -> None:
+        """Persist state after a sub-stage completes (e.g. '2a', '2b')."""
+        run_dir = Path(self.run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.cache is not None:
+            self.cache.to_parquet(run_dir / "cache.parquet")
+
+        if self.linked_caches:
+            lc_dir = run_dir / "linked_caches"
+            lc_dir.mkdir(exist_ok=True)
+            for eid, lc in self.linked_caches.items():
+                safe_name = eid.replace("/", "_").replace("\\", "_")[:50]
+                lc.to_parquet(lc_dir / f"{safe_name}.parquet")
+            with open(lc_dir / "_ids.json", "w") as f:
+                json.dump(list(self.linked_caches.keys()), f)
+
+        if self.linked_agg_df is not None and not self.linked_agg_df.empty:
+            self.linked_agg_df.to_parquet(run_dir / "linked_agg.parquet")
+
+        state_dict = {}
+        skip_keys = {"cache", "linked_caches", "linked_agg_df", "_secrets", "_llm_client", "_pit_client"}
+        for k, v in self.__dict__.items():
+            if k in skip_keys:
+                continue
+            try:
+                pickle.dumps(v)
+                state_dict[k] = v
+            except (pickle.PicklingError, TypeError, AttributeError):
+                pass
+
+        with open(run_dir / f"state_{sub_stage}.pkl", "wb") as f:
+            pickle.dump(state_dict, f)
+
+        config = {
+            "market_id": self.market_id, "company": self.company,
+            "end_date": self.end_date, "years": self.years,
+            "run_dir": self.run_dir, "sub_stage_completed": sub_stage,
+            "timestamp": datetime.now().isoformat(),
+        }
+        with open(run_dir / "config.json", "w") as f:
+            json.dump(config, f, indent=2)
+
+        logger.info("State saved to %s (sub-stage %s)", run_dir, sub_stage)
+
+    def load_sub(self, sub_stage: str) -> None:
+        """Load state from a previous sub-stage (e.g. '1', '2a', '2b')."""
+        run_dir = Path(self.run_dir)
+
+        config_path = run_dir / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                config = json.load(f)
+            self.market_id = config.get("market_id", self.market_id)
+            self.company = config.get("company", self.company)
+            self.end_date = config.get("end_date", self.end_date)
+            self.years = config.get("years", self.years)
+
+        cache_path = run_dir / "cache.parquet"
+        if cache_path.exists():
+            self.cache = pd.read_parquet(cache_path)
+            logger.info("Loaded cache: %d rows x %d cols", len(self.cache), len(self.cache.columns))
+
+        lc_dir = run_dir / "linked_caches"
+        ids_path = lc_dir / "_ids.json"
+        if ids_path.exists():
+            with open(ids_path) as f:
+                ids = json.load(f)
+            self.linked_caches = {}
+            for eid in ids:
+                safe_name = eid.replace("/", "_").replace("\\", "_")[:50]
+                pq = lc_dir / f"{safe_name}.parquet"
+                if pq.exists():
+                    self.linked_caches[eid] = pd.read_parquet(pq)
+
+        lag_path = run_dir / "linked_agg.parquet"
+        if lag_path.exists():
+            self.linked_agg_df = pd.read_parquet(lag_path)
+
+        # Try the exact sub-stage pickle, then fall back to stage number pickles
+        pkl_candidates = [
+            run_dir / f"state_{sub_stage}.pkl",
+            run_dir / f"state_stage{sub_stage}.pkl",
+        ]
+        # Also try numeric stages for backward compat
+        if sub_stage.isdigit():
+            pkl_candidates.append(run_dir / f"state_stage{sub_stage}.pkl")
+
+        for pkl_path in pkl_candidates:
+            if pkl_path.exists():
+                with open(pkl_path, "rb") as f:
+                    state_dict = pickle.load(f)
+                for k, v in state_dict.items():
+                    if hasattr(self, k):
+                        setattr(self, k, v)
+                logger.info("Loaded state from %s (%d keys)", pkl_path.name, len(state_dict))
+                break
+
+        # Reload secrets (not persisted)
+        try:
+            from operator1.secrets_loader import load_secrets
+            self._secrets = load_secrets()
+        except Exception:
+            pass
+
     def load(self, stage: int) -> None:
         """Load state from a previous stage."""
         run_dir = Path(self.run_dir)
@@ -938,7 +1043,7 @@ def run_stage1(state: BacktestState) -> None:
             logger.debug("Ownership contagion skipped: %s", exc)
 
     state.cache = cache
-    state.save(stage=1)
+    state.save_sub("1")
     logger.info("STAGE 1 COMPLETE: %d rows x %d cols", len(cache), len(cache.columns))
 
 
@@ -946,22 +1051,9 @@ def run_stage1(state: BacktestState) -> None:
 # Stage 2: Temporal models
 # ---------------------------------------------------------------------------
 
-def run_stage2(state: BacktestState) -> None:
-    """Run all temporal models on the cached data from Stage 1."""
-    logger.info("=" * 60)
-    logger.info("STAGE 2: Temporal Models")
-    logger.info("=" * 60)
-
+def _init_extra_vars(state: BacktestState) -> None:
+    """Build the _extra_vars list from cache columns."""
     cache = state.cache
-    if cache is None or cache.empty:
-        raise ValueError("No cache data -- run Stage 1 first")
-
-    from operator1.models.regime_detector import detect_regimes_and_breaks
-    from operator1.models.forecasting import run_forecasting, run_forward_pass, run_burnout
-    from operator1.models.monte_carlo import run_monte_carlo
-    from operator1.models.prediction_aggregator import run_prediction_aggregation
-
-    # Extra variables for temporal models
     _linked_prefixes = ("competitors_", "suppliers_", "customers_", "financial_institutions_", "sector_peers_")
     state._extra_vars = [
         c for c in cache.columns
@@ -976,9 +1068,23 @@ def run_stage2(state: BacktestState) -> None:
         and not c.startswith("is_missing_")
     ]
 
-    # Regime detection (skip if already done)
+
+def run_stage2a(state: BacktestState) -> None:
+    """Stage 2a: Regime detection + causality + cycle/pattern + forecasting."""
+    logger.info("=" * 60)
+    logger.info("STAGE 2a: Regime + Causality + Forecasting")
+    logger.info("=" * 60)
+
+    cache = state.cache
+    if cache is None or cache.empty:
+        raise ValueError("No cache data -- run Stage 1 first")
+
+    _init_extra_vars(state)
+
+    # Regime detection
     if state.regime_detector is None or "regime_label" not in cache.columns:
         try:
+            from operator1.models.regime_detector import detect_regimes_and_breaks
             cache, state.regime_detector = detect_regimes_and_breaks(cache)
         except Exception as exc:
             logger.warning("Regime detection failed: %s", exc)
@@ -1044,13 +1150,36 @@ def run_stage2(state: BacktestState) -> None:
 
     # Forecasting
     try:
+        from operator1.models.forecasting import run_forecasting
         cache, state.forecast_result = run_forecasting(cache, extra_variables=state._extra_vars)
         logger.info("Forecasting complete")
     except Exception as exc:
         logger.warning("Forecasting failed: %s", exc)
 
-    # Forward pass
+    state.cache = cache
+    state.save_sub("2a")
+    logger.info("STAGE 2a COMPLETE")
+
+
+def run_stage2b(state: BacktestState) -> None:
+    """Stage 2b: Forward pass + burnout + walk-forward + Monte Carlo."""
+    logger.info("=" * 60)
+    logger.info("STAGE 2b: Forward Pass + Burnout + Walk-Forward + MC")
+    logger.info("=" * 60)
+
+    cache = state.cache
+    if cache is None or cache.empty:
+        raise ValueError("No cache data -- run Stage 2a first")
+
+    if not state._extra_vars:
+        _init_extra_vars(state)
+
+    from operator1.models.forecasting import run_forward_pass, run_burnout
+    from operator1.models.monte_carlo import run_monte_carlo
+
     regime_labels = cache.get("regime_label") if "regime_label" in cache.columns else None
+
+    # Forward pass
     try:
         state.forward_pass_result = run_forward_pass(
             cache, hierarchy_weights=state.weights, regime_labels=regime_labels,
@@ -1115,11 +1244,7 @@ def run_stage2(state: BacktestState) -> None:
             stability_score=_stab, transition_halflife=_thl, reference_date=_ref,
         )
         if regime_shift_result and regime_shift_result.available:
-            logger.info(
-                "Regime shift: P(exit 21d)=%.1f%%, expected_days=%.0f",
-                regime_shift_result.prob_exit_21d * 100,
-                regime_shift_result.expected_days_to_shift,
-            )
+            logger.info("Regime shift: P(exit 21d)=%.1f%%", regime_shift_result.prob_exit_21d * 100)
     except Exception as exc:
         logger.debug("Regime shift prediction skipped: %s", exc)
 
@@ -1129,6 +1254,23 @@ def run_stage2(state: BacktestState) -> None:
         state.copula_result = run_copula_analysis(cache)
     except Exception:
         pass
+
+    state.cache = cache
+    state.save_sub("2b")
+    logger.info("STAGE 2b COMPLETE")
+
+
+def run_stage2c(state: BacktestState) -> None:
+    """Stage 2c: Transformer + Particle + Conformal + DTW + Aggregation + SHAP + Sobol + GA + OHLC."""
+    logger.info("=" * 60)
+    logger.info("STAGE 2c: Ensemble Models + Aggregation")
+    logger.info("=" * 60)
+
+    cache = state.cache
+    if cache is None or cache.empty:
+        raise ValueError("No cache data -- run Stage 2b first")
+
+    from operator1.models.prediction_aggregator import run_prediction_aggregation
 
     # Transformer
     try:
@@ -1243,6 +1385,21 @@ def run_stage2(state: BacktestState) -> None:
     except Exception:
         pass
 
+    state.cache = cache
+    state.save_sub("2c")
+    logger.info("STAGE 2c COMPLETE")
+
+
+def run_stage2d(state: BacktestState) -> None:
+    """Stage 2d: USS + Multi-frequency + Retroactive calibration + Diagnostics."""
+    logger.info("=" * 60)
+    logger.info("STAGE 2d: USS + Multi-Frequency + Calibration")
+    logger.info("=" * 60)
+
+    cache = state.cache
+    if cache is None or cache.empty:
+        raise ValueError("No cache data -- run Stage 2c first")
+
     # USS: Unified Survival System integration
     try:
         from operator1.analysis.survival_regime_controller import (
@@ -1250,14 +1407,12 @@ def run_stage2(state: BacktestState) -> None:
         )
         state.survival_controller = SurvivalRegimeController.from_cache(cache)
         if state.survival_controller.is_survival:
-            # Apply forecast bounding
             if state.forecast_result is not None and hasattr(state.forecast_result, "forecasts"):
                 state.forecast_result.forecasts = bound_forecast_dict(
                     state.forecast_result.forecasts, cache,
                     state.survival_controller.current_regime,
                 )
                 logger.info("USS forecast bounding applied")
-            # Run scenario engine
             from operator1.analysis.scenario_engine import run_scenario_engine
             state.scenario_result = run_scenario_engine(
                 cache, regime=state.survival_controller.current_regime,
@@ -1297,10 +1452,9 @@ def run_stage2(state: BacktestState) -> None:
     except Exception as exc:
         logger.warning("Multi-frequency failed: %s", exc)
 
-    # Step 6.5: Retroactive calibration (Empirical Bayes second-pass priors)
+    # Retroactive calibration
     try:
         from operator1.analysis.retroactive_calibration import run_retroactive_calibration
-
         _entity_groups_for_retro = {}
         if state.relationships:
             for grp, ents in state.relationships.items():
@@ -1315,7 +1469,6 @@ def run_stage2(state: BacktestState) -> None:
                         if eid:
                             ids.append(eid)
                     _entity_groups_for_retro[grp] = ids
-
         state._retro_params = run_retroactive_calibration(
             cache=cache,
             linked_caches=state.linked_caches if state.linked_caches else None,
@@ -1326,38 +1479,36 @@ def run_stage2(state: BacktestState) -> None:
             target_profile=state.target_profile,
         )
         if state._retro_params.n_calibrated > 0:
-            logger.info(
-                "Retroactive calibration: %d groups calibrated",
-                state._retro_params.n_calibrated,
-            )
+            logger.info("Retroactive calibration: %d groups calibrated", state._retro_params.n_calibrated)
     except Exception as exc:
         logger.warning("Retroactive calibration failed: %s", exc)
 
-    # Step 6.6: Model diagnostics (expected path vs actual path)
+    # Model diagnostics
     try:
         from operator1.monitoring.model_diagnostics import compute_model_diagnostics
         _diag = compute_model_diagnostics(
-            cache,
-            forecast_result=state.forecast_result,
-            mc_result=state.mc_result,
-            copula_result=state.copula_result,
-            granger_result=state.granger_result,
-            cycle_result=state.cycle_result,
-            dtw_result=state.dtw_result,
+            cache, forecast_result=state.forecast_result, mc_result=state.mc_result,
+            copula_result=state.copula_result, granger_result=state.granger_result,
+            cycle_result=state.cycle_result, dtw_result=state.dtw_result,
             conformal_result=state.conformal_result,
         )
         if _diag and _diag.available:
-            logger.info(
-                "Model diagnostics: %d/%d on track, overall=%s",
-                _diag.n_models_on_track, _diag.n_models_assessed,
-                _diag.overall_robustness,
-            )
+            logger.info("Model diagnostics: %d/%d on track", _diag.n_models_on_track, _diag.n_models_assessed)
     except Exception as exc:
         logger.debug("Model diagnostics failed: %s", exc)
 
     state.cache = cache
-    state.save(stage=2)
-    logger.info("STAGE 2 COMPLETE")
+    state.save_sub("2d")
+    logger.info("STAGE 2d COMPLETE")
+
+
+# Keep backward compat: run_stage2 runs all sub-stages
+def run_stage2(state: BacktestState) -> None:
+    """Run all Stage 2 sub-stages sequentially (backward compat)."""
+    run_stage2a(state)
+    run_stage2b(state)
+    run_stage2c(state)
+    run_stage2d(state)
 
 
 # ---------------------------------------------------------------------------
@@ -1603,7 +1754,7 @@ def run_stage3(state: BacktestState) -> None:
     except Exception as exc:
         logger.info("Report generation skipped: %s", exc)
 
-    state.save(stage=3)
+    state.save_sub("3")
     logger.info("STAGE 3 COMPLETE")
 
 
@@ -1880,8 +2031,11 @@ Examples:
   python backtest_runner.py --market kr_dart --company 005930 --end-date 2024-06-30 --years 1.5 --stage all
 """,
     )
-    parser.add_argument("--stage", type=str, default="all", choices=["1", "2", "3", "all"],
-                        help="Which stage to run (1, 2, 3, or all)")
+    parser.add_argument("--stage", type=str, default="all",
+                        choices=["1", "2", "2a", "2b", "2c", "2d", "3", "all"],
+                        help="Which stage to run. Stage 2 is split into sub-stages "
+                             "(2a=regime+causality+forecasting, 2b=forward+burnout+MC, "
+                             "2c=ensemble+ML, 2d=USS+multifreq). Use '2' to run all sub-stages.")
     parser.add_argument("--market", type=str, default="us_sec_edgar",
                         help="Market ID (e.g. us_sec_edgar, kr_dart, jp_jquants)")
     parser.add_argument("--company", type=str, default="AAPL",
@@ -1918,29 +2072,50 @@ Examples:
         validate_predictions(state)
         return 0
 
-    stages = [1, 2, 3] if args.stage == "all" else [int(args.stage)]
+    # Build ordered list of stages to run
+    if args.stage == "all":
+        stages = ["1", "2a", "2b", "2c", "2d", "3"]
+    elif args.stage == "2":
+        stages = ["2a", "2b", "2c", "2d"]
+    else:
+        stages = [args.stage]
 
-    for stage_num in stages:
-        # Load state from prior stage if resuming
-        if stage_num > 1:
-            state.load(stage=stage_num - 1)
+    _STAGE_FUNCS = {
+        "1": run_stage1,
+        "2a": run_stage2a,
+        "2b": run_stage2b,
+        "2c": run_stage2c,
+        "2d": run_stage2d,
+        "3": run_stage3,
+    }
+    # Map sub-stages to the stage they depend on for loading state
+    _STAGE_DEPS = {
+        "1": None,
+        "2a": 1,
+        "2b": "2a",
+        "2c": "2b",
+        "2d": "2c",
+        "3": "2d",
+    }
+
+    for stage_key in stages:
+        dep = _STAGE_DEPS[stage_key]
+        if dep is not None:
+            # Load state from the dependency stage
+            dep_key = str(dep)
+            state.load_sub(dep_key)
 
         t0 = time.time()
         try:
-            if stage_num == 1:
-                run_stage1(state)
-            elif stage_num == 2:
-                run_stage2(state)
-            elif stage_num == 3:
-                run_stage3(state)
+            _STAGE_FUNCS[stage_key](state)
         except Exception as exc:
-            logger.error("Stage %d FAILED: %s", stage_num, exc)
+            logger.error("Stage %s FAILED: %s", stage_key, exc)
             import traceback
             traceback.print_exc()
             return 1
 
         elapsed = time.time() - t0
-        logger.info("Stage %d completed in %.1fs", stage_num, elapsed)
+        logger.info("Stage %s completed in %.1fs", stage_key, elapsed)
 
     return 0
 
