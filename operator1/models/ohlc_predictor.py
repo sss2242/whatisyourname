@@ -163,7 +163,12 @@ def predict_ohlc_series(
                 # phase is in radians; advance by 2*pi/period per day
                 import math as _math
                 # Negative cosine: +1 at trough (buy), -1 at peak (sell)
-                _cycle_adjustment = -_math.cos(phase) * amplitude * 0.01
+                # Normalize amplitude by price (EMD amplitude is in price
+                # units, not percentage units).  Cap to prevent the cycle
+                # adjustment from dominating the base drift.
+                _norm_amplitude = amplitude / max(last_close, 1.0)
+                _cycle_adjustment = -_math.cos(phase) * _norm_amplitude * 0.01
+                _cycle_adjustment = max(-0.005, min(0.005, _cycle_adjustment))
                 mu += _cycle_adjustment
                 logger.debug(
                     "Cycle phase adjustment: period=%dd, phase=%.2f rad, "
