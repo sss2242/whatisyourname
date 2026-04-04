@@ -49,7 +49,17 @@ DEFAULT_MAX_VARS_FOR_VAR: int = 20
 
 
 # ---------------------------------------------------------------------------
-# Granger causality matrix
+# Granger causality matrix (BACKWARD-COMPAT WRAPPER)
+#
+# NOTE: This is an intentional backward-compatible wrapper that delegates to
+# the canonical implementation in operator1.models.granger_causality.
+# The function name is the same in both modules by design:
+#   - granger_causality.py  -> canonical (returns GrangerResult dataclass)
+#   - causality.py          -> legacy wrapper (returns pd.DataFrame matrix)
+#
+# New code should import from granger_causality.py directly.
+# This wrapper exists so that old callers (e.g. test_phase6_regime.py) that
+# expect a DataFrame matrix continue to work without changes.
 # ---------------------------------------------------------------------------
 
 
