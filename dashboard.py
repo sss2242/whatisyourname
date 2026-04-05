@@ -567,6 +567,14 @@ def render_home():
                         _sig = pos.get("signal", 0)
                         _lbl = pos.get("label", "hold").upper()
                         _card("HF Signal", f"{_sig:+.2f} ({_lbl})", "", "trending_up")
+                    # Show cross-pipeline fused signal if available
+                    fusion = hf.get("fusion", {})
+                    if fusion.get("available"):
+                        _fused = fusion.get("fused_signal", 0)
+                        _flbl = fusion.get("fused_label", "hold").upper()
+                        _fconv = fusion.get("fused_conviction", 0)
+                        _card("Fused Signal", f"{_fused:+.2f} ({_flbl})",
+                              f"Conviction: {_fconv:.0%}", "merge_type")
                     dcf = hf.get("dcf", {})
                     if dcf.get("available") and dcf.get("intrinsic_p50"):
                         _card("Intrinsic", f"${dcf['intrinsic_p50']:.2f}", f"vs ${dcf.get('current_price', 0):.2f}" if dcf.get("current_price") else "", "calculate")

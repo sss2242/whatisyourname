@@ -238,13 +238,13 @@ def compute_cox_survival_score(
     pd.Series
         Continuous hazard score (higher = more distressed). Normalized to [0, 1].
     """
+    import numpy as np
+
     try:
         from lifelines import CoxPHFitter
     except ImportError:
         logger.debug("lifelines not installed, skipping Cox PH survival score")
         return pd.Series(np.nan, index=df.index, name="cox_survival_score")
-
-    import numpy as np
 
     # Covariates for Cox model -- same ratios as threshold-based detection
     covariates = []

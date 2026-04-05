@@ -73,6 +73,8 @@ from operator1.models.forecasting import (
     ForecastResult,
     ForwardPassResult,
     ModelMetrics,
+    _load_tier_variables,
+    _get_tier_for_variable,
 )
 from operator1.models.monte_carlo import MonteCarloResult
 
@@ -1905,6 +1907,11 @@ def run_prediction_aggregation(
             result.current_regime = "unknown"
     else:
         result.current_regime = "unknown"
+
+    # ------------------------------------------------------------------
+    # Build tier map for per-tier confidence multipliers (Phase 2.5)
+    # ------------------------------------------------------------------
+    tier_map = _load_tier_variables()
 
     # ------------------------------------------------------------------
     # Ensemble weights (survival-aware if mode_weights provided)

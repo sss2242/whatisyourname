@@ -4078,6 +4078,11 @@ def generate_synthetic_financials(
     # instead of annual, using Kalman-smoothed earnings trajectory.
     div_freq = detect_dividend_frequency(dividends)
 
+    # Pre-compute payout ratio for use in both Q and A paths.
+    # Use the adaptive payout ratio estimated earlier (from sector + index
+    # membership), or fall back to 0.7 (typical mature company payout).
+    payout = getattr(result, "estimated_payout_ratio", None) or 0.7
+
     if target_frequency == "Q":
         _q_result = _generate_quarterly_from_dividends(
             dividends=dividends,
