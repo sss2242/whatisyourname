@@ -891,6 +891,15 @@ def compute_derived_variables(df: pd.DataFrame) -> pd.DataFrame:
     # pandas 2.x fragmented DataFrame internals.
     result = result.copy()
 
+    # Deduplicate columns: when compute_derived_variables() is called
+    # multiple times on the same cache (e.g. backtest_runner re-runs
+    # features after loading state), technical indicator columns (sma_50,
+    # rsi_14, macd, etc.) get added again.  Keep the first occurrence.
+    if result.columns.duplicated().any():
+        n_dupes = result.columns.duplicated().sum()
+        result = result.loc[:, ~result.columns.duplicated()]
+        logger.debug("Removed %d duplicate columns", n_dupes)
+
     logger.info(
         "Derived variables computed: %d new columns",
         len(result.columns) - len(df.columns),
