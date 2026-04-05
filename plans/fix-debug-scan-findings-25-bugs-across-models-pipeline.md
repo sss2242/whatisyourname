@@ -1,8 +1,47 @@
-# Fix Debug Scan Findings -- 25 Bugs Across Models Pipeline
+# Fix Debug Scan Findings -- 38 Bugs Across Models Pipeline
 
 *Created: 2026-04-05*
+*Updated: 2026-04-05 (second-pass scan added 13 more findings)*
 
-Full pyflakes static analysis + manual code review across all 60+ model modules, main.py, dashboard.py, and scoring_weights integration. 25 findings categorized by severity.
+Full pyflakes static analysis + manual code review across all 60+ model modules, main.py, dashboard.py, and scoring_weights integration. 38 findings categorized by severity.
+
+## Fix Status
+
+| Severity | Total | Fixed | Remaining |
+|----------|-------|-------|-----------|
+| Critical (NameError crash) | 3 | 3 (PR #1) | 0 |
+| High (wrong behavior) | 3 | 2 (PR #1) | 1 |
+| Medium (report-profile mismatch) | 2 | 2 (PR #1) | 0 |
+| Medium (config disconnection) | 10 | 0 | 10 |
+| Medium (dead code/logic gaps) | 15 | 0 | 15 |
+| Low (unused imports, etc.) | 5 | 0 | 5 |
+
+## Second-Pass Findings (13 additional)
+
+### Scoring Weights Config Disconnections (10 keys)
+
+7 YAML keys in `config/scoring_weights.yml` are defined but never consumed:
+- `conflict_propagation` -- linked conflict propagation uses hardcoded weights
+- `forecasting_min_data` -- forecasting.py uses hardcoded min_periods
+- `signal_filtering` -- signal_ic.py uses hardcoded IC threshold
+- `uss_forecast_bounds` -- survival_regime_controller uses hardcoded bounds
+- `uss_horizons` -- survival_regime_controller uses hardcoded horizons
+- `vanity_labels` -- vanity.py uses hardcoded label breakpoints
+- `vanity_weight_shift_pct` -- hierarchy_weights.py uses hardcoded 5% shift
+
+3 YAML keys are partially connected (code exists but doesn't read from config):
+- `fuzzy_protection` -- module uses hardcoded membership functions
+- `scenario_engine` -- module uses hardcoded scenario parameters
+- `model_regime_affinity` -- prediction_aggregator builds inline defaults
+
+### Report-Profile Key Mismatches (2 keys) -- FIXED
+
+- `technical_patterns` -- report reads this key but data stored in `extended_models.candlestick_patterns`. Fixed: added fallback chain.
+- `linked_conflict` -- report reads this key but data stored as flat keys in `conflict_risk`. Fixed: added fallback to read flat keys.
+
+### run.py CLI Arg Gap (1 finding)
+
+- `run.py` has `--quiet` flag that `main.py` doesn't recognize (harmless)
 
 ---
 
