@@ -1312,7 +1312,8 @@ def _build_predictions_forecasts(profile: dict[str, Any]) -> str:
 
 def _build_technical_patterns(profile: dict[str, Any]) -> str:
     """Build the Technical Patterns & Chart Analysis section (Section 9)."""
-    patterns = profile.get("patterns", profile.get("technical_patterns", {}))
+    patterns = profile.get("patterns", profile.get("technical_patterns",
+                profile.get("extended_models", {}).get("candlestick_patterns", {})))
     lines: list[str] = []
 
     recent = patterns.get("recent_patterns", [])
@@ -3095,7 +3096,13 @@ def _build_geopolitical_risk_section(profile: dict[str, Any]) -> str:
         lines.append("")
 
     # Linked entity conflict propagation
-    linked_conflict = profile.get("linked_conflict", conflict.get("linked_conflict", {}))
+    # Data may be stored as nested dict under "linked_conflict" or as flat
+    # keys (supply_chain_risk_score, etc.) directly in the conflict_risk dict.
+    linked_conflict = (
+        profile.get("linked_conflict")
+        or conflict.get("linked_conflict")
+        or conflict  # flat keys stored directly in conflict_risk
+    )
     if linked_conflict and isinstance(linked_conflict, dict):
         affected = linked_conflict.get("linked_entities_in_conflict", [])
         if affected:
