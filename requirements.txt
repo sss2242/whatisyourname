@@ -53,6 +53,7 @@ pymc==5.28.0              # Bayesian change-point detection
 # --- Stage 4: Data Source Wrappers ---
 # US
 edgartools==5.19.1         # US SEC EDGAR (primary)
+httpx>=0.27,<1.0           # edgartools 5.19 needs httpx with Limits class (removed in httpx 1.0)
 pyrate-limiter<4.0         # sec-edgar-api 1.1 needs pyrate-limiter 3.x
 sec-edgar-api==1.1.0      # US SEC EDGAR (fallback)
 # Japan
