@@ -1179,9 +1179,21 @@ class USEdgarClient:
                     for xbrl_concept, value in df[col].items():
                         if pd.isna(value):
                             continue
-                        canonical = self._map_edgartools_concept(
-                            str(concept_label), statement_type,
+                        # Resolve concept label: prefer human-readable label
+                        # from the DataFrame's 'label' column, fall back to
+                        # the raw XBRL concept name (DataFrame index).
+                        concept_label = label_lookup.get(
+                            str(xbrl_concept), str(xbrl_concept),
                         )
+                        # Try mapping via human-readable label first,
+                        # then via raw XBRL concept name.
+                        canonical = self._map_edgartools_concept(
+                            concept_label, statement_type,
+                        )
+                        if not canonical:
+                            canonical = self._map_xbrl_concept(
+                                str(xbrl_concept), statement_type,
+                            )
                         if not canonical:
                             # Log unmapped concepts once per label to help
                             # diagnose missing canonical field mappings.
@@ -1191,8 +1203,8 @@ class USEdgarClient:
                             if _key not in self._unmapped_concepts:
                                 self._unmapped_concepts.add(_key)
                                 logger.debug(
-                                    "Unmapped edgartools concept: %s (type=%s)",
-                                    concept_label, statement_type,
+                                    "Unmapped edgartools concept: %s (xbrl=%s, type=%s)",
+                                    concept_label, xbrl_concept, statement_type,
                                 )
                         if canonical:
                             # Look up filing date from our map
