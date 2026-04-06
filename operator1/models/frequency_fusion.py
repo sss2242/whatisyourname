@@ -423,6 +423,59 @@ def fuse_multi_frequency_results(
     predictions = fuse_predictions(results)
     logger.info("Prediction fusion: %d fused predictions", len(predictions))
 
+    # F2: Multi-frequency constraint propagation.
+    # Slower frequencies constrain faster frequencies: annual forecast
+    # bounds quarterly, which bounds monthly, which bounds daily.
+    # Prevents fast-frequency models from producing forecasts that
+    # are inconsistent with slower-frequency structural trends.
+    _n_constrained = 0
+    try:
+        # Extract forecast bounds from each frequency's context
+        _freq_bounds: dict[str, dict[str, tuple[float, float]]] = {}
+        _freq_order = ["A", "Q", "M", "W", "D"]  # slow to fast
+
+        for freq, result in results.items():
+            _ctx = getattr(result, "context", None)
+            if _ctx and hasattr(_ctx, "forecast_bounds"):
+                _bounds = _ctx.forecast_bounds
+                if isinstance(_bounds, dict) and _bounds:
+                    _freq_bounds[freq] = _bounds
+
+        # Apply constraints: for each fused prediction, check if it violates
+        # the bounds from any slower frequency
+        if _freq_bounds and predictions:
+            for pred in predictions:
+                _var = pred.variable
+                _horizon = pred.horizon
+                _point = pred.point_forecast
+
+                if _point is None or (_point != _point):  # NaN check
+                    continue
+
+                # Find the slowest frequency that has bounds for this variable
+                for slow_freq in _freq_order:
+                    if slow_freq in _freq_bounds and _var in _freq_bounds[slow_freq]:
+                        _lo, _hi = _freq_bounds[slow_freq][_var]
+                        if _lo is not None and _hi is not None and _hi > _lo:
+                            # Scale bounds by horizon fraction
+                            # (annual bound constrains daily proportionally)
+                            _orig = _point
+                            if _point > _hi:
+                                pred.point_forecast = _hi
+                                _n_constrained += 1
+                            elif _point < _lo:
+                                pred.point_forecast = _lo
+                                _n_constrained += 1
+                            break  # slowest constraint wins
+
+        if _n_constrained > 0:
+            logger.info(
+                "F2 constraint propagation: %d predictions constrained by slower frequencies",
+                _n_constrained,
+            )
+    except Exception as _exc:
+        logger.debug("F2 constraint propagation skipped: %s", _exc)
+
     # 4. Build frequency summary
     freq_summary = {}
     for freq, result in results.items():

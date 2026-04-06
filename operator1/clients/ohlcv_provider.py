@@ -221,3 +221,180 @@ def fetch_benchmark_returns(
 
     _benchmark_cache[market_id] = returns
     return returns
+
+
+# ---------------------------------------------------------------------------
+# D3: Options-implied volatility (forward-looking vol signal)
+# ---------------------------------------------------------------------------
+
+_iv_cache: dict[str, pd.Series] = {}
+
+
+def fetch_implied_volatility(
+    ticker: str,
+    years: int = 1,
+) -> pd.Series:
+    """Fetch 30-day at-the-money implied volatility for a ticker.
+
+    Uses yfinance options chain data. The IV-RV spread (implied minus
+    realized vol) is the single best predictor of vol regime changes
+    (Christensen & Prabhala 1998).
+
+    Parameters
+    ----------
+    ticker:
+        Stock ticker (e.g. "AAPL").
+    years:
+        Not used for options (only current chain available), but kept
+        for API consistency.
+
+    Returns
+    -------
+    pd.Series with single value (current IV30), or empty if unavailable.
+    """
+    if ticker in _iv_cache:
+        return _iv_cache[ticker]
+
+    empty = pd.Series(dtype=float, name="iv30")
+
+    try:
+        import yfinance as yf
+
+        yticker = yf.Ticker(ticker)
+        # Get nearest expiry options chain
+        expirations = yticker.options
+        if not expirations:
+            _iv_cache[ticker] = empty
+            return empty
+
+        # Pick expiry closest to 30 days
+        from datetime import datetime, timedelta
+        target_date = datetime.now() + timedelta(days=30)
+        _closest_exp = min(
+            expirations,
+            key=lambda x: abs(datetime.strptime(x, "%Y-%m-%d") - target_date),
+        )
+
+        chain = yticker.option_chain(_closest_exp)
+        if chain is None or chain.calls is None or chain.calls.empty:
+            _iv_cache[ticker] = empty
+            return empty
+
+        calls = chain.calls
+        # Find ATM call (strike closest to current price)
+        _info = yticker.fast_info
+        _current_price = getattr(_info, "last_price", None)
+        if _current_price is None:
+            _iv_cache[ticker] = empty
+            return empty
+
+        calls["strike_dist"] = abs(calls["strike"] - _current_price)
+        atm = calls.nsmallest(1, "strike_dist")
+
+        if atm.empty or "impliedVolatility" not in atm.columns:
+            _iv_cache[ticker] = empty
+            return empty
+
+        iv30 = float(atm["impliedVolatility"].iloc[0])
+        result = pd.Series([iv30], index=[pd.Timestamp.now().normalize()], name="iv30")
+
+        logger.info("IV30 fetched for %s: %.4f", ticker, iv30)
+        _iv_cache[ticker] = result
+        return result
+
+    except Exception as exc:
+        logger.debug("IV fetch failed for %s: %s", ticker, exc)
+        _iv_cache[ticker] = empty
+        return empty
+
+
+# ---------------------------------------------------------------------------
+# D4: Cross-asset sector leading indicators
+# ---------------------------------------------------------------------------
+
+_SECTOR_LEADERS: dict[str, list[str]] = {
+    "technology": ["SMH", "SOXX", "QQQ"],
+    "information technology": ["SMH", "SOXX", "QQQ"],
+    "semiconductors": ["SMH", "SOXX"],
+    "energy": ["XLE", "USO", "OIH"],
+    "financials": ["XLF", "KRE", "KBE"],
+    "healthcare": ["XLV", "IBB", "XBI"],
+    "consumer discretionary": ["XLY", "AMZN"],
+    "consumer staples": ["XLP"],
+    "industrials": ["XLI"],
+    "materials": ["XLB", "GLD"],
+    "real estate": ["XLRE", "VNQ"],
+    "utilities": ["XLU"],
+    "communication services": ["XLC"],
+}
+
+_leader_cache: dict[str, pd.DataFrame] = {}
+
+
+def fetch_sector_leading_indicators(
+    sector: str,
+    years: int = 2,
+) -> pd.DataFrame:
+    """Fetch daily returns for sector-relevant ETFs that historically lead.
+
+    Parameters
+    ----------
+    sector:
+        Company sector (e.g. "Technology", "Energy").
+    years:
+        Years of history to fetch.
+
+    Returns
+    -------
+    DataFrame with columns = ETF tickers, values = daily returns.
+    Empty DataFrame if no leaders configured or fetch fails.
+    """
+    _sector_key = sector.lower() if sector else ""
+    if _sector_key in _leader_cache:
+        return _leader_cache[_sector_key]
+
+    etfs = _SECTOR_LEADERS.get(_sector_key, [])
+    if not etfs:
+        # Try partial match
+        for k, v in _SECTOR_LEADERS.items():
+            if k in _sector_key or _sector_key in k:
+                etfs = v
+                break
+
+    if not etfs:
+        empty = pd.DataFrame()
+        _leader_cache[_sector_key] = empty
+        return empty
+
+    try:
+        from operator1.clients.ohlcv_yfinance import fetch_ohlcv_yfinance
+
+        returns_dict: dict[str, pd.Series] = {}
+        for etf in etfs[:3]:  # cap at 3 to limit API calls
+            try:
+                df = fetch_ohlcv_yfinance(etf, market_id="", years=years)
+                if not df.empty and "close" in df.columns:
+                    if "date" in df.columns:
+                        df["date"] = pd.to_datetime(df["date"])
+                        df = df.set_index("date").sort_index()
+                    ret = df["close"].pct_change()
+                    ret.name = f"leader_{etf}_return"
+                    returns_dict[etf] = ret
+            except Exception:
+                continue
+
+        if returns_dict:
+            result = pd.DataFrame(returns_dict)
+            logger.info(
+                "Sector leaders fetched: sector=%s, %d ETFs (%s)",
+                sector, len(result.columns), list(result.columns),
+            )
+            _leader_cache[_sector_key] = result
+            return result
+
+    except Exception as exc:
+        logger.debug("Sector leader fetch failed: %s", exc)
+
+    empty = pd.DataFrame()
+    _leader_cache[_sector_key] = empty
+    return empty

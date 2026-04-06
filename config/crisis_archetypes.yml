@@ -1,0 +1,80 @@
+# Historical crisis archetype distributions for Monte Carlo simulation.
+# These inject tail scenarios that the 2-year training window may never
+# have seen, breaking the "training window trap" (Plan v2 Category A1).
+#
+# Each archetype has:
+#   mean_daily_return: average daily return during the crisis
+#   std_daily_return: daily return standard deviation
+#   df_t: Student-t degrees of freedom (lower = fatter tails)
+#   typical_duration_days: business days the crisis typically lasted
+#   macro_similarity_features: which macro conditions make this archetype relevant
+#
+# The MC simulator uses these when P_crisis > 0 (calibrated from current
+# macro conditions, EPU, and conflict risk).
+
+archetypes:
+  gfc_2008:
+    label: "Global Financial Crisis (2008-2009)"
+    mean_daily_return: -0.0025
+    std_daily_return: 0.035
+    df_t: 4.0
+    typical_duration_days: 252
+    macro_triggers:
+      - credit_spread_widening
+      - banking_stress
+      - housing_decline
+
+  covid_2020:
+    label: "COVID-19 Crash (2020)"
+    mean_daily_return: -0.005
+    std_daily_return: 0.045
+    df_t: 3.5
+    typical_duration_days: 63
+    macro_triggers:
+      - pandemic
+      - supply_chain_disruption
+      - unemployment_spike
+
+  rate_shock_2022:
+    label: "Rate Tightening Shock (2022)"
+    mean_daily_return: -0.0015
+    std_daily_return: 0.025
+    df_t: 5.0
+    typical_duration_days: 189
+    macro_triggers:
+      - inflation_surge
+      - rate_hike_cycle
+      - growth_valuation_compression
+
+  trade_war_2018:
+    label: "US-China Trade War (2018-2019)"
+    mean_daily_return: -0.001
+    std_daily_return: 0.020
+    df_t: 6.0
+    typical_duration_days: 126
+    macro_triggers:
+      - tariff_escalation
+      - trade_policy_uncertainty
+      - supply_chain_restructuring
+
+  sovereign_debt_2011:
+    label: "European Sovereign Debt Crisis (2011)"
+    mean_daily_return: -0.0012
+    std_daily_return: 0.022
+    df_t: 5.5
+    typical_duration_days: 168
+    macro_triggers:
+      - sovereign_default_risk
+      - austerity
+      - banking_contagion
+
+# Base crisis probability (before macro adjustment).
+# Increased when macro_quadrant = stagflation/recession,
+# conflict_intensity > 0.5, or EPU > P75.
+base_crisis_probability: 0.05
+
+# Maximum crisis injection probability (cap to prevent over-pessimism).
+max_crisis_probability: 0.30
+
+# Fraction of MC paths that use crisis archetype distributions.
+crisis_path_fraction: 0.15

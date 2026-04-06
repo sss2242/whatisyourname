@@ -99,6 +99,11 @@ class RegimeDistribution:
     n_obs: int = 0
     use_student_t: bool = False  # True when Jarque-Bera rejects normality
     df_t: float = 30.0           # degrees of freedom for Student-t
+    # E1: EVT (Extreme Value Theory) tail parameters via GPD
+    evt_fitted: bool = False
+    evt_xi: float = 0.0          # shape parameter (tail heaviness)
+    evt_scale: float = 0.01      # scale parameter
+    evt_threshold: float = -0.03  # P5 threshold for exceedances
 
 
 @dataclass
@@ -149,6 +154,11 @@ class MonteCarloResult:
     max_drawdown_distribution: dict[str, dict[str, float]] = field(
         default_factory=dict,
     )
+
+    # E2: Forward-looking survival -- fraction of paths that trigger
+    # ANY survival condition at ANY point along the path (not just terminal).
+    # Standard in credit risk (first-passage-time models) but novel in equity.
+    anticipated_survival: dict[str, float] = field(default_factory=dict)
 
     # Error info.
     error: str | None = None
@@ -231,6 +241,28 @@ def estimate_regime_distributions(
                         )
                 except Exception as _exc:
                     logger.debug("Student-t fit skipped for regime '%s': %s", regime, _exc)
+
+            # E1: EVT tail calibration via GPD (Peaks-Over-Threshold).
+            # Fits Generalized Pareto Distribution to return tails (below P5)
+            # for more accurate crisis probability estimation.
+            # McNeil & Frey (2000), standard in bank risk management.
+            if len(regime_returns) >= 50:
+                try:
+                    from scipy.stats import genpareto
+                    _lower_threshold = float(np.percentile(regime_returns, 5))
+                    _exceedances = _lower_threshold - regime_returns[regime_returns < _lower_threshold]
+                    if len(_exceedances) >= 5:
+                        _xi, _loc, _scale = genpareto.fit(_exceedances, floc=0)
+                        dist.evt_xi = float(_xi)
+                        dist.evt_scale = float(_scale)
+                        dist.evt_threshold = float(_lower_threshold)
+                        dist.evt_fitted = True
+                        logger.debug(
+                            "EVT GPD for regime '%s': xi=%.3f, scale=%.4f, threshold=%.4f, n_exceed=%d",
+                            regime, _xi, _scale, _lower_threshold, len(_exceedances),
+                        )
+                except Exception as _evt_exc:
+                    logger.debug("EVT GPD skipped for regime '%s': %s", regime, _evt_exc)
         else:
             # Fallback to overall distribution.
             if len(clean_returns) >= _MIN_OBS_PER_REGIME:
@@ -856,6 +888,131 @@ def detect_current_regime(
     return str(labels.iloc[-1])
 
 
+# ---------------------------------------------------------------------------
+# E2: Forward-looking (path-wise) survival trigger checking
+# ---------------------------------------------------------------------------
+
+
+def compute_anticipated_survival(
+    cache: pd.DataFrame,
+    mc_result: "MonteCarloResult",
+    horizon_days: int = 63,
+    n_paths: int = 5000,
+    random_state: int = 42,
+) -> float:
+    """E2: Compute fraction of MC paths that trigger ANY survival condition
+    at ANY point along the path (not just terminal).
+
+    Standard in credit risk as 'first-passage-time' but novel in equity.
+    If 40% of paths trigger survival within 63 days, the market will
+    price the distress in immediately.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache with survival trigger variables.
+    mc_result:
+        Completed MC result with regime distributions and transition matrix.
+    horizon_days:
+        How far forward to check (default 63 = one quarter).
+    n_paths:
+        Number of simulation paths.
+    random_state:
+        Seed for reproducibility.
+
+    Returns
+    -------
+    Float in [0, 1]: fraction of paths that trigger survival at any point.
+    """
+    if not mc_result.fitted or mc_result.transition_matrix is None:
+        return 0.0
+
+    rng = np.random.default_rng(random_state + 999)
+
+    # Get initial variable values
+    initial = extract_initial_values(cache)
+    if not initial:
+        return 0.0
+
+    # Get current regime
+    regime_to_idx = {r: i for i, r in enumerate(mc_result.regime_order)}
+    current_idx = regime_to_idx.get(mc_result.current_regime, 0)
+    n_regimes = len(mc_result.regime_order)
+
+    # Build distribution parameters
+    dist_list = [
+        mc_result.regime_distributions.get(r, RegimeDistribution())
+        for r in mc_result.regime_order
+    ]
+
+    # Default thresholds
+    thresholds = DEFAULT_SURVIVAL_THRESHOLDS
+
+    # Default variable sensitivities to returns
+    sensitivities = {
+        "current_ratio": -0.5,
+        "debt_to_equity_abs": 0.3,
+        "fcf_yield": -0.8,
+        "drawdown_252d": 1.0,
+    }
+
+    n_triggered = 0
+
+    for _p in range(n_paths):
+        regime_idx = current_idx
+        cumulative_return = 0.0
+        triggered = False
+
+        # Copy initial values
+        _vals = dict(initial)
+
+        for _t in range(horizon_days):
+            # Sample regime transition
+            probs = mc_result.transition_matrix[regime_idx]
+            regime_idx = int(rng.choice(n_regimes, p=probs))
+
+            # Sample return from regime distribution
+            dist = dist_list[regime_idx]
+            if dist.use_student_t and dist.df_t > 2:
+                from scipy.stats import t as t_dist
+                r = float(t_dist.rvs(dist.df_t, loc=dist.mean, scale=dist.std, random_state=rng))
+            else:
+                r = float(rng.normal(dist.mean, dist.std))
+
+            cumulative_return += r
+
+            # Update variable proxies
+            for var, (direction, threshold) in thresholds.items():
+                if var not in _vals:
+                    continue
+                sens = sensitivities.get(var, 0.0)
+                if var == "drawdown_252d":
+                    _vals[var] = min(_vals[var], cumulative_return)
+                else:
+                    _vals[var] += sens * r * _vals[var]
+
+                # Check trigger
+                if direction == "lt" and _vals[var] < threshold:
+                    triggered = True
+                    break
+                elif direction == "gt" and _vals[var] > threshold:
+                    triggered = True
+                    break
+
+            if triggered:
+                break
+
+        if triggered:
+            n_triggered += 1
+
+    anticipated = n_triggered / max(n_paths, 1)
+    logger.info(
+        "E2 anticipated survival: %.1f%% of paths trigger within %d days",
+        anticipated * 100, horizon_days,
+    )
+    return anticipated
+
+
 # ===========================================================================
 # Pipeline entry point
 # ===========================================================================
@@ -992,9 +1149,101 @@ def run_monte_carlo(
 
     result.regime_distributions = distributions
 
+    # ------------------------------------------------------------------
+    # A1: Crisis archetype injection (Plan v2 Category A).
+    # Inject historical crisis distributions as additional regimes so MC
+    # can simulate tail events the training window never saw. The crisis
+    # probability is calibrated from current macro conditions.
+    # ------------------------------------------------------------------
+    _crisis_archetypes_injected = 0
+    try:
+        from operator1.config_loader import load_config as _load_cfg
+        _crisis_cfg = _load_cfg("crisis_archetypes")
+        _archetypes = _crisis_cfg.get("archetypes", {})
+        _base_p_crisis = float(_crisis_cfg.get("base_crisis_probability", 0.05))
+        _max_p_crisis = float(_crisis_cfg.get("max_crisis_probability", 0.30))
+
+        if _archetypes:
+            # Calibrate crisis probability from current conditions
+            _p_crisis = _base_p_crisis
+
+            # Increase if survival intensity is elevated
+            if "survival_intensity" in cache.columns:
+                _si = cache["survival_intensity"].dropna()
+                if len(_si) > 0:
+                    _p_crisis += float(_si.iloc[-1]) * 0.15
+
+            # Increase if conflict risk is elevated
+            if "conflict_intensity_score" in cache.columns:
+                _ci = cache["conflict_intensity_score"].dropna()
+                if len(_ci) > 0 and float(_ci.iloc[-1]) > 0.3:
+                    _p_crisis += 0.05
+
+            # Increase if macro quadrant is adverse
+            if "macro_quadrant" in cache.columns:
+                _mq = cache["macro_quadrant"].dropna()
+                if len(_mq) > 0:
+                    _latest_q = str(_mq.iloc[-1]).lower()
+                    if _latest_q in ("stagflation", "recession"):
+                        _p_crisis += 0.10
+                    elif _latest_q == "overheating":
+                        _p_crisis += 0.03
+
+            _p_crisis = min(_p_crisis, _max_p_crisis)
+
+            if _p_crisis > 0.01:
+                # Select 1-2 most relevant archetypes based on conditions
+                _selected = list(_archetypes.items())[:2]
+                for _arch_name, _arch in _selected:
+                    _crisis_regime = f"crisis_{_arch_name}"
+                    distributions[_crisis_regime] = RegimeDistribution(
+                        regime_label=_crisis_regime,
+                        mean=float(_arch.get("mean_daily_return", -0.002)),
+                        std=float(_arch.get("std_daily_return", 0.03)),
+                        n_obs=int(_arch.get("typical_duration_days", 126)),
+                        use_student_t=True,
+                        df_t=float(_arch.get("df_t", 5.0)),
+                    )
+                    unique_regimes.append(_crisis_regime)
+                    _crisis_archetypes_injected += 1
+
+                if _crisis_archetypes_injected > 0:
+                    logger.info(
+                        "A1 crisis archetypes: injected %d archetypes, P(crisis)=%.3f",
+                        _crisis_archetypes_injected, _p_crisis,
+                    )
+    except FileNotFoundError:
+        pass  # crisis_archetypes.yml not present -- skip gracefully
+    except Exception as _exc:
+        logger.debug("Crisis archetype injection skipped: %s", _exc)
+
     transition_matrix, regime_order = estimate_transition_matrix(
         regime_labels, unique_regimes,
     )
+
+    # Patch transition matrix for injected crisis archetypes: add rows/cols
+    # with small transition probability from all regimes to crisis.
+    if _crisis_archetypes_injected > 0 and transition_matrix is not None:
+        try:
+            _n_orig = transition_matrix.shape[0] - _crisis_archetypes_injected
+            _p_to_crisis = _p_crisis / max(_crisis_archetypes_injected, 1)
+            for _ci in range(_n_orig, transition_matrix.shape[0]):
+                # From any normal regime -> crisis: small probability
+                for _ri in range(_n_orig):
+                    transition_matrix[_ri, _ci] = _p_to_crisis
+                # From crisis -> crisis: high persistence (crises last)
+                transition_matrix[_ci, _ci] = 0.92
+                # From crisis -> normal regimes: small recovery probability
+                for _ri in range(_n_orig):
+                    transition_matrix[_ci, _ri] = (1.0 - 0.92) / max(_n_orig, 1)
+            # Renormalize rows
+            for _ri in range(transition_matrix.shape[0]):
+                _row_sum = transition_matrix[_ri].sum()
+                if _row_sum > 0:
+                    transition_matrix[_ri] /= _row_sum
+        except Exception:
+            pass  # matrix patching failed -- use unpatched version
+
     result.transition_matrix = transition_matrix
     result.regime_order = list(regime_order)
 

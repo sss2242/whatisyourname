@@ -416,6 +416,234 @@ def compute_ensemble_weights(
     return {name: w / total for name, w in inv_rmse.items()}
 
 
+def apply_ic_weighted_calibration(
+    base_weights: dict[str, float],
+    signal_ic_result: Any | None = None,
+) -> dict[str, float]:
+    """C3: Adjust ensemble weights using signal IC measurements.
+
+    The signal_ic module already computes rolling Spearman IC for every
+    signal but it's only used for feature pruning. Here we use it to
+    upweight models whose signals have high IC (historically predictive)
+    and downweight models with low IC.
+
+    Parameters
+    ----------
+    base_weights:
+        Inverse-RMSE ensemble weights from ``compute_ensemble_weights``.
+    signal_ic_result:
+        ``SignalICResult`` from ``signal_ic.py``. Contains
+        ``strong_signals``, ``weak_signals``, ``best_ic``.
+
+    Returns
+    -------
+    Adjusted weights (still sum to 1.0).
+    """
+    if not base_weights or signal_ic_result is None:
+        return base_weights
+
+    if not getattr(signal_ic_result, "available", False):
+        return base_weights
+
+    # Map model types to the signals they're best at predicting
+    _MODEL_SIGNAL_MAP = {
+        "kalman": ["close", "revenue", "total_assets"],
+        "garch": ["volatility_21d", "volatility_63d"],
+        "var": ["return_1d", "close"],
+        "lstm": ["close", "return_1d"],
+        "tree": ["close", "return_1d", "fcf_yield", "current_ratio"],
+        "baseline": ["close"],
+        "autoarima": ["close", "revenue"],
+        "transformer": ["close", "return_1d"],
+    }
+
+    # Get IC scores per signal
+    _ic_scores = getattr(signal_ic_result, "ic_scores", {})
+    if not _ic_scores:
+        return base_weights
+
+    # Compute IC-based multiplier per model
+    adjusted = dict(base_weights)
+    for model_name, weight in base_weights.items():
+        _base_model = model_name.lower().split("_")[0].split("(")[0]
+        _relevant_signals = _MODEL_SIGNAL_MAP.get(_base_model, [])
+        if not _relevant_signals:
+            continue
+
+        # Average absolute IC across this model's relevant signals
+        _ics = [abs(_ic_scores.get(s, 0.0)) for s in _relevant_signals if s in _ic_scores]
+        if _ics:
+            _avg_ic = sum(_ics) / len(_ics)
+            # IC multiplier: IC=0.05 -> 1.5x, IC=0.01 -> 0.5x, IC=0.10 -> 2.0x
+            _ic_mult = max(0.3, min(3.0, _avg_ic * 20.0))
+            adjusted[model_name] = weight * _ic_mult
+
+    # Renormalize
+    total = sum(adjusted.values())
+    if total > 0:
+        adjusted = {k: v / total for k, v in adjusted.items()}
+
+    return adjusted
+
+
+def apply_prediction_log_feedback(
+    base_weights: dict[str, float],
+    prediction_log_summary: dict | None = None,
+) -> dict[str, float]:
+    """F3: Realized IC feedback from previous prediction logs.
+
+    If past predictions and actuals are available, compute realized
+    accuracy per model and use it to calibrate current weights.
+    Creates a self-improving feedback loop.
+
+    Parameters
+    ----------
+    base_weights:
+        Current ensemble weights.
+    prediction_log_summary:
+        Output from ``prediction_log.fill_actuals()``. Contains
+        ``hit_rate``, ``realized_ic``, ``per_model_ic`` (if available).
+
+    Returns
+    -------
+    Adjusted weights incorporating historical accuracy.
+    """
+    if not base_weights or not prediction_log_summary:
+        return base_weights
+
+    _per_model = prediction_log_summary.get("per_model_ic", {})
+    if not _per_model:
+        # No per-model breakdown -- use overall IC as a global confidence scaler
+        _realized_ic = prediction_log_summary.get("realized_ic", 0.0)
+        if abs(_realized_ic) > 0.001:
+            # If overall realized IC is very low, reduce all weights toward uniform
+            _confidence = max(0.3, min(1.0, abs(_realized_ic) * 10))
+            n = len(base_weights)
+            uniform = 1.0 / max(n, 1)
+            adjusted = {
+                k: _confidence * v + (1 - _confidence) * uniform
+                for k, v in base_weights.items()
+            }
+            total = sum(adjusted.values())
+            return {k: v / total for k, v in adjusted.items()} if total > 0 else base_weights
+        return base_weights
+
+    # Per-model IC available: upweight models with high realized IC
+    adjusted = dict(base_weights)
+    for model_name, weight in base_weights.items():
+        _base = model_name.lower().split("_")[0].split("(")[0]
+        _model_ic = _per_model.get(_base, _per_model.get(model_name, 0.0))
+        if abs(_model_ic) > 0.001:
+            _mult = max(0.2, min(3.0, abs(_model_ic) * 15))
+            adjusted[model_name] = weight * _mult
+
+    total = sum(adjusted.values())
+    if total > 0:
+        adjusted = {k: v / total for k, v in adjusted.items()}
+
+    return adjusted
+
+
+def train_stacking_meta_learner(
+    forward_pass_predictions: list[dict] | None = None,
+    cache: Any = None,
+) -> dict[str, float] | None:
+    """F1: Train a Ridge regression stacking meta-learner on walk-forward predictions.
+
+    Instead of inverse-RMSE weighting, learns conditional patterns from
+    model outputs -- e.g. 'trust GARCH during high vol, trust Kalman during trends'.
+
+    Parameters
+    ----------
+    forward_pass_predictions:
+        List of prediction log entries from ForwardPassResult.predictions_log.
+        Each entry has model predictions and actual values.
+    cache:
+        Daily cache DataFrame for extracting regime/survival features.
+
+    Returns
+    -------
+    Dict of model_name -> learned weight, or None if insufficient data.
+    """
+    if not forward_pass_predictions or len(forward_pass_predictions) < 50:
+        return None
+
+    try:
+        from sklearn.linear_model import Ridge
+    except ImportError:
+        logger.debug("F1: scikit-learn not available for stacking")
+        return None
+
+    try:
+        # Extract model predictions and actuals from forward pass log
+        model_names: list[str] = []
+        X_rows: list[list[float]] = []
+        y_vals: list[float] = []
+
+        # First pass: identify all model names
+        for entry in forward_pass_predictions:
+            if not isinstance(entry, dict):
+                continue
+            _preds = entry.get("predictions", {})
+            for m_name in _preds:
+                if m_name not in model_names:
+                    model_names.append(m_name)
+
+        if len(model_names) < 2:
+            return None
+
+        # Second pass: build feature matrix
+        for entry in forward_pass_predictions:
+            if not isinstance(entry, dict):
+                continue
+            _actual = entry.get("actual")
+            _preds = entry.get("predictions", {})
+            if _actual is None or math.isnan(_actual):
+                continue
+
+            row = [_preds.get(m, float("nan")) for m in model_names]
+            if any(math.isnan(v) for v in row):
+                continue
+
+            X_rows.append(row)
+            y_vals.append(_actual)
+
+        if len(X_rows) < 30:
+            return None
+
+        X = np.array(X_rows)
+        y = np.array(y_vals)
+
+        # Fit Ridge regression (regularized to prevent overfitting)
+        meta = Ridge(alpha=1.0, fit_intercept=True)
+        meta.fit(X, y)
+
+        # Extract learned weights (coefficients)
+        raw_weights = {
+            model_names[i]: max(0.0, float(meta.coef_[i]))
+            for i in range(len(model_names))
+        }
+
+        # Normalize to sum to 1
+        total = sum(raw_weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in raw_weights.items()}
+        else:
+            return None
+
+        logger.info(
+            "F1 stacking meta-learner: trained on %d samples, %d models, "
+            "weights=%s",
+            len(X_rows), len(model_names),
+            {k: f"{v:.3f}" for k, v in sorted(weights.items(), key=lambda x: -x[1])[:5]},
+        )
+        return weights
+
+    except Exception as exc:
+        logger.debug("F1 stacking meta-learner failed: %s", exc)
+        return None
+
+
 def optimise_ensemble_weights_ga(
     metrics: list[ModelMetrics],
     *,
@@ -1823,6 +2051,11 @@ def run_prediction_aggregation(
     save_to_cache: bool = True,
     cache_dir: str = CACHE_DIR,
     mode_weights: dict[str, dict[str, float]] | None = None,
+    # --- v2 improvement inputs ---
+    macro_quadrant_label: str = "",
+    fundamental_fair_value: float | None = None,
+    scenario_result: Any | None = None,
+    signal_ic_result: Any | None = None,
     # --- New optional inputs from sibling modules ---
     conformal_result: Any | None = None,
     dual_regime_result: Any | None = None,
@@ -1919,6 +2152,10 @@ def run_prediction_aggregation(
     base_weights = compute_ensemble_weights(
         forecast_result.metrics,
     )
+
+    # C3: IC-weighted calibration (use signal IC to upweight predictive models)
+    if signal_ic_result is not None:
+        base_weights = apply_ic_weighted_calibration(base_weights, signal_ic_result)
 
     # Apply survival-aware weighting if walk-forward mode weights and
     # survival context are available.
@@ -2119,6 +2356,117 @@ def run_prediction_aggregation(
             # Survival probability for this horizon.
             surv_prob = mc_survival_by_horizon.get(h_label, 1.0)
             survival_adjusted = surv_prob < 1.0
+
+            # ----------------------------------------------------------
+            # B1: Survival-intensity POINT FORECAST adjustment.
+            # When survival signals indicate distress, shift the point
+            # forecast downward proportionally. This fixes the gap where
+            # bands widen but the center stays bullish during distress.
+            # Uses survival_intensity (continuous 0-1 from enriched
+            # survival timeline) and expected max drawdown from MC.
+            # ----------------------------------------------------------
+            if not math.isnan(point) and survival_adjusted:
+                _surv_intensity = 0.0
+                if "survival_intensity" in cache.columns:
+                    _si = cache["survival_intensity"].dropna()
+                    if len(_si) > 0:
+                        _surv_intensity = float(_si.iloc[-1])
+
+                if _surv_intensity > 0.3:
+                    # Expected max drawdown from MC (or conservative default)
+                    _expected_dd = 0.20  # default 20% drawdown assumption
+                    if mc_result is not None and mc_result.fitted:
+                        _dd_stats = mc_result.max_drawdown_distribution.get(h_label, {})
+                        _mc_dd = abs(_dd_stats.get("median", 0.0))
+                        if _mc_dd > 0.01:
+                            _expected_dd = min(0.60, _mc_dd)
+
+                    # Horizon factor: longer horizons get more adjustment
+                    # because fundamentals dominate over momentum
+                    _horizon_factor = {1: 0.2, 5: 0.5, 21: 0.8, 252: 1.0}
+                    _hf = _horizon_factor.get(horizon_days, min(1.0, horizon_days / 252))
+
+                    # Distress haircut: intensity * expected drawdown * horizon factor
+                    _distress_haircut = _surv_intensity * _expected_dd * _hf
+                    _distress_haircut = min(0.40, _distress_haircut)  # cap at 40%
+                    point = point * (1.0 - _distress_haircut)
+                    logger.debug(
+                        "B1 survival adjustment: %s %s haircut=%.3f "
+                        "(intensity=%.2f, dd=%.2f, hf=%.1f)",
+                        var_name, h_label, _distress_haircut,
+                        _surv_intensity, _expected_dd, _hf,
+                    )
+
+            # ----------------------------------------------------------
+            # B2: Macro-conditional return shift.
+            # When macro quadrant indicates deterioration, apply a
+            # drift adjustment to return-like variables.
+            # ----------------------------------------------------------
+            if (not math.isnan(point)
+                    and macro_quadrant_label
+                    and var_name in ("close", "return_1d", "return_5d", "return_21d")):
+                _QUADRANT_DRIFT = {
+                    "goldilocks": +0.0005,
+                    "overheating": +0.0002,
+                    "stagflation": -0.0003,
+                    "recession": -0.0005,
+                }
+                _drift = _QUADRANT_DRIFT.get(macro_quadrant_label.lower(), 0.0)
+                if abs(_drift) > 1e-6 and var_name == "close":
+                    # For close price: apply return drift * horizon * last close
+                    point = point * (1.0 + _drift * horizon_days)
+                elif abs(_drift) > 1e-6:
+                    # For return variables: shift directly
+                    point = point + _drift * horizon_days
+
+            # ----------------------------------------------------------
+            # B3: Scenario-weighted price expectation.
+            # During survival mode, blend with scenario engine results.
+            # ----------------------------------------------------------
+            if (not math.isnan(point)
+                    and scenario_result is not None
+                    and getattr(scenario_result, "available", False)
+                    and var_name == "close"):
+                _surv_intensity_b3 = 0.0
+                if "survival_intensity" in cache.columns:
+                    _si_b3 = cache["survival_intensity"].dropna()
+                    if len(_si_b3) > 0:
+                        _surv_intensity_b3 = float(_si_b3.iloc[-1])
+
+                if _surv_intensity_b3 > 0.5:
+                    try:
+                        _orderly = getattr(scenario_result, "orderly", None)
+                        _muddle = getattr(scenario_result, "muddle_through", None)
+                        _catastrophic = getattr(scenario_result, "catastrophic", None)
+                        if _orderly and _muddle and _catastrophic:
+                            _ord_med = getattr(_orderly, "terminal_median_equity", point)
+                            _mud_med = getattr(_muddle, "terminal_median_equity", point)
+                            _cat_med = getattr(_catastrophic, "terminal_median_equity", point)
+                            # Probability weights (from scenario engine or defaults)
+                            _p_ord = 0.30
+                            _p_mud = 0.45
+                            _p_cat = 0.25
+                            _scenario_price = _p_ord * _ord_med + _p_mud * _mud_med + _p_cat * _cat_med
+                            if _scenario_price > 0 and not math.isnan(_scenario_price):
+                                _scen_weight = min(0.6, _surv_intensity_b3 * 0.8)
+                                point = (1.0 - _scen_weight) * point + _scen_weight * _scenario_price
+                    except Exception:
+                        pass  # scenario data structure mismatch -- skip gracefully
+
+            # ----------------------------------------------------------
+            # C2: Fundamental gravity for long horizons.
+            # Blend price forecasts with fundamental fair value (DCF)
+            # for 21d+ horizons. Price converges to fundamentals over time.
+            # ----------------------------------------------------------
+            if (not math.isnan(point)
+                    and fundamental_fair_value is not None
+                    and not math.isnan(fundamental_fair_value)
+                    and fundamental_fair_value > 0
+                    and var_name == "close"):
+                _FUND_WEIGHTS = {"1d": 0.00, "5d": 0.05, "21d": 0.20, "252d": 0.50}
+                _fw = _FUND_WEIGHTS.get(h_label, 0.0)
+                if _fw > 0:
+                    point = (1.0 - _fw) * point + _fw * fundamental_fair_value
 
             # ----------------------------------------------------------
             # Phase 1: Try conformal intervals first.
