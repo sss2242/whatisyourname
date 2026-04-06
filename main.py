@@ -1008,6 +1008,49 @@ Non-interactive examples:
         logger.debug("Sector leading indicators skipped: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 4d: Product segment analysis
+    # ------------------------------------------------------------------
+    product_segment_result = None
+    _segment_data: dict = {}
+    try:
+        from operator1.features.product_segments import (
+            fetch_product_segments,
+            compute_product_segment_features,
+        )
+        logger.info("")
+        logger.info("Step 4d: Product segment analysis...")
+
+        _seg_result = fetch_product_segments(
+            ticker=ticker,
+            market_id=market_id,
+            pit_client=pit_client,
+            secrets=secrets,
+        )
+        _segment_data = _seg_result.get("segments", {})
+
+        if _segment_data:
+            cache, product_segment_result = compute_product_segment_features(
+                cache,
+                segment_data=_segment_data,
+                target_profile=target_profile,
+                macro_data=macro_data if macro_data else None,
+            )
+            if product_segment_result and product_segment_result.available:
+                logger.info(
+                    "Product segments: %d via %s, HHI=%.3f, dominant=%s (%.0f%%), lifecycle=%s",
+                    product_segment_result.n_segments,
+                    _seg_result.get("source", "?"),
+                    product_segment_result.hhi,
+                    product_segment_result.dominant_segment,
+                    product_segment_result.dominant_segment_pct * 100,
+                    product_segment_result.lifecycle_stage,
+                )
+        else:
+            logger.info("Product segments: no segment data available for %s", ticker)
+    except Exception as exc:
+        logger.warning("Product segment analysis failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 4a: Fetch macro data for survival mode analysis
     # ------------------------------------------------------------------
     macro_data = {}
@@ -2431,10 +2474,17 @@ Non-interactive examples:
                 or c.startswith("conflict_") or c.startswith("demand_")
                 or c.startswith("merton_") or c.startswith("rv_")
                 or c.startswith("policy_risk_") or c.startswith("sector_leader_")
+                or c.startswith("segment_") or c.startswith("product_")
+                or c.startswith("pricing_") or c.startswith("margin_")
+                or c.startswith("som_") or c.startswith("customer_")
                 or c in ("stability_score_21d",
                          "buying_power_index", "sector_demand_momentum",
                          "catalyst_score", "online_change_score",
-                         "iv30", "iv_rv_spread")
+                         "iv30", "iv_rv_spread",
+                         "cannibalization_rate", "net_new_revenue_pct",
+                         "network_effect_score", "input_cost_pressure",
+                         "growth_runway_quarters", "maturity_concentration",
+                         "estimated_market_share", "dominant_segment_growth")
                 or any(c.startswith(p) for p in _linked_prefixes))
             and cache[c].dtype in ("float64", "float32", "int64")
             and not c.startswith("is_missing_")
@@ -2755,6 +2805,12 @@ Non-interactive examples:
                 burnout_distributions=_burnout_dists,
             )
             logger.info("Monte Carlo simulation complete")
+
+            # Set product concentration risk flag on MC result
+            if mc_result is not None and "segment_hhi" in cache.columns:
+                _seg_hhi = float(cache["segment_hhi"].iloc[-1]) if cache["segment_hhi"].notna().any() else 0
+                mc_result.segment_hhi = _seg_hhi
+                mc_result.concentration_risk_flag = _seg_hhi > 0.5
 
             # E2: Forward-looking (path-wise) survival trigger checking.
             # Computes fraction of MC paths that trigger ANY survival condition
@@ -3632,6 +3688,12 @@ Non-interactive examples:
             }
         else:
             profile["product_catalysts"] = {"available": False}
+
+        # Inject product segment analysis
+        if product_segment_result is not None and product_segment_result.available:
+            profile["product_segments"] = product_segment_result.to_profile_dict()
+        else:
+            profile["product_segments"] = {"available": False}
 
         # Inject reconciliation report
         if reconciliation_report:
