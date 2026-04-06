@@ -806,6 +806,122 @@ def _compute_earnings_quality_signals(df: pd.DataFrame) -> pd.DataFrame:
 # Public API
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# A2: Realized vol decomposition (continuous + jump)
+# Barndorff-Nielsen & Shephard (2004) bipower variation.
+# Separates "normal" diffusion vol from sudden shock (jump) events.
+# ---------------------------------------------------------------------------
+
+def _compute_realized_vol_decomposition(df: pd.DataFrame) -> pd.DataFrame:
+    """Decompose realized volatility into continuous and jump components.
+
+    Uses bipower variation (BV) to estimate the continuous component.
+    Jump variation (JV) = RV - BV captures sudden exogenous shocks
+    (tariff announcements, earnings surprises, policy changes).
+
+    Reference: Barndorff-Nielsen & Shephard (2004).
+    """
+    if "return_1d" not in df.columns:
+        return df
+
+    returns = df["return_1d"]
+    if returns.notna().sum() < 30:
+        return df
+
+    # Realized variance: rolling sum of squared returns (21-day window)
+    rv_21d = (returns ** 2).rolling(21, min_periods=10).sum()
+
+    # Bipower variation: rolling sum of |r_t| * |r_{t-1}| * pi/2
+    abs_ret = returns.abs()
+    abs_ret_lag = abs_ret.shift(1)
+    bv_21d = (np.pi / 2.0) * (abs_ret * abs_ret_lag).rolling(21, min_periods=10).sum()
+
+    # Jump variation: max(RV - BV, 0)
+    jv_21d = (rv_21d - bv_21d).clip(lower=0.0)
+
+    # Realized vol (annualized sqrt of RV)
+    df["realized_vol_21d"] = np.sqrt(rv_21d.clip(lower=0.0))
+
+    # Continuous vol component (sqrt of BV)
+    df["continuous_vol_21d"] = np.sqrt(bv_21d.clip(lower=0.0))
+
+    # Jump vol component (sqrt of JV)
+    df["jump_vol_21d"] = np.sqrt(jv_21d)
+
+    # Jump ratio: what fraction of total vol comes from jumps
+    # High jump_ratio = exogenous shock environment
+    _total = rv_21d.clip(lower=1e-12)
+    df["jump_ratio_21d"] = jv_21d / _total
+
+    # Jump spike flag: jump_ratio above P90 of its own history
+    if df["jump_ratio_21d"].notna().sum() > 50:
+        _p90 = df["jump_ratio_21d"].quantile(0.90)
+        df["jump_spike_flag"] = (df["jump_ratio_21d"] > _p90).astype(int)
+    else:
+        df["jump_spike_flag"] = 0
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# G2: Merton distance-to-default
+# Structural credit model: equity = call option on firm assets.
+# Low DD = close to default boundary = equity vol will increase.
+# ---------------------------------------------------------------------------
+
+def _compute_merton_distance_to_default(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute Merton (1974) distance-to-default from equity and debt data.
+
+    DD = (log(V/D) + (mu - 0.5*sigma_V^2)*T) / (sigma_V * sqrt(T))
+
+    Where V = equity + debt (proxy for asset value), D = total debt,
+    sigma_V is estimated from equity volatility via leverage adjustment.
+    """
+    has_required = all(
+        c in df.columns and df[c].notna().any()
+        for c in ("close", "volatility_21d")
+    )
+    has_debt = "total_debt" in df.columns or "total_debt_asof" in df.columns
+
+    if not has_required or not has_debt:
+        return df
+
+    _debt_col = "total_debt" if "total_debt" in df.columns else "total_debt_asof"
+    debt = df[_debt_col].ffill().fillna(0)
+    equity_vol = df["volatility_21d"].ffill().fillna(0.02)
+
+    # Market cap proxy (or use actual if available)
+    if "market_cap" in df.columns and df["market_cap"].notna().any():
+        mkt_cap = df["market_cap"].ffill()
+    elif "shares_outstanding" in df.columns and df["shares_outstanding"].notna().any():
+        mkt_cap = df["close"] * df["shares_outstanding"].ffill()
+    else:
+        # Rough proxy: last close * 1B shares (very approximate)
+        mkt_cap = df["close"] * 1e9
+
+    # Asset value proxy: equity + debt
+    asset_value = mkt_cap + debt
+
+    # Asset volatility via leverage adjustment (Merton approximation)
+    # sigma_V = sigma_E * E / V
+    leverage = mkt_cap / asset_value.clip(lower=1.0)
+    asset_vol = equity_vol * leverage
+
+    # Distance to default (T=1 year, mu=0 for risk-neutral)
+    _T = 1.0
+    _safe_debt = debt.clip(lower=1.0)
+    _safe_vol = asset_vol.clip(lower=0.001)
+    dd = (np.log(asset_value / _safe_debt) + (-0.5 * _safe_vol ** 2) * _T) / (_safe_vol * np.sqrt(_T))
+
+    # Clip extreme values
+    df["merton_dd"] = dd.clip(-10.0, 20.0)
+
+    # DD change (declining DD = increasing default risk = rising vol)
+    df["merton_dd_change_21d"] = df["merton_dd"] - df["merton_dd"].shift(21)
+
+    return df
+
+
 # Ordered pipeline of computation stages
 _COMPUTE_STAGES = (
     _compute_returns_and_risk,
@@ -823,6 +939,8 @@ _COMPUTE_STAGES = (
     _compute_recovery_time,
     _compute_beta,
     _compute_earnings_quality_signals,
+    _compute_realized_vol_decomposition,  # A2: vol decomposition
+    _compute_merton_distance_to_default,  # G2: Merton DD
 )
 
 # All derived variable names (for inspection / downstream reference)

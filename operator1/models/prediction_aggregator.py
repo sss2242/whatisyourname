@@ -1823,6 +1823,11 @@ def run_prediction_aggregation(
     save_to_cache: bool = True,
     cache_dir: str = CACHE_DIR,
     mode_weights: dict[str, dict[str, float]] | None = None,
+    # --- v2 improvement inputs ---
+    macro_quadrant_label: str = "",
+    fundamental_fair_value: float | None = None,
+    scenario_result: Any | None = None,
+    signal_ic_result: Any | None = None,
     # --- New optional inputs from sibling modules ---
     conformal_result: Any | None = None,
     dual_regime_result: Any | None = None,
@@ -2119,6 +2124,117 @@ def run_prediction_aggregation(
             # Survival probability for this horizon.
             surv_prob = mc_survival_by_horizon.get(h_label, 1.0)
             survival_adjusted = surv_prob < 1.0
+
+            # ----------------------------------------------------------
+            # B1: Survival-intensity POINT FORECAST adjustment.
+            # When survival signals indicate distress, shift the point
+            # forecast downward proportionally. This fixes the gap where
+            # bands widen but the center stays bullish during distress.
+            # Uses survival_intensity (continuous 0-1 from enriched
+            # survival timeline) and expected max drawdown from MC.
+            # ----------------------------------------------------------
+            if not math.isnan(point) and survival_adjusted:
+                _surv_intensity = 0.0
+                if "survival_intensity" in cache.columns:
+                    _si = cache["survival_intensity"].dropna()
+                    if len(_si) > 0:
+                        _surv_intensity = float(_si.iloc[-1])
+
+                if _surv_intensity > 0.3:
+                    # Expected max drawdown from MC (or conservative default)
+                    _expected_dd = 0.20  # default 20% drawdown assumption
+                    if mc_result is not None and mc_result.fitted:
+                        _dd_stats = mc_result.max_drawdown_distribution.get(h_label, {})
+                        _mc_dd = abs(_dd_stats.get("median", 0.0))
+                        if _mc_dd > 0.01:
+                            _expected_dd = min(0.60, _mc_dd)
+
+                    # Horizon factor: longer horizons get more adjustment
+                    # because fundamentals dominate over momentum
+                    _horizon_factor = {1: 0.2, 5: 0.5, 21: 0.8, 252: 1.0}
+                    _hf = _horizon_factor.get(horizon_days, min(1.0, horizon_days / 252))
+
+                    # Distress haircut: intensity * expected drawdown * horizon factor
+                    _distress_haircut = _surv_intensity * _expected_dd * _hf
+                    _distress_haircut = min(0.40, _distress_haircut)  # cap at 40%
+                    point = point * (1.0 - _distress_haircut)
+                    logger.debug(
+                        "B1 survival adjustment: %s %s haircut=%.3f "
+                        "(intensity=%.2f, dd=%.2f, hf=%.1f)",
+                        var_name, h_label, _distress_haircut,
+                        _surv_intensity, _expected_dd, _hf,
+                    )
+
+            # ----------------------------------------------------------
+            # B2: Macro-conditional return shift.
+            # When macro quadrant indicates deterioration, apply a
+            # drift adjustment to return-like variables.
+            # ----------------------------------------------------------
+            if (not math.isnan(point)
+                    and macro_quadrant_label
+                    and var_name in ("close", "return_1d", "return_5d", "return_21d")):
+                _QUADRANT_DRIFT = {
+                    "goldilocks": +0.0005,
+                    "overheating": +0.0002,
+                    "stagflation": -0.0003,
+                    "recession": -0.0005,
+                }
+                _drift = _QUADRANT_DRIFT.get(macro_quadrant_label.lower(), 0.0)
+                if abs(_drift) > 1e-6 and var_name == "close":
+                    # For close price: apply return drift * horizon * last close
+                    point = point * (1.0 + _drift * horizon_days)
+                elif abs(_drift) > 1e-6:
+                    # For return variables: shift directly
+                    point = point + _drift * horizon_days
+
+            # ----------------------------------------------------------
+            # B3: Scenario-weighted price expectation.
+            # During survival mode, blend with scenario engine results.
+            # ----------------------------------------------------------
+            if (not math.isnan(point)
+                    and scenario_result is not None
+                    and getattr(scenario_result, "available", False)
+                    and var_name == "close"):
+                _surv_intensity_b3 = 0.0
+                if "survival_intensity" in cache.columns:
+                    _si_b3 = cache["survival_intensity"].dropna()
+                    if len(_si_b3) > 0:
+                        _surv_intensity_b3 = float(_si_b3.iloc[-1])
+
+                if _surv_intensity_b3 > 0.5:
+                    try:
+                        _orderly = getattr(scenario_result, "orderly", None)
+                        _muddle = getattr(scenario_result, "muddle_through", None)
+                        _catastrophic = getattr(scenario_result, "catastrophic", None)
+                        if _orderly and _muddle and _catastrophic:
+                            _ord_med = getattr(_orderly, "terminal_median_equity", point)
+                            _mud_med = getattr(_muddle, "terminal_median_equity", point)
+                            _cat_med = getattr(_catastrophic, "terminal_median_equity", point)
+                            # Probability weights (from scenario engine or defaults)
+                            _p_ord = 0.30
+                            _p_mud = 0.45
+                            _p_cat = 0.25
+                            _scenario_price = _p_ord * _ord_med + _p_mud * _mud_med + _p_cat * _cat_med
+                            if _scenario_price > 0 and not math.isnan(_scenario_price):
+                                _scen_weight = min(0.6, _surv_intensity_b3 * 0.8)
+                                point = (1.0 - _scen_weight) * point + _scen_weight * _scenario_price
+                    except Exception:
+                        pass  # scenario data structure mismatch -- skip gracefully
+
+            # ----------------------------------------------------------
+            # C2: Fundamental gravity for long horizons.
+            # Blend price forecasts with fundamental fair value (DCF)
+            # for 21d+ horizons. Price converges to fundamentals over time.
+            # ----------------------------------------------------------
+            if (not math.isnan(point)
+                    and fundamental_fair_value is not None
+                    and not math.isnan(fundamental_fair_value)
+                    and fundamental_fair_value > 0
+                    and var_name == "close"):
+                _FUND_WEIGHTS = {"1d": 0.00, "5d": 0.05, "21d": 0.20, "252d": 0.50}
+                _fw = _FUND_WEIGHTS.get(h_label, 0.0)
+                if _fw > 0:
+                    point = (1.0 - _fw) * point + _fw * fundamental_fair_value
 
             # ----------------------------------------------------------
             # Phase 1: Try conformal intervals first.

@@ -115,6 +115,64 @@ def _keyword_score(text: str) -> float:
     return (pos - neg) / total
 
 
+# ---------------------------------------------------------------------------
+# D2: Policy risk scoring (separate dimension from sentiment)
+# Extracts policy/geopolitical risk signals from article text.
+# ---------------------------------------------------------------------------
+
+_POLICY_RISK_TAXONOMY: dict[str, list[str]] = {
+    "trade": ["tariff", "trade war", "embargo", "import duty", "quota",
+              "sanctions", "trade deficit", "trade surplus", "protectionism",
+              "dumping", "countervailing", "anti-dumping", "customs"],
+    "regulatory": ["regulation", "antitrust", "break up", "fine", "penalty",
+                   "compliance", "enforcement", "deregulation", "oversight",
+                   "investigation", "probe", "lawsuit", "ruling", "ban"],
+    "fiscal": ["tax hike", "tax cut", "stimulus", "austerity", "deficit",
+               "spending bill", "budget", "subsidy", "bailout", "debt ceiling"],
+    "monetary": ["rate hike", "rate cut", "taper", "quantitative easing",
+                 "hawkish", "dovish", "inflation target", "fed", "ecb",
+                 "central bank", "interest rate"],
+    "geopolitical": ["war", "invasion", "conflict", "military", "missile",
+                     "nuclear", "coup", "election", "political crisis",
+                     "regime change", "uprising", "protest"],
+}
+
+
+def _compute_policy_risk_score(text: str) -> tuple[float, str]:
+    """Score article text for policy/geopolitical risk.
+
+    Returns (score, category) where score is 0-1 and category is the
+    dominant risk type detected.
+
+    D2 from Plan v2: separate from sentiment to capture whether articles
+    mention policy-driven risks regardless of positive/negative tone.
+    """
+    if not text:
+        return 0.0, "none"
+
+    text_lower = text.lower()
+    category_hits: dict[str, int] = {}
+
+    for category, keywords in _POLICY_RISK_TAXONOMY.items():
+        hits = sum(1 for kw in keywords if kw in text_lower)
+        if hits > 0:
+            category_hits[category] = hits
+
+    if not category_hits:
+        return 0.0, "none"
+
+    total_hits = sum(category_hits.values())
+    total_keywords = sum(len(kws) for kws in _POLICY_RISK_TAXONOMY.values())
+
+    # Score: normalize by total possible keywords, cap at 1.0
+    score = min(1.0, total_hits / max(total_keywords * 0.05, 1))
+
+    # Dominant category
+    dominant = max(category_hits, key=category_hits.get)
+
+    return score, dominant
+
+
 def _sentiment_label(score: float) -> str:
     """Map a sentiment score to a label."""
     if np.isnan(score):
@@ -488,6 +546,19 @@ def compute_news_sentiment(
     articles["sentiment"] = scores
     result.n_articles_scored = len(scores)
 
+    # D2: Policy risk scoring (separate dimension from sentiment).
+    # Captures whether articles mention policy-driven risks regardless
+    # of positive/negative tone (e.g. "tariff deal reached" is positive
+    # sentiment but high policy risk).
+    policy_scores = []
+    policy_categories = []
+    for h in headlines:
+        _ps, _pc = _compute_policy_risk_score(h)
+        policy_scores.append(_ps)
+        policy_categories.append(_pc)
+    articles["policy_risk_score"] = policy_scores
+    articles["policy_risk_category"] = policy_categories
+
     # Store scored articles for downstream modules (e.g., product_catalysts)
     # Filter out NaN-scored articles so catalysts sees real scores only.
     try:
@@ -538,10 +609,37 @@ def compute_news_sentiment(
     ).std()
     cache["is_missing_sentiment"] = daily_sentiment.isna().astype(int)
 
+    # D2: Inject policy risk columns into cache
+    if "policy_risk_score" in articles.columns:
+        daily_policy = articles.groupby("date").agg(
+            policy_risk_mean=("policy_risk_score", "mean"),
+            policy_risk_max=("policy_risk_score", "max"),
+        )
+        cache["policy_risk_score"] = daily_policy["policy_risk_mean"].reindex(
+            cache.index, method="ffill",
+        )
+        cache["policy_risk_max"] = daily_policy["policy_risk_max"].reindex(
+            cache.index, method="ffill",
+        )
+        # Dominant category for the most recent day
+        _latest_cats = articles.groupby("date")["policy_risk_category"].agg(
+            lambda x: x.value_counts().index[0] if len(x) > 0 else "none"
+        )
+        _latest_cat_series = _latest_cats.reindex(cache.index, method="ffill")
+        # Don't store string in cache (numeric only for models), but log it
+        _pr_mean = cache["policy_risk_score"].dropna()
+        if len(_pr_mean) > 0 and float(_pr_mean.iloc[-1]) > 0.1:
+            logger.info(
+                "D2 policy risk: mean=%.3f, max=%.3f, dominant_category=%s",
+                float(_pr_mean.mean()), float(cache["policy_risk_max"].dropna().max()),
+                str(_latest_cat_series.iloc[-1]) if len(_latest_cat_series.dropna()) > 0 else "none",
+            )
+
     result.columns_added = [
         "sentiment_score", "sentiment_count",
         "sentiment_momentum_5d", "sentiment_momentum_21d",
         "sentiment_volatility_21d", "is_missing_sentiment",
+        "policy_risk_score", "policy_risk_max",
     ]
 
     # Summary
