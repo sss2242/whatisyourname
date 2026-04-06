@@ -2038,12 +2038,62 @@ def run_forecasting(
                 best_model_name = f"{best_model_name}_burnout"
                 best_metrics = burnout_met
 
+        # ----------------------------------------------------------
+        # C1: Horizon-specific model selection.
+        # For long horizons (21d, 252d), prefer fundamental/tree models
+        # over autoregressive models. Tree ensembles with macro features
+        # outperform Kalman/GARCH at longer horizons where momentum
+        # decays and fundamentals dominate.
+        # ----------------------------------------------------------
+        _horizon_forecasts: dict[str, float] = {}
+        _long_horizon_model: np.ndarray | None = None
+        _long_model_name = ""
+
+        if best_forecast is not None:
+            # For short horizons (1d, 5d): use best autoregressive model (default cascade winner)
+            for label, h in HORIZONS.items():
+                _horizon_forecasts[label] = float(best_forecast[min(h - 1, len(best_forecast) - 1)])
+
+            # For long horizons (21d, 252d): try tree ensemble as alternative
+            # if the cascade winner was an autoregressive model (Kalman, GARCH, VAR, LSTM)
+            _ar_models = {"kalman", "kalman_per_regime", "kalman_burnout", "kalman_dfm",
+                          "garch", "var", "ar1", "lstm", "lstm_fallback_gbm",
+                          "lstm_fallback_lr", "autoarima"}
+            if best_model_name.lower().split("(")[0] in _ar_models:
+                feat_df = _extract_features(var_name)
+                if not feat_df.empty:
+                    _lh_fcast, _lh_met = fit_tree_ensemble(
+                        feat_df, var_name,
+                        n_forecast=max_horizon,
+                        random_state=random_state,
+                    )
+                    if _lh_fcast is not None and _lh_met.fitted:
+                        _long_horizon_model = _lh_fcast
+                        _long_model_name = _lh_met.model_name
+                        # Blend: at 21d use 60% tree + 40% AR; at 252d use 80% tree + 20% AR
+                        for label, h in HORIZONS.items():
+                            if h >= 21:
+                                _tree_val = float(_long_horizon_model[min(h - 1, len(_long_horizon_model) - 1)])
+                                _ar_val = _horizon_forecasts[label]
+                                _tree_weight = 0.6 if h == 21 else 0.8
+                                _horizon_forecasts[label] = _tree_weight * _tree_val + (1 - _tree_weight) * _ar_val
+
+            # Also try AutoARIMA for medium horizons (5d-21d) if not already the winner
+            if best_model_name != "autoarima":
+                _arima_fcast, _arima_met = fit_autoarima(
+                    series[~np.isnan(series)],
+                    n_forecast=max_horizon,
+                )
+                if _arima_fcast is not None and _arima_met.fitted:
+                    # For 5d: blend 30% ARIMA + 70% cascade winner
+                    for label, h in [(l, hh) for l, hh in HORIZONS.items() if 5 <= hh <= 21]:
+                        _arima_val = float(_arima_fcast[min(h - 1, len(_arima_fcast) - 1)])
+                        _arima_weight = 0.3 if h == 5 else 0.2  # Less weight at 21d (tree dominates)
+                        _horizon_forecasts[label] = (1 - _arima_weight) * _horizon_forecasts[label] + _arima_weight * _arima_val
+
         # Store results.
         if best_forecast is not None:
-            result.forecasts[var_name] = {
-                label: float(best_forecast[min(h - 1, len(best_forecast) - 1)])
-                for label, h in HORIZONS.items()
-            }
+            result.forecasts[var_name] = _horizon_forecasts
             result.model_used[var_name] = best_model_name
 
     # ------------------------------------------------------------------

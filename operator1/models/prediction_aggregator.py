@@ -416,6 +416,134 @@ def compute_ensemble_weights(
     return {name: w / total for name, w in inv_rmse.items()}
 
 
+def apply_ic_weighted_calibration(
+    base_weights: dict[str, float],
+    signal_ic_result: Any | None = None,
+) -> dict[str, float]:
+    """C3: Adjust ensemble weights using signal IC measurements.
+
+    The signal_ic module already computes rolling Spearman IC for every
+    signal but it's only used for feature pruning. Here we use it to
+    upweight models whose signals have high IC (historically predictive)
+    and downweight models with low IC.
+
+    Parameters
+    ----------
+    base_weights:
+        Inverse-RMSE ensemble weights from ``compute_ensemble_weights``.
+    signal_ic_result:
+        ``SignalICResult`` from ``signal_ic.py``. Contains
+        ``strong_signals``, ``weak_signals``, ``best_ic``.
+
+    Returns
+    -------
+    Adjusted weights (still sum to 1.0).
+    """
+    if not base_weights or signal_ic_result is None:
+        return base_weights
+
+    if not getattr(signal_ic_result, "available", False):
+        return base_weights
+
+    # Map model types to the signals they're best at predicting
+    _MODEL_SIGNAL_MAP = {
+        "kalman": ["close", "revenue", "total_assets"],
+        "garch": ["volatility_21d", "volatility_63d"],
+        "var": ["return_1d", "close"],
+        "lstm": ["close", "return_1d"],
+        "tree": ["close", "return_1d", "fcf_yield", "current_ratio"],
+        "baseline": ["close"],
+        "autoarima": ["close", "revenue"],
+        "transformer": ["close", "return_1d"],
+    }
+
+    # Get IC scores per signal
+    _ic_scores = getattr(signal_ic_result, "ic_scores", {})
+    if not _ic_scores:
+        return base_weights
+
+    # Compute IC-based multiplier per model
+    adjusted = dict(base_weights)
+    for model_name, weight in base_weights.items():
+        _base_model = model_name.lower().split("_")[0].split("(")[0]
+        _relevant_signals = _MODEL_SIGNAL_MAP.get(_base_model, [])
+        if not _relevant_signals:
+            continue
+
+        # Average absolute IC across this model's relevant signals
+        _ics = [abs(_ic_scores.get(s, 0.0)) for s in _relevant_signals if s in _ic_scores]
+        if _ics:
+            _avg_ic = sum(_ics) / len(_ics)
+            # IC multiplier: IC=0.05 -> 1.5x, IC=0.01 -> 0.5x, IC=0.10 -> 2.0x
+            _ic_mult = max(0.3, min(3.0, _avg_ic * 20.0))
+            adjusted[model_name] = weight * _ic_mult
+
+    # Renormalize
+    total = sum(adjusted.values())
+    if total > 0:
+        adjusted = {k: v / total for k, v in adjusted.items()}
+
+    return adjusted
+
+
+def apply_prediction_log_feedback(
+    base_weights: dict[str, float],
+    prediction_log_summary: dict | None = None,
+) -> dict[str, float]:
+    """F3: Realized IC feedback from previous prediction logs.
+
+    If past predictions and actuals are available, compute realized
+    accuracy per model and use it to calibrate current weights.
+    Creates a self-improving feedback loop.
+
+    Parameters
+    ----------
+    base_weights:
+        Current ensemble weights.
+    prediction_log_summary:
+        Output from ``prediction_log.fill_actuals()``. Contains
+        ``hit_rate``, ``realized_ic``, ``per_model_ic`` (if available).
+
+    Returns
+    -------
+    Adjusted weights incorporating historical accuracy.
+    """
+    if not base_weights or not prediction_log_summary:
+        return base_weights
+
+    _per_model = prediction_log_summary.get("per_model_ic", {})
+    if not _per_model:
+        # No per-model breakdown -- use overall IC as a global confidence scaler
+        _realized_ic = prediction_log_summary.get("realized_ic", 0.0)
+        if abs(_realized_ic) > 0.001:
+            # If overall realized IC is very low, reduce all weights toward uniform
+            _confidence = max(0.3, min(1.0, abs(_realized_ic) * 10))
+            n = len(base_weights)
+            uniform = 1.0 / max(n, 1)
+            adjusted = {
+                k: _confidence * v + (1 - _confidence) * uniform
+                for k, v in base_weights.items()
+            }
+            total = sum(adjusted.values())
+            return {k: v / total for k, v in adjusted.items()} if total > 0 else base_weights
+        return base_weights
+
+    # Per-model IC available: upweight models with high realized IC
+    adjusted = dict(base_weights)
+    for model_name, weight in base_weights.items():
+        _base = model_name.lower().split("_")[0].split("(")[0]
+        _model_ic = _per_model.get(_base, _per_model.get(model_name, 0.0))
+        if abs(_model_ic) > 0.001:
+            _mult = max(0.2, min(3.0, abs(_model_ic) * 15))
+            adjusted[model_name] = weight * _mult
+
+    total = sum(adjusted.values())
+    if total > 0:
+        adjusted = {k: v / total for k, v in adjusted.items()}
+
+    return adjusted
+
+
 def optimise_ensemble_weights_ga(
     metrics: list[ModelMetrics],
     *,
@@ -1924,6 +2052,10 @@ def run_prediction_aggregation(
     base_weights = compute_ensemble_weights(
         forecast_result.metrics,
     )
+
+    # C3: IC-weighted calibration (use signal IC to upweight predictive models)
+    if signal_ic_result is not None:
+        base_weights = apply_ic_weighted_calibration(base_weights, signal_ic_result)
 
     # Apply survival-aware weighting if walk-forward mode weights and
     # survival context are available.
