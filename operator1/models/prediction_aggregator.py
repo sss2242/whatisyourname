@@ -544,6 +544,106 @@ def apply_prediction_log_feedback(
     return adjusted
 
 
+def train_stacking_meta_learner(
+    forward_pass_predictions: list[dict] | None = None,
+    cache: Any = None,
+) -> dict[str, float] | None:
+    """F1: Train a Ridge regression stacking meta-learner on walk-forward predictions.
+
+    Instead of inverse-RMSE weighting, learns conditional patterns from
+    model outputs -- e.g. 'trust GARCH during high vol, trust Kalman during trends'.
+
+    Parameters
+    ----------
+    forward_pass_predictions:
+        List of prediction log entries from ForwardPassResult.predictions_log.
+        Each entry has model predictions and actual values.
+    cache:
+        Daily cache DataFrame for extracting regime/survival features.
+
+    Returns
+    -------
+    Dict of model_name -> learned weight, or None if insufficient data.
+    """
+    if not forward_pass_predictions or len(forward_pass_predictions) < 50:
+        return None
+
+    try:
+        from sklearn.linear_model import Ridge
+    except ImportError:
+        logger.debug("F1: scikit-learn not available for stacking")
+        return None
+
+    try:
+        # Extract model predictions and actuals from forward pass log
+        model_names: list[str] = []
+        X_rows: list[list[float]] = []
+        y_vals: list[float] = []
+
+        # First pass: identify all model names
+        for entry in forward_pass_predictions:
+            if not isinstance(entry, dict):
+                continue
+            _preds = entry.get("predictions", {})
+            for m_name in _preds:
+                if m_name not in model_names:
+                    model_names.append(m_name)
+
+        if len(model_names) < 2:
+            return None
+
+        # Second pass: build feature matrix
+        for entry in forward_pass_predictions:
+            if not isinstance(entry, dict):
+                continue
+            _actual = entry.get("actual")
+            _preds = entry.get("predictions", {})
+            if _actual is None or math.isnan(_actual):
+                continue
+
+            row = [_preds.get(m, float("nan")) for m in model_names]
+            if any(math.isnan(v) for v in row):
+                continue
+
+            X_rows.append(row)
+            y_vals.append(_actual)
+
+        if len(X_rows) < 30:
+            return None
+
+        X = np.array(X_rows)
+        y = np.array(y_vals)
+
+        # Fit Ridge regression (regularized to prevent overfitting)
+        meta = Ridge(alpha=1.0, fit_intercept=True)
+        meta.fit(X, y)
+
+        # Extract learned weights (coefficients)
+        raw_weights = {
+            model_names[i]: max(0.0, float(meta.coef_[i]))
+            for i in range(len(model_names))
+        }
+
+        # Normalize to sum to 1
+        total = sum(raw_weights.values())
+        if total > 0:
+            weights = {k: v / total for k, v in raw_weights.items()}
+        else:
+            return None
+
+        logger.info(
+            "F1 stacking meta-learner: trained on %d samples, %d models, "
+            "weights=%s",
+            len(X_rows), len(model_names),
+            {k: f"{v:.3f}" for k, v in sorted(weights.items(), key=lambda x: -x[1])[:5]},
+        )
+        return weights
+
+    except Exception as exc:
+        logger.debug("F1 stacking meta-learner failed: %s", exc)
+        return None
+
+
 def optimise_ensemble_weights_ga(
     metrics: list[ModelMetrics],
     *,
