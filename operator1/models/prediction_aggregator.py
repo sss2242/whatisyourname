@@ -2056,6 +2056,7 @@ def run_prediction_aggregation(
     fundamental_fair_value: float | None = None,
     scenario_result: Any | None = None,
     signal_ic_result: Any | None = None,
+    prediction_log_summary: dict | None = None,
     # --- New optional inputs from sibling modules ---
     conformal_result: Any | None = None,
     dual_regime_result: Any | None = None,
@@ -2156,6 +2157,10 @@ def run_prediction_aggregation(
     # C3: IC-weighted calibration (use signal IC to upweight predictive models)
     if signal_ic_result is not None:
         base_weights = apply_ic_weighted_calibration(base_weights, signal_ic_result)
+
+    # F3: Realized IC feedback from previous prediction logs
+    if prediction_log_summary is not None:
+        base_weights = apply_prediction_log_feedback(base_weights, prediction_log_summary)
 
     # Apply survival-aware weighting if walk-forward mode weights and
     # survival context are available.

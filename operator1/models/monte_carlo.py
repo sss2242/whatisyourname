@@ -160,6 +160,12 @@ class MonteCarloResult:
     # Standard in credit risk (first-passage-time models) but novel in equity.
     anticipated_survival: dict[str, float] = field(default_factory=dict)
 
+    # Product concentration risk: when segment_hhi > 0.5, the dominant
+    # product drives most of the company's risk.  Flag for downstream
+    # consumers to apply concentrated-risk adjustments.
+    concentration_risk_flag: bool = False
+    segment_hhi: float = 0.0
+
     # Error info.
     error: str | None = None
     fitted: bool = False

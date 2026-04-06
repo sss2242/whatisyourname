@@ -87,12 +87,9 @@ class ReportMode(str, Enum):
 # Sections included in each tier.  Section numbers match the fallback
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
-    ReportTier.BASIC: {1, 2, 4, 6, 20},
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20},
-    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005},  # all 22 sections + extended sections + USS + scenarios + diagnostics + structure + calendar + macro + supply chain + synergies + multi-frequency
-    ReportTier.BASIC: {1, 2, 4, 6, 20, 2007},  # + position signal
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20, 2006, 2007, 2008},  # + thesis scorecard + position signal + signal IC
-    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2023, 2024, 2025, 2026, 2027, 2028, 2029},  # all sections + multi-frequency + thesis scorecard + position signal + signal IC + hedge fund analysis
+    ReportTier.BASIC: {1, 2, 4, 6, 20, 2007},  # quick screening + position signal
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20, 2006, 2007, 2008, 2030},  # peers + macro + thesis scorecard + position signal + signal IC + product segments
+    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2023, 2024, 2025, 2026, 2027, 2028, 2029, 2030},  # all sections + multi-frequency + thesis scorecard + position signal + signal IC + hedge fund analysis + product segments
 }
 
 
@@ -3950,6 +3947,56 @@ def _build_hf_scorecard(profile: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _build_product_segments_section(profile: dict[str, Any]) -> str:
+    """Section 30: Product Portfolio Analysis."""
+    ps = profile.get("product_segments", {})
+    if not ps.get("available"):
+        return "*Product segment data not available for this company.*\n"
+
+    lines = ["Product-level revenue decomposition, lifecycle classification, and risk assessment.\n"]
+
+    # Segment overview
+    lines.append(f"**Segments**: {ps.get('n_segments', 0)} product lines")
+    lines.append(f"**Dominant segment**: {ps.get('dominant_segment', 'N/A')} "
+                 f"({ps.get('dominant_segment_pct', 0):.0%} of revenue)")
+    hhi = ps.get("hhi", 0)
+    conc_label = "Low" if hhi < 0.25 else "Moderate" if hhi < 0.5 else "High" if hhi < 0.75 else "Very High"
+    lines.append(f"**Revenue concentration (HHI)**: {hhi:.3f} ({conc_label})")
+
+    # Lifecycle
+    stage = ps.get("lifecycle_stage", "unknown")
+    runway = ps.get("growth_runway_quarters", 0)
+    lines.append(f"\n**Product Lifecycle**: {stage.title()}")
+    if runway > 0:
+        lines.append(f"- Estimated growth runway: ~{runway} quarters until peak adoption")
+    elif stage == "maturity":
+        lines.append("- Product at maturity -- growth deceleration expected")
+    elif stage == "decline":
+        lines.append("- Product in decline -- revenue erosion likely without new launches")
+
+    # Pricing power
+    pp = ps.get("pricing_power", 0)
+    pp_label = "Strong" if pp > 0.3 else "Moderate" if pp > 0 else "Weak" if pp > -0.3 else "Negative"
+    lines.append(f"\n**Pricing Power**: {pp:.3f} ({pp_label})")
+    if pp > 0:
+        lines.append("- Company can raise prices above inflation -- moat indicator")
+    else:
+        lines.append("- Revenue growth depends on volume, not pricing -- margin pressure risk")
+
+    # Cannibalization
+    cr = ps.get("cannibalization_rate", 0)
+    if cr > 0.1:
+        lines.append(f"\n**Cannibalization Rate**: {cr:.0%} of new product revenue displaces existing products")
+
+    # Network effect
+    nfx = ps.get("network_effect_score", 0)
+    if nfx > 0.1:
+        nfx_label = "Strong" if nfx > 0.5 else "Moderate"
+        lines.append(f"\n**Network Effect**: {nfx:.2f} ({nfx_label}) -- platform economics detected")
+
+    return "\n".join(lines) + "\n"
+
+
 def _build_hf_position(profile: dict[str, Any]) -> str:
     """Section 29: HF Position Signal & Sizing."""
     hf = profile.get("hedge_fund", {})
@@ -4058,6 +4105,7 @@ def _build_fallback_report(
         2027: ("27. Hedge Fund Thesis: Valuation", _build_hf_valuation(profile)),
         2028: ("28. Investment Thesis Scorecard (HF)", _build_hf_scorecard(profile)),
         2029: ("29. Position Signal & Sizing (HF)", _build_hf_position(profile)),
+        2030: ("30. Product Portfolio Analysis", _build_product_segments_section(profile)),
         22: ("22. Appendix & Methodology", _build_appendix(profile)),
     }
 

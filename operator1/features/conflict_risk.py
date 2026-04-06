@@ -1115,3 +1115,50 @@ def compute_supply_chain_stress(
     result["supply_chain_stress_flag"] = combined > 0.4
     result["available"] = True
     return result
+
+
+# ---------------------------------------------------------------------------
+# Product-weighted conflict exposure
+# ---------------------------------------------------------------------------
+
+def compute_product_weighted_conflict_exposure(
+    conflict_result: ConflictRiskResult,
+    segment_shares: dict[str, float],
+    segment_geo_exposure: dict[str, float] | None = None,
+) -> float:
+    """Compute product-weighted conflict exposure.
+
+    When segment geographic exposure data is available, weights the
+    conflict intensity by each product's manufacturing/supply chain
+    dependency on the affected region.
+
+    Parameters
+    ----------
+    conflict_result:
+        Result from ``assess_conflict_risk()``.
+    segment_shares:
+        Dict of {segment_name: revenue_share} (values sum to ~1.0).
+    segment_geo_exposure:
+        Optional dict of {segment_name: exposure_to_conflict_zone}.
+        Values 0-1 where 1.0 = fully dependent on conflict zone.
+        If None, defaults to uniform exposure (all segments equal).
+
+    Returns
+    -------
+    Product-weighted conflict intensity (0-1).
+    """
+    if not conflict_result or conflict_result.conflict_intensity_score <= 0:
+        return 0.0
+
+    base_intensity = conflict_result.conflict_intensity_score
+
+    if segment_geo_exposure:
+        # Weighted by actual geographic exposure per segment
+        weighted = sum(
+            segment_shares.get(name, 0) * segment_geo_exposure.get(name, 0.5)
+            for name in segment_shares
+        )
+        return base_intensity * weighted
+
+    # Default: uniform exposure (same as before product analysis)
+    return base_intensity
