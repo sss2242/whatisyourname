@@ -834,3 +834,168 @@ class ConformalPIDCalibrator:
             "per_variable_alpha": dict(self._alpha_t),
             "bucket_sizes": {k: len(v) for k, v in self._scores.items()},
         }
+
+
+# ---------------------------------------------------------------------------
+# G1: Quantile Regression Forest for asymmetric prediction intervals
+# ---------------------------------------------------------------------------
+
+
+class QuantileRegressionCalibrator:
+    """Asymmetric prediction intervals via Quantile Regression.
+
+    Unlike symmetric conformal intervals (point +/- width), QR produces
+    naturally asymmetric intervals conditioned on regime and features.
+    During crisis regimes, downside intervals are much wider than upside.
+
+    Uses GradientBoostingRegressor with quantile loss (scikit-learn).
+    Falls back to symmetric conformal when insufficient calibration data.
+
+    Reference: Meinshausen (2006), 'Quantile Regression Forests'.
+    """
+
+    def __init__(
+        self,
+        lower_quantile: float = 0.05,
+        upper_quantile: float = 0.95,
+        min_samples: int = 50,
+    ) -> None:
+        self._lower_q = lower_quantile
+        self._upper_q = upper_quantile
+        self._min_samples = min_samples
+        self._fitted = False
+        self._model_lower: Any = None
+        self._model_upper: Any = None
+        self._feature_names: list[str] = []
+
+    def fit(
+        self,
+        residuals: list[float],
+        features: np.ndarray | None = None,
+        feature_names: list[str] | None = None,
+    ) -> bool:
+        """Fit quantile regression models on calibration residuals.
+
+        Parameters
+        ----------
+        residuals:
+            List of (actual - predicted) residuals from walk-forward.
+        features:
+            Optional feature matrix (n_samples, n_features) with regime
+            indicators, survival_intensity, volatility etc. If None,
+            falls back to residual magnitude as sole feature.
+        feature_names:
+            Names of feature columns for interpretability.
+
+        Returns
+        -------
+        True if fitting succeeded.
+        """
+        if len(residuals) < self._min_samples:
+            logger.debug(
+                "QRF: insufficient residuals (%d < %d), skipping",
+                len(residuals), self._min_samples,
+            )
+            return False
+
+        try:
+            from sklearn.ensemble import GradientBoostingRegressor
+        except ImportError:
+            logger.debug("QRF: scikit-learn not available")
+            return False
+
+        residuals_arr = np.array(residuals)
+
+        # Build feature matrix
+        if features is not None and len(features) == len(residuals):
+            X = np.asarray(features)
+        else:
+            # Use absolute residual as sole feature (captures vol clustering)
+            X = np.abs(residuals_arr).reshape(-1, 1)
+
+        self._feature_names = feature_names or [f"f{i}" for i in range(X.shape[1])]
+
+        try:
+            # Lower quantile model (P5 -- wide for downside during crisis)
+            self._model_lower = GradientBoostingRegressor(
+                loss="quantile",
+                alpha=self._lower_q,
+                n_estimators=100,
+                max_depth=3,
+                learning_rate=0.05,
+                min_samples_leaf=10,
+            )
+            self._model_lower.fit(X, residuals_arr)
+
+            # Upper quantile model (P95)
+            self._model_upper = GradientBoostingRegressor(
+                loss="quantile",
+                alpha=self._upper_q,
+                n_estimators=100,
+                max_depth=3,
+                learning_rate=0.05,
+                min_samples_leaf=10,
+            )
+            self._model_upper.fit(X, residuals_arr)
+
+            self._fitted = True
+            logger.info(
+                "QRF calibrator fitted: %d residuals, %d features, Q=[%.2f, %.2f]",
+                len(residuals), X.shape[1], self._lower_q, self._upper_q,
+            )
+            return True
+
+        except Exception as exc:
+            logger.debug("QRF fitting failed: %s", exc)
+            return False
+
+    def predict_interval(
+        self,
+        point_forecast: float,
+        features: np.ndarray | None = None,
+    ) -> tuple[float, float]:
+        """Predict asymmetric interval for a point forecast.
+
+        Parameters
+        ----------
+        point_forecast:
+            Central prediction value.
+        features:
+            Feature vector for this prediction (same dimension as fit).
+            If None, uses zero vector.
+
+        Returns
+        -------
+        (lower, upper) bounds.
+        """
+        if not self._fitted:
+            # Fallback to symmetric +/- 10%
+            spread = abs(point_forecast) * 0.10
+            return point_forecast - spread, point_forecast + spread
+
+        if features is not None:
+            X = np.asarray(features).reshape(1, -1)
+        else:
+            X = np.zeros((1, 1))
+
+        try:
+            lower_residual = float(self._model_lower.predict(X)[0])
+            upper_residual = float(self._model_upper.predict(X)[0])
+
+            # Intervals are forecast + residual quantile
+            lower = point_forecast + lower_residual  # lower_residual is negative
+            upper = point_forecast + upper_residual  # upper_residual is positive
+
+            # Sanity: ensure lower < upper
+            if lower > upper:
+                lower, upper = upper, lower
+
+            return lower, upper
+
+        except Exception:
+            spread = abs(point_forecast) * 0.10
+            return point_forecast - spread, point_forecast + spread
+
+    @property
+    def fitted(self) -> bool:
+        return self._fitted

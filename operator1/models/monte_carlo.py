@@ -155,6 +155,11 @@ class MonteCarloResult:
         default_factory=dict,
     )
 
+    # E2: Forward-looking survival -- fraction of paths that trigger
+    # ANY survival condition at ANY point along the path (not just terminal).
+    # Standard in credit risk (first-passage-time models) but novel in equity.
+    anticipated_survival: dict[str, float] = field(default_factory=dict)
+
     # Error info.
     error: str | None = None
     fitted: bool = False
@@ -881,6 +886,131 @@ def detect_current_regime(
         return "unknown"
 
     return str(labels.iloc[-1])
+
+
+# ---------------------------------------------------------------------------
+# E2: Forward-looking (path-wise) survival trigger checking
+# ---------------------------------------------------------------------------
+
+
+def compute_anticipated_survival(
+    cache: pd.DataFrame,
+    mc_result: "MonteCarloResult",
+    horizon_days: int = 63,
+    n_paths: int = 5000,
+    random_state: int = 42,
+) -> float:
+    """E2: Compute fraction of MC paths that trigger ANY survival condition
+    at ANY point along the path (not just terminal).
+
+    Standard in credit risk as 'first-passage-time' but novel in equity.
+    If 40% of paths trigger survival within 63 days, the market will
+    price the distress in immediately.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache with survival trigger variables.
+    mc_result:
+        Completed MC result with regime distributions and transition matrix.
+    horizon_days:
+        How far forward to check (default 63 = one quarter).
+    n_paths:
+        Number of simulation paths.
+    random_state:
+        Seed for reproducibility.
+
+    Returns
+    -------
+    Float in [0, 1]: fraction of paths that trigger survival at any point.
+    """
+    if not mc_result.fitted or mc_result.transition_matrix is None:
+        return 0.0
+
+    rng = np.random.default_rng(random_state + 999)
+
+    # Get initial variable values
+    initial = extract_initial_values(cache)
+    if not initial:
+        return 0.0
+
+    # Get current regime
+    regime_to_idx = {r: i for i, r in enumerate(mc_result.regime_order)}
+    current_idx = regime_to_idx.get(mc_result.current_regime, 0)
+    n_regimes = len(mc_result.regime_order)
+
+    # Build distribution parameters
+    dist_list = [
+        mc_result.regime_distributions.get(r, RegimeDistribution())
+        for r in mc_result.regime_order
+    ]
+
+    # Default thresholds
+    thresholds = DEFAULT_SURVIVAL_THRESHOLDS
+
+    # Default variable sensitivities to returns
+    sensitivities = {
+        "current_ratio": -0.5,
+        "debt_to_equity_abs": 0.3,
+        "fcf_yield": -0.8,
+        "drawdown_252d": 1.0,
+    }
+
+    n_triggered = 0
+
+    for _p in range(n_paths):
+        regime_idx = current_idx
+        cumulative_return = 0.0
+        triggered = False
+
+        # Copy initial values
+        _vals = dict(initial)
+
+        for _t in range(horizon_days):
+            # Sample regime transition
+            probs = mc_result.transition_matrix[regime_idx]
+            regime_idx = int(rng.choice(n_regimes, p=probs))
+
+            # Sample return from regime distribution
+            dist = dist_list[regime_idx]
+            if dist.use_student_t and dist.df_t > 2:
+                from scipy.stats import t as t_dist
+                r = float(t_dist.rvs(dist.df_t, loc=dist.mean, scale=dist.std, random_state=rng))
+            else:
+                r = float(rng.normal(dist.mean, dist.std))
+
+            cumulative_return += r
+
+            # Update variable proxies
+            for var, (direction, threshold) in thresholds.items():
+                if var not in _vals:
+                    continue
+                sens = sensitivities.get(var, 0.0)
+                if var == "drawdown_252d":
+                    _vals[var] = min(_vals[var], cumulative_return)
+                else:
+                    _vals[var] += sens * r * _vals[var]
+
+                # Check trigger
+                if direction == "lt" and _vals[var] < threshold:
+                    triggered = True
+                    break
+                elif direction == "gt" and _vals[var] > threshold:
+                    triggered = True
+                    break
+
+            if triggered:
+                break
+
+        if triggered:
+            n_triggered += 1
+
+    anticipated = n_triggered / max(n_paths, 1)
+    logger.info(
+        "E2 anticipated survival: %.1f%% of paths trigger within %d days",
+        anticipated * 100, horizon_days,
+    )
+    return anticipated
 
 
 # ===========================================================================
