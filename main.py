@@ -2956,12 +2956,14 @@ Non-interactive examples:
                                 for var, horizons_dict in conformal_result.intervals.items():
                                     if isinstance(horizons_dict, dict):
                                         for h, interval in horizons_dict.items():
-                                            pf = getattr(interval, "point_forecast", None)
+                                            pf = getattr(interval, "point_forecast", None) or getattr(interval, "forecast", None)
                                             if pf is not None:
-                                                _lo, _hi = _qr_cal.predict(float(pf))
+                                                _lo, _hi = _qr_cal.predict_interval(float(pf))
                                                 if _lo is not None and _hi is not None:
-                                                    interval.lower = _lo
-                                                    interval.upper = _hi
+                                                    if hasattr(interval, "lower"):
+                                                        interval.lower = _lo
+                                                    if hasattr(interval, "upper"):
+                                                        interval.upper = _hi
                                                     _n_asym += 1
                                 if _n_asym > 0:
                                     logger.info("G1 asymmetric intervals applied to %d predictions", _n_asym)
