@@ -971,6 +971,43 @@ Non-interactive examples:
         logger.debug("Benchmark fetch skipped: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 4.bench.1: Fetch options-implied volatility (D3)
+    # IV-RV spread is the best single predictor of vol regime changes.
+    # ------------------------------------------------------------------
+    try:
+        from operator1.clients.ohlcv_provider import fetch_implied_volatility
+        _iv_series = fetch_implied_volatility(ticker)
+        if not _iv_series.empty:
+            _iv_val = float(_iv_series.iloc[0])
+            cache["iv30"] = _iv_val  # constant (current snapshot)
+            # IV-RV spread: implied minus realized vol
+            if "volatility_21d" in cache.columns:
+                _rv = cache["volatility_21d"].iloc[-1] if cache["volatility_21d"].notna().any() else 0.0
+                cache["iv_rv_spread"] = _iv_val - float(_rv)
+                logger.info("IV30=%.4f, RV=%.4f, IV-RV spread=%.4f", _iv_val, float(_rv), _iv_val - float(_rv))
+    except Exception as exc:
+        logger.debug("Implied volatility fetch skipped: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 4.bench.2: Fetch sector leading indicators (D4)
+    # Cross-asset ETFs that historically lead the target's sector.
+    # ------------------------------------------------------------------
+    try:
+        from operator1.clients.ohlcv_provider import fetch_sector_leading_indicators
+        _sector = target_profile.get("sector", "")
+        _leader_df = fetch_sector_leading_indicators(_sector, years=int(getattr(args, "years", 2)))
+        if not _leader_df.empty:
+            # Merge leading indicator returns into cache
+            _leader_aligned = _leader_df.reindex(cache.index, method="ffill")
+            for _ldr_col in _leader_aligned.columns:
+                _col_name = f"sector_leader_{_ldr_col}"
+                if _col_name not in cache.columns:
+                    cache[_col_name] = _leader_aligned[_ldr_col]
+            logger.info("Sector leading indicators merged: %d ETFs for sector '%s'", len(_leader_df.columns), _sector)
+    except Exception as exc:
+        logger.debug("Sector leading indicators skipped: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 4a: Fetch macro data for survival mode analysis
     # ------------------------------------------------------------------
     macro_data = {}
@@ -2392,9 +2429,12 @@ Non-interactive examples:
                 or c.startswith("inst_")
                 or c.startswith("buying_power_") or c.startswith("catalyst_")
                 or c.startswith("conflict_") or c.startswith("demand_")
+                or c.startswith("merton_") or c.startswith("rv_")
+                or c.startswith("policy_risk_") or c.startswith("sector_leader_")
                 or c in ("stability_score_21d",
                          "buying_power_index", "sector_demand_momentum",
-                         "catalyst_score", "online_change_score")
+                         "catalyst_score", "online_change_score",
+                         "iv30", "iv_rv_spread")
                 or any(c.startswith(p) for p in _linked_prefixes))
             and cache[c].dtype in ("float64", "float32", "int64")
             and not c.startswith("is_missing_")
@@ -2715,6 +2755,26 @@ Non-interactive examples:
                 burnout_distributions=_burnout_dists,
             )
             logger.info("Monte Carlo simulation complete")
+
+            # E2: Forward-looking (path-wise) survival trigger checking.
+            # Computes fraction of MC paths that trigger ANY survival condition
+            # at ANY point along the path (not just terminal). Standard in
+            # credit risk as 'first-passage-time' but novel in equity.
+            try:
+                from operator1.models.monte_carlo import compute_anticipated_survival
+                for _as_horizon_label, _as_horizon_days in [("63d", 63), ("252d", 252)]:
+                    _as_prob = compute_anticipated_survival(
+                        cache, mc_result, horizon_days=_as_horizon_days,
+                    )
+                    if mc_result is not None:
+                        mc_result.anticipated_survival[_as_horizon_label] = _as_prob
+                if mc_result is not None and mc_result.anticipated_survival:
+                    logger.info(
+                        "E2 anticipated survival: %s",
+                        {k: f"{v:.1%}" for k, v in mc_result.anticipated_survival.items()},
+                    )
+            except Exception as _as_exc:
+                logger.debug("E2 anticipated survival skipped: %s", _as_exc)
         except Exception as exc:
             logger.warning("Monte Carlo failed: %s", exc)
 
@@ -2876,6 +2936,37 @@ Non-interactive examples:
                     regime_vol_ratio=_conf_vol_ratio,
                 )
                 logger.info("Conformal prediction intervals computed")
+
+                # G1: Quantile Regression for asymmetric prediction intervals.
+                # Augments conformal intervals with regime-conditioned asymmetry
+                # (crisis = wider downside, bull = wider upside).
+                try:
+                    from operator1.models.conformal import QuantileRegressionCalibrator
+                    _qr_cal = QuantileRegressionCalibrator(lower_quantile=0.05, upper_quantile=0.95)
+                    _residuals_list = []
+                    if hasattr(forecast_result, "residuals") and forecast_result.residuals is not None:
+                        _residuals_list = list(forecast_result.residuals)
+                    if len(_residuals_list) >= _qr_cal._min_samples:
+                        _qr_fitted = _qr_cal.fit(_residuals_list)
+                        if _qr_fitted:
+                            logger.info("G1 Quantile Regression calibrator fitted (%d residuals)", len(_residuals_list))
+                            # Produce asymmetric intervals for each variable
+                            if conformal_result is not None and hasattr(conformal_result, "intervals"):
+                                _n_asym = 0
+                                for var, horizons_dict in conformal_result.intervals.items():
+                                    if isinstance(horizons_dict, dict):
+                                        for h, interval in horizons_dict.items():
+                                            pf = getattr(interval, "point_forecast", None)
+                                            if pf is not None:
+                                                _lo, _hi = _qr_cal.predict(float(pf))
+                                                if _lo is not None and _hi is not None:
+                                                    interval.lower = _lo
+                                                    interval.upper = _hi
+                                                    _n_asym += 1
+                                if _n_asym > 0:
+                                    logger.info("G1 asymmetric intervals applied to %d predictions", _n_asym)
+                except Exception as _qr_exc:
+                    logger.debug("G1 Quantile Regression skipped: %s", _qr_exc)
         except Exception as exc:
             logger.warning("Conformal prediction failed: %s", exc)
 
@@ -2923,6 +3014,8 @@ Non-interactive examples:
                 pred_result = run_prediction_aggregation(
                     cache, forecast_result, mc_result,
                     mode_weights=_mode_weights,
+                    signal_ic_result=signal_ic_result,
+                    prediction_log_summary=prediction_log_summary,
                     conformal_result=conformal_result,
                     dual_regime_result=dual_regime_result,
                     copula_result=copula_result,

@@ -2017,6 +2017,33 @@ def run_forecasting(
             }
             result.model_used["volatility_garch"] = "garch"
 
+        # A3: GARCH-MIDAS with macro-driven long-run volatility component.
+        # Try GARCH-MIDAS when macro features are available in cache.
+        # The long-run component lets macro deterioration influence vol
+        # forecasts BEFORE the crash happens.
+        try:
+            _macro_cols_for_midas = [
+                c for c in cache.columns
+                if c.startswith("macro_") and cache[c].dtype in ("float64", "float32")
+                and cache[c].notna().sum() > 20
+            ][:5]
+            if _macro_cols_for_midas:
+                _macro_df = cache[_macro_cols_for_midas].copy()
+                _midas_fcast, _midas_met = fit_garch_midas(
+                    returns, macro_features=_macro_df, n_forecast=max_horizon,
+                )
+                _midas_met.variable = "volatility_21d"
+                result.metrics.append(_midas_met)
+                if _midas_fcast is not None and not result.model_failed_garch:
+                    result.forecasts["volatility_garch_midas"] = {
+                        label: float(_midas_fcast[min(h - 1, len(_midas_fcast) - 1)])
+                        for label, h in HORIZONS.items()
+                    }
+                    result.model_used["volatility_garch_midas"] = "garch_midas"
+                    logger.info("A3 GARCH-MIDAS fitted with %d macro features", len(_macro_cols_for_midas))
+        except Exception as _midas_exc:
+            logger.debug("A3 GARCH-MIDAS skipped: %s", _midas_exc)
+
         # HAR-RV (Corsi 2009): Heterogeneous Autoregressive Realized Volatility.
         # Uses daily, weekly, and monthly RV as regressors. Captures long-memory
         # of volatility that single-regime GARCH misses. Often outperforms GARCH
