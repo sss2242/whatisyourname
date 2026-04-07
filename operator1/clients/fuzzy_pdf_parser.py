@@ -1101,6 +1101,8 @@ _SEGMENT_SKIP_LABELS = {
     "reconciliation", "head office", "holding company",
     "total revenue", "total segment revenue", "total consolidated",
     "particulars", "segment", "description", "category",
+    "group", "total group", "group and unallocated",
+    "group and unallocated items", "third-party products",
 }
 
 
@@ -1162,30 +1164,67 @@ def extract_segments_from_pdf(
 
             logger.debug("Segment pages found: %d (top score: %d)", len(seg_pages), seg_pages[0][1])
 
-            # Process top segment pages
-            for page_idx, _ in seg_pages[:5]:
-                page = doc.pages[page_idx]
-                tables = page.extract_tables()
+            # Target only top 10 highest-scoring pages (1-indexed for camelot)
+            target_pages = [p + 1 for p, _ in seg_pages[:10]]
 
-                for table in tables:
-                    if not table or len(table) < 3:
-                        continue
+            # --- Path 1: Camelot table extraction (highest accuracy) ---
+            # Uses the same targeted page approach as extract_financials_from_pdf
+            try:
+                import camelot
+                import tempfile
+                import os
 
-                    extracted = _extract_segments_from_table(table)
-                    if extracted and len(extracted) >= 2:
-                        # Prefer results with more segments
-                        if len(extracted) > len(segments):
-                            segments = extracted
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+                    f.write(pdf_bytes)
+                    tmp_path = f.name
 
-                # If no table extraction worked, try text-based
-                if not segments:
+                try:
+                    page_str = ",".join(str(p) for p in target_pages[:10])
+                    tables = camelot.read_pdf(tmp_path, pages=page_str, flavor="stream")
+                    logger.debug("Camelot segment tables: %d on pages %s", len(tables), page_str)
+
+                    for table in tables:
+                        if table.shape[0] < 3:
+                            continue
+                        extracted = _extract_segments_from_table(table.df.values.tolist())
+                        if extracted and len(extracted) >= 2:
+                            if len(extracted) > len(segments):
+                                segments = extracted
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+            except ImportError:
+                logger.debug("camelot-py not installed, using pdfplumber for segment tables")
+            except Exception as exc:
+                logger.debug("Camelot segment extraction failed: %s", exc)
+
+            # --- Path 2: pdfplumber table extraction (fallback) ---
+            if not segments:
+                for page_idx, _ in seg_pages[:10]:
+                    page = doc.pages[page_idx]
+                    tables = page.extract_tables()
+
+                    for table in tables:
+                        if not table or len(table) < 3:
+                            continue
+
+                        extracted = _extract_segments_from_table(table)
+                        if extracted and len(extracted) >= 2:
+                            if len(extracted) > len(segments):
+                                segments = extracted
+
+                    if len(segments) >= 2:
+                        break
+
+            # --- Path 3: Text-based extraction (final fallback) ---
+            if not segments:
+                for page_idx, _ in seg_pages[:10]:
+                    page = doc.pages[page_idx]
                     text = page.extract_text() or ""
                     extracted = _extract_segments_from_text(text)
                     if extracted and len(extracted) >= 2:
                         segments = extracted
-
-                if len(segments) >= 2:
-                    break
+                        break
 
     except Exception as exc:
         logger.debug("Fuzzy PDF segment extraction failed: %s", exc)
@@ -1205,29 +1244,38 @@ def _extract_segments_from_table(table: list[list]) -> dict[str, float]:
     """Extract segment name/revenue pairs from a table.
 
     Handles two common layouts:
-    1. Rows = segments, columns = periods (most common in annual reports)
+    1. Rows = segments, columns = metrics (most common in annual reports)
+       e.g. col 0 = segment name, col 1 = Revenue, col 2 = EBITDA, ...
     2. Rows = line items, columns = segments (some quarterly reports)
 
     Identifies the revenue column by header keywords and the best
     (most populated) numeric column for current-period values.
+
+    For BHP-style tables with "Total X" aggregation rows, collects
+    both individual sub-items and totals, then deduplicates by
+    preferring "Total {Segment}" entries.
     """
     if not table or len(table) < 3:
         return {}
 
+    # Find header rows (may span 2-3 rows in complex layouts)
+    header_text = ""
+    header_rows = 0
+    for row in table[:4]:
+        if not row:
+            continue
+        cells = [str(c).lower().strip() if c else "" for c in row]
+        if any(kw in " ".join(cells) for kw in ["revenue", "us$m", "ebitda", "ebit"]):
+            header_text += " " + " ".join(cells)
+            header_rows += 1
+
     header = table[0] if table[0] else []
     header_lower = [str(h).lower().strip() if h else "" for h in header]
 
-    # Check if this table has segment-like structure
-    has_revenue_keyword = any(
-        any(kw in h for kw in ["revenue", "sales", "turnover", "income"])
-        for h in header_lower
-    )
-
     # Detect if first column is segment names (rows = segments layout)
-    # by checking if most non-header cells in col 0 are text, not numbers
     text_count = 0
     num_count = 0
-    for row in table[1:]:
+    for row in table[max(1, header_rows):]:
         if not row or not row[0]:
             continue
         cell = str(row[0]).strip()
@@ -1244,7 +1292,7 @@ def _extract_segments_from_table(table: list[list]) -> dict[str, float]:
     # Find the best numeric column (most populated, excluding col 0)
     n_cols = max(len(r) for r in table if r)
     col_counts = [0] * n_cols
-    for row in table[1:]:
+    for row in table[max(1, header_rows):]:
         if not row:
             continue
         for ci in range(1, min(len(row), n_cols)):
@@ -1258,18 +1306,27 @@ def _extract_segments_from_table(table: list[list]) -> dict[str, float]:
 
     # Prefer columns with "revenue" in header, else use most populated
     best_col = -1
-    for ci, h in enumerate(header_lower):
-        if ci > 0 and any(kw in h for kw in ["revenue", "sales", "turnover", "total"]):
-            if col_counts[ci] >= 2:
-                best_col = ci
-                break
+    # Check across all potential header rows
+    for ri in range(min(4, len(table))):
+        if not table[ri]:
+            continue
+        for ci, cell in enumerate(table[ri]):
+            h = str(cell).lower().strip() if cell else ""
+            if ci > 0 and any(kw in h for kw in ["revenue", "sales", "turnover"]):
+                if col_counts[ci] >= 2 if ci < len(col_counts) else False:
+                    best_col = ci
+                    break
+        if best_col >= 0:
+            break
 
     if best_col < 0:
         best_col = max(range(1, len(col_counts)), key=lambda i: col_counts[i])
 
     # Extract segment name -> revenue from rows
     segments: dict[str, float] = {}
-    for row in table[1:]:
+    total_segments: dict[str, float] = {}
+
+    for row in table[max(1, header_rows):]:
         if not row or not row[0]:
             continue
 
@@ -1277,10 +1334,7 @@ def _extract_segments_from_table(table: list[list]) -> dict[str, float]:
         if not name or len(name) < 2:
             continue
 
-        # Skip totals, headers, and elimination rows
         name_lower = name.lower().strip()
-        if any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
-            continue
 
         # Skip rows that are just numbers
         if _parse_indian_number(name) is not None:
@@ -1300,55 +1354,165 @@ def _extract_segments_from_table(table: list[list]) -> dict[str, float]:
                         value = v
                         break
 
-        if value is not None and abs(value) >= 1.0:
-            # Clean segment name: remove trailing punctuation, normalize
-            clean_name = re.sub(r"[:\-\.\(\)]+$", "", name).strip()
-            if clean_name and len(clean_name) >= 2:
-                segments[clean_name] = value
+        if value is None or abs(value) < 1.0:
+            continue
+
+        # Clean segment name
+        clean_name = re.sub(r"[:\-\.\(\)]+$", "", name).strip()
+        # Remove footnote markers (e.g. "Pampa Norte6" -> "Pampa Norte")
+        clean_name = re.sub(r"\d+$", "", clean_name).strip()
+        if not clean_name or len(clean_name) < 2:
+            continue
+
+        # Classify: is this a "Total X" aggregate row?
+        if clean_name.lower().startswith("total "):
+            total_name = clean_name[6:].strip()  # strip "Total "
+            # Remove "from Group production" suffix
+            total_name = re.sub(
+                r"\s+from\s+Group\s+production\s*$", "",
+                total_name, flags=re.IGNORECASE,
+            ).strip()
+            # Skip grand totals (Total Group, Total Revenue, Total Consolidated)
+            if total_name.lower() in _SEGMENT_SKIP_LABELS:
+                continue
+            if total_name and len(total_name) >= 2:
+                # Keep higher value if duplicate base name
+                if total_name not in total_segments or value > total_segments[total_name]:
+                    total_segments[total_name] = value
+        elif not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+            segments[clean_name] = value
+
+    # Prefer total segments (aggregates) over individual sub-items
+    if total_segments and len(total_segments) >= 2:
+        return total_segments
 
     return segments
 
 
 def _extract_segments_from_text(text: str) -> dict[str, float]:
-    """Extract segment revenue from unstructured text (fallback).
+    """Extract segment revenue from text using multiple layout patterns.
 
-    Looks for patterns like:
-    - "Segment A revenue was $1.2 billion"
-    - "Segment A: 1,234 million"
-    - "Segment A ... 1,234"
+    Handles three common annual report text layouts:
+
+    1. **Simple two-column**: "Segment Name    1,234,567"
+    2. **Multi-column tabular** (BHP/mining style):
+       "Escondida 10,013 5,759 4,821 13,113 1,806"
+       where the FIRST number after the name is revenue.
+    3. **Total-line pattern**: "Total Copper 22,247 12,701 ..."
+       where "Total {Segment}" lines carry the aggregate segment revenue.
+    4. **Colon-separated**: "Segment Name: 1,234 million"
     """
     segments: dict[str, float] = {}
+    total_segments: dict[str, float] = {}
     lines = text.split("\n")
 
-    # Look for lines with segment-like structure: text followed by number
     for line in lines:
         line = line.strip()
         if not line or len(line) < 5:
             continue
 
         lower = line.lower()
-        # Skip totals and headers
-        if any(skip in lower for skip in _SEGMENT_SKIP_LABELS):
-            continue
         # Skip lines without numbers
         if not re.search(r"\d", line):
             continue
 
-        # Try to split into label + value
-        # Pattern: "Segment Name    1,234,567" or "Segment Name: 1,234"
-        match = re.match(
+        # --- Pattern 3: "Total {Segment} {numbers}" (highest priority) ---
+        # These are aggregate segment totals like "Total Copper 22,247 12,701"
+        total_match = re.match(
+            r"^Total\s+([A-Za-z][\w\s&/\-\.]+?)\s+"
+            r"([\(\-]?[\d,]+\.?\d*\)?)"
+            r"(?:\s+[\(\-]?[\d,]+\.?\d*\)?)*\s*$",
+            line,
+        )
+        if total_match:
+            name = total_match.group(1).strip()
+            val_str = total_match.group(2).strip()
+            value = _parse_indian_number(val_str)
+            if value is not None and abs(value) >= 1.0 and len(name) >= 2:
+                name_lower = name.lower()
+                # Skip generic totals but keep segment totals
+                if name_lower not in {"revenue", "segment", "group", "consolidated"}:
+                    total_segments[name] = value
+            continue
+
+        # Skip other totals and headers
+        if any(skip in lower for skip in _SEGMENT_SKIP_LABELS):
+            continue
+
+        # --- Pattern 2: Multi-column tabular ---
+        # "SegmentName 10,013 5,759 4,821 13,113 1,806"
+        # The first number is typically revenue (leftmost column)
+        multi_col_match = re.match(
+            r"^([A-Za-z][\w\s&/\-\.]+?)\s+"
+            r"([\(\-]?[\d,]+\.?\d*\)?)"
+            r"(?:\s+[\(\-]?[\d,]+\.?\d*\)?){2,}\s*$",
+            line,
+        )
+        if multi_col_match:
+            name = multi_col_match.group(1).strip()
+            val_str = multi_col_match.group(2).strip()
+            value = _parse_indian_number(val_str)
+            if value is not None and abs(value) >= 1.0 and len(name) >= 2:
+                name_lower = name.lower()
+                if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+                    # Skip if name is too short (likely a sub-item like "Other")
+                    if len(name) >= 3:
+                        segments[name] = value
+            continue
+
+        # --- Pattern 1: Simple two-column ---
+        # "Segment Name    1,234,567"
+        simple_match = re.match(
             r"^([A-Za-z][\w\s&/\-\.]+?)\s{2,}([\(\-]?[\d,]+\.?\d*\)?)\s*$",
             line,
         )
-        if match:
-            name = match.group(1).strip()
-            val_str = match.group(2).strip()
+        if simple_match:
+            name = simple_match.group(1).strip()
+            val_str = simple_match.group(2).strip()
             value = _parse_indian_number(val_str)
-
             if value is not None and abs(value) >= 1.0 and len(name) >= 2:
                 name_lower = name.lower()
                 if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
                     segments[name] = value
+            continue
+
+        # --- Pattern 4: Colon-separated ---
+        # "Segment Name: 1,234"
+        colon_match = re.match(
+            r"^([A-Za-z][\w\s&/\-\.]+?):\s*([\(\-]?[\d,]+\.?\d*\)?)",
+            line,
+        )
+        if colon_match:
+            name = colon_match.group(1).strip()
+            val_str = colon_match.group(2).strip()
+            value = _parse_indian_number(val_str)
+            if value is not None and abs(value) >= 1.0 and len(name) >= 2:
+                name_lower = name.lower()
+                if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+                    segments[name] = value
+
+    # Prefer "Total {Segment}" entries over individual sub-items when available.
+    # Total segments are aggregates (e.g. "Total Copper" = sum of Escondida +
+    # Pampa Norte + Antamina + Copper SA), which is what product_segments.py needs.
+    if total_segments and len(total_segments) >= 2:
+        # Deduplicate: when both "Total X" and "Total X from Group production"
+        # exist, keep only the shorter name (the inclusive total).
+        # BHP reports both: "Total Copper from Group production" (excl. EAI)
+        # and "Total Copper" (incl. equity accounted investments).
+        deduped: dict[str, float] = {}
+        for name, value in total_segments.items():
+            # Extract base segment name (strip "from Group production" suffix)
+            base = re.sub(r"\s+from\s+Group\s+production\s*$", "", name, flags=re.IGNORECASE).strip()
+            # Keep the entry with the SHORTER name (inclusive total)
+            # or if same base name, keep the one with higher revenue
+            if base in deduped:
+                if len(name) < len(next(k for k, v in total_segments.items() if re.sub(r"\s+from\s+Group\s+production\s*$", "", k, flags=re.IGNORECASE).strip() == base)):
+                    deduped[base] = value
+                elif value > deduped[base]:
+                    deduped[base] = value
+            else:
+                deduped[base] = value
+        return deduped
 
     return segments
 
