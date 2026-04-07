@@ -360,10 +360,15 @@ _ASX_SHAREHOLDING_TYPES = {
 class ASXFilingDiscoverer:
     """Discovers financial filing announcements from ASX via MarkitDigital API.
 
-    The MarkitDigital API returns announcement metadata including document
-    keys. Document download URL patterns are still under investigation;
-    this discoverer provides announcement discovery which can be used to
-    identify filing dates even when the PDF is not directly downloadable.
+    Uses ``/markets/announcements?xids[]=<xid>`` (market-wide feed with
+    company filter) instead of ``/companies/{ticker}/announcements``
+    (hard-capped at 5 items).  The ``xids[]`` parameter was discovered
+    via community project niallCDS/ASX-Announcements-Discord-Bot.
+
+    The ``xid`` is obtained from ``/search/predictive?searchText={ticker}``
+    or ``/companies/{ticker}/header``.
+
+    PDF download uses the CDN endpoint with a public access token.
     """
 
     # Shareholding headline keywords
@@ -373,6 +378,46 @@ class ASXFilingDiscoverer:
         "appendix 3y", "director interest", "change of director",
     ]
 
+    def _resolve_xid(self, ticker: str) -> str:
+        """Resolve ticker to MarkitDigital xid for announcement filtering.
+
+        Tries search/predictive first (returns xid directly), then
+        falls back to header endpoint.
+        """
+        # Path 1: search/predictive (returns xid in response)
+        try:
+            resp = requests.get(
+                f"{_ASX_MARKIT_BASE}/search/predictive",
+                params={"searchText": ticker},
+                headers=_ASX_HEADERS,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                items = resp.json().get("data", {}).get("items", [])
+                for item in items:
+                    if item.get("symbol", "").upper() == ticker.upper():
+                        xid = str(item.get("xid", ""))
+                        if xid:
+                            return xid
+        except Exception:
+            pass
+
+        # Path 2: company header
+        try:
+            resp = requests.get(
+                f"{_ASX_MARKIT_BASE}/companies/{ticker}/header",
+                headers=_ASX_HEADERS,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                xid = str(resp.json().get("data", {}).get("xid", ""))
+                if xid:
+                    return xid
+        except Exception:
+            pass
+
+        return ""
+
     def discover_filings(
         self,
         ticker: str,
@@ -380,6 +425,11 @@ class ASXFilingDiscoverer:
         categories: list[str] | None = None,
     ) -> FilingDiscovery:
         """Discover financial and/or shareholding announcements from ASX.
+
+        Uses ``/markets/announcements?xids[]=<xid>`` with pagination
+        (``itemsPerPage`` + ``page``) to retrieve the full announcement
+        history for a company.  This replaces the broken per-company
+        endpoint which is hard-capped at 5 items.
 
         Parameters
         ----------
@@ -396,20 +446,44 @@ class ASXFilingDiscoverer:
 
         result = FilingDiscovery(ticker=ticker, market_id="au_asx")
 
-        try:
-            resp = requests.get(
-                f"{_ASX_MARKIT_BASE}/companies/{ticker}/announcements",
-                params={"count": 100, "market_sensitive": "false"},
-                headers=_ASX_HEADERS,
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:
-            result.errors.append(f"ASX MarkitDigital API failed: {exc}")
+        # Resolve ticker to xid for the market-wide announcements filter
+        xid = self._resolve_xid(ticker)
+        if not xid:
+            result.errors.append(f"Could not resolve xid for {ticker}")
             return result
 
-        items = data.get("data", {}).get("items", [])
+        # Fetch announcements via /markets/announcements?xids[]=<xid>
+        # This endpoint supports pagination (itemsPerPage + page) and
+        # returns the full announcement history, unlike the per-company
+        # endpoint which is hard-capped at 5 items.
+        items: list[dict] = []
+        try:
+            for page in range(5):  # Up to 1000 announcements (5 x 200)
+                resp = requests.get(
+                    f"{_ASX_MARKIT_BASE}/markets/announcements",
+                    params={
+                        "xids[]": xid,
+                        "itemsPerPage": "200",
+                        "page": str(page),
+                    },
+                    headers=_ASX_HEADERS,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                page_items = resp.json().get("data", {}).get("items", [])
+                if not page_items:
+                    break
+                items.extend(page_items)
+                # Stop if we've gone past the lookback window
+                last_date = page_items[-1].get("date", "")[:10]
+                cutoff_str = (date.today() - timedelta(days=365 * years)).isoformat()
+                if last_date and last_date < cutoff_str:
+                    break
+        except Exception as exc:
+            result.errors.append(f"ASX MarkitDigital API failed: {exc}")
+            if not items:
+                return result
+
         if not items:
             result.errors.append("No announcements found")
             return result
