@@ -1036,6 +1036,323 @@ _HOLDER_ROW_INDICATORS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Product segment revenue extraction from PDFs
+# ---------------------------------------------------------------------------
+
+# Keywords that identify pages containing segment revenue data
+_SEGMENT_KEYWORDS = [
+    "segment information", "operating segments", "reportable segments",
+    "business segments", "segment revenue", "segment reporting",
+    "revenue by segment", "segment-wise revenue", "business segment revenue",
+    "products and services", "geographic revenue", "revenue by geography",
+    "revenue by product", "revenue disaggregation", "disaggregation of revenue",
+    "segment results", "segment performance", "divisional performance",
+    "revenue by business", "revenue by division", "revenue breakdown",
+    "ind as 108", "ifrs 8", "asc 280", "operating segment information",
+]
+
+# Per-market segment keywords
+_SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
+    "in_bse": [
+        "segment reporting as per ind as 108", "segment wise revenue",
+        "segment wise results", "business segment", "geographical segment",
+        "segment assets and liabilities",
+    ],
+    "au_asx": [
+        "operating segment information", "segment revenues",
+        "revenue from external customers by segment",
+    ],
+    "ca_sedar": [
+        "segment disclosures", "operating segments",
+        "revenue by operating segment", "segmented information",
+    ],
+    "sg_sgx": [
+        "segment information", "business segment",
+        "revenue by segment", "operating segments",
+    ],
+    "za_jse": [
+        "segment report", "segmental analysis",
+        "revenue per segment", "operating segments",
+    ],
+    "ae_dfm": [
+        "segment information", "operating segments",
+        "revenue by segment",
+    ],
+    "hk_hkex": [
+        "segment information", "business segments",
+        "revenue by segment", "分部资料", "业务分部",
+    ],
+    "sa_tadawul": [
+        "segment information", "operating segments",
+        "revenue by segment", "معلومات القطاعات",
+    ],
+    "mx_bmv": [
+        "información por segmentos", "segmentos operativos",
+        "ingresos por segmento",
+    ],
+}
+
+# Labels that indicate a row is a segment total or header (not an individual segment)
+_SEGMENT_SKIP_LABELS = {
+    "total", "grand total", "sub-total", "subtotal", "consolidated",
+    "elimination", "eliminations", "inter-segment", "intersegment",
+    "unallocated", "corporate", "others", "other", "adjustments",
+    "reconciliation", "head office", "holding company",
+    "total revenue", "total segment revenue", "total consolidated",
+    "particulars", "segment", "description", "category",
+}
+
+
+def extract_segments_from_pdf(
+    pdf_bytes: bytes,
+    filing_date: str = "",
+    report_date: str = "",
+    market_id: str = "",
+) -> dict[str, float]:
+    """Extract product/business segment revenue from a PDF.
+
+    Finds pages with segment reporting tables and extracts segment
+    names with their revenue values. Designed for IFRS 8, Ind AS 108,
+    ASC 280 segment disclosures in annual and quarterly reports.
+
+    Parameters
+    ----------
+    pdf_bytes:
+        Raw PDF file content.
+    filing_date:
+        ISO date string of when the filing was published.
+    report_date:
+        ISO date string of the fiscal period end date.
+    market_id:
+        Market identifier for market-specific keyword hints.
+
+    Returns
+    -------
+    Dict of {segment_name: revenue_value}. Empty dict if no segments found.
+    At least 2 segments required for a valid result.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.debug("pdfplumber not installed, cannot extract segments from PDF")
+        return {}
+
+    # Build keyword list: base + market-specific
+    keywords = list(_SEGMENT_KEYWORDS)
+    market_kw = _SEGMENT_KEYWORDS_BY_MARKET.get(market_id, [])
+    if market_kw:
+        keywords = market_kw + keywords
+
+    segments: dict[str, float] = {}
+
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+            # Score pages for segment content
+            seg_pages: list[tuple[int, int]] = []
+            for i, page in enumerate(doc.pages):
+                text = (page.extract_text() or "").lower()
+                score = sum(1 for kw in keywords if kw in text)
+                if score >= 1:
+                    seg_pages.append((i, score))
+
+            seg_pages.sort(key=lambda x: -x[1])
+            if not seg_pages:
+                return {}
+
+            logger.debug("Segment pages found: %d (top score: %d)", len(seg_pages), seg_pages[0][1])
+
+            # Process top segment pages
+            for page_idx, _ in seg_pages[:5]:
+                page = doc.pages[page_idx]
+                tables = page.extract_tables()
+
+                for table in tables:
+                    if not table or len(table) < 3:
+                        continue
+
+                    extracted = _extract_segments_from_table(table)
+                    if extracted and len(extracted) >= 2:
+                        # Prefer results with more segments
+                        if len(extracted) > len(segments):
+                            segments = extracted
+
+                # If no table extraction worked, try text-based
+                if not segments:
+                    text = page.extract_text() or ""
+                    extracted = _extract_segments_from_text(text)
+                    if extracted and len(extracted) >= 2:
+                        segments = extracted
+
+                if len(segments) >= 2:
+                    break
+
+    except Exception as exc:
+        logger.debug("Fuzzy PDF segment extraction failed: %s", exc)
+
+    if len(segments) >= 2:
+        logger.info(
+            "Fuzzy PDF segment extraction: %d segments from %d pages (%s)",
+            len(segments), len(seg_pages), market_id or "unknown",
+        )
+    else:
+        segments = {}
+
+    return segments
+
+
+def _extract_segments_from_table(table: list[list]) -> dict[str, float]:
+    """Extract segment name/revenue pairs from a table.
+
+    Handles two common layouts:
+    1. Rows = segments, columns = periods (most common in annual reports)
+    2. Rows = line items, columns = segments (some quarterly reports)
+
+    Identifies the revenue column by header keywords and the best
+    (most populated) numeric column for current-period values.
+    """
+    if not table or len(table) < 3:
+        return {}
+
+    header = table[0] if table[0] else []
+    header_lower = [str(h).lower().strip() if h else "" for h in header]
+
+    # Check if this table has segment-like structure
+    has_revenue_keyword = any(
+        any(kw in h for kw in ["revenue", "sales", "turnover", "income"])
+        for h in header_lower
+    )
+
+    # Detect if first column is segment names (rows = segments layout)
+    # by checking if most non-header cells in col 0 are text, not numbers
+    text_count = 0
+    num_count = 0
+    for row in table[1:]:
+        if not row or not row[0]:
+            continue
+        cell = str(row[0]).strip()
+        if _parse_indian_number(cell) is not None:
+            num_count += 1
+        elif len(cell) > 2:
+            text_count += 1
+
+    rows_are_segments = text_count > num_count and text_count >= 2
+
+    if not rows_are_segments:
+        return {}
+
+    # Find the best numeric column (most populated, excluding col 0)
+    n_cols = max(len(r) for r in table if r)
+    col_counts = [0] * n_cols
+    for row in table[1:]:
+        if not row:
+            continue
+        for ci in range(1, min(len(row), n_cols)):
+            if row[ci] is not None:
+                val = _parse_indian_number(str(row[ci]).strip())
+                if val is not None and abs(val) >= 1.0:
+                    col_counts[ci] += 1
+
+    if sum(col_counts[1:]) == 0:
+        return {}
+
+    # Prefer columns with "revenue" in header, else use most populated
+    best_col = -1
+    for ci, h in enumerate(header_lower):
+        if ci > 0 and any(kw in h for kw in ["revenue", "sales", "turnover", "total"]):
+            if col_counts[ci] >= 2:
+                best_col = ci
+                break
+
+    if best_col < 0:
+        best_col = max(range(1, len(col_counts)), key=lambda i: col_counts[i])
+
+    # Extract segment name -> revenue from rows
+    segments: dict[str, float] = {}
+    for row in table[1:]:
+        if not row or not row[0]:
+            continue
+
+        name = str(row[0]).strip()
+        if not name or len(name) < 2:
+            continue
+
+        # Skip totals, headers, and elimination rows
+        name_lower = name.lower().strip()
+        if any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+            continue
+
+        # Skip rows that are just numbers
+        if _parse_indian_number(name) is not None:
+            continue
+
+        # Get revenue value from best column
+        value = None
+        if best_col < len(row) and row[best_col] is not None:
+            value = _parse_indian_number(str(row[best_col]).strip())
+
+        # Fallback: try adjacent columns
+        if value is None:
+            for ci in range(1, min(len(row), n_cols)):
+                if ci != best_col and row[ci] is not None:
+                    v = _parse_indian_number(str(row[ci]).strip())
+                    if v is not None and abs(v) >= 1.0:
+                        value = v
+                        break
+
+        if value is not None and abs(value) >= 1.0:
+            # Clean segment name: remove trailing punctuation, normalize
+            clean_name = re.sub(r"[:\-\.\(\)]+$", "", name).strip()
+            if clean_name and len(clean_name) >= 2:
+                segments[clean_name] = value
+
+    return segments
+
+
+def _extract_segments_from_text(text: str) -> dict[str, float]:
+    """Extract segment revenue from unstructured text (fallback).
+
+    Looks for patterns like:
+    - "Segment A revenue was $1.2 billion"
+    - "Segment A: 1,234 million"
+    - "Segment A ... 1,234"
+    """
+    segments: dict[str, float] = {}
+    lines = text.split("\n")
+
+    # Look for lines with segment-like structure: text followed by number
+    for line in lines:
+        line = line.strip()
+        if not line or len(line) < 5:
+            continue
+
+        lower = line.lower()
+        # Skip totals and headers
+        if any(skip in lower for skip in _SEGMENT_SKIP_LABELS):
+            continue
+        # Skip lines without numbers
+        if not re.search(r"\d", line):
+            continue
+
+        # Try to split into label + value
+        # Pattern: "Segment Name    1,234,567" or "Segment Name: 1,234"
+        match = re.match(
+            r"^([A-Za-z][\w\s&/\-\.]+?)\s{2,}([\(\-]?[\d,]+\.?\d*\)?)\s*$",
+            line,
+        )
+        if match:
+            name = match.group(1).strip()
+            val_str = match.group(2).strip()
+            value = _parse_indian_number(val_str)
+
+            if value is not None and abs(value) >= 1.0 and len(name) >= 2:
+                name_lower = name.lower()
+                if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+                    segments[name] = value
+
+    return segments
+
+
 def extract_shareholders_from_pdf(
     pdf_bytes: bytes,
     filing_date: str = "",

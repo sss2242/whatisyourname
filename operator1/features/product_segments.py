@@ -79,7 +79,7 @@ def fetch_product_segments(
     pit_client: Any = None,
     secrets: dict | None = None,
 ) -> dict[str, Any]:
-    """Fetch product segment revenue via 3-source waterfall.
+    """Fetch product segment revenue via 4-source waterfall.
 
     Returns dict with 'source' and 'segments' keys.
     'segments' is a dict of {segment_name: pd.Series} with quarterly revenue.
@@ -111,6 +111,16 @@ def fetch_product_segments(
                 return {"source": "llm", "segments": segments}
         except Exception as exc:
             logger.debug("LLM segment extraction failed: %s", exc)
+
+    # Source 4: Fuzzy PDF extraction from filing discovery (no LLM needed)
+    # Covers Tier 2 markets (AU, CA, SG, ZA, AE, IN, HK, SA, MX) where
+    # the filing discovery framework can download annual report PDFs.
+    try:
+        segments = _try_pdf_segment_extraction(ticker, market_id)
+        if segments and len(segments) >= 2:
+            return {"source": "pdf", "segments": segments}
+    except Exception as exc:
+        logger.debug("PDF segment extraction failed: %s", exc)
 
     return {"source": "none", "segments": {}}
 
@@ -218,6 +228,77 @@ def _try_llm_segment_extraction(
                 }
     except Exception as exc:
         logger.debug("LLM segment extraction error: %s", exc)
+    return {}
+
+
+def _try_pdf_segment_extraction(
+    ticker: str,
+    market_id: str,
+) -> dict[str, pd.Series]:
+    """Extract segment revenue from annual report PDFs via fuzzy PDF parser.
+
+    Uses the filing discovery framework to download annual report PDFs,
+    then applies the fuzzy_pdf_parser's segment extraction (no LLM needed).
+    This covers Tier 2 markets (AU, CA, SG, ZA, AE, IN, HK, SA, MX)
+    where structured XBRL segment data is unavailable.
+    """
+    try:
+        from operator1.clients.filing_discoverer import get_discoverer
+        from operator1.clients.fuzzy_pdf_parser import extract_segments_from_pdf
+    except ImportError:
+        logger.debug("Filing discoverer or fuzzy_pdf_parser not available")
+        return {}
+
+    discoverer = get_discoverer(market_id)
+    if discoverer is None:
+        return {}
+
+    try:
+        # Discover filings (annual reports preferred for segment data)
+        discovery = discoverer.discover_filings(ticker, years=2)
+        if not discovery or not discovery.filings:
+            return {}
+
+        # Filter for annual reports first, then any filing
+        annual_filings = [
+            f for f in discovery.filings
+            if f.filing_type in ("annual", "annual_report", "10-K", "20-F")
+        ]
+        target_filings = annual_filings if annual_filings else discovery.filings[:3]
+
+        for filing in target_filings[:3]:
+            try:
+                pdf_bytes = discoverer.download_filing(filing)
+                if not pdf_bytes or len(pdf_bytes) < 1000:
+                    continue
+
+                # Validate PDF magic bytes
+                if not pdf_bytes[:4] == b"%PDF":
+                    continue
+
+                raw_segments = extract_segments_from_pdf(
+                    pdf_bytes,
+                    filing_date=getattr(filing, "filing_date", "") or "",
+                    report_date=getattr(filing, "report_date", "") or "",
+                    market_id=market_id,
+                )
+
+                if raw_segments and len(raw_segments) >= 2:
+                    # Convert to pd.Series format expected by the pipeline
+                    report_date = getattr(filing, "report_date", None)
+                    ts = pd.Timestamp(str(report_date)) if report_date else pd.Timestamp.now().normalize()
+
+                    return {
+                        name: pd.Series({ts: revenue})
+                        for name, revenue in raw_segments.items()
+                    }
+            except Exception as exc:
+                logger.debug("PDF segment extraction for filing failed: %s", exc)
+                continue
+
+    except Exception as exc:
+        logger.debug("PDF segment discovery failed: %s", exc)
+
     return {}
 
 
