@@ -1493,7 +1493,7 @@ def _extract_segments_from_text(text: str) -> dict[str, float]:
 
     # Prefer "Total {Segment}" entries over individual sub-items when available.
     # Total segments are aggregates (e.g. "Total Copper" = sum of Escondida +
-    # Pampa Norte + Antamina + Copper SA), which is what product_segments.py needs.
+    # Pampa Norte + Antamina + Copper SA), which is what downstream consumers need.
     if total_segments and len(total_segments) >= 2:
         # Deduplicate: when both "Total X" and "Total X from Group production"
         # exist, keep only the shorter name (the inclusive total).
@@ -1515,6 +1515,310 @@ def _extract_segments_from_text(text: str) -> dict[str, float]:
         return deduped
 
     return segments
+
+
+# ---------------------------------------------------------------------------
+# Product description extraction from segment notes (Ind AS 108 / IFRS 8)
+# ---------------------------------------------------------------------------
+
+# Keywords that identify pages with segment description notes
+_PRODUCT_DESC_KEYWORDS = [
+    "ind as 108", "ifrs 8", "asc 280",
+    "operating segments", "segment information",
+    "notes to segment information",
+    "reportable segments", "basis of segmentation",
+    "the company has reported",
+    "segment includes", "segment comprises",
+    "products and services", "nature of products",
+    "principal activities", "description of segments",
+]
+
+_PRODUCT_DESC_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
+    "in_bse": [
+        "notes to segment information",
+        "as per indian accounting standard 108",
+        "segment reporting as per ind as 108",
+        "the company has reported segment information",
+    ],
+    "au_asx": [
+        "operating segment information", "nature of segments",
+        "identification of reportable operating segments",
+    ],
+    "hk_hkex": [
+        "segment information", "分部资料", "业务分部",
+        "reportable and operating segments",
+    ],
+    "sa_tadawul": [
+        "segment information", "operating segments",
+        "description of segments", "معلومات القطاعات",
+    ],
+}
+
+
+def extract_product_descriptions_from_pdf(
+    pdf_bytes: bytes,
+    filing_date: str = "",
+    report_date: str = "",
+    market_id: str = "",
+) -> dict[str, str]:
+    """Extract product/business segment descriptions from a PDF.
+
+    Finds pages with Ind AS 108 / IFRS 8 / ASC 280 segment notes and
+    extracts the text describing what each segment does -- its products,
+    services, and principal activities.
+
+    Indian quarterly/annual filings typically have a "Notes to Segment
+    Information" section listing each segment with a paragraph describing
+    the segment's scope (e.g. "The Oil to Chemicals segment includes
+    refining, petrochemicals, fuel retailing...").
+
+    Parameters
+    ----------
+    pdf_bytes:
+        Raw PDF file content.
+    filing_date:
+        ISO date string of when the filing was published.
+    report_date:
+        ISO date string of the fiscal period end date.
+    market_id:
+        Market identifier for market-specific keyword hints.
+
+    Returns
+    -------
+    Dict of {segment_name: description_text}. Empty dict if no
+    product descriptions found.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.debug("pdfplumber not installed, cannot extract product descriptions")
+        return {}
+
+    # Build keyword list
+    keywords = list(_PRODUCT_DESC_KEYWORDS)
+    market_kw = _PRODUCT_DESC_KEYWORDS_BY_MARKET.get(market_id, [])
+    if market_kw:
+        keywords = market_kw + keywords
+
+    descriptions: dict[str, str] = {}
+
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+            # Score pages for segment description content
+            desc_pages: list[tuple[int, int]] = []
+            for i, page in enumerate(doc.pages):
+                text = (page.extract_text() or "").lower()
+                score = sum(1 for kw in keywords if kw in text)
+                # Boost pages that have segment description patterns
+                if "segment includes" in text or "segment comprises" in text:
+                    score += 3
+                if "principal activities" in text or "nature of products" in text:
+                    score += 2
+                if score >= 2:
+                    desc_pages.append((i, score))
+
+            desc_pages.sort(key=lambda x: -x[1])
+            if not desc_pages:
+                return {}
+
+            logger.debug(
+                "Product description pages found: %d (top score: %d)",
+                len(desc_pages), desc_pages[0][1],
+            )
+
+            # Extract segment descriptions from top-scoring pages
+            for page_idx, _ in desc_pages[:5]:
+                page = doc.pages[page_idx]
+                text = page.extract_text() or ""
+
+                extracted = _parse_segment_descriptions(text)
+                if extracted and len(extracted) >= 2:
+                    descriptions = extracted
+                    break
+
+                # If no structured descriptions, try to extract from
+                # less structured paragraph text
+                if not descriptions:
+                    extracted = _parse_segment_paragraphs(text)
+                    if extracted and len(extracted) >= 2:
+                        descriptions = extracted
+                        break
+
+    except Exception as exc:
+        logger.debug("Fuzzy PDF product description extraction failed: %s", exc)
+
+    if descriptions:
+        logger.info(
+            "Fuzzy PDF product descriptions: %d segments from %s",
+            len(descriptions), market_id or "unknown",
+        )
+
+    return descriptions
+
+
+def _parse_segment_descriptions(text: str) -> dict[str, str]:
+    """Parse Ind AS 108 / IFRS 8 lettered segment descriptions.
+
+    Handles the common format found in Indian and IFRS filings::
+
+        a) The Oil to Chemicals segment includes refining, petrochemicals...
+        b) The Oil and Gas segment includes exploration, development...
+        c) The Retail segment includes consumer retail and range of...
+        d) The Digital Services segment includes provision of...
+
+    Also handles numbered variants (1., 2., i., ii.) and bullet points.
+    """
+    descriptions: dict[str, str] = {}
+
+    # Pattern: lettered or numbered items with "segment" keyword
+    # Matches: a) The X segment includes/comprises/consists of...
+    #          (i) The X segment ...
+    #          1. X segment ...
+    item_pattern = re.compile(
+        r"(?:^|\n)\s*"
+        r"(?:[a-z]\)|[a-z]\.|\([a-z]\)|\([ivx]+\)|\d+[\.\)])\s*"
+        r"(?:The\s+)?"
+        r"(.+?)(?:\s+segment\b|\s+business\b)"
+        r"\s+(?:includes?|comprises?|consists?\s+of|covers?|provides?|involves?)"
+        r"\s+(.+?)(?=\n\s*(?:[a-z]\)|[a-z]\.|\([a-z]\)|\([ivx]+\)|\d+[\.\)])\s|\Z)",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    for match in item_pattern.finditer(text):
+        segment_name = match.group(1).strip().rstrip(",.:;")
+        description = match.group(2).strip()
+
+        # Clean up the description: remove trailing page footers, addresses
+        description = re.split(
+            r"(?:Registered\s+Offic|Corporate\s+Communications|Telephone|"
+            r"Page\s+\d+|CIN\s+L|www\.)",
+            description,
+            maxsplit=1,
+        )[0].strip().rstrip(".,;")
+
+        if len(segment_name) >= 2 and len(description) >= 10:
+            descriptions[segment_name] = description
+
+    return descriptions
+
+
+def _parse_segment_paragraphs(text: str) -> dict[str, str]:
+    """Fallback parser for less structured segment descriptions.
+
+    Looks for patterns like:
+      - "Oil to Chemicals: includes refining..."
+      - "Retail - consumer retail and related services"
+      - "Digital Services segment provides a range of..."
+    """
+    descriptions: dict[str, str] = {}
+
+    # Pattern: "Name segment/business" followed by description text
+    para_pattern = re.compile(
+        r"(?:^|\n)\s*"
+        r"(?:The\s+)?"
+        r"([A-Z][A-Za-z\s&/,]+?)"
+        r"\s*(?:segment|business|division)\s*"
+        r"(?:[-:]\s*|\s+)"
+        r"(?:includes?|comprises?|provides?|covers?|involves?|is\s+engaged\s+in)"
+        r"\s+(.+?)(?:\.\s|\n\n|\Z)",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    for match in para_pattern.finditer(text):
+        name = match.group(1).strip().rstrip(",.:;- ")
+        desc = match.group(2).strip()
+
+        # Clean name: remove leading "The" and trailing whitespace
+        name = re.sub(r"^\s*The\s+", "", name, flags=re.IGNORECASE).strip()
+
+        # Clean description: trim at common footer patterns
+        desc = re.split(
+            r"(?:Registered\s+Offic|Corporate\s+Comm|Telephone|Page\s+\d+|CIN\s+L)",
+            desc,
+            maxsplit=1,
+        )[0].strip().rstrip(".,;")
+
+        if len(name) >= 2 and len(name) <= 80 and len(desc) >= 10:
+            descriptions[name] = desc
+
+    return descriptions
+
+
+def extract_product_data_from_pdf(
+    pdf_bytes: bytes,
+    filing_date: str = "",
+    report_date: str = "",
+    market_id: str = "",
+) -> dict[str, Any]:
+    """Extract complete product data from a PDF: segment revenue + descriptions.
+
+    Combines segment revenue extraction (from ``extract_segments_from_pdf``)
+    with product description extraction (from ``extract_product_descriptions_from_pdf``)
+    into a single result suitable for downstream analysis.
+
+    Parameters
+    ----------
+    pdf_bytes:
+        Raw PDF file content.
+    filing_date:
+        ISO date string of when the filing was published.
+    report_date:
+        ISO date string of the fiscal period end date.
+    market_id:
+        Market identifier for market-specific keyword hints.
+
+    Returns
+    -------
+    Dict with keys:
+        - ``segments``: {segment_name: revenue_value} from revenue tables
+        - ``descriptions``: {segment_name: description_text} from notes
+        - ``has_revenue``: bool
+        - ``has_descriptions``: bool
+        - ``n_segments``: int
+    """
+    segments = extract_segments_from_pdf(
+        pdf_bytes, filing_date=filing_date,
+        report_date=report_date, market_id=market_id,
+    )
+    descriptions = extract_product_descriptions_from_pdf(
+        pdf_bytes, filing_date=filing_date,
+        report_date=report_date, market_id=market_id,
+    )
+
+    # Try to align description keys with segment keys via fuzzy matching
+    if segments and descriptions:
+        aligned_desc: dict[str, str] = {}
+        for seg_name in segments:
+            seg_lower = seg_name.lower().strip()
+            best_match = ""
+            best_score = 0
+            for desc_name, desc_text in descriptions.items():
+                desc_lower = desc_name.lower().strip()
+                # Simple substring containment score
+                if seg_lower in desc_lower or desc_lower in seg_lower:
+                    score = 100
+                else:
+                    # Word overlap score
+                    seg_words = set(seg_lower.split())
+                    desc_words = set(desc_lower.split())
+                    overlap = len(seg_words & desc_words)
+                    score = overlap * 30
+                if score > best_score:
+                    best_score = score
+                    best_match = desc_text
+            if best_score >= 30 and best_match:
+                aligned_desc[seg_name] = best_match
+
+        if aligned_desc:
+            descriptions = aligned_desc
+
+    return {
+        "segments": segments,
+        "descriptions": descriptions,
+        "has_revenue": len(segments) >= 2,
+        "has_descriptions": len(descriptions) >= 1,
+        "n_segments": max(len(segments), len(descriptions)),
+    }
 
 
 def extract_shareholders_from_pdf(
