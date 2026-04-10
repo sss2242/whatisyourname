@@ -1989,15 +1989,21 @@ def extract_product_descriptions_from_pdf(
                 len(desc_pages), desc_pages[0][1],
             )
 
-            # SGX-specific: parse segment descriptions from Note 44 heading format
+            # SGX-specific: parse segment descriptions from Note 44 page ONLY.
+            # Restrict to pages containing "business segment reporting" or
+            # "44.1" to avoid picking up segment name mentions from
+            # unrelated sections (CEO letter, CIO statement, etc.)
             if market_id == "sg_sgx":
-                combined_text = ""
-                for page_idx, _ in desc_pages[:8]:
-                    page = doc.pages[page_idx]
-                    combined_text += (page.extract_text() or "") + "\n"
-                extracted = _parse_sgx_segment_descriptions(combined_text)
-                if extracted and len(extracted) >= 2:
-                    descriptions = extracted
+                for page_obj in doc.pages:
+                    page_text = page_obj.extract_text() or ""
+                    page_lower = page_text.lower()
+                    if ("business segment reporting" in page_lower
+                            or "44.1" in page_lower
+                            or ("segment reporting" in page_lower and "business segment" in page_lower)):
+                        extracted = _parse_sgx_segment_descriptions(page_text)
+                        if extracted and len(extracted) >= 2:
+                            descriptions = extracted
+                            break
 
             # HKEX-specific: aggregate "– Revenues from {Segment}" across multiple pages
             if market_id == "hk_hkex":
@@ -2216,49 +2222,69 @@ def _parse_sgx_segment_descriptions(text: str) -> dict[str, str]:
         "Others",
     ]
 
+    # SGX annual reports are two-column PDFs. pdfplumber merges both
+    # columns onto the same line, so segment headings appear mid-line:
+    #   "Capital commitments 54 13 6 – 73 Institutional Banking"
+    #   "Total 426,862 ... Institutional Banking provides financial..."
+    # Strategy: scan each line for segment name occurrences.  When found,
+    # extract the text AFTER the segment name on that line + subsequent
+    # lines until the next segment name appears.
+
     lines = text.split("\n")
     current_segment = ""
     current_desc_lines: list[str] = []
+
+    def _save_sgx():
+        nonlocal current_segment, current_desc_lines
+        if current_segment and current_desc_lines:
+            desc = " ".join(current_desc_lines).strip()
+            # Clean: remove leading numbers/noise from merged column data
+            desc = re.sub(r"^[\d,\s\-–]+", "", desc).strip()
+            if len(desc) >= 20:
+                descriptions[current_segment] = desc
+        current_segment = ""
+        current_desc_lines = []
 
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
 
-        # Check if this line matches a known segment heading
+        # Check if any known segment name appears in this line
         matched_segment = ""
+        match_pos = -1
         for seg_name in _sgx_segment_names:
-            if stripped == seg_name or stripped.startswith(seg_name + "\n"):
-                matched_segment = seg_name
-                break
+            pos = stripped.find(seg_name)
+            if pos >= 0:
+                # Prefer matches that are followed by description text
+                after = stripped[pos + len(seg_name):].strip()
+                if after and (after[0].isupper() or after.startswith("provides") or after.startswith("reflects")):
+                    matched_segment = seg_name
+                    match_pos = pos
+                    break
+                elif pos == 0:
+                    # Segment name at start of line (clean heading)
+                    matched_segment = seg_name
+                    match_pos = pos
+                    break
 
         if matched_segment:
-            # Save previous segment
-            if current_segment and current_desc_lines:
-                desc = " ".join(current_desc_lines).strip()
-                if len(desc) >= 20:
-                    descriptions[current_segment] = desc
-
+            _save_sgx()
             current_segment = matched_segment
-            current_desc_lines = []
-        elif current_segment:
-            # Check if this line starts a new section (non-segment heading)
-            if stripped.startswith(("44.", "45.", "The Group", "The following table")):
-                if current_desc_lines:
-                    desc = " ".join(current_desc_lines).strip()
-                    if len(desc) >= 20:
-                        descriptions[current_segment] = desc
-                current_segment = ""
+            # Extract text after the segment name on this same line
+            after_text = stripped[match_pos + len(matched_segment):].strip()
+            if after_text:
+                current_desc_lines = [after_text]
+            else:
                 current_desc_lines = []
+        elif current_segment:
+            # Check section boundaries
+            if stripped.startswith(("44.", "45.", "The Group", "The following table")):
+                _save_sgx()
             else:
                 current_desc_lines.append(stripped)
 
-    # Save last segment
-    if current_segment and current_desc_lines:
-        desc = " ".join(current_desc_lines).strip()
-        if len(desc) >= 20:
-            descriptions[current_segment] = desc
-
+    _save_sgx()
     return descriptions
 
 
@@ -2277,8 +2303,6 @@ def _parse_hkex_revenue_descriptions(text: str) -> dict[str, str]:
     Each paragraph starts with "– Revenues from {Segment}" and continues
     until the next "–" paragraph or a section break.
     """
-    descriptions: dict[str, str] = {}
-
     # Split into paragraphs by the dash prefix
     # HKEX uses both "–" (en-dash) and "-" (hyphen)
     para_pattern = re.compile(
@@ -2286,10 +2310,38 @@ def _parse_hkex_revenue_descriptions(text: str) -> dict[str, str]:
         re.IGNORECASE,
     )
 
-    # Find all revenue paragraphs
+    # Collect YoY and QoQ descriptions separately, prefer YoY
+    yoy_descs: dict[str, str] = {}
+    qoq_descs: dict[str, str] = {}
+
     lines = text.split("\n")
     current_segment = ""
     current_desc_lines: list[str] = []
+
+    def _save_current():
+        nonlocal current_segment, current_desc_lines
+        if current_segment and current_desc_lines:
+            desc = " ".join(current_desc_lines).strip()
+            if len(desc) >= 20:
+                desc_lower = desc.lower()
+                is_full_year = "year ended" in desc_lower or "for the year" in desc_lower
+                is_quarterly_yoy = "year-on-year" in desc_lower and not is_full_year
+                is_qoq = "quarter-on-quarter" in desc_lower or "three months" in desc_lower
+                if is_full_year:
+                    # Full-year description (highest priority)
+                    yoy_descs[current_segment] = desc
+                elif is_qoq:
+                    qoq_descs[current_segment] = desc
+                elif is_quarterly_yoy:
+                    # Q4 YoY -- use as fallback, not preferred over full-year
+                    if current_segment not in yoy_descs:
+                        yoy_descs[current_segment] = desc
+                else:
+                    # Default bucket
+                    if current_segment not in yoy_descs:
+                        yoy_descs[current_segment] = desc
+        current_segment = ""
+        current_desc_lines = []
 
     for line in lines:
         stripped = line.strip()
@@ -2298,43 +2350,26 @@ def _parse_hkex_revenue_descriptions(text: str) -> dict[str, str]:
 
         match = para_pattern.match(stripped)
         if match:
-            # Save previous segment
-            if current_segment and current_desc_lines:
-                desc = " ".join(current_desc_lines).strip()
-                if len(desc) >= 20:
-                    descriptions[current_segment] = desc
-
-            # Start new segment
+            _save_current()
             current_segment = match.group(1).strip().rstrip(",.:;")
             current_desc_lines = [stripped]
         elif current_segment:
-            # Check if this line starts a new non-revenue section
             if stripped.startswith(("Cost of revenues", "Gross profit", "Selling and",
                                     "General and admin", "Interest income", "Finance costs",
                                     "Share of profit", "Income tax", "Profit attributable")):
-                # Save and close current segment
-                if current_desc_lines:
-                    desc = " ".join(current_desc_lines).strip()
-                    if len(desc) >= 20:
-                        descriptions[current_segment] = desc
-                current_segment = ""
-                current_desc_lines = []
+                _save_current()
             elif stripped.startswith(("-", "\u2013", "\u2014")) and "Revenue" not in stripped:
-                # New dash paragraph that is not a revenue description -- close current
-                if current_desc_lines:
-                    desc = " ".join(current_desc_lines).strip()
-                    if len(desc) >= 20:
-                        descriptions[current_segment] = desc
-                current_segment = ""
-                current_desc_lines = []
+                _save_current()
             else:
                 current_desc_lines.append(stripped)
 
-    # Save last segment
-    if current_segment and current_desc_lines:
-        desc = " ".join(current_desc_lines).strip()
-        if len(desc) >= 20:
-            descriptions[current_segment] = desc
+    _save_current()
+
+    # Prefer YoY descriptions; fall back to QoQ for segments without YoY
+    descriptions: dict[str, str] = dict(yoy_descs)
+    for seg, desc in qoq_descs.items():
+        if seg not in descriptions:
+            descriptions[seg] = desc
 
     return descriptions
 
