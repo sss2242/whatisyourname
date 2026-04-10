@@ -1058,14 +1058,32 @@ _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
         "segment reporting as per ind as 108", "segment wise revenue",
         "segment wise results", "business segment", "geographical segment",
         "segment assets and liabilities",
+        "segment value of sales",  # Reliance: "Segment Value of Sales & Services"
+        "segment profit",  # "Segment Profit before Interest and Tax"
+        "inter segment",  # "Inter Segment Transfers"
+        "oil to chemicals",  # Reliance segment name (data page indicator)
+        "digital services",  # Reliance/Jio segment name
+        "consolidated segment information",  # Header on data pages
     ],
     "au_asx": [
         "operating segment information", "segment revenues",
         "revenue from external customers by segment",
+        "financial performance summary",  # BHP/mining annual report layout
+        "key asset metrics",
+        "from group production",  # "Total X from Group production" pattern
+        "segment value of sales",  # Reliance-style but also some AU
+        "statutory result",  # "Total X statutory result" aggregation lines
+        "underlying ebitda",  # BHP-style segment EBITDA
+        "underlying ebit",
     ],
     "ca_sedar": [
         "segment disclosures", "operating segments",
         "revenue by operating segment", "segmented information",
+        "results by business segment",  # RBC/TD/BMO annual report format
+        "personal & commercial banking", "wealth management",
+        "capital markets", "investor & treasury services",
+        "segment net income", "segment revenue",
+        "total segment", "intersegment",
     ],
     "sg_sgx": [
         "segment information", "business segment",
@@ -1103,6 +1121,72 @@ _SEGMENT_SKIP_LABELS = {
     "particulars", "segment", "description", "category",
     "group", "total group", "group and unallocated",
     "group and unallocated items", "third-party products",
+    "revenue from operations", "gross value of sales",
+    "value of sales", "net revenue", "total income",
+    "profit before tax", "profit after tax", "net profit",
+    "current tax", "deferred tax", "tax expense",
+}
+
+
+# Per-market table extraction strategy.
+# Markets produce different PDF layouts, so camelot/pdfplumber settings,
+# extraction priority, and page scoring thresholds differ per market.
+#
+# "prefer_text": Skip table extraction entirely and go straight to text
+#   parsing.  Best for dense multi-column reports (ASX mining, JSE) where
+#   "Total {Segment}" lines are the cleanest signal.
+#
+# "camelot_flavor": "stream" (default) or "lattice" for table detection.
+#   "lattice" works better for PDFs with visible cell borders (BSE SEBI).
+#
+# "min_page_score": Minimum keyword score for a page to be considered.
+#   Higher values filter out pages with only tangential segment mentions.
+#   Default is 1 (any keyword match).  ASX/JSE use 1 because their
+#   data pages have specific keywords; BSE uses 2 for stricter filtering.
+#
+# "max_pages": Maximum number of candidate pages to process. Default 10.
+_SEGMENT_EXTRACTION_CONFIG: dict[str, dict[str, Any]] = {
+    "au_asx": {
+        "prefer_text": True,  # BHP/mining: "Total X" lines are most reliable
+        "min_page_score": 1,
+        "max_pages": 15,  # Mining reports are long; check more pages
+    },
+    "za_jse": {
+        "prefer_text": True,  # Similar mining report format
+        "min_page_score": 1,
+        "max_pages": 15,
+    },
+    "in_bse": {
+        "camelot_flavor": "stream",  # SEBI quarterly results -- standard tables
+        "prefer_text": True,  # Reliance/Tata: multi-column segment table, text "• Segment" lines
+        "min_page_score": 2,  # Stricter -- BSE has many pages with "segment"
+    },
+    "sg_sgx": {
+        "camelot_flavor": "stream",
+        "prefer_text": False,
+        "min_page_score": 2,
+    },
+    "sa_tadawul": {
+        "prefer_text": False,  # IFRS tables
+        "min_page_score": 2,
+    },
+    "hk_hkex": {
+        "prefer_text": False,
+        "min_page_score": 2,
+    },
+    "ae_dfm": {
+        "prefer_text": False,
+        "min_page_score": 2,
+    },
+    "ca_sedar": {
+        "camelot_flavor": "stream",
+        "prefer_text": False,  # Canadian IFRS tables are well-structured
+        "min_page_score": 2,
+    },
+    "mx_bmv": {
+        "prefer_text": False,
+        "min_page_score": 2,
+    },
 }
 
 
@@ -1118,6 +1202,11 @@ def extract_segments_from_pdf(
     names with their revenue values. Designed for IFRS 8, Ind AS 108,
     ASC 280 segment disclosures in annual and quarterly reports.
 
+    Uses per-market extraction strategies: some markets (ASX, JSE) have
+    dense multi-column layouts where text-based "Total {Segment}" parsing
+    works best; others (BSE, SGX) have clean tabular layouts where
+    camelot/pdfplumber table extraction is more accurate.
+
     Parameters
     ----------
     pdf_bytes:
@@ -1127,7 +1216,7 @@ def extract_segments_from_pdf(
     report_date:
         ISO date string of the fiscal period end date.
     market_id:
-        Market identifier for market-specific keyword hints.
+        Market identifier for market-specific extraction config.
 
     Returns
     -------
@@ -1146,85 +1235,113 @@ def extract_segments_from_pdf(
     if market_kw:
         keywords = market_kw + keywords
 
+    # Per-market extraction config
+    config = _SEGMENT_EXTRACTION_CONFIG.get(market_id, {})
+    prefer_text = config.get("prefer_text", False)
+    camelot_flavor = config.get("camelot_flavor", "stream")
+    min_page_score = config.get("min_page_score", 1)
+    max_pages = config.get("max_pages", 10)
+
     segments: dict[str, float] = {}
 
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
-            # Score pages for segment content
+            # Score pages for segment content using per-market keyword list
             seg_pages: list[tuple[int, int]] = []
             for i, page in enumerate(doc.pages):
                 text = (page.extract_text() or "").lower()
                 score = sum(1 for kw in keywords if kw in text)
-                if score >= 1:
+                if score >= min_page_score:
                     seg_pages.append((i, score))
 
             seg_pages.sort(key=lambda x: -x[1])
             if not seg_pages:
                 return {}
 
-            logger.debug("Segment pages found: %d (top score: %d)", len(seg_pages), seg_pages[0][1])
+            logger.debug(
+                "Segment pages found: %d (top score: %d, min_score: %d, market: %s)",
+                len(seg_pages), seg_pages[0][1], min_page_score, market_id or "default",
+            )
 
-            # Target only top 10 highest-scoring pages (1-indexed for camelot)
-            target_pages = [p + 1 for p, _ in seg_pages[:10]]
+            # Target top N highest-scoring pages (1-indexed for camelot)
+            target_pages = [p + 1 for p, _ in seg_pages[:max_pages]]
 
-            # --- Path 1: Camelot table extraction (highest accuracy) ---
-            # Uses the same targeted page approach as extract_financials_from_pdf
-            try:
-                import camelot
-                import tempfile
-                import os
-
-                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-                    f.write(pdf_bytes)
-                    tmp_path = f.name
-
-                try:
-                    page_str = ",".join(str(p) for p in target_pages[:10])
-                    tables = camelot.read_pdf(tmp_path, pages=page_str, flavor="stream")
-                    logger.debug("Camelot segment tables: %d on pages %s", len(tables), page_str)
-
-                    for table in tables:
-                        if table.shape[0] < 3:
-                            continue
-                        extracted = _extract_segments_from_table(table.df.values.tolist())
-                        if extracted and len(extracted) >= 2:
-                            if len(extracted) > len(segments):
-                                segments = extracted
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-            except ImportError:
-                logger.debug("camelot-py not installed, using pdfplumber for segment tables")
-            except Exception as exc:
-                logger.debug("Camelot segment extraction failed: %s", exc)
-
-            # --- Path 2: pdfplumber table extraction (fallback) ---
-            if not segments:
-                for page_idx, _ in seg_pages[:10]:
-                    page = doc.pages[page_idx]
-                    tables = page.extract_tables()
-
-                    for table in tables:
-                        if not table or len(table) < 3:
-                            continue
-
-                        extracted = _extract_segments_from_table(table)
-                        if extracted and len(extracted) >= 2:
-                            if len(extracted) > len(segments):
-                                segments = extracted
-
-                    if len(segments) >= 2:
-                        break
-
-            # --- Path 3: Text-based extraction (final fallback) ---
-            if not segments:
-                for page_idx, _ in seg_pages[:10]:
+            # --- Text-first path (for markets with dense multi-column layouts) ---
+            if prefer_text:
+                for page_idx, _ in seg_pages[:max_pages]:
                     page = doc.pages[page_idx]
                     text = page.extract_text() or ""
                     extracted = _extract_segments_from_text(text)
-                    if extracted and len(extracted) >= 2:
+                    if extracted and len(extracted) > len(segments):
                         segments = extracted
+                    if len(segments) >= 3:
                         break
+                if len(segments) >= 2:
+                    # Got good results from text; skip table extraction
+                    pass
+                else:
+                    # Text didn't work, fall through to table extraction
+                    prefer_text = False
+
+            if not prefer_text:
+                # --- Path 1: Camelot table extraction ---
+                try:
+                    import camelot
+                    import tempfile
+                    import os
+
+                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+                        f.write(pdf_bytes)
+                        tmp_path = f.name
+
+                    try:
+                        page_str = ",".join(str(p) for p in target_pages[:10])
+                        tables = camelot.read_pdf(tmp_path, pages=page_str, flavor=camelot_flavor)
+                        logger.debug("Camelot segment tables: %d on pages %s (flavor=%s)",
+                                     len(tables), page_str, camelot_flavor)
+
+                        for table in tables:
+                            if table.shape[0] < 3:
+                                continue
+                            extracted = _extract_segments_from_table(table.df.values.tolist())
+                            if extracted and len(extracted) >= 2:
+                                if len(extracted) > len(segments):
+                                    segments = extracted
+                    finally:
+                        if os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+                except ImportError:
+                    logger.debug("camelot-py not installed, using pdfplumber for segment tables")
+                except Exception as exc:
+                    logger.debug("Camelot segment extraction failed: %s", exc)
+
+                # --- Path 2: pdfplumber table extraction (fallback) ---
+                if not segments:
+                    for page_idx, _ in seg_pages[:max_pages]:
+                        page = doc.pages[page_idx]
+                        tables = page.extract_tables()
+
+                        for table in tables:
+                            if not table or len(table) < 3:
+                                continue
+
+                            extracted = _extract_segments_from_table(table)
+                            if extracted and len(extracted) >= 2:
+                                if len(extracted) > len(segments):
+                                    segments = extracted
+
+                        if len(segments) >= 2:
+                            break
+
+                # --- Path 3: Text-based extraction (final fallback) ---
+                if not segments:
+                    for page_idx, _ in seg_pages[:max_pages]:
+                        page = doc.pages[page_idx]
+                        text = page.extract_text() or ""
+                        extracted = _extract_segments_from_text(text)
+                        if extracted and len(extracted) >= 2:
+                            segments = extracted
+                            break
 
     except Exception as exc:
         logger.debug("Fuzzy PDF segment extraction failed: %s", exc)
@@ -1402,6 +1519,16 @@ def _extract_segments_from_text(text: str) -> dict[str, float]:
        where "Total {Segment}" lines carry the aggregate segment revenue.
     4. **Colon-separated**: "Segment Name: 1,234 million"
     """
+    # Normalize Unicode characters that break number parsing:
+    # U+2212 (−) -> ASCII hyphen-minus (-), U+2013 (–) -> (-),
+    # U+2014 (—) -> (-), U+00A0 (non-breaking space) -> space
+    text = (
+        text.replace("\u2212", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u00a0", " ")
+    )
+
     segments: dict[str, float] = {}
     total_segments: dict[str, float] = {}
     lines = text.split("\n")
@@ -1416,12 +1543,39 @@ def _extract_segments_from_text(text: str) -> dict[str, float]:
         if not re.search(r"\d", line):
             continue
 
+        # --- Pattern 4: Bullet-prefixed segments (BSE/Indian format) ---
+        # "• Oil to Chemicals (O2C) 160,558 149,595 477457 462,308"
+        # "- Retail' 5,269 13,756"
+        # Common in Indian SEBI quarterly results. The bullet (•) or dash (-)
+        # prefix distinguishes segment rows from header/total rows.
+        bullet_match = re.match(
+            r"^[•\-\*]\s+([A-Za-z][\w\s&/()\-\.]+?)\s+"
+            r"([\(\-]?[\d,]+\.?\d*\)?)"
+            r"(?:\s+(?:[\(\-]?[\d,]+\.?\d*\)?|[-•]))*\s*$",
+            line,
+        )
+        if bullet_match:
+            name = bullet_match.group(1).strip().rstrip("'\"*.,;: ")
+            # Remove parenthetical suffixes like "(O2C)" for cleaner names
+            clean_name = re.sub(r"\s*\([A-Z0-9]+\)\s*\*?\s*$", "", name).strip()
+            if not clean_name:
+                clean_name = name
+            val_str = bullet_match.group(2).strip()
+            value = _parse_indian_number(val_str)
+            if value is not None and abs(value) >= 1.0 and len(clean_name) >= 2:
+                name_lower = clean_name.lower()
+                if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+                    segments[clean_name] = value
+            continue
+
         # --- Pattern 3: "Total {Segment} {numbers}" (highest priority) ---
         # These are aggregate segment totals like "Total Copper 22,247 12,701"
+        # Financial PDFs use "-" or "–" as nil/zero indicators between numbers.
+        # The trailing number group must accept: digits, (digits), -digits, or bare "-"
         total_match = re.match(
             r"^Total\s+([A-Za-z][\w\s&/\-\.]+?)\s+"
             r"([\(\-]?[\d,]+\.?\d*\)?)"
-            r"(?:\s+[\(\-]?[\d,]+\.?\d*\)?)*\s*$",
+            r"(?:\s+(?:[\(\-]?[\d,]+\.?\d*\)?|-))*\s*$",
             line,
         )
         if total_match:
@@ -1493,7 +1647,7 @@ def _extract_segments_from_text(text: str) -> dict[str, float]:
 
     # Prefer "Total {Segment}" entries over individual sub-items when available.
     # Total segments are aggregates (e.g. "Total Copper" = sum of Escondida +
-    # Pampa Norte + Antamina + Copper SA), which is what product_segments.py needs.
+    # Pampa Norte + Antamina + Copper SA), which is what downstream consumers need.
     if total_segments and len(total_segments) >= 2:
         # Deduplicate: when both "Total X" and "Total X from Group production"
         # exist, keep only the shorter name (the inclusive total).
@@ -1515,6 +1669,422 @@ def _extract_segments_from_text(text: str) -> dict[str, float]:
         return deduped
 
     return segments
+
+
+# ---------------------------------------------------------------------------
+# Product description extraction from segment notes (Ind AS 108 / IFRS 8)
+# ---------------------------------------------------------------------------
+
+# Keywords that identify pages with segment description notes
+_PRODUCT_DESC_KEYWORDS = [
+    "ind as 108", "ifrs 8", "asc 280",
+    "operating segments", "segment information",
+    "notes to segment information",
+    "reportable segments", "basis of segmentation",
+    "the company has reported",
+    "segment includes", "segment comprises",
+    "products and services", "nature of products",
+    "principal activities", "description of segments",
+]
+
+_PRODUCT_DESC_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
+    "in_bse": [
+        "notes to segment information",
+        "as per indian accounting standard 108",
+        "segment reporting as per ind as 108",
+        "the company has reported segment information",
+    ],
+    "au_asx": [
+        "operating segment information", "nature of segments",
+        "identification of reportable operating segments",
+        "from group production",  # BHP: sub-asset hierarchy pages (same as segment data pages)
+        "underlying ebitda margin",  # Segment contribution pages
+        "segment contribution",
+        "statutory result",  # "Total X statutory result" lines indicate segment data pages
+        "key asset metrics",  # BHP header on segment data pages
+    ],
+    "hk_hkex": [
+        "segment information", "分部资料", "业务分部",
+        "reportable and operating segments",
+    ],
+    "sa_tadawul": [
+        "segment information", "operating segments",
+        "description of segments", "معلومات القطاعات",
+    ],
+    "ca_sedar": [
+        "operating segments", "segmented information",
+        "description of segments", "nature of segments",
+        "results by business segment",
+        "personal & commercial banking",  # Canadian bank segment names
+        "wealth management", "capital markets",
+    ],
+}
+
+
+def extract_product_descriptions_from_pdf(
+    pdf_bytes: bytes,
+    filing_date: str = "",
+    report_date: str = "",
+    market_id: str = "",
+) -> dict[str, str]:
+    """Extract product/business segment descriptions from a PDF.
+
+    Finds pages with Ind AS 108 / IFRS 8 / ASC 280 segment notes and
+    extracts the text describing what each segment does -- its products,
+    services, and principal activities.
+
+    Indian quarterly/annual filings typically have a "Notes to Segment
+    Information" section listing each segment with a paragraph describing
+    the segment's scope (e.g. "The Oil to Chemicals segment includes
+    refining, petrochemicals, fuel retailing...").
+
+    Parameters
+    ----------
+    pdf_bytes:
+        Raw PDF file content.
+    filing_date:
+        ISO date string of when the filing was published.
+    report_date:
+        ISO date string of the fiscal period end date.
+    market_id:
+        Market identifier for market-specific keyword hints.
+
+    Returns
+    -------
+    Dict of {segment_name: description_text}. Empty dict if no
+    product descriptions found.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.debug("pdfplumber not installed, cannot extract product descriptions")
+        return {}
+
+    # Build keyword list
+    keywords = list(_PRODUCT_DESC_KEYWORDS)
+    market_kw = _PRODUCT_DESC_KEYWORDS_BY_MARKET.get(market_id, [])
+    if market_kw:
+        keywords = market_kw + keywords
+
+    descriptions: dict[str, str] = {}
+
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+            # Score pages for segment description content
+            desc_pages: list[tuple[int, int]] = []
+            for i, page in enumerate(doc.pages):
+                text = (page.extract_text() or "").lower()
+                score = sum(1 for kw in keywords if kw in text)
+                # Boost pages that have segment description patterns
+                if "segment includes" in text or "segment comprises" in text:
+                    score += 3
+                if "principal activities" in text or "nature of products" in text:
+                    score += 2
+                # Boost pages with sub-asset hierarchy (ASX/mining: "Total Copper from Group production")
+                if "from group production" in text:
+                    score += 3
+                if "statutory result" in text and "total" in text:
+                    score += 2
+                if score >= 2:
+                    desc_pages.append((i, score))
+
+            desc_pages.sort(key=lambda x: -x[1])
+            if not desc_pages:
+                return {}
+
+            logger.debug(
+                "Product description pages found: %d (top score: %d)",
+                len(desc_pages), desc_pages[0][1],
+            )
+
+            # Extract segment descriptions from top-scoring pages
+            for page_idx, _ in desc_pages[:5]:
+                page = doc.pages[page_idx]
+                text = page.extract_text() or ""
+
+                extracted = _parse_segment_descriptions(text)
+                if extracted and len(extracted) >= 2:
+                    descriptions = extracted
+                    break
+
+                # If no structured descriptions, try paragraph text
+                if not descriptions:
+                    extracted = _parse_segment_paragraphs(text)
+                    if extracted and len(extracted) >= 2:
+                        descriptions = extracted
+                        break
+
+                # If still no descriptions, try sub-asset hierarchy
+                # (ASX/mining reports: Copper = Escondida + Pampa Norte + ...)
+                if not descriptions:
+                    extracted = _parse_segment_subassets(text)
+                    if extracted and len(extracted) >= 2:
+                        descriptions = extracted
+                        break
+
+    except Exception as exc:
+        logger.debug("Fuzzy PDF product description extraction failed: %s", exc)
+
+    if descriptions:
+        logger.info(
+            "Fuzzy PDF product descriptions: %d segments from %s",
+            len(descriptions), market_id or "unknown",
+        )
+
+    return descriptions
+
+
+def _parse_segment_descriptions(text: str) -> dict[str, str]:
+    """Parse Ind AS 108 / IFRS 8 lettered segment descriptions.
+
+    Handles the common format found in Indian and IFRS filings::
+
+        a) The Oil to Chemicals segment includes refining, petrochemicals...
+        b) The Oil and Gas segment includes exploration, development...
+        c) The Retail segment includes consumer retail and range of...
+        d) The Digital Services segment includes provision of...
+
+    Also handles numbered variants (1., 2., i., ii.) and bullet points.
+    """
+    descriptions: dict[str, str] = {}
+
+    # Pattern: lettered or numbered items with "segment" keyword
+    # Matches: a) The X segment includes/comprises/consists of...
+    #          (i) The X segment ...
+    #          1. X segment ...
+    item_pattern = re.compile(
+        r"(?:^|\n)\s*"
+        r"(?:[a-z]\)|[a-z]\.|\([a-z]\)|\([ivx]+\)|\d+[\.\)])\s*"
+        r"(?:The\s+)?"
+        r"(.+?)(?:\s+segment\b|\s+business\b)"
+        r"\s+(?:includes?|comprises?|consists?\s+of|covers?|provides?|involves?)"
+        r"\s+(.+?)(?=\n\s*(?:[a-z]\)|[a-z]\.|\([a-z]\)|\([ivx]+\)|\d+[\.\)])\s|\Z)",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    for match in item_pattern.finditer(text):
+        segment_name = match.group(1).strip().rstrip(",.:;")
+        description = match.group(2).strip()
+
+        # Clean up the description: remove trailing page footers, addresses
+        description = re.split(
+            r"(?:Registered\s+Offic|Corporate\s+Communications|Telephone|"
+            r"Page\s+\d+|CIN\s+L|www\.)",
+            description,
+            maxsplit=1,
+        )[0].strip().rstrip(".,;")
+
+        if len(segment_name) >= 2 and len(description) >= 10:
+            descriptions[segment_name] = description
+
+    return descriptions
+
+
+def _parse_segment_subassets(text: str) -> dict[str, str]:
+    """Parse ASX/mining-style segment descriptions from sub-asset hierarchy.
+
+    BHP-style reports don't have narrative segment descriptions. Instead,
+    the sub-assets listed under each "Total {Segment}" heading form a
+    natural product description::
+
+        Copper
+        Escondida 7,924 5,642 5,115 15,682 1,085
+        Pampa Norte 1,302 666 435 5,354 395
+        Antamina 1,188 800 735 1,781 242
+        Copper South Australia 2,615 1,251 875 18,012 760
+        Total Copper from Group production 13,110 8,271 7,037
+
+    Produces: {"Copper": "Escondida, Pampa Norte, Antamina, Copper South Australia"}
+    """
+    # Normalize unicode
+    text = (
+        text.replace("\u2212", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u00a0", " ")
+    )
+
+    descriptions: dict[str, str] = {}
+    lines = text.split("\n")
+
+    current_segment = ""
+    sub_assets: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Detect "Total {Segment}" lines -- these close the current group
+        total_match = re.match(
+            r"^Total\s+([A-Za-z][\w\s&/\-\.]+?)\s+(?:from\s+Group|[\(\-]?[\d,])",
+            stripped,
+        )
+        if total_match:
+            seg_name = total_match.group(1).strip()
+            # Clean: remove "from Group production", "statutory result" suffixes
+            seg_name = re.sub(
+                r"\s*(?:from\s+Group\s+production|statutory\s+result)\s*$",
+                "", seg_name, flags=re.IGNORECASE,
+            ).strip()
+
+            if seg_name and sub_assets:
+                # Deduplicate and filter sub-asset names
+                clean_subs = []
+                seen = set()
+                for sa in sub_assets:
+                    if sa.lower() not in seen and sa.lower() != seg_name.lower():
+                        clean_subs.append(sa)
+                        seen.add(sa.lower())
+                if clean_subs:
+                    descriptions[seg_name] = ", ".join(clean_subs)
+
+            current_segment = ""
+            sub_assets = []
+            continue
+
+        # Detect segment header (standalone name, no numbers or few numbers)
+        # e.g. "Copper" or "Iron Ore" alone on a line
+        if re.match(r"^[A-Z][A-Za-z\s]+$", stripped) and len(stripped) < 40:
+            current_segment = stripped
+            sub_assets = []
+            continue
+
+        # Collect sub-asset names (lines with name + numbers under a segment)
+        if current_segment:
+            sub_match = re.match(
+                r"^([A-Za-z][\w\s&/\-\.]+?)\s+[\(\-]?[\d,]+",
+                stripped,
+            )
+            if sub_match:
+                name = sub_match.group(1).strip()
+                # Skip "Other", "Third-party", totals, adjustments
+                name_lower = name.lower()
+                skip = {"other", "others", "third-party products", "adjustment",
+                        "inter-segment", "total", "net", "less"}
+                if not any(s in name_lower for s in skip) and len(name) >= 3:
+                    sub_assets.append(name)
+
+    return descriptions
+
+
+def _parse_segment_paragraphs(text: str) -> dict[str, str]:
+    """Fallback parser for less structured segment descriptions.
+
+    Looks for patterns like:
+      - "Oil to Chemicals: includes refining..."
+      - "Retail - consumer retail and related services"
+      - "Digital Services segment provides a range of..."
+    """
+    descriptions: dict[str, str] = {}
+
+    # Pattern: "Name segment/business" followed by description text
+    para_pattern = re.compile(
+        r"(?:^|\n)\s*"
+        r"(?:The\s+)?"
+        r"([A-Z][A-Za-z\s&/,]+?)"
+        r"\s*(?:segment|business|division)\s*"
+        r"(?:[-:]\s*|\s+)"
+        r"(?:includes?|comprises?|provides?|covers?|involves?|is\s+engaged\s+in)"
+        r"\s+(.+?)(?:\.\s|\n\n|\Z)",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    for match in para_pattern.finditer(text):
+        name = match.group(1).strip().rstrip(",.:;- ")
+        desc = match.group(2).strip()
+
+        # Clean name: remove leading "The" and trailing whitespace
+        name = re.sub(r"^\s*The\s+", "", name, flags=re.IGNORECASE).strip()
+
+        # Clean description: trim at common footer patterns
+        desc = re.split(
+            r"(?:Registered\s+Offic|Corporate\s+Comm|Telephone|Page\s+\d+|CIN\s+L)",
+            desc,
+            maxsplit=1,
+        )[0].strip().rstrip(".,;")
+
+        if len(name) >= 2 and len(name) <= 80 and len(desc) >= 10:
+            descriptions[name] = desc
+
+    return descriptions
+
+
+def extract_product_data_from_pdf(
+    pdf_bytes: bytes,
+    filing_date: str = "",
+    report_date: str = "",
+    market_id: str = "",
+) -> dict[str, Any]:
+    """Extract complete product data from a PDF: segment revenue + descriptions.
+
+    Combines segment revenue extraction (from ``extract_segments_from_pdf``)
+    with product description extraction (from ``extract_product_descriptions_from_pdf``)
+    into a single result suitable for downstream analysis.
+
+    Parameters
+    ----------
+    pdf_bytes:
+        Raw PDF file content.
+    filing_date:
+        ISO date string of when the filing was published.
+    report_date:
+        ISO date string of the fiscal period end date.
+    market_id:
+        Market identifier for market-specific keyword hints.
+
+    Returns
+    -------
+    Dict with keys:
+        - ``segments``: {segment_name: revenue_value} from revenue tables
+        - ``descriptions``: {segment_name: description_text} from notes
+        - ``has_revenue``: bool
+        - ``has_descriptions``: bool
+        - ``n_segments``: int
+    """
+    segments = extract_segments_from_pdf(
+        pdf_bytes, filing_date=filing_date,
+        report_date=report_date, market_id=market_id,
+    )
+    descriptions = extract_product_descriptions_from_pdf(
+        pdf_bytes, filing_date=filing_date,
+        report_date=report_date, market_id=market_id,
+    )
+
+    # Try to align description keys with segment keys via fuzzy matching
+    if segments and descriptions:
+        aligned_desc: dict[str, str] = {}
+        for seg_name in segments:
+            seg_lower = seg_name.lower().strip()
+            best_match = ""
+            best_score = 0
+            for desc_name, desc_text in descriptions.items():
+                desc_lower = desc_name.lower().strip()
+                # Simple substring containment score
+                if seg_lower in desc_lower or desc_lower in seg_lower:
+                    score = 100
+                else:
+                    # Word overlap score
+                    seg_words = set(seg_lower.split())
+                    desc_words = set(desc_lower.split())
+                    overlap = len(seg_words & desc_words)
+                    score = overlap * 30
+                if score > best_score:
+                    best_score = score
+                    best_match = desc_text
+            if best_score >= 30 and best_match:
+                aligned_desc[seg_name] = best_match
+
+        if aligned_desc:
+            descriptions = aligned_desc
+
+    return {
+        "segments": segments,
+        "descriptions": descriptions,
+        "has_revenue": len(segments) >= 2,
+        "has_descriptions": len(descriptions) >= 1,
+        "n_segments": max(len(segments), len(descriptions)),
+    }
 
 
 def extract_shareholders_from_pdf(
