@@ -1079,6 +1079,11 @@ _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
     "ca_sedar": [
         "segment disclosures", "operating segments",
         "revenue by operating segment", "segmented information",
+        "results by business segment",  # RBC/TD/BMO annual report format
+        "personal & commercial banking", "wealth management",
+        "capital markets", "investor & treasury services",
+        "segment net income", "segment revenue",
+        "total segment", "intersegment",
     ],
     "sg_sgx": [
         "segment information", "business segment",
@@ -1174,7 +1179,8 @@ _SEGMENT_EXTRACTION_CONFIG: dict[str, dict[str, Any]] = {
         "min_page_score": 2,
     },
     "ca_sedar": {
-        "prefer_text": False,
+        "camelot_flavor": "stream",
+        "prefer_text": False,  # Canadian IFRS tables are well-structured
         "min_page_score": 2,
     },
     "mx_bmv": {
@@ -1704,6 +1710,13 @@ _PRODUCT_DESC_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
     "sa_tadawul": [
         "segment information", "operating segments",
         "description of segments", "معلومات القطاعات",
+    ],
+    "ca_sedar": [
+        "operating segments", "segmented information",
+        "description of segments", "nature of segments",
+        "results by business segment",
+        "personal & commercial banking",  # Canadian bank segment names
+        "wealth management", "capital markets",
     ],
 }
 
