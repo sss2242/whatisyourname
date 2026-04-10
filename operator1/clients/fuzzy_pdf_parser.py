@@ -1088,10 +1088,22 @@ _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
     "sg_sgx": [
         "segment information", "business segment",
         "revenue by segment", "operating segments",
+        "business segment reporting",  # DBS Note 44.1 heading
+        "segment reporting",  # SFRS(I) 8 disclosure
+        "total income",  # DBS key row in segment table
+        "consumer banking", "institutional banking",  # DBS/OCBC/UOB segment names
+        "wealth management", "markets trading",  # DBS segment names
+        "group wholesale banking", "group retail",  # OCBC segment names
     ],
     "za_jse": [
         "segment report", "segmental analysis",
         "revenue per segment", "operating segments",
+        "group performance",  # Sasol-style segment table footer
+        "intersegmental turnover",  # Sasol inter-segment elimination line
+        "external turnover",  # Sasol net turnover line
+        "southern africa",  # Sasol segment group heading
+        "international chemicals",  # Sasol segment group heading
+        "turnover", "ebit",  # JSE column headers
     ],
     "ae_dfm": [
         "segment information", "operating segments",
@@ -1100,10 +1112,26 @@ _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
     "hk_hkex": [
         "segment information", "business segments",
         "revenue by segment", "分部资料", "业务分部",
+        "revenues of the group and its segments",  # Tencent-style revenue table header
+        "sets forth revenues",  # "The following table sets forth revenues..."
+        "revenue from contracts with customers",  # IFRS 15 disclosure
+        "revenues % of total revenues",  # Tencent column header
+        "segment revenue", "revenue breakdown",
+        "value-added services",  # Tencent segment name (VAS)
+        "fintech and business services",  # Tencent segment name
+        "marketing services",  # Tencent segment name
     ],
     "sa_tadawul": [
         "segment information", "operating segments",
         "revenue by segment", "معلومات القطاعات",
+        "reportable segments",  # IFRS 8 disclosure
+        "segment reporting",
+        "upstream", "downstream",  # Aramco/petrochemical segment names
+        "chemicals", "refining",  # SABIC/Ma'aden segment names
+        "retail banking", "corporate banking",  # Bank segment names (Al Rajhi, SNB)
+        "insurance operations",  # Insurance segment names (Bupa Arabia, Tawuniya)
+        "revenue from external customers",  # IFRS 8 disclosure line
+        "zakat",  # Saudi-specific tax line (confirms Saudi PDF)
     ],
     "mx_bmv": [
         "información por segmentos", "segmentos operativos",
@@ -1119,12 +1147,24 @@ _SEGMENT_SKIP_LABELS = {
     "reconciliation", "head office", "holding company",
     "total revenue", "total segment revenue", "total consolidated",
     "particulars", "segment", "description", "category",
-    "group", "total group", "group and unallocated",
+    "group", "the group", "total group", "group and unallocated",
     "group and unallocated items", "third-party products",
     "revenue from operations", "gross value of sales",
     "value of sales", "net revenue", "total income",
     "profit before tax", "profit after tax", "net profit",
     "current tax", "deferred tax", "tax expense",
+    "net interest income", "net fee and commission income",
+    "other non-interest income", "total expenses", "expenses",
+    "amortisation of intangible assets", "depreciation",
+    "allowances for credit and other losses",
+    "income tax expense and non-controlling interest",
+    "net profit attributable to shareholders",
+    "capital expenditure", "total liabilities",
+    "goodwill and intangible assets",
+    "share of profits or losses of associates",
+    "interests",
+    "group performance", "intersegmental turnover",
+    "external turnover", "business support",
 }
 
 
@@ -1163,16 +1203,18 @@ _SEGMENT_EXTRACTION_CONFIG: dict[str, dict[str, Any]] = {
     },
     "sg_sgx": {
         "camelot_flavor": "stream",
-        "prefer_text": False,
+        "prefer_text": True,  # SGX bank annual reports: segment tables embedded in text
         "min_page_score": 2,
+        "max_pages": 15,
     },
     "sa_tadawul": {
         "prefer_text": False,  # IFRS tables
         "min_page_score": 2,
     },
     "hk_hkex": {
-        "prefer_text": False,
+        "prefer_text": True,  # HKEX results announcements embed segment tables in prose text
         "min_page_score": 2,
+        "max_pages": 15,  # HKEX annual results can be 50-60 pages
     },
     "ae_dfm": {
         "prefer_text": False,
@@ -1251,6 +1293,33 @@ def extract_segments_from_pdf(
             for i, page in enumerate(doc.pages):
                 text = (page.extract_text() or "").lower()
                 score = sum(1 for kw in keywords if kw in text)
+                # SGX segment table priority: boost Note 44 pages in financial
+                # statements section over summary tables in overview section.
+                if market_id == "sg_sgx":
+                    if "business segment reporting" in text:
+                        score += 10  # Strong boost for the actual Note 44
+                    # Key signal: "Total income" line with "In $ millions" on same
+                    # line -- this ONLY appears on the business segment data page
+                    # where pdfplumber merges both columns into one line.
+                    import re as _re
+                    if _re.search(r"total income.*in\s+[\$]\s+millions", text):
+                        score += 15  # Strongest boost -- this is THE segment data page
+                    if "geographical segment" in text and "business segment" not in text:
+                        score -= 3  # Only penalize pure geographic pages
+                    # Boost financial statements pages (typically page 60+)
+                    if i >= 50 and ("segment reporting" in text or "business segment" in text):
+                        score += 5
+                # HKEX revenue-priority boost: pages with "revenues" or
+                # "sets forth revenues" score higher than pages with only
+                # "gross profit" (both have segment breakdowns, but we want
+                # revenue tables, not gross profit tables).
+                if market_id == "hk_hkex":
+                    if "sets forth revenues" in text or "revenues % of total" in text:
+                        score += 5  # Strong boost for revenue table pages
+                    elif "revenue" in text and "gross profit" not in text:
+                        score += 3  # Moderate boost for revenue-only pages
+                    elif "gross profit" in text and "revenue" not in text:
+                        score -= 2  # Penalize gross-profit-only pages
                 if score >= min_page_score:
                     seg_pages.append((i, score))
 
@@ -1265,6 +1334,35 @@ def extract_segments_from_pdf(
 
             # Target top N highest-scoring pages (1-indexed for camelot)
             target_pages = [p + 1 for p, _ in seg_pages[:max_pages]]
+
+            # --- SGX direct extraction: find "Total income ... In $ millions" ---
+            # SGX bank annual reports have a unique pattern where pdfplumber
+            # merges the business and geographic segment tables onto the same
+            # text line. We scan ALL pages for this specific signature line.
+            if market_id == "sg_sgx" and not segments:
+                _sgx_known_segments = [
+                    "Consumer Banking/ Wealth Management",
+                    "Institutional Banking",
+                    "Markets Trading",
+                ]
+                for page_obj in doc.pages:
+                    page_text = page_obj.extract_text() or ""
+                    for text_line in page_text.split("\n"):
+                        if (text_line.lower().startswith("total income")
+                                and re.search(r"In\s+[\$]\s+millions", text_line)):
+                            clean = re.split(r"In\s+[\$]\s+millions", text_line, maxsplit=1)[0]
+                            nums = [_parse_indian_number(n)
+                                    for n in re.findall(r"[\(\-]?[\d,]+\.?\d*\)?", clean)]
+                            nums = [n for n in nums if n is not None and abs(n) >= 1.0]
+                            if len(nums) >= 4:
+                                seg_vals = nums[:-1]  # exclude group total
+                                for idx, seg_name in enumerate(_sgx_known_segments):
+                                    if idx < len(seg_vals):
+                                        segments[seg_name] = seg_vals[idx]
+                                if len(segments) >= 3:
+                                    break
+                    if segments:
+                        break
 
             # --- Text-first path (for markets with dense multi-column layouts) ---
             if prefer_text:
@@ -1568,6 +1666,150 @@ def _extract_segments_from_text(text: str) -> dict[str, float]:
                     segments[clean_name] = value
             continue
 
+        # --- Pattern 7: JSE SENS left-number format ---
+        # JSE financial results have turnover on LEFT, segment name in CENTER,
+        # EBIT on RIGHT: "14 744 15 347 Mining 2 138 2 291"
+        # SA number format: spaces as thousands separators (not commas)
+        # Format: {num1} {num2} {SegmentName} {num3} {num4}
+        # where num1=current turnover, num2=prior turnover
+        # Match: one or more digit groups (SA thousands format) followed by a
+        # capitalized segment name, followed by more digit groups
+        # SA number format: "14 744" = 14,744 (1-3 digits, then groups of 3)
+        _sa_num = r"\d{1,3}(?:\s\d{3})*"
+        jse_match = re.match(
+            r"^(" + _sa_num + r")\s+(" + _sa_num + r")\s+"  # two SA-format numbers
+            r"([A-Z][A-Za-z ]+?)\s+"                          # segment name
+            r"[\(\-]?[\d]",                                    # EBIT number starts
+            line,
+        )
+        if jse_match:
+            val_str = jse_match.group(1).strip()
+            name = jse_match.group(3).strip()
+            # Parse SA number format (spaces as thousands: "14 744" -> 14744)
+            val_clean = val_str.replace(" ", "")
+            try:
+                value = float(val_clean)
+            except ValueError:
+                value = None
+            if value is not None and abs(value) >= 1.0 and len(name) >= 2:
+                name_lower = name.lower()
+                if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+                    segments[name] = value
+            continue
+
+        # --- Pattern 7b: JSE negative/zero turnover segments ---
+        # "- - Business Support (302) 325"
+        # Segments with zero turnover have "-" instead of numbers
+        jse_zero_match = re.match(
+            r"^-\s+-\s+([A-Z][A-Za-z ]+?)\s+[\(\-]?[\d]",
+            line,
+        )
+        if jse_zero_match:
+            name = jse_zero_match.group(1).strip()
+            name_lower = name.lower()
+            if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+                segments[name] = 0.0
+            continue
+
+        # --- Pattern 7c: JSE group performance total line ---
+        # "141 991 141 176 Group performance 4 619 9 533"
+        # Skip this -- it's the total, not a segment
+        if "group performance" in lower:
+            continue
+
+        # --- Pattern 6: SGX transposed segment table ---
+        # SGX bank annual reports (DBS, OCBC, UOB) have columns = segments:
+        #   "Total income 10,541 8,906 1,374 2,079 22,900 ..."
+        # The segment names are in header rows above but pdfplumber merges
+        # both page columns making header detection unreliable.  Instead we
+        # use a direct approach: detect "Total income" lines and extract the
+        # first N numbers, mapping them to known SGX bank segment names in
+        # the canonical order: CBG/WM, IBG, Markets/Trading, Others.
+        # The Nth+1 number is the group total (skip it).
+        if lower.startswith("total income") and re.search(r"\d", line) and not segments:
+            # SGX bank segment table: "Total income 10,541 8,906 1,374 2,079 22,900"
+            # On multi-column pages, pdfplumber merges both tables onto one line:
+            # "Total income 10,541 8,906 1,374 2,079 22,900 In $ millions Singapore..."
+            # We PREFER lines containing "In $ millions" (they have the business
+            # segment table on the left, not just geographic data).
+            has_dollar_split = bool(re.search(r"In\s+[\$]\s+millions", line))
+            if has_dollar_split:
+                clean_line = re.split(r"In\s+[\$]\s+millions", line, maxsplit=1)[0]
+            else:
+                clean_line = line
+            numbers = [_parse_indian_number(n) for n in re.findall(r"[\(\-]?[\d,]+\.?\d*\)?", clean_line)]
+            numbers = [n for n in numbers if n is not None and abs(n) >= 1.0]
+            # DBS/OCBC/UOB pattern: 4 segment values + 1 total = 5 numbers
+            # We take numbers[:-1] as segments (exclude last = total)
+            # Only proceed if we have the dollar-split (confirms business segment table)
+            # or if there are exactly 5 numbers (4 segments + total)
+            if len(numbers) >= 4 and (has_dollar_split or len(numbers) == 5):
+                _sgx_known_segments = [
+                    "Consumer Banking/ Wealth Management",
+                    "Institutional Banking",
+                    "Markets Trading",
+                ]
+                seg_values = numbers[:-1]  # exclude total
+                if len(seg_values) >= 3:
+                    for idx, seg_name in enumerate(_sgx_known_segments):
+                        if idx < len(seg_values):
+                            segments[seg_name] = seg_values[idx]
+                if segments:
+                    continue
+
+        # --- Pattern 5: HKEX multi-column with percentages ---
+        # "VAS 319,168 298,375 7% 49% 49%"
+        # "FinTech and Business Services 211,956 203,763 4% 32% 33%"
+        # "The Group 660,257 609,015 8% 100% 100%"
+        # HKEX results announcements embed segment revenue tables in prose
+        # with columns: Segment | Current Year | Prior Year | YoY% | Current% | Prior%
+        # The first number is the current-year revenue figure.
+        hkex_pct_match = re.match(
+            r"^([A-Za-z][\w\s&/\-\.]+?)\s+"
+            r"([\(\-]?[\d,]+\.?\d*\)?)\s+"     # current year number
+            r"(?:[\(\-]?[\d,]+\.?\d*\)?\s+)"    # prior year number
+            r"(?:[\-\+]?\d+%?\s+)"               # YoY change (7%, -5%, NA, etc.)
+            r"(?:\d+%?\s+)"                       # current % of total
+            r"(?:\d+%?)\s*$",                     # prior % of total
+            line,
+        )
+        if hkex_pct_match:
+            name = hkex_pct_match.group(1).strip()
+            val_str = hkex_pct_match.group(2).strip()
+            value = _parse_indian_number(val_str)
+            if value is not None and abs(value) >= 1.0 and len(name) >= 2:
+                name_lower = name.lower()
+                if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+                    segments[name] = value
+            continue
+
+        # --- Pattern 5b: HKEX simplified multi-column (fewer % columns) ---
+        # "VAS 79,041 82,234 -4%"
+        # "Marketing Services 34,951 29,924 17%"
+        # Quarterly results have: Segment | Q Revenue | Q-1 Revenue | QoQ%
+        hkex_simple_match = re.match(
+            r"^([A-Za-z][\w\s&/\-\.]+?)\s+"
+            r"([\(\-]?[\d,]+\.?\d*\)?)\s+"     # current period number
+            r"[\(\-]?[\d,]+\.?\d*\)?\s+"        # prior period number
+            r"[\-\+]?\d+%\s*$",                 # percentage change
+            line,
+        )
+        if hkex_simple_match:
+            name = hkex_simple_match.group(1).strip()
+            val_str = hkex_simple_match.group(2).strip()
+            value = _parse_indian_number(val_str)
+            if value is not None and abs(value) >= 1.0 and len(name) >= 2:
+                name_lower = name.lower()
+                if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+                    segments[name] = value
+            continue
+
+        # --- Pattern 5c: HKEX gross profit/margin table (skip these) ---
+        # "VAS 181,657 161,919 12% 57% 54%"
+        # These are gross profit tables, not revenue. We detect them by
+        # checking if the page context says "gross profit" near this line.
+        # Handled by page scoring: revenue pages score higher than GP pages.
+
         # --- Pattern 3: "Total {Segment} {numbers}" (highest priority) ---
         # These are aggregate segment totals like "Total Copper 22,247 12,701"
         # Financial PDFs use "-" or "–" as nil/zero indicators between numbers.
@@ -1703,13 +1945,34 @@ _PRODUCT_DESC_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
         "statutory result",  # "Total X statutory result" lines indicate segment data pages
         "key asset metrics",  # BHP header on segment data pages
     ],
+    "sg_sgx": [
+        "segment information", "business segment",
+        "business segment reporting",  # DBS Note 44 heading
+        "segment reporting",
+        "total income",  # Key row in transposed segment table
+        "consumer banking", "institutional banking",  # DBS/OCBC/UOB segments
+        "wealth management", "markets trading",  # DBS segments
+        "diverse range of banking",  # DBS segment description phrases
+        "financial services and products to institutional",
+    ],
     "hk_hkex": [
         "segment information", "分部资料", "业务分部",
         "reportable and operating segments",
+        "sets forth revenues",  # Tencent: "The following table sets forth revenues"
+        "revenues of the group",  # Tencent revenue table context
+        "business review and outlook",  # HKEX results: segment descriptions in business review
+        "revenues from",  # "Revenues from VAS increased by..."
+        "value-added services",  # Tencent segment name
+        "fintech",  # Tencent segment name
+        "marketing services",  # Tencent segment name
     ],
     "sa_tadawul": [
         "segment information", "operating segments",
         "description of segments", "معلومات القطاعات",
+        "reportable segments", "basis of segmentation",
+        "upstream", "downstream", "chemicals",  # Aramco/SABIC
+        "retail banking", "corporate banking",  # Saudi banks
+        "nature of products and services",  # IFRS 8 narrative
     ],
     "ca_sedar": [
         "operating segments", "segmented information",
@@ -1797,30 +2060,57 @@ def extract_product_descriptions_from_pdf(
                 len(desc_pages), desc_pages[0][1],
             )
 
-            # Extract segment descriptions from top-scoring pages
-            for page_idx, _ in desc_pages[:5]:
-                page = doc.pages[page_idx]
-                text = page.extract_text() or ""
+            # SGX-specific: parse segment descriptions from Note 44 page ONLY.
+            # Restrict to pages containing "business segment reporting" or
+            # "44.1" to avoid picking up segment name mentions from
+            # unrelated sections (CEO letter, CIO statement, etc.)
+            if market_id == "sg_sgx":
+                for page_obj in doc.pages:
+                    page_text = page_obj.extract_text() or ""
+                    page_lower = page_text.lower()
+                    if ("business segment reporting" in page_lower
+                            or "44.1" in page_lower
+                            or ("segment reporting" in page_lower and "business segment" in page_lower)):
+                        extracted = _parse_sgx_segment_descriptions(page_text)
+                        if extracted and len(extracted) >= 2:
+                            descriptions = extracted
+                            break
 
-                extracted = _parse_segment_descriptions(text)
+            # HKEX-specific: aggregate "– Revenues from {Segment}" across multiple pages
+            if market_id == "hk_hkex":
+                combined_text = ""
+                for page_idx, _ in desc_pages[:8]:
+                    page = doc.pages[page_idx]
+                    combined_text += (page.extract_text() or "") + "\n"
+                extracted = _parse_hkex_revenue_descriptions(combined_text)
                 if extracted and len(extracted) >= 2:
                     descriptions = extracted
-                    break
 
-                # If no structured descriptions, try paragraph text
-                if not descriptions:
-                    extracted = _parse_segment_paragraphs(text)
+            # Extract segment descriptions from top-scoring pages
+            if not descriptions:
+                for page_idx, _ in desc_pages[:5]:
+                    page = doc.pages[page_idx]
+                    text = page.extract_text() or ""
+
+                    extracted = _parse_segment_descriptions(text)
                     if extracted and len(extracted) >= 2:
                         descriptions = extracted
                         break
 
-                # If still no descriptions, try sub-asset hierarchy
-                # (ASX/mining reports: Copper = Escondida + Pampa Norte + ...)
-                if not descriptions:
-                    extracted = _parse_segment_subassets(text)
-                    if extracted and len(extracted) >= 2:
-                        descriptions = extracted
-                        break
+                    # If no structured descriptions, try paragraph text
+                    if not descriptions:
+                        extracted = _parse_segment_paragraphs(text)
+                        if extracted and len(extracted) >= 2:
+                            descriptions = extracted
+                            break
+
+                    # If still no descriptions, try sub-asset hierarchy
+                    # (ASX/mining reports: Copper = Escondida + Pampa Norte + ...)
+                    if not descriptions:
+                        extracted = _parse_segment_subassets(text)
+                        if extracted and len(extracted) >= 2:
+                            descriptions = extracted
+                            break
 
     except Exception as exc:
         logger.debug("Fuzzy PDF product description extraction failed: %s", exc)
@@ -1964,6 +2254,193 @@ def _parse_segment_subassets(text: str) -> dict[str, str]:
                         "inter-segment", "total", "net", "less"}
                 if not any(s in name_lower for s in skip) and len(name) >= 3:
                     sub_assets.append(name)
+
+    return descriptions
+
+
+def _parse_sgx_segment_descriptions(text: str) -> dict[str, str]:
+    """Parse SGX annual report segment descriptions.
+
+    SGX bank reports (DBS, OCBC, UOB) describe each segment in a
+    structured note (e.g. Note 44.1) with segment name as heading
+    followed by a paragraph description::
+
+        Consumer Banking/ Wealth Management
+        Consumer Banking/ Wealth Management provides individual customers
+        with a diverse range of banking and related financial services...
+
+        Institutional Banking
+        Institutional Banking provides financial services and products
+        to institutional clients, including bank and non-bank financial
+        institutions...
+
+        Markets Trading
+        The Markets Trading segment reflects the structuring, market-making
+        and trading activities carried out by Global Financial Markets...
+    """
+    descriptions: dict[str, str] = {}
+
+    # Known SGX bank segment names (used as heading anchors)
+    _sgx_segment_names = [
+        "Consumer Banking/ Wealth Management",
+        "Consumer Banking/Wealth Management",
+        "Institutional Banking",
+        "Markets Trading",
+        "Group Wholesale Banking",
+        "Group Retail",
+        "Treasury",
+        "Insurance",
+        "Others",
+    ]
+
+    # SGX annual reports are two-column PDFs. pdfplumber merges both
+    # columns onto the same line, so segment headings appear mid-line:
+    #   "Capital commitments 54 13 6 – 73 Institutional Banking"
+    #   "Total 426,862 ... Institutional Banking provides financial..."
+    # Strategy: scan each line for segment name occurrences.  When found,
+    # extract the text AFTER the segment name on that line + subsequent
+    # lines until the next segment name appears.
+
+    lines = text.split("\n")
+    current_segment = ""
+    current_desc_lines: list[str] = []
+
+    def _save_sgx():
+        nonlocal current_segment, current_desc_lines
+        if current_segment and current_desc_lines:
+            desc = " ".join(current_desc_lines).strip()
+            # Clean: remove leading numbers/noise from merged column data
+            desc = re.sub(r"^[\d,\s\-–]+", "", desc).strip()
+            if len(desc) >= 20:
+                descriptions[current_segment] = desc
+        current_segment = ""
+        current_desc_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Check if any known segment name appears in this line
+        matched_segment = ""
+        match_pos = -1
+        for seg_name in _sgx_segment_names:
+            pos = stripped.find(seg_name)
+            if pos >= 0:
+                # Prefer matches that are followed by description text
+                after = stripped[pos + len(seg_name):].strip()
+                if after and (after[0].isupper() or after.startswith("provides") or after.startswith("reflects")):
+                    matched_segment = seg_name
+                    match_pos = pos
+                    break
+                elif pos == 0:
+                    # Segment name at start of line (clean heading)
+                    matched_segment = seg_name
+                    match_pos = pos
+                    break
+
+        if matched_segment:
+            _save_sgx()
+            current_segment = matched_segment
+            # Extract text after the segment name on this same line
+            after_text = stripped[match_pos + len(matched_segment):].strip()
+            if after_text:
+                current_desc_lines = [after_text]
+            else:
+                current_desc_lines = []
+        elif current_segment:
+            # Check section boundaries
+            if stripped.startswith(("44.", "45.", "The Group", "The following table")):
+                _save_sgx()
+            else:
+                current_desc_lines.append(stripped)
+
+    _save_sgx()
+    return descriptions
+
+
+def _parse_hkex_revenue_descriptions(text: str) -> dict[str, str]:
+    """Parse HKEX results announcement segment descriptions.
+
+    HKEX annual/interim results announcements describe each segment's
+    revenue in dash-prefixed paragraphs following the revenue table::
+
+        - Revenues from VAS increased by 7% year-on-year to RMB319.2 billion
+          for the year ended 31 December 2024. International Games revenues
+          were RMB58.0 billion...
+
+        - Revenues from Marketing Services increased by 20% year-on-year...
+
+    Each paragraph starts with "– Revenues from {Segment}" and continues
+    until the next "–" paragraph or a section break.
+    """
+    # Split into paragraphs by the dash prefix
+    # HKEX uses both "–" (en-dash) and "-" (hyphen)
+    para_pattern = re.compile(
+        r"[-\u2013\u2014]\s*Revenues?\s+from\s+(.+?)(?:increased|decreased|grew|rose|declined|were|was)\s+",
+        re.IGNORECASE,
+    )
+
+    # Collect YoY and QoQ descriptions separately, prefer YoY
+    yoy_descs: dict[str, str] = {}
+    qoq_descs: dict[str, str] = {}
+
+    lines = text.split("\n")
+    current_segment = ""
+    current_desc_lines: list[str] = []
+
+    def _save_current():
+        nonlocal current_segment, current_desc_lines
+        if current_segment and current_desc_lines:
+            desc = " ".join(current_desc_lines).strip()
+            if len(desc) >= 20:
+                desc_lower = desc.lower()
+                is_full_year = "year ended" in desc_lower or "for the year" in desc_lower
+                is_quarterly_yoy = "year-on-year" in desc_lower and not is_full_year
+                is_qoq = "quarter-on-quarter" in desc_lower or "three months" in desc_lower
+                if is_full_year:
+                    # Full-year description (highest priority)
+                    yoy_descs[current_segment] = desc
+                elif is_qoq:
+                    qoq_descs[current_segment] = desc
+                elif is_quarterly_yoy:
+                    # Q4 YoY -- use as fallback, not preferred over full-year
+                    if current_segment not in yoy_descs:
+                        yoy_descs[current_segment] = desc
+                else:
+                    # Default bucket
+                    if current_segment not in yoy_descs:
+                        yoy_descs[current_segment] = desc
+        current_segment = ""
+        current_desc_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        match = para_pattern.match(stripped)
+        if match:
+            _save_current()
+            current_segment = match.group(1).strip().rstrip(",.:;")
+            current_desc_lines = [stripped]
+        elif current_segment:
+            if stripped.startswith(("Cost of revenues", "Gross profit", "Selling and",
+                                    "General and admin", "Interest income", "Finance costs",
+                                    "Share of profit", "Income tax", "Profit attributable")):
+                _save_current()
+            elif stripped.startswith(("-", "\u2013", "\u2014")) and "Revenue" not in stripped:
+                _save_current()
+            else:
+                current_desc_lines.append(stripped)
+
+    _save_current()
+
+    # Prefer YoY descriptions; fall back to QoQ for segments without YoY
+    descriptions: dict[str, str] = dict(yoy_descs)
+    for seg, desc in qoq_descs.items():
+        if seg not in descriptions:
+            descriptions[seg] = desc
 
     return descriptions
 

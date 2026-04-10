@@ -631,6 +631,85 @@ def _fetch_xbrl_financials(
 # ---------------------------------------------------------------------------
 
 
+def _extract_segment_revenue_from_xbrl(html_text: str) -> dict[str, float]:
+    """Extract segment revenue from Tadawul XBRL HTML.
+
+    Aramco/SABIC/Saudi bank XBRL files contain a segment revenue table
+    with columns = segments (Upstream, Downstream, Corporate) and rows
+    = product types (Crude oil, Refined products, Natural gas, etc.).
+
+    Finds the "Revenue from contracts with customers" row and reads
+    across segment columns for revenue totals.
+
+    Returns dict of {segment_name: revenue_value}. Empty if not found.
+    """
+    try:
+        from io import StringIO
+        dfs = pd.read_html(StringIO(html_text))
+    except Exception:
+        return {}
+
+    for df in dfs:
+        if df.shape[0] < 3 or df.shape[1] < 3:
+            continue
+
+        # Check if header row contains segment names (Upstream/Downstream)
+        header_text = " ".join(str(v).lower() for v in df.iloc[0:2].values.flatten())
+        if "upstream" not in header_text and "downstream" not in header_text:
+            # Also check for bank segments
+            if "retail" not in header_text and "corporate" not in header_text:
+                continue
+
+        # Find segment names from header rows (row 0 or 1)
+        segments: dict[int, str] = {}
+        for ri in range(min(3, len(df))):
+            for ci in range(1, df.shape[1]):
+                val = str(df.iloc[ri, ci]).strip()
+                if val.lower() in ("nan", "", "none", "total"):
+                    continue
+                # Check if this looks like a segment name (starts with uppercase)
+                if val[0].isupper() and not val.replace(",", "").replace(".", "").isdigit():
+                    if ci not in segments:
+                        segments[ci] = val
+
+        if len(segments) < 2:
+            continue
+
+        # Find revenue total row
+        revenue_keywords = [
+            "revenue from contracts with customers",
+            "external revenue",
+            "total revenue",
+            "net revenue",
+            "total income",
+        ]
+        result: dict[str, float] = {}
+        for _, row_data in df.iterrows():
+            row_label = str(row_data.iloc[0]).strip().lower()
+            if any(kw in row_label for kw in revenue_keywords):
+                for ci, seg_name in segments.items():
+                    if ci < len(row_data):
+                        val = str(row_data.iloc[ci]).strip()
+                        val = val.replace(",", "").replace("–", "0").replace("-", "0").replace("(", "-").replace(")", "")
+                        try:
+                            num = float(val)
+                            if seg_name.lower() not in ("total", "corporate") or abs(num) >= 1.0:
+                                result[seg_name] = num
+                        except (ValueError, TypeError):
+                            pass
+                if result:
+                    break
+
+        if len(result) >= 2:
+            logger.info(
+                "Tadawul XBRL segment revenue: %d segments from HTML table",
+                len(result),
+            )
+            return result
+
+    return {}
+
+
 class SATadawulClient:
     """PIT client for Saudi Tadawul equities.
 

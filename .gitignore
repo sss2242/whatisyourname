@@ -9,5 +9,8 @@
 cache/
 !cache/.gitkeep
 
+# Virtual environment
+venv/
+
 # Prevent accidental commit of git internals as a regular folder
 git/
