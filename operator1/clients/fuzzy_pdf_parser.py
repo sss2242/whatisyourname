@@ -1062,6 +1062,13 @@ _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
     "au_asx": [
         "operating segment information", "segment revenues",
         "revenue from external customers by segment",
+        "financial performance summary",  # BHP/mining annual report layout
+        "key asset metrics",
+        "from group production",  # "Total X from Group production" pattern
+        "segment value of sales",  # Reliance-style but also some AU
+        "statutory result",  # "Total X statutory result" aggregation lines
+        "underlying ebitda",  # BHP-style segment EBITDA
+        "underlying ebit",
     ],
     "ca_sedar": [
         "segment disclosures", "operating segments",
@@ -1106,6 +1113,43 @@ _SEGMENT_SKIP_LABELS = {
 }
 
 
+# Per-market table extraction strategy.
+# Markets produce different PDF layouts, so camelot/pdfplumber settings
+# and extraction priority differ per market.
+#
+# "prefer_text": Skip table extraction entirely and go straight to text
+#   parsing.  Best for dense multi-column reports (ASX mining, JSE) where
+#   "Total {Segment}" lines are the cleanest signal.
+#
+# "camelot_flavor": "stream" (default) or "lattice" for table detection.
+#   "lattice" works better for PDFs with visible cell borders (BSE SEBI).
+#
+# "pdfplumber_settings": dict passed to pdfplumber's extract_tables().
+#   Adjusts line tolerance, snap distances, etc.
+_SEGMENT_EXTRACTION_CONFIG: dict[str, dict[str, Any]] = {
+    "au_asx": {
+        "prefer_text": True,  # BHP/mining: "Total X" lines are most reliable
+    },
+    "za_jse": {
+        "prefer_text": True,  # Similar mining report format
+    },
+    "in_bse": {
+        "camelot_flavor": "stream",  # SEBI quarterly results -- standard tables
+        "prefer_text": False,
+    },
+    "sg_sgx": {
+        "camelot_flavor": "stream",
+        "prefer_text": False,
+    },
+    "sa_tadawul": {
+        "prefer_text": False,  # IFRS tables
+    },
+    "hk_hkex": {
+        "prefer_text": False,
+    },
+}
+
+
 def extract_segments_from_pdf(
     pdf_bytes: bytes,
     filing_date: str = "",
@@ -1118,6 +1162,11 @@ def extract_segments_from_pdf(
     names with their revenue values. Designed for IFRS 8, Ind AS 108,
     ASC 280 segment disclosures in annual and quarterly reports.
 
+    Uses per-market extraction strategies: some markets (ASX, JSE) have
+    dense multi-column layouts where text-based "Total {Segment}" parsing
+    works best; others (BSE, SGX) have clean tabular layouts where
+    camelot/pdfplumber table extraction is more accurate.
+
     Parameters
     ----------
     pdf_bytes:
@@ -1127,7 +1176,7 @@ def extract_segments_from_pdf(
     report_date:
         ISO date string of the fiscal period end date.
     market_id:
-        Market identifier for market-specific keyword hints.
+        Market identifier for market-specific extraction config.
 
     Returns
     -------
@@ -1145,6 +1194,11 @@ def extract_segments_from_pdf(
     market_kw = _SEGMENT_KEYWORDS_BY_MARKET.get(market_id, [])
     if market_kw:
         keywords = market_kw + keywords
+
+    # Per-market extraction config
+    config = _SEGMENT_EXTRACTION_CONFIG.get(market_id, {})
+    prefer_text = config.get("prefer_text", False)
+    camelot_flavor = config.get("camelot_flavor", "stream")
 
     segments: dict[str, float] = {}
 
@@ -1167,64 +1221,82 @@ def extract_segments_from_pdf(
             # Target only top 10 highest-scoring pages (1-indexed for camelot)
             target_pages = [p + 1 for p, _ in seg_pages[:10]]
 
-            # --- Path 1: Camelot table extraction (highest accuracy) ---
-            # Uses the same targeted page approach as extract_financials_from_pdf
-            try:
-                import camelot
-                import tempfile
-                import os
-
-                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-                    f.write(pdf_bytes)
-                    tmp_path = f.name
-
-                try:
-                    page_str = ",".join(str(p) for p in target_pages[:10])
-                    tables = camelot.read_pdf(tmp_path, pages=page_str, flavor="stream")
-                    logger.debug("Camelot segment tables: %d on pages %s", len(tables), page_str)
-
-                    for table in tables:
-                        if table.shape[0] < 3:
-                            continue
-                        extracted = _extract_segments_from_table(table.df.values.tolist())
-                        if extracted and len(extracted) >= 2:
-                            if len(extracted) > len(segments):
-                                segments = extracted
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-            except ImportError:
-                logger.debug("camelot-py not installed, using pdfplumber for segment tables")
-            except Exception as exc:
-                logger.debug("Camelot segment extraction failed: %s", exc)
-
-            # --- Path 2: pdfplumber table extraction (fallback) ---
-            if not segments:
-                for page_idx, _ in seg_pages[:10]:
-                    page = doc.pages[page_idx]
-                    tables = page.extract_tables()
-
-                    for table in tables:
-                        if not table or len(table) < 3:
-                            continue
-
-                        extracted = _extract_segments_from_table(table)
-                        if extracted and len(extracted) >= 2:
-                            if len(extracted) > len(segments):
-                                segments = extracted
-
-                    if len(segments) >= 2:
-                        break
-
-            # --- Path 3: Text-based extraction (final fallback) ---
-            if not segments:
+            # --- Text-first path (for markets with dense multi-column layouts) ---
+            if prefer_text:
                 for page_idx, _ in seg_pages[:10]:
                     page = doc.pages[page_idx]
                     text = page.extract_text() or ""
                     extracted = _extract_segments_from_text(text)
-                    if extracted and len(extracted) >= 2:
+                    if extracted and len(extracted) > len(segments):
                         segments = extracted
+                    if len(segments) >= 3:
                         break
+                if len(segments) >= 2:
+                    # Got good results from text; skip table extraction
+                    pass
+                else:
+                    # Text didn't work, fall through to table extraction
+                    prefer_text = False
+
+            if not prefer_text:
+                # --- Path 1: Camelot table extraction ---
+                try:
+                    import camelot
+                    import tempfile
+                    import os
+
+                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+                        f.write(pdf_bytes)
+                        tmp_path = f.name
+
+                    try:
+                        page_str = ",".join(str(p) for p in target_pages[:10])
+                        tables = camelot.read_pdf(tmp_path, pages=page_str, flavor=camelot_flavor)
+                        logger.debug("Camelot segment tables: %d on pages %s (flavor=%s)",
+                                     len(tables), page_str, camelot_flavor)
+
+                        for table in tables:
+                            if table.shape[0] < 3:
+                                continue
+                            extracted = _extract_segments_from_table(table.df.values.tolist())
+                            if extracted and len(extracted) >= 2:
+                                if len(extracted) > len(segments):
+                                    segments = extracted
+                    finally:
+                        if os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+                except ImportError:
+                    logger.debug("camelot-py not installed, using pdfplumber for segment tables")
+                except Exception as exc:
+                    logger.debug("Camelot segment extraction failed: %s", exc)
+
+                # --- Path 2: pdfplumber table extraction (fallback) ---
+                if not segments:
+                    for page_idx, _ in seg_pages[:10]:
+                        page = doc.pages[page_idx]
+                        tables = page.extract_tables()
+
+                        for table in tables:
+                            if not table or len(table) < 3:
+                                continue
+
+                            extracted = _extract_segments_from_table(table)
+                            if extracted and len(extracted) >= 2:
+                                if len(extracted) > len(segments):
+                                    segments = extracted
+
+                        if len(segments) >= 2:
+                            break
+
+                # --- Path 3: Text-based extraction (final fallback) ---
+                if not segments:
+                    for page_idx, _ in seg_pages[:10]:
+                        page = doc.pages[page_idx]
+                        text = page.extract_text() or ""
+                        extracted = _extract_segments_from_text(text)
+                        if extracted and len(extracted) >= 2:
+                            segments = extracted
+                            break
 
     except Exception as exc:
         logger.debug("Fuzzy PDF segment extraction failed: %s", exc)
@@ -1402,6 +1474,16 @@ def _extract_segments_from_text(text: str) -> dict[str, float]:
        where "Total {Segment}" lines carry the aggregate segment revenue.
     4. **Colon-separated**: "Segment Name: 1,234 million"
     """
+    # Normalize Unicode characters that break number parsing:
+    # U+2212 (−) -> ASCII hyphen-minus (-), U+2013 (–) -> (-),
+    # U+2014 (—) -> (-), U+00A0 (non-breaking space) -> space
+    text = (
+        text.replace("\u2212", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u00a0", " ")
+    )
+
     segments: dict[str, float] = {}
     total_segments: dict[str, float] = {}
     lines = text.split("\n")
@@ -1418,10 +1500,12 @@ def _extract_segments_from_text(text: str) -> dict[str, float]:
 
         # --- Pattern 3: "Total {Segment} {numbers}" (highest priority) ---
         # These are aggregate segment totals like "Total Copper 22,247 12,701"
+        # Financial PDFs use "-" or "–" as nil/zero indicators between numbers.
+        # The trailing number group must accept: digits, (digits), -digits, or bare "-"
         total_match = re.match(
             r"^Total\s+([A-Za-z][\w\s&/\-\.]+?)\s+"
             r"([\(\-]?[\d,]+\.?\d*\)?)"
-            r"(?:\s+[\(\-]?[\d,]+\.?\d*\)?)*\s*$",
+            r"(?:\s+(?:[\(\-]?[\d,]+\.?\d*\)?|-))*\s*$",
             line,
         )
         if total_match:
