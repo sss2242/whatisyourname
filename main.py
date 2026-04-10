@@ -3646,9 +3646,7 @@ Non-interactive examples:
         else:
             profile["product_catalysts"] = {"available": False}
 
-        # Product segment analysis removed (simfin dependency dropped).
-        # Segment data is now extracted directly by fuzzy_pdf_parser.extract_segments_from_pdf()
-        # and extract_product_descriptions_from_pdf() when filing PDFs are available.
+        # Product segment data extracted by fuzzy_pdf_parser when filing PDFs are available.
         profile["product_segments"] = {"available": False}
 
         # Inject reconciliation report
