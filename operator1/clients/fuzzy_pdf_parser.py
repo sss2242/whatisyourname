@@ -1114,8 +1114,8 @@ _SEGMENT_SKIP_LABELS = {
 
 
 # Per-market table extraction strategy.
-# Markets produce different PDF layouts, so camelot/pdfplumber settings
-# and extraction priority differ per market.
+# Markets produce different PDF layouts, so camelot/pdfplumber settings,
+# extraction priority, and page scoring thresholds differ per market.
 #
 # "prefer_text": Skip table extraction entirely and go straight to text
 #   parsing.  Best for dense multi-column reports (ASX mining, JSE) where
@@ -1124,28 +1124,52 @@ _SEGMENT_SKIP_LABELS = {
 # "camelot_flavor": "stream" (default) or "lattice" for table detection.
 #   "lattice" works better for PDFs with visible cell borders (BSE SEBI).
 #
-# "pdfplumber_settings": dict passed to pdfplumber's extract_tables().
-#   Adjusts line tolerance, snap distances, etc.
+# "min_page_score": Minimum keyword score for a page to be considered.
+#   Higher values filter out pages with only tangential segment mentions.
+#   Default is 1 (any keyword match).  ASX/JSE use 1 because their
+#   data pages have specific keywords; BSE uses 2 for stricter filtering.
+#
+# "max_pages": Maximum number of candidate pages to process. Default 10.
 _SEGMENT_EXTRACTION_CONFIG: dict[str, dict[str, Any]] = {
     "au_asx": {
         "prefer_text": True,  # BHP/mining: "Total X" lines are most reliable
+        "min_page_score": 1,
+        "max_pages": 15,  # Mining reports are long; check more pages
     },
     "za_jse": {
         "prefer_text": True,  # Similar mining report format
+        "min_page_score": 1,
+        "max_pages": 15,
     },
     "in_bse": {
         "camelot_flavor": "stream",  # SEBI quarterly results -- standard tables
         "prefer_text": False,
+        "min_page_score": 2,  # Stricter -- BSE has many pages with "segment"
     },
     "sg_sgx": {
         "camelot_flavor": "stream",
         "prefer_text": False,
+        "min_page_score": 2,
     },
     "sa_tadawul": {
         "prefer_text": False,  # IFRS tables
+        "min_page_score": 2,
     },
     "hk_hkex": {
         "prefer_text": False,
+        "min_page_score": 2,
+    },
+    "ae_dfm": {
+        "prefer_text": False,
+        "min_page_score": 2,
+    },
+    "ca_sedar": {
+        "prefer_text": False,
+        "min_page_score": 2,
+    },
+    "mx_bmv": {
+        "prefer_text": False,
+        "min_page_score": 2,
     },
 }
 
@@ -1199,31 +1223,36 @@ def extract_segments_from_pdf(
     config = _SEGMENT_EXTRACTION_CONFIG.get(market_id, {})
     prefer_text = config.get("prefer_text", False)
     camelot_flavor = config.get("camelot_flavor", "stream")
+    min_page_score = config.get("min_page_score", 1)
+    max_pages = config.get("max_pages", 10)
 
     segments: dict[str, float] = {}
 
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
-            # Score pages for segment content
+            # Score pages for segment content using per-market keyword list
             seg_pages: list[tuple[int, int]] = []
             for i, page in enumerate(doc.pages):
                 text = (page.extract_text() or "").lower()
                 score = sum(1 for kw in keywords if kw in text)
-                if score >= 1:
+                if score >= min_page_score:
                     seg_pages.append((i, score))
 
             seg_pages.sort(key=lambda x: -x[1])
             if not seg_pages:
                 return {}
 
-            logger.debug("Segment pages found: %d (top score: %d)", len(seg_pages), seg_pages[0][1])
+            logger.debug(
+                "Segment pages found: %d (top score: %d, min_score: %d, market: %s)",
+                len(seg_pages), seg_pages[0][1], min_page_score, market_id or "default",
+            )
 
-            # Target only top 10 highest-scoring pages (1-indexed for camelot)
-            target_pages = [p + 1 for p, _ in seg_pages[:10]]
+            # Target top N highest-scoring pages (1-indexed for camelot)
+            target_pages = [p + 1 for p, _ in seg_pages[:max_pages]]
 
             # --- Text-first path (for markets with dense multi-column layouts) ---
             if prefer_text:
-                for page_idx, _ in seg_pages[:10]:
+                for page_idx, _ in seg_pages[:max_pages]:
                     page = doc.pages[page_idx]
                     text = page.extract_text() or ""
                     extracted = _extract_segments_from_text(text)
@@ -1272,7 +1301,7 @@ def extract_segments_from_pdf(
 
                 # --- Path 2: pdfplumber table extraction (fallback) ---
                 if not segments:
-                    for page_idx, _ in seg_pages[:10]:
+                    for page_idx, _ in seg_pages[:max_pages]:
                         page = doc.pages[page_idx]
                         tables = page.extract_tables()
 
@@ -1290,7 +1319,7 @@ def extract_segments_from_pdf(
 
                 # --- Path 3: Text-based extraction (final fallback) ---
                 if not segments:
-                    for page_idx, _ in seg_pages[:10]:
+                    for page_idx, _ in seg_pages[:max_pages]:
                         page = doc.pages[page_idx]
                         text = page.extract_text() or ""
                         extracted = _extract_segments_from_text(text)
