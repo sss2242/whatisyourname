@@ -1058,6 +1058,12 @@ _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
         "segment reporting as per ind as 108", "segment wise revenue",
         "segment wise results", "business segment", "geographical segment",
         "segment assets and liabilities",
+        "segment value of sales",  # Reliance: "Segment Value of Sales & Services"
+        "segment profit",  # "Segment Profit before Interest and Tax"
+        "inter segment",  # "Inter Segment Transfers"
+        "oil to chemicals",  # Reliance segment name (data page indicator)
+        "digital services",  # Reliance/Jio segment name
+        "consolidated segment information",  # Header on data pages
     ],
     "au_asx": [
         "operating segment information", "segment revenues",
@@ -1110,6 +1116,10 @@ _SEGMENT_SKIP_LABELS = {
     "particulars", "segment", "description", "category",
     "group", "total group", "group and unallocated",
     "group and unallocated items", "third-party products",
+    "revenue from operations", "gross value of sales",
+    "value of sales", "net revenue", "total income",
+    "profit before tax", "profit after tax", "net profit",
+    "current tax", "deferred tax", "tax expense",
 }
 
 
@@ -1143,7 +1153,7 @@ _SEGMENT_EXTRACTION_CONFIG: dict[str, dict[str, Any]] = {
     },
     "in_bse": {
         "camelot_flavor": "stream",  # SEBI quarterly results -- standard tables
-        "prefer_text": False,
+        "prefer_text": True,  # Reliance/Tata: multi-column segment table, text "• Segment" lines
         "min_page_score": 2,  # Stricter -- BSE has many pages with "segment"
     },
     "sg_sgx": {
@@ -1525,6 +1535,31 @@ def _extract_segments_from_text(text: str) -> dict[str, float]:
         lower = line.lower()
         # Skip lines without numbers
         if not re.search(r"\d", line):
+            continue
+
+        # --- Pattern 4: Bullet-prefixed segments (BSE/Indian format) ---
+        # "• Oil to Chemicals (O2C) 160,558 149,595 477457 462,308"
+        # "- Retail' 5,269 13,756"
+        # Common in Indian SEBI quarterly results. The bullet (•) or dash (-)
+        # prefix distinguishes segment rows from header/total rows.
+        bullet_match = re.match(
+            r"^[•\-\*]\s+([A-Za-z][\w\s&/()\-\.]+?)\s+"
+            r"([\(\-]?[\d,]+\.?\d*\)?)"
+            r"(?:\s+(?:[\(\-]?[\d,]+\.?\d*\)?|[-•]))*\s*$",
+            line,
+        )
+        if bullet_match:
+            name = bullet_match.group(1).strip().rstrip("'\"*.,;: ")
+            # Remove parenthetical suffixes like "(O2C)" for cleaner names
+            clean_name = re.sub(r"\s*\([A-Z0-9]+\)\s*\*?\s*$", "", name).strip()
+            if not clean_name:
+                clean_name = name
+            val_str = bullet_match.group(2).strip()
+            value = _parse_indian_number(val_str)
+            if value is not None and abs(value) >= 1.0 and len(clean_name) >= 2:
+                name_lower = clean_name.lower()
+                if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+                    segments[clean_name] = value
             continue
 
         # --- Pattern 3: "Total {Segment} {numbers}" (highest priority) ---
