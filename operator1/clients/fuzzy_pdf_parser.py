@@ -1100,6 +1100,14 @@ _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
     "hk_hkex": [
         "segment information", "business segments",
         "revenue by segment", "分部资料", "业务分部",
+        "revenues of the group and its segments",  # Tencent-style revenue table header
+        "sets forth revenues",  # "The following table sets forth revenues..."
+        "revenue from contracts with customers",  # IFRS 15 disclosure
+        "revenues % of total revenues",  # Tencent column header
+        "segment revenue", "revenue breakdown",
+        "value-added services",  # Tencent segment name (VAS)
+        "fintech and business services",  # Tencent segment name
+        "marketing services",  # Tencent segment name
     ],
     "sa_tadawul": [
         "segment information", "operating segments",
@@ -1119,7 +1127,7 @@ _SEGMENT_SKIP_LABELS = {
     "reconciliation", "head office", "holding company",
     "total revenue", "total segment revenue", "total consolidated",
     "particulars", "segment", "description", "category",
-    "group", "total group", "group and unallocated",
+    "group", "the group", "total group", "group and unallocated",
     "group and unallocated items", "third-party products",
     "revenue from operations", "gross value of sales",
     "value of sales", "net revenue", "total income",
@@ -1171,8 +1179,9 @@ _SEGMENT_EXTRACTION_CONFIG: dict[str, dict[str, Any]] = {
         "min_page_score": 2,
     },
     "hk_hkex": {
-        "prefer_text": False,
+        "prefer_text": True,  # HKEX results announcements embed segment tables in prose text
         "min_page_score": 2,
+        "max_pages": 15,  # HKEX annual results can be 50-60 pages
     },
     "ae_dfm": {
         "prefer_text": False,
@@ -1251,6 +1260,17 @@ def extract_segments_from_pdf(
             for i, page in enumerate(doc.pages):
                 text = (page.extract_text() or "").lower()
                 score = sum(1 for kw in keywords if kw in text)
+                # HKEX revenue-priority boost: pages with "revenues" or
+                # "sets forth revenues" score higher than pages with only
+                # "gross profit" (both have segment breakdowns, but we want
+                # revenue tables, not gross profit tables).
+                if market_id == "hk_hkex":
+                    if "sets forth revenues" in text or "revenues % of total" in text:
+                        score += 5  # Strong boost for revenue table pages
+                    elif "revenue" in text and "gross profit" not in text:
+                        score += 3  # Moderate boost for revenue-only pages
+                    elif "gross profit" in text and "revenue" not in text:
+                        score -= 2  # Penalize gross-profit-only pages
                 if score >= min_page_score:
                     seg_pages.append((i, score))
 
@@ -1568,6 +1588,59 @@ def _extract_segments_from_text(text: str) -> dict[str, float]:
                     segments[clean_name] = value
             continue
 
+        # --- Pattern 5: HKEX multi-column with percentages ---
+        # "VAS 319,168 298,375 7% 49% 49%"
+        # "FinTech and Business Services 211,956 203,763 4% 32% 33%"
+        # "The Group 660,257 609,015 8% 100% 100%"
+        # HKEX results announcements embed segment revenue tables in prose
+        # with columns: Segment | Current Year | Prior Year | YoY% | Current% | Prior%
+        # The first number is the current-year revenue figure.
+        hkex_pct_match = re.match(
+            r"^([A-Za-z][\w\s&/\-\.]+?)\s+"
+            r"([\(\-]?[\d,]+\.?\d*\)?)\s+"     # current year number
+            r"(?:[\(\-]?[\d,]+\.?\d*\)?\s+)"    # prior year number
+            r"(?:[\-\+]?\d+%?\s+)"               # YoY change (7%, -5%, NA, etc.)
+            r"(?:\d+%?\s+)"                       # current % of total
+            r"(?:\d+%?)\s*$",                     # prior % of total
+            line,
+        )
+        if hkex_pct_match:
+            name = hkex_pct_match.group(1).strip()
+            val_str = hkex_pct_match.group(2).strip()
+            value = _parse_indian_number(val_str)
+            if value is not None and abs(value) >= 1.0 and len(name) >= 2:
+                name_lower = name.lower()
+                if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+                    segments[name] = value
+            continue
+
+        # --- Pattern 5b: HKEX simplified multi-column (fewer % columns) ---
+        # "VAS 79,041 82,234 -4%"
+        # "Marketing Services 34,951 29,924 17%"
+        # Quarterly results have: Segment | Q Revenue | Q-1 Revenue | QoQ%
+        hkex_simple_match = re.match(
+            r"^([A-Za-z][\w\s&/\-\.]+?)\s+"
+            r"([\(\-]?[\d,]+\.?\d*\)?)\s+"     # current period number
+            r"[\(\-]?[\d,]+\.?\d*\)?\s+"        # prior period number
+            r"[\-\+]?\d+%\s*$",                 # percentage change
+            line,
+        )
+        if hkex_simple_match:
+            name = hkex_simple_match.group(1).strip()
+            val_str = hkex_simple_match.group(2).strip()
+            value = _parse_indian_number(val_str)
+            if value is not None and abs(value) >= 1.0 and len(name) >= 2:
+                name_lower = name.lower()
+                if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+                    segments[name] = value
+            continue
+
+        # --- Pattern 5c: HKEX gross profit/margin table (skip these) ---
+        # "VAS 181,657 161,919 12% 57% 54%"
+        # These are gross profit tables, not revenue. We detect them by
+        # checking if the page context says "gross profit" near this line.
+        # Handled by page scoring: revenue pages score higher than GP pages.
+
         # --- Pattern 3: "Total {Segment} {numbers}" (highest priority) ---
         # These are aggregate segment totals like "Total Copper 22,247 12,701"
         # Financial PDFs use "-" or "–" as nil/zero indicators between numbers.
@@ -1706,6 +1779,13 @@ _PRODUCT_DESC_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
     "hk_hkex": [
         "segment information", "分部资料", "业务分部",
         "reportable and operating segments",
+        "sets forth revenues",  # Tencent: "The following table sets forth revenues"
+        "revenues of the group",  # Tencent revenue table context
+        "business review and outlook",  # HKEX results: segment descriptions in business review
+        "revenues from",  # "Revenues from VAS increased by..."
+        "value-added services",  # Tencent segment name
+        "fintech",  # Tencent segment name
+        "marketing services",  # Tencent segment name
     ],
     "sa_tadawul": [
         "segment information", "operating segments",
@@ -1797,30 +1877,41 @@ def extract_product_descriptions_from_pdf(
                 len(desc_pages), desc_pages[0][1],
             )
 
-            # Extract segment descriptions from top-scoring pages
-            for page_idx, _ in desc_pages[:5]:
-                page = doc.pages[page_idx]
-                text = page.extract_text() or ""
-
-                extracted = _parse_segment_descriptions(text)
+            # HKEX-specific: aggregate "– Revenues from {Segment}" across multiple pages
+            if market_id == "hk_hkex":
+                combined_text = ""
+                for page_idx, _ in desc_pages[:8]:
+                    page = doc.pages[page_idx]
+                    combined_text += (page.extract_text() or "") + "\n"
+                extracted = _parse_hkex_revenue_descriptions(combined_text)
                 if extracted and len(extracted) >= 2:
                     descriptions = extracted
-                    break
 
-                # If no structured descriptions, try paragraph text
-                if not descriptions:
-                    extracted = _parse_segment_paragraphs(text)
+            # Extract segment descriptions from top-scoring pages
+            if not descriptions:
+                for page_idx, _ in desc_pages[:5]:
+                    page = doc.pages[page_idx]
+                    text = page.extract_text() or ""
+
+                    extracted = _parse_segment_descriptions(text)
                     if extracted and len(extracted) >= 2:
                         descriptions = extracted
                         break
 
-                # If still no descriptions, try sub-asset hierarchy
-                # (ASX/mining reports: Copper = Escondida + Pampa Norte + ...)
-                if not descriptions:
-                    extracted = _parse_segment_subassets(text)
-                    if extracted and len(extracted) >= 2:
-                        descriptions = extracted
-                        break
+                    # If no structured descriptions, try paragraph text
+                    if not descriptions:
+                        extracted = _parse_segment_paragraphs(text)
+                        if extracted and len(extracted) >= 2:
+                            descriptions = extracted
+                            break
+
+                    # If still no descriptions, try sub-asset hierarchy
+                    # (ASX/mining reports: Copper = Escondida + Pampa Norte + ...)
+                    if not descriptions:
+                        extracted = _parse_segment_subassets(text)
+                        if extracted and len(extracted) >= 2:
+                            descriptions = extracted
+                            break
 
     except Exception as exc:
         logger.debug("Fuzzy PDF product description extraction failed: %s", exc)
@@ -1964,6 +2055,83 @@ def _parse_segment_subassets(text: str) -> dict[str, str]:
                         "inter-segment", "total", "net", "less"}
                 if not any(s in name_lower for s in skip) and len(name) >= 3:
                     sub_assets.append(name)
+
+    return descriptions
+
+
+def _parse_hkex_revenue_descriptions(text: str) -> dict[str, str]:
+    """Parse HKEX results announcement segment descriptions.
+
+    HKEX annual/interim results announcements describe each segment's
+    revenue in dash-prefixed paragraphs following the revenue table::
+
+        - Revenues from VAS increased by 7% year-on-year to RMB319.2 billion
+          for the year ended 31 December 2024. International Games revenues
+          were RMB58.0 billion...
+
+        - Revenues from Marketing Services increased by 20% year-on-year...
+
+    Each paragraph starts with "– Revenues from {Segment}" and continues
+    until the next "–" paragraph or a section break.
+    """
+    descriptions: dict[str, str] = {}
+
+    # Split into paragraphs by the dash prefix
+    # HKEX uses both "–" (en-dash) and "-" (hyphen)
+    para_pattern = re.compile(
+        r"[-\u2013\u2014]\s*Revenues?\s+from\s+(.+?)(?:increased|decreased|grew|rose|declined|were|was)\s+",
+        re.IGNORECASE,
+    )
+
+    # Find all revenue paragraphs
+    lines = text.split("\n")
+    current_segment = ""
+    current_desc_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        match = para_pattern.match(stripped)
+        if match:
+            # Save previous segment
+            if current_segment and current_desc_lines:
+                desc = " ".join(current_desc_lines).strip()
+                if len(desc) >= 20:
+                    descriptions[current_segment] = desc
+
+            # Start new segment
+            current_segment = match.group(1).strip().rstrip(",.:;")
+            current_desc_lines = [stripped]
+        elif current_segment:
+            # Check if this line starts a new non-revenue section
+            if stripped.startswith(("Cost of revenues", "Gross profit", "Selling and",
+                                    "General and admin", "Interest income", "Finance costs",
+                                    "Share of profit", "Income tax", "Profit attributable")):
+                # Save and close current segment
+                if current_desc_lines:
+                    desc = " ".join(current_desc_lines).strip()
+                    if len(desc) >= 20:
+                        descriptions[current_segment] = desc
+                current_segment = ""
+                current_desc_lines = []
+            elif stripped.startswith(("-", "\u2013", "\u2014")) and "Revenue" not in stripped:
+                # New dash paragraph that is not a revenue description -- close current
+                if current_desc_lines:
+                    desc = " ".join(current_desc_lines).strip()
+                    if len(desc) >= 20:
+                        descriptions[current_segment] = desc
+                current_segment = ""
+                current_desc_lines = []
+            else:
+                current_desc_lines.append(stripped)
+
+    # Save last segment
+    if current_segment and current_desc_lines:
+        desc = " ".join(current_desc_lines).strip()
+        if len(desc) >= 20:
+            descriptions[current_segment] = desc
 
     return descriptions
 
