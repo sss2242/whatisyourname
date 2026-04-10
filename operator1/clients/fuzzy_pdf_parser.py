@@ -1098,6 +1098,12 @@ _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
     "za_jse": [
         "segment report", "segmental analysis",
         "revenue per segment", "operating segments",
+        "group performance",  # Sasol-style segment table footer
+        "intersegmental turnover",  # Sasol inter-segment elimination line
+        "external turnover",  # Sasol net turnover line
+        "southern africa",  # Sasol segment group heading
+        "international chemicals",  # Sasol segment group heading
+        "turnover", "ebit",  # JSE column headers
     ],
     "ae_dfm": [
         "segment information", "operating segments",
@@ -1149,6 +1155,8 @@ _SEGMENT_SKIP_LABELS = {
     "goodwill and intangible assets",
     "share of profits or losses of associates",
     "interests",
+    "group performance", "intersegmental turnover",
+    "external turnover", "business support",
 }
 
 
@@ -1648,6 +1656,57 @@ def _extract_segments_from_text(text: str) -> dict[str, float]:
                 name_lower = clean_name.lower()
                 if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
                     segments[clean_name] = value
+            continue
+
+        # --- Pattern 7: JSE SENS left-number format ---
+        # JSE financial results have turnover on LEFT, segment name in CENTER,
+        # EBIT on RIGHT: "14 744 15 347 Mining 2 138 2 291"
+        # SA number format: spaces as thousands separators (not commas)
+        # Format: {num1} {num2} {SegmentName} {num3} {num4}
+        # where num1=current turnover, num2=prior turnover
+        # Match: one or more digit groups (SA thousands format) followed by a
+        # capitalized segment name, followed by more digit groups
+        # SA number format: "14 744" = 14,744 (1-3 digits, then groups of 3)
+        _sa_num = r"\d{1,3}(?:\s\d{3})*"
+        jse_match = re.match(
+            r"^(" + _sa_num + r")\s+(" + _sa_num + r")\s+"  # two SA-format numbers
+            r"([A-Z][A-Za-z ]+?)\s+"                          # segment name
+            r"[\(\-]?[\d]",                                    # EBIT number starts
+            line,
+        )
+        if jse_match:
+            val_str = jse_match.group(1).strip()
+            name = jse_match.group(3).strip()
+            # Parse SA number format (spaces as thousands: "14 744" -> 14744)
+            val_clean = val_str.replace(" ", "")
+            try:
+                value = float(val_clean)
+            except ValueError:
+                value = None
+            if value is not None and abs(value) >= 1.0 and len(name) >= 2:
+                name_lower = name.lower()
+                if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+                    segments[name] = value
+            continue
+
+        # --- Pattern 7b: JSE negative/zero turnover segments ---
+        # "- - Business Support (302) 325"
+        # Segments with zero turnover have "-" instead of numbers
+        jse_zero_match = re.match(
+            r"^-\s+-\s+([A-Z][A-Za-z ]+?)\s+[\(\-]?[\d]",
+            line,
+        )
+        if jse_zero_match:
+            name = jse_zero_match.group(1).strip()
+            name_lower = name.lower()
+            if not any(skip in name_lower for skip in _SEGMENT_SKIP_LABELS):
+                segments[name] = 0.0
+            continue
+
+        # --- Pattern 7c: JSE group performance total line ---
+        # "141 991 141 176 Group performance 4 619 9 533"
+        # Skip this -- it's the total, not a segment
+        if "group performance" in lower:
             continue
 
         # --- Pattern 6: SGX transposed segment table ---
