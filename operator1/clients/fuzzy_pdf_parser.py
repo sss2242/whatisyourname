@@ -1124,6 +1124,14 @@ _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
     "sa_tadawul": [
         "segment information", "operating segments",
         "revenue by segment", "معلومات القطاعات",
+        "reportable segments",  # IFRS 8 disclosure
+        "segment reporting",
+        "upstream", "downstream",  # Aramco/petrochemical segment names
+        "chemicals", "refining",  # SABIC/Ma'aden segment names
+        "retail banking", "corporate banking",  # Bank segment names (Al Rajhi, SNB)
+        "insurance operations",  # Insurance segment names (Bupa Arabia, Tawuniya)
+        "revenue from external customers",  # IFRS 8 disclosure line
+        "zakat",  # Saudi-specific tax line (confirms Saudi PDF)
     ],
     "mx_bmv": [
         "información por segmentos", "segmentos operativos",
@@ -1961,6 +1969,10 @@ _PRODUCT_DESC_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
     "sa_tadawul": [
         "segment information", "operating segments",
         "description of segments", "معلومات القطاعات",
+        "reportable segments", "basis of segmentation",
+        "upstream", "downstream", "chemicals",  # Aramco/SABIC
+        "retail banking", "corporate banking",  # Saudi banks
+        "nature of products and services",  # IFRS 8 narrative
     ],
     "ca_sedar": [
         "operating segments", "segmented information",
