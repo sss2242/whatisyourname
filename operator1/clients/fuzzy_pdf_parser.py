@@ -1691,6 +1691,11 @@ _PRODUCT_DESC_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
     "au_asx": [
         "operating segment information", "nature of segments",
         "identification of reportable operating segments",
+        "from group production",  # BHP: sub-asset hierarchy pages (same as segment data pages)
+        "underlying ebitda margin",  # Segment contribution pages
+        "segment contribution",
+        "statutory result",  # "Total X statutory result" lines indicate segment data pages
+        "key asset metrics",  # BHP header on segment data pages
     ],
     "hk_hkex": [
         "segment information", "分部资料", "业务分部",
@@ -1762,6 +1767,11 @@ def extract_product_descriptions_from_pdf(
                     score += 3
                 if "principal activities" in text or "nature of products" in text:
                     score += 2
+                # Boost pages with sub-asset hierarchy (ASX/mining: "Total Copper from Group production")
+                if "from group production" in text:
+                    score += 3
+                if "statutory result" in text and "total" in text:
+                    score += 2
                 if score >= 2:
                     desc_pages.append((i, score))
 
@@ -1784,10 +1794,17 @@ def extract_product_descriptions_from_pdf(
                     descriptions = extracted
                     break
 
-                # If no structured descriptions, try to extract from
-                # less structured paragraph text
+                # If no structured descriptions, try paragraph text
                 if not descriptions:
                     extracted = _parse_segment_paragraphs(text)
+                    if extracted and len(extracted) >= 2:
+                        descriptions = extracted
+                        break
+
+                # If still no descriptions, try sub-asset hierarchy
+                # (ASX/mining reports: Copper = Escondida + Pampa Norte + ...)
+                if not descriptions:
+                    extracted = _parse_segment_subassets(text)
                     if extracted and len(extracted) >= 2:
                         descriptions = extracted
                         break
@@ -1846,6 +1863,94 @@ def _parse_segment_descriptions(text: str) -> dict[str, str]:
 
         if len(segment_name) >= 2 and len(description) >= 10:
             descriptions[segment_name] = description
+
+    return descriptions
+
+
+def _parse_segment_subassets(text: str) -> dict[str, str]:
+    """Parse ASX/mining-style segment descriptions from sub-asset hierarchy.
+
+    BHP-style reports don't have narrative segment descriptions. Instead,
+    the sub-assets listed under each "Total {Segment}" heading form a
+    natural product description::
+
+        Copper
+        Escondida 7,924 5,642 5,115 15,682 1,085
+        Pampa Norte 1,302 666 435 5,354 395
+        Antamina 1,188 800 735 1,781 242
+        Copper South Australia 2,615 1,251 875 18,012 760
+        Total Copper from Group production 13,110 8,271 7,037
+
+    Produces: {"Copper": "Escondida, Pampa Norte, Antamina, Copper South Australia"}
+    """
+    # Normalize unicode
+    text = (
+        text.replace("\u2212", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u00a0", " ")
+    )
+
+    descriptions: dict[str, str] = {}
+    lines = text.split("\n")
+
+    current_segment = ""
+    sub_assets: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Detect "Total {Segment}" lines -- these close the current group
+        total_match = re.match(
+            r"^Total\s+([A-Za-z][\w\s&/\-\.]+?)\s+(?:from\s+Group|[\(\-]?[\d,])",
+            stripped,
+        )
+        if total_match:
+            seg_name = total_match.group(1).strip()
+            # Clean: remove "from Group production", "statutory result" suffixes
+            seg_name = re.sub(
+                r"\s*(?:from\s+Group\s+production|statutory\s+result)\s*$",
+                "", seg_name, flags=re.IGNORECASE,
+            ).strip()
+
+            if seg_name and sub_assets:
+                # Deduplicate and filter sub-asset names
+                clean_subs = []
+                seen = set()
+                for sa in sub_assets:
+                    if sa.lower() not in seen and sa.lower() != seg_name.lower():
+                        clean_subs.append(sa)
+                        seen.add(sa.lower())
+                if clean_subs:
+                    descriptions[seg_name] = ", ".join(clean_subs)
+
+            current_segment = ""
+            sub_assets = []
+            continue
+
+        # Detect segment header (standalone name, no numbers or few numbers)
+        # e.g. "Copper" or "Iron Ore" alone on a line
+        if re.match(r"^[A-Z][A-Za-z\s]+$", stripped) and len(stripped) < 40:
+            current_segment = stripped
+            sub_assets = []
+            continue
+
+        # Collect sub-asset names (lines with name + numbers under a segment)
+        if current_segment:
+            sub_match = re.match(
+                r"^([A-Za-z][\w\s&/\-\.]+?)\s+[\(\-]?[\d,]+",
+                stripped,
+            )
+            if sub_match:
+                name = sub_match.group(1).strip()
+                # Skip "Other", "Third-party", totals, adjustments
+                name_lower = name.lower()
+                skip = {"other", "others", "third-party products", "adjustment",
+                        "inter-segment", "total", "net", "less"}
+                if not any(s in name_lower for s in skip) and len(name) >= 3:
+                    sub_assets.append(name)
 
     return descriptions
 
