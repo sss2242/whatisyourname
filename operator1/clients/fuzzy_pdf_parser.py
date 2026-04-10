@@ -1088,6 +1088,12 @@ _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
     "sg_sgx": [
         "segment information", "business segment",
         "revenue by segment", "operating segments",
+        "business segment reporting",  # DBS Note 44.1 heading
+        "segment reporting",  # SFRS(I) 8 disclosure
+        "total income",  # DBS key row in segment table
+        "consumer banking", "institutional banking",  # DBS/OCBC/UOB segment names
+        "wealth management", "markets trading",  # DBS segment names
+        "group wholesale banking", "group retail",  # OCBC segment names
     ],
     "za_jse": [
         "segment report", "segmental analysis",
@@ -1133,6 +1139,16 @@ _SEGMENT_SKIP_LABELS = {
     "value of sales", "net revenue", "total income",
     "profit before tax", "profit after tax", "net profit",
     "current tax", "deferred tax", "tax expense",
+    "net interest income", "net fee and commission income",
+    "other non-interest income", "total expenses", "expenses",
+    "amortisation of intangible assets", "depreciation",
+    "allowances for credit and other losses",
+    "income tax expense and non-controlling interest",
+    "net profit attributable to shareholders",
+    "capital expenditure", "total liabilities",
+    "goodwill and intangible assets",
+    "share of profits or losses of associates",
+    "interests",
 }
 
 
@@ -1171,8 +1187,9 @@ _SEGMENT_EXTRACTION_CONFIG: dict[str, dict[str, Any]] = {
     },
     "sg_sgx": {
         "camelot_flavor": "stream",
-        "prefer_text": False,
+        "prefer_text": True,  # SGX bank annual reports: segment tables embedded in text
         "min_page_score": 2,
+        "max_pages": 15,
     },
     "sa_tadawul": {
         "prefer_text": False,  # IFRS tables
@@ -1260,6 +1277,22 @@ def extract_segments_from_pdf(
             for i, page in enumerate(doc.pages):
                 text = (page.extract_text() or "").lower()
                 score = sum(1 for kw in keywords if kw in text)
+                # SGX segment table priority: boost Note 44 pages in financial
+                # statements section over summary tables in overview section.
+                if market_id == "sg_sgx":
+                    if "business segment reporting" in text:
+                        score += 10  # Strong boost for the actual Note 44
+                    # Key signal: "Total income" line with "In $ millions" on same
+                    # line -- this ONLY appears on the business segment data page
+                    # where pdfplumber merges both columns into one line.
+                    import re as _re
+                    if _re.search(r"total income.*in\s+[\$]\s+millions", text):
+                        score += 15  # Strongest boost -- this is THE segment data page
+                    if "geographical segment" in text and "business segment" not in text:
+                        score -= 3  # Only penalize pure geographic pages
+                    # Boost financial statements pages (typically page 60+)
+                    if i >= 50 and ("segment reporting" in text or "business segment" in text):
+                        score += 5
                 # HKEX revenue-priority boost: pages with "revenues" or
                 # "sets forth revenues" score higher than pages with only
                 # "gross profit" (both have segment breakdowns, but we want
@@ -1285,6 +1318,35 @@ def extract_segments_from_pdf(
 
             # Target top N highest-scoring pages (1-indexed for camelot)
             target_pages = [p + 1 for p, _ in seg_pages[:max_pages]]
+
+            # --- SGX direct extraction: find "Total income ... In $ millions" ---
+            # SGX bank annual reports have a unique pattern where pdfplumber
+            # merges the business and geographic segment tables onto the same
+            # text line. We scan ALL pages for this specific signature line.
+            if market_id == "sg_sgx" and not segments:
+                _sgx_known_segments = [
+                    "Consumer Banking/ Wealth Management",
+                    "Institutional Banking",
+                    "Markets Trading",
+                ]
+                for page_obj in doc.pages:
+                    page_text = page_obj.extract_text() or ""
+                    for text_line in page_text.split("\n"):
+                        if (text_line.lower().startswith("total income")
+                                and re.search(r"In\s+[\$]\s+millions", text_line)):
+                            clean = re.split(r"In\s+[\$]\s+millions", text_line, maxsplit=1)[0]
+                            nums = [_parse_indian_number(n)
+                                    for n in re.findall(r"[\(\-]?[\d,]+\.?\d*\)?", clean)]
+                            nums = [n for n in nums if n is not None and abs(n) >= 1.0]
+                            if len(nums) >= 4:
+                                seg_vals = nums[:-1]  # exclude group total
+                                for idx, seg_name in enumerate(_sgx_known_segments):
+                                    if idx < len(seg_vals):
+                                        segments[seg_name] = seg_vals[idx]
+                                if len(segments) >= 3:
+                                    break
+                    if segments:
+                        break
 
             # --- Text-first path (for markets with dense multi-column layouts) ---
             if prefer_text:
@@ -1588,6 +1650,46 @@ def _extract_segments_from_text(text: str) -> dict[str, float]:
                     segments[clean_name] = value
             continue
 
+        # --- Pattern 6: SGX transposed segment table ---
+        # SGX bank annual reports (DBS, OCBC, UOB) have columns = segments:
+        #   "Total income 10,541 8,906 1,374 2,079 22,900 ..."
+        # The segment names are in header rows above but pdfplumber merges
+        # both page columns making header detection unreliable.  Instead we
+        # use a direct approach: detect "Total income" lines and extract the
+        # first N numbers, mapping them to known SGX bank segment names in
+        # the canonical order: CBG/WM, IBG, Markets/Trading, Others.
+        # The Nth+1 number is the group total (skip it).
+        if lower.startswith("total income") and re.search(r"\d", line) and not segments:
+            # SGX bank segment table: "Total income 10,541 8,906 1,374 2,079 22,900"
+            # On multi-column pages, pdfplumber merges both tables onto one line:
+            # "Total income 10,541 8,906 1,374 2,079 22,900 In $ millions Singapore..."
+            # We PREFER lines containing "In $ millions" (they have the business
+            # segment table on the left, not just geographic data).
+            has_dollar_split = bool(re.search(r"In\s+[\$]\s+millions", line))
+            if has_dollar_split:
+                clean_line = re.split(r"In\s+[\$]\s+millions", line, maxsplit=1)[0]
+            else:
+                clean_line = line
+            numbers = [_parse_indian_number(n) for n in re.findall(r"[\(\-]?[\d,]+\.?\d*\)?", clean_line)]
+            numbers = [n for n in numbers if n is not None and abs(n) >= 1.0]
+            # DBS/OCBC/UOB pattern: 4 segment values + 1 total = 5 numbers
+            # We take numbers[:-1] as segments (exclude last = total)
+            # Only proceed if we have the dollar-split (confirms business segment table)
+            # or if there are exactly 5 numbers (4 segments + total)
+            if len(numbers) >= 4 and (has_dollar_split or len(numbers) == 5):
+                _sgx_known_segments = [
+                    "Consumer Banking/ Wealth Management",
+                    "Institutional Banking",
+                    "Markets Trading",
+                ]
+                seg_values = numbers[:-1]  # exclude total
+                if len(seg_values) >= 3:
+                    for idx, seg_name in enumerate(_sgx_known_segments):
+                        if idx < len(seg_values):
+                            segments[seg_name] = seg_values[idx]
+                if segments:
+                    continue
+
         # --- Pattern 5: HKEX multi-column with percentages ---
         # "VAS 319,168 298,375 7% 49% 49%"
         # "FinTech and Business Services 211,956 203,763 4% 32% 33%"
@@ -1776,6 +1878,16 @@ _PRODUCT_DESC_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
         "statutory result",  # "Total X statutory result" lines indicate segment data pages
         "key asset metrics",  # BHP header on segment data pages
     ],
+    "sg_sgx": [
+        "segment information", "business segment",
+        "business segment reporting",  # DBS Note 44 heading
+        "segment reporting",
+        "total income",  # Key row in transposed segment table
+        "consumer banking", "institutional banking",  # DBS/OCBC/UOB segments
+        "wealth management", "markets trading",  # DBS segments
+        "diverse range of banking",  # DBS segment description phrases
+        "financial services and products to institutional",
+    ],
     "hk_hkex": [
         "segment information", "分部资料", "业务分部",
         "reportable and operating segments",
@@ -1876,6 +1988,16 @@ def extract_product_descriptions_from_pdf(
                 "Product description pages found: %d (top score: %d)",
                 len(desc_pages), desc_pages[0][1],
             )
+
+            # SGX-specific: parse segment descriptions from Note 44 heading format
+            if market_id == "sg_sgx":
+                combined_text = ""
+                for page_idx, _ in desc_pages[:8]:
+                    page = doc.pages[page_idx]
+                    combined_text += (page.extract_text() or "") + "\n"
+                extracted = _parse_sgx_segment_descriptions(combined_text)
+                if extracted and len(extracted) >= 2:
+                    descriptions = extracted
 
             # HKEX-specific: aggregate "– Revenues from {Segment}" across multiple pages
             if market_id == "hk_hkex":
@@ -2055,6 +2177,87 @@ def _parse_segment_subassets(text: str) -> dict[str, str]:
                         "inter-segment", "total", "net", "less"}
                 if not any(s in name_lower for s in skip) and len(name) >= 3:
                     sub_assets.append(name)
+
+    return descriptions
+
+
+def _parse_sgx_segment_descriptions(text: str) -> dict[str, str]:
+    """Parse SGX annual report segment descriptions.
+
+    SGX bank reports (DBS, OCBC, UOB) describe each segment in a
+    structured note (e.g. Note 44.1) with segment name as heading
+    followed by a paragraph description::
+
+        Consumer Banking/ Wealth Management
+        Consumer Banking/ Wealth Management provides individual customers
+        with a diverse range of banking and related financial services...
+
+        Institutional Banking
+        Institutional Banking provides financial services and products
+        to institutional clients, including bank and non-bank financial
+        institutions...
+
+        Markets Trading
+        The Markets Trading segment reflects the structuring, market-making
+        and trading activities carried out by Global Financial Markets...
+    """
+    descriptions: dict[str, str] = {}
+
+    # Known SGX bank segment names (used as heading anchors)
+    _sgx_segment_names = [
+        "Consumer Banking/ Wealth Management",
+        "Consumer Banking/Wealth Management",
+        "Institutional Banking",
+        "Markets Trading",
+        "Group Wholesale Banking",
+        "Group Retail",
+        "Treasury",
+        "Insurance",
+        "Others",
+    ]
+
+    lines = text.split("\n")
+    current_segment = ""
+    current_desc_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Check if this line matches a known segment heading
+        matched_segment = ""
+        for seg_name in _sgx_segment_names:
+            if stripped == seg_name or stripped.startswith(seg_name + "\n"):
+                matched_segment = seg_name
+                break
+
+        if matched_segment:
+            # Save previous segment
+            if current_segment and current_desc_lines:
+                desc = " ".join(current_desc_lines).strip()
+                if len(desc) >= 20:
+                    descriptions[current_segment] = desc
+
+            current_segment = matched_segment
+            current_desc_lines = []
+        elif current_segment:
+            # Check if this line starts a new section (non-segment heading)
+            if stripped.startswith(("44.", "45.", "The Group", "The following table")):
+                if current_desc_lines:
+                    desc = " ".join(current_desc_lines).strip()
+                    if len(desc) >= 20:
+                        descriptions[current_segment] = desc
+                current_segment = ""
+                current_desc_lines = []
+            else:
+                current_desc_lines.append(stripped)
+
+    # Save last segment
+    if current_segment and current_desc_lines:
+        desc = " ".join(current_desc_lines).strip()
+        if len(desc) >= 20:
+            descriptions[current_segment] = desc
 
     return descriptions
 
