@@ -1241,6 +1241,12 @@ _SEGMENT_EXTRACTION_CONFIG: dict[str, dict[str, Any]] = {
         "prefer_text": False,
         "min_page_score": 2,
     },
+    "br_cvm": {
+        "camelot_flavor": "stream",
+        "prefer_text": False,  # Brazilian DFP reports have well-structured IFRS tables
+        "min_page_score": 2,  # Strict -- DFP reports are 200+ pages, many mention "segmento"
+        "max_pages": 15,  # Notes section is long; check enough pages for CPC 22 disclosure
+    },
 }
 
 
