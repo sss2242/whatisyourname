@@ -1137,6 +1137,18 @@ _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
         "información por segmentos", "segmentos operativos",
         "ingresos por segmento",
     ],
+    "br_cvm": [
+        "informações por segmento", "segmentos operacionais",
+        "receita por segmento", "cpc 22", "ifrs 8",
+        "segmentos reportáveis", "informação por segmento",
+        "receita líquida por segmento", "resultado por segmento",
+        "exploração e produção",  # Petrobras segment name
+        "refino e comercialização",  # Petrobras segment name
+        "gás e energia",  # Petrobras segment name
+        "distribuição",  # Petrobras/fuel retail segment
+        "receita intersegmentos", "eliminações entre segmentos",
+        "notas explicativas",  # Notes section where segments live
+    ],
 }
 
 # Labels that indicate a row is a segment total or header (not an individual segment)
@@ -1980,6 +1992,15 @@ _PRODUCT_DESC_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
         "results by business segment",
         "personal & commercial banking",  # Canadian bank segment names
         "wealth management", "capital markets",
+    ],
+    "br_cvm": [
+        "informações por segmento", "segmentos operacionais",
+        "cpc 22", "ifrs 8", "notas explicativas",
+        "segmentos reportáveis", "descrição dos segmentos",
+        "exploração e produção",  # Petrobras E&P
+        "refino", "gás e energia", "distribuição",
+        "natureza dos produtos e serviços",
+        "segment includes", "segment comprises",
     ],
 }
 

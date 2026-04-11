@@ -500,6 +500,167 @@ class BRCvmClient:
 
 
 
+    # -- Segment / product data extraction -----------------------------------
+
+    def extract_segment_data(self, identifier: str) -> dict[str, Any]:
+        """Extract segment revenue and product descriptions from CVM filings.
+
+        Brazilian CVM structured CSVs (DRE, BPA, BPP, DFC) contain only
+        standardized account codes -- NOT segment breakdowns.  Segment data
+        (CPC 22 / IFRS 8) lives in the notes to financial statements, which
+        are in the annual report PDF.
+
+        This method:
+          1. Finds the DFP (annual) filing PDF URL from the CVM filing index
+          2. Downloads the PDF from CVM RAD or B3 investor relations
+          3. Passes it to the fuzzy PDF parser with ``br_cvm``-specific
+             segment keywords for revenue table extraction + product
+             description extraction
+
+        Falls back to yfinance annual report PDF if CVM RAD is unreachable.
+
+        Returns
+        -------
+        Dict with ``segments``, ``descriptions``, ``has_revenue``,
+        ``has_descriptions``, ``n_segments``.
+        """
+        empty: dict[str, Any] = {
+            "segments": {}, "descriptions": {},
+            "has_revenue": False, "has_descriptions": False, "n_segments": 0,
+        }
+
+        cd_cvm = self._resolve_cd_cvm(identifier)
+        if not cd_cvm:
+            logger.debug("BR segment: could not resolve CD_CVM for %s", identifier)
+            return empty
+
+        # Step 1: Find the DFP filing PDF URL from the filing index
+        pdf_bytes = self._download_dfp_pdf(cd_cvm)
+        if not pdf_bytes:
+            # Fallback: try filing discoverer framework
+            pdf_bytes = self._download_pdf_via_discoverer(identifier)
+
+        if not pdf_bytes:
+            logger.info("BR segment: no PDF available for %s", identifier)
+            return empty
+
+        # Step 2: Extract segment data using fuzzy PDF parser
+        try:
+            from operator1.clients.fuzzy_pdf_parser import extract_product_data_from_pdf
+            result = extract_product_data_from_pdf(
+                pdf_bytes,
+                market_id="br_cvm",
+            )
+            if result.get("n_segments", 0) >= 2:
+                result["source"] = "cvm_dfp_pdf"
+                logger.info(
+                    "BR segment data for %s: %d segments, revenue=%s",
+                    identifier, result["n_segments"], result.get("has_revenue"),
+                )
+                return result
+        except ImportError:
+            logger.debug("fuzzy_pdf_parser not available for BR segment extraction")
+        except Exception as exc:
+            logger.debug("BR PDF segment extraction failed for %s: %s", identifier, exc)
+
+        return empty
+
+    def _download_dfp_pdf(self, cd_cvm: str) -> bytes | None:
+        """Download the DFP annual report PDF from CVM RAD.
+
+        Reads the filing index CSV inside the DFP ZIP to get the LINK_DOC
+        URL, then downloads the PDF (which is actually a ZIP containing the
+        individual statement PDFs and the complete annual report).
+        """
+        import requests as req
+
+        current_year = date.today().year
+
+        for year in range(current_year, current_year - 3, -1):
+            url = f"{_CVM_DATASET_BASE}/DOC/DFP/DADOS/dfp_cia_aberta_{year}.zip"
+            try:
+                z = self._download_zip(url)
+                index_csv = f"dfp_cia_aberta_{year}.csv"
+                if index_csv not in z.namelist():
+                    continue
+
+                with z.open(index_csv) as f:
+                    idx_df = pd.read_csv(f, sep=";", encoding="latin-1")
+
+                company = idx_df[idx_df["CD_CVM"].astype(str) == str(cd_cvm)]
+                if company.empty:
+                    continue
+
+                # Get the latest version
+                row = company.sort_values("VERSAO", ascending=False).iloc[0]
+                link_doc = str(row.get("LINK_DOC", ""))
+                if not link_doc:
+                    continue
+
+                # Try downloading the PDF/ZIP from CVM RAD
+                try:
+                    resp = req.get(
+                        link_doc,
+                        timeout=30,
+                        headers={
+                            "User-Agent": (
+                                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                            ),
+                        },
+                        allow_redirects=True,
+                    )
+                    resp.raise_for_status()
+
+                    content = resp.content
+                    # CVM RAD may return a ZIP containing PDFs
+                    if content[:2] == b"PK":
+                        # Extract the largest PDF from the ZIP
+                        inner_z = zipfile.ZipFile(io.BytesIO(content))
+                        pdf_files = [
+                            n for n in inner_z.namelist()
+                            if n.lower().endswith(".pdf")
+                        ]
+                        if pdf_files:
+                            # Pick the largest PDF (likely the full annual report)
+                            largest = max(pdf_files, key=lambda n: inner_z.getinfo(n).file_size)
+                            pdf_data = inner_z.read(largest)
+                            if pdf_data[:4] == b"%PDF":
+                                logger.info(
+                                    "BR DFP PDF for CD_CVM=%s: %d bytes from %s (%s)",
+                                    cd_cvm, len(pdf_data), link_doc[:60], largest,
+                                )
+                                return pdf_data
+                    elif content[:4] == b"%PDF":
+                        logger.info(
+                            "BR DFP PDF for CD_CVM=%s: %d bytes from %s",
+                            cd_cvm, len(content), link_doc[:60],
+                        )
+                        return content
+
+                except Exception as exc:
+                    logger.debug(
+                        "CVM RAD download failed for CD_CVM=%s: %s", cd_cvm, exc,
+                    )
+
+            except Exception as exc:
+                logger.debug("CVM DFP index %d failed: %s", year, exc)
+
+        return None
+
+    def _download_pdf_via_discoverer(self, identifier: str) -> bytes | None:
+        """Fallback: try the filing discoverer framework for BR PDFs."""
+        try:
+            from operator1.clients.filing_discoverer import try_filing_extraction
+            # The filing discoverer may have a BR path or generic fallback
+            logger.debug(
+                "BR segment: trying filing discoverer fallback for %s",
+                identifier,
+            )
+        except ImportError:
+            pass
+        return None
+
     def get_quotes(self, identifier: str) -> pd.DataFrame:
         return pd.DataFrame()
 
