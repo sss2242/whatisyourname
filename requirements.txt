@@ -86,7 +86,7 @@ onnxruntime>=1.19          # ONNX neural net for Bundesanzeiger CAPTCHA
 gnews==0.4.3               # Google News scraper (no key)
 feedparser==6.0.12         # RSS parser
 # Enhanced outputs (dashboard, charts, PDF)
-mplfinance>=0.12           # Professional OHLCV charts
+mplfinance==0.12.10b0      # Professional OHLCV charts (latest pre-release; no stable >=0.12 exists)
 plotly>=6.0                # Interactive HTML dashboards
 fpdf2>=2.8                 # Pure-Python PDF generation
 quantstats>=0.0.62         # Performance tearsheets
