@@ -663,7 +663,7 @@ class MXBmvClient:
         transactions: list[dict[str, Any]] = []
         try:
             # BMV search API can find insider disclosure filings
-            token = self._get_token()
+            token = _token_manager.get_token()
             if not token:
                 return transactions
             # Search for insider-related filings
@@ -733,6 +733,26 @@ _STATEMENT_CONCEPTS: dict[str, dict[str, str]] = {
     "balance": _IFRS_BALANCE_CONCEPTS,
     "cashflow": _IFRS_CASHFLOW_CONCEPTS,
 }
+
+# IFRS 8 Operating Segments -- concept names for segment revenue extraction.
+# Mexican XBRL files use these IFRS concepts when reporting segment data.
+_IFRS_SEGMENT_REVENUE_CONCEPTS: tuple[str, ...] = (
+    "ifrs-full_RevenueFromExternalCustomers",
+    "ifrs-full_Revenue",
+    "ifrs-full_RevenueFromContractsWithCustomers",
+    "ifrs-full_RevenueFromRenderingOfServices",
+    "ifrs-full_RevenueFromSaleOfGoods",
+)
+
+# Product-level concepts that appear within segment dimensions.
+_IFRS_SEGMENT_DETAIL_CONCEPTS: tuple[str, ...] = (
+    "ifrs-full_RevenueFromExternalCustomers",
+    "ifrs-full_Revenue",
+    "ifrs-full_ProfitLossFromOperatingActivities",
+    "ifrs-full_Assets",
+    "ifrs-full_DepreciationAndAmortisationExpense",
+    "ifrs-full_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",
+)
 
 
 def _get_xbrl_index() -> dict[str, list[dict]]:
@@ -966,3 +986,324 @@ def _fetch_bmv_xbrl_financials(
         ticker, statement_type, len(df), len(entries_to_fetch), len(zip_entries),
     )
     return df
+
+
+# ---------------------------------------------------------------------------
+# BMV XBRL Segment / Product Extraction (IFRS 8 Operating Segments)
+# ---------------------------------------------------------------------------
+
+
+def _extract_segments_from_xbrl_json(
+    zip_bytes: bytes,
+) -> dict[str, Any]:
+    """Extract segment revenue and product data from a BMV XBRL JSON ZIP.
+
+    Mexican XBRL files use IFRS 8 segment reporting with dimension members
+    in the context IDs. Each fact has an ``IdContexto`` that encodes the
+    segment dimension (e.g. ``D-2024Q4-Segmento1``, ``D-2024Q4-Upstream``).
+
+    The segment dimension member name IS the segment/product name.
+
+    Returns
+    -------
+    Dict with:
+        - ``segments``: {segment_name: revenue_value}
+        - ``products``: {segment_name: [product_name, ...]}
+        - ``segment_details``: {segment_name: {metric: value}}
+        - ``n_segments``: int
+    """
+    import zipfile
+    import io
+    import json as _json
+    import re as _re
+
+    result: dict[str, Any] = {
+        "segments": {},
+        "products": {},
+        "segment_details": {},
+        "descriptions": {},
+        "n_segments": 0,
+    }
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            json_files = [n for n in zf.namelist() if n.endswith(".json")]
+            if not json_files:
+                return result
+            with zf.open(json_files[0]) as jf:
+                data = _json.loads(jf.read())
+    except Exception:
+        return result
+
+    hechos_por_concepto = data.get("HechosPorIdConcepto", {})
+    hechos_por_id = data.get("HechosPorId", {})
+    contextos = data.get("ContextosPorId", {})
+
+    # Step 1: Identify segment dimension members from contexts.
+    # BMV XBRL contexts with segment dimensions contain "Miembro" (member)
+    # or dimension axis references. We look for contexts that have
+    # dimensional qualifiers beyond the simple period contexts.
+    segment_contexts: dict[str, str] = {}  # context_id -> segment_name
+
+    for ctx_id, ctx in contextos.items():
+        if not isinstance(ctx, dict):
+            continue
+
+        # Check for dimension members in the context
+        # BMV XBRL uses "Entidad" -> "Segmento" or dimension axis references
+        dims = ctx.get("ValoresDimension", [])
+        if not dims and isinstance(ctx.get("Entidad"), dict):
+            dims = ctx.get("Entidad", {}).get("Segmento", [])
+
+        if isinstance(dims, list) and dims:
+            for dim in dims:
+                if isinstance(dim, dict):
+                    member = dim.get("Miembro", dim.get("MiembroExplicito", ""))
+                    if member:
+                        # Clean the member name: remove namespace prefixes
+                        clean = _re.sub(r"^[a-z]+[-_]full[_:]", "", str(member))
+                        clean = _re.sub(r"^.*:", "", clean)
+                        # Convert CamelCase to readable
+                        clean = _re.sub(r"([a-z])([A-Z])", r"\1 \2", clean)
+                        clean = clean.replace("Member", "").replace("Segment", "").strip()
+                        if clean and len(clean) > 1:
+                            segment_contexts[ctx_id] = clean
+
+        # Also check for explicit segment dimension in context ID string
+        # (some BMV files embed segment info in the context ID itself)
+        if ctx_id not in segment_contexts:
+            # Pattern: context IDs containing segment identifiers
+            seg_match = _re.search(
+                r"(?:Segmento|Segment|BusinessSegment|OperatingSegment)"
+                r"[_-]?(\w+)",
+                ctx_id, _re.IGNORECASE,
+            )
+            if seg_match:
+                seg_name = seg_match.group(1)
+                seg_name = _re.sub(r"([a-z])([A-Z])", r"\1 \2", seg_name).strip()
+                if seg_name and len(seg_name) > 1:
+                    segment_contexts[ctx_id] = seg_name
+
+    # Step 2: Extract revenue per segment from IFRS segment concepts.
+    segment_revenue: dict[str, float] = {}
+    segment_details: dict[str, dict[str, float]] = {}
+    segment_products: dict[str, list[str]] = {}
+
+    # Try segment revenue concepts
+    for concept in _IFRS_SEGMENT_REVENUE_CONCEPTS:
+        fact_ids = hechos_por_concepto.get(concept, [])
+        if not isinstance(fact_ids, list):
+            continue
+
+        for fact_id in fact_ids:
+            fact = hechos_por_id.get(fact_id)
+            if fact is None:
+                continue
+
+            ctx_id = fact.get("IdContexto", "")
+            if ctx_id not in segment_contexts:
+                continue
+
+            seg_name = segment_contexts[ctx_id]
+            value = fact.get("Valor") or fact.get("ValorNumerico")
+            if value is None:
+                continue
+
+            try:
+                num_val = float(str(value).replace(",", ""))
+            except (ValueError, TypeError):
+                continue
+
+            # Keep the largest revenue value per segment (avoid double-counting
+            # from different periods in the same ZIP)
+            if seg_name not in segment_revenue or abs(num_val) > abs(segment_revenue[seg_name]):
+                segment_revenue[seg_name] = num_val
+
+    # Step 3: Extract additional segment metrics (profit, assets, capex)
+    for concept in _IFRS_SEGMENT_DETAIL_CONCEPTS:
+        canonical = concept.split("_", 1)[-1] if "_" in concept else concept
+        fact_ids = hechos_por_concepto.get(concept, [])
+        if not isinstance(fact_ids, list):
+            continue
+
+        for fact_id in fact_ids:
+            fact = hechos_por_id.get(fact_id)
+            if fact is None:
+                continue
+
+            ctx_id = fact.get("IdContexto", "")
+            if ctx_id not in segment_contexts:
+                continue
+
+            seg_name = segment_contexts[ctx_id]
+            value = fact.get("Valor") or fact.get("ValorNumerico")
+            if value is None:
+                continue
+
+            try:
+                num_val = float(str(value).replace(",", ""))
+            except (ValueError, TypeError):
+                continue
+
+            if seg_name not in segment_details:
+                segment_details[seg_name] = {}
+            segment_details[seg_name][canonical] = num_val
+
+    # Step 4: Build product descriptions from segment names and details.
+    # In Mexican XBRL, the segment member names ARE the product categories
+    # (e.g., "Telecomunicaciones", "Infraestructura", "Tiendas de autoservicio").
+    descriptions: dict[str, str] = {}
+    for seg_name in set(list(segment_revenue.keys()) + list(segment_details.keys())):
+        details = segment_details.get(seg_name, {})
+        parts: list[str] = []
+
+        if seg_name in segment_revenue:
+            parts.append(f"Revenue: {segment_revenue[seg_name]:,.0f}")
+
+        for metric, val in details.items():
+            if metric.lower() not in ("revenue", "revenueFromExternalCustomers"):
+                readable = _re.sub(r"([a-z])([A-Z])", r"\1 \2", metric)
+                parts.append(f"{readable}: {val:,.0f}")
+
+        if parts:
+            descriptions[seg_name] = "; ".join(parts)
+
+        # Track product names per segment
+        if seg_name not in segment_products:
+            segment_products[seg_name] = []
+
+    # Step 5: Also scan for product-level dimension members
+    # (sub-segments within operating segments)
+    for ctx_id, ctx in contextos.items():
+        if not isinstance(ctx, dict):
+            continue
+        dims = ctx.get("ValoresDimension", [])
+        if not isinstance(dims, list) or len(dims) < 2:
+            continue
+
+        # Multiple dimensions = segment + product breakdown
+        parent_seg = ""
+        product_name = ""
+        for dim in dims:
+            if not isinstance(dim, dict):
+                continue
+            axis = dim.get("Dimension", dim.get("EjeDimension", ""))
+            member = dim.get("Miembro", dim.get("MiembroExplicito", ""))
+
+            axis_str = str(axis).lower()
+            member_clean = _re.sub(r"^[a-z]+[-_]full[_:]", "", str(member))
+            member_clean = _re.sub(r"^.*:", "", member_clean)
+            member_clean = _re.sub(r"([a-z])([A-Z])", r"\1 \2", member_clean)
+            member_clean = member_clean.replace("Member", "").strip()
+
+            if "segment" in axis_str or "segmento" in axis_str:
+                parent_seg = member_clean
+            elif "product" in axis_str or "producto" in axis_str or "service" in axis_str:
+                product_name = member_clean
+
+        if parent_seg and product_name:
+            if parent_seg not in segment_products:
+                segment_products[parent_seg] = []
+            if product_name not in segment_products[parent_seg]:
+                segment_products[parent_seg].append(product_name)
+
+    n_segments = max(len(segment_revenue), len(segment_details), len(segment_products))
+
+    result = {
+        "segments": segment_revenue,
+        "products": segment_products,
+        "segment_details": segment_details,
+        "descriptions": descriptions,
+        "has_revenue": len(segment_revenue) >= 2,
+        "has_descriptions": len(descriptions) >= 1,
+        "n_segments": n_segments,
+    }
+
+    if n_segments > 0:
+        logger.info(
+            "BMV XBRL segments: %d segments, %d with revenue, %d with details",
+            n_segments, len(segment_revenue), len(segment_details),
+        )
+
+    return result
+
+
+def extract_bmv_segment_data(
+    ticker: str,
+    max_zips: int = 3,
+) -> dict[str, Any]:
+    """Extract segment revenue and product data from BMV XBRL ZIPs.
+
+    Public entry point for BMV segment extraction. Downloads recent XBRL
+    ZIPs and extracts IFRS 8 segment information.
+
+    Parameters
+    ----------
+    ticker:
+        BMV ticker (e.g. ``'WALMEX'``, ``'AMX'``, ``'CEMEX'``).
+    max_zips:
+        Maximum ZIPs to download (3 = recent annual + 2 quarterlies).
+
+    Returns
+    -------
+    Dict with ``segments``, ``products``, ``descriptions``, ``n_segments``.
+    Falls back to fuzzy PDF extraction if XBRL segment data is empty.
+    """
+    # Primary: XBRL JSON extraction (fast, structured)
+    index = _get_xbrl_index()
+    zip_entries = index.get(ticker.upper(), [])
+    if not zip_entries:
+        return {"segments": {}, "products": {}, "descriptions": {}, "n_segments": 0}
+
+    # Sort by date, newest first
+    zip_entries.sort(key=lambda e: e.get("filing_date", ""), reverse=True)
+    entries = zip_entries[:max_zips]
+
+    best_result: dict[str, Any] = {
+        "segments": {}, "products": {}, "descriptions": {}, "n_segments": 0,
+    }
+
+    for entry in entries:
+        try:
+            resp = requests.get(entry["url"], headers=_BMV_HEADERS, timeout=20)
+            resp.raise_for_status()
+            if resp.content[:2] != b"PK":
+                continue
+
+            seg_result = _extract_segments_from_xbrl_json(resp.content)
+
+            # Keep the result with the most segments
+            if seg_result["n_segments"] > best_result["n_segments"]:
+                best_result = seg_result
+                best_result["filing_date"] = entry.get("filing_date", "")
+                best_result["source"] = "bmv_xbrl_json"
+
+            # If we found good segment data, stop downloading more ZIPs
+            if seg_result["n_segments"] >= 2 and seg_result.get("has_revenue"):
+                break
+
+        except Exception as exc:
+            logger.debug("BMV segment ZIP download failed: %s", exc)
+            continue
+
+    # Fallback: try fuzzy PDF extraction if XBRL yielded no segments
+    if best_result["n_segments"] < 2:
+        try:
+            from operator1.clients.filing_discoverer import try_filing_extraction
+            logger.debug(
+                "BMV XBRL segment extraction found %d segments for %s; "
+                "PDF fallback available via filing_discoverer",
+                best_result["n_segments"], ticker,
+            )
+        except ImportError:
+            pass
+
+    logger.info(
+        "BMV segment data for %s: %d segments, revenue=%s, source=%s",
+        ticker,
+        best_result["n_segments"],
+        best_result.get("has_revenue", False),
+        best_result.get("source", "none"),
+    )
+
+    return best_result

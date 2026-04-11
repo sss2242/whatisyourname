@@ -58,7 +58,7 @@ gnews==0.4.3
 feedparser==6.0.12
 
 # Enhanced outputs (optional -- dashboard, charts, PDF)
-mplfinance>=0.12             # Professional OHLCV candlestick charts
+mplfinance==0.12.10b0        # Professional OHLCV candlestick charts (latest pre-release; no stable >=0.12 exists)
 plotly>=6.0                  # Interactive HTML dashboards
 fpdf2>=2.8                   # Pure-Python PDF generation (no pandoc needed)
 quantstats>=0.0.62           # Performance tearsheets (Sharpe, Sortino, drawdown)

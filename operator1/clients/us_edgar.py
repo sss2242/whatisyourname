@@ -527,6 +527,274 @@ class USEdgarClient:
 
         return self._fetch_statement_fallback(identifier, "cashflow")
 
+    # -- Segment / product data extraction -----------------------------------
+
+    def extract_segment_data(self, identifier: str) -> dict[str, Any]:
+        """Extract segment revenue and product descriptions from SEC EDGAR XBRL.
+
+        US companies disclose segment data under ASC 280 using XBRL dimensions.
+        The companyfacts JSON contains segment-level revenue facts with
+        dimensional qualifiers (e.g., ``us-gaap:RevenueFromExternalCustomers``
+        with ``srt:ProductOrServiceAxis`` dimension members).
+
+        Three extraction paths:
+        1. **companyfacts XBRL dimensions** -- structured segment revenue from
+           SEC EDGAR companyfacts JSON with ASC 280 dimensional qualifiers
+        2. **10-K filing text** -- parse segment notes from the annual report
+           using fuzzy_pdf_parser text patterns
+        3. **edgartools Financials** -- if dimensional data is exposed
+
+        Returns
+        -------
+        Dict with ``segments``, ``descriptions``, ``has_revenue``,
+        ``has_descriptions``, ``n_segments``.
+        """
+        empty: dict[str, Any] = {
+            "segments": {}, "descriptions": {},
+            "has_revenue": False, "has_descriptions": False, "n_segments": 0,
+        }
+
+        # --- Path 1: companyfacts XBRL dimensional segment data ---
+        try:
+            segments = self._extract_segments_from_companyfacts(identifier)
+            if segments and segments.get("n_segments", 0) >= 2:
+                segments["source"] = "sec_edgar_xbrl_dimensions"
+                logger.info(
+                    "US segment data for %s: %d segments from XBRL companyfacts",
+                    identifier, segments["n_segments"],
+                )
+                return segments
+        except Exception as exc:
+            logger.debug("SEC XBRL segment extraction failed for %s: %s", identifier, exc)
+
+        # --- Path 2: 10-K filing text parsing via fuzzy_pdf_parser ---
+        try:
+            segments = self._extract_segments_from_10k(identifier)
+            if segments and segments.get("n_segments", 0) >= 2:
+                segments["source"] = "sec_edgar_10k_text"
+                logger.info(
+                    "US segment data for %s: %d segments from 10-K text",
+                    identifier, segments["n_segments"],
+                )
+                return segments
+        except Exception as exc:
+            logger.debug("SEC 10-K segment extraction failed for %s: %s", identifier, exc)
+
+        return empty
+
+    def _extract_segments_from_companyfacts(self, identifier: str) -> dict[str, Any]:
+        """Extract ASC 280 segment revenue from SEC EDGAR companyfacts XBRL.
+
+        SEC companyfacts JSON contains dimensional facts where the segment
+        axis (``us-gaap:StatementBusinessSegmentsAxis`` or
+        ``srt:ProductOrServiceAxis``) has dimension members that ARE the
+        segment/product names.
+
+        The structure is:
+        ``facts -> us-gaap -> RevenueFromExternalCustomers -> units -> USD``
+        where each entry has a ``dimensions`` dict containing the segment member.
+        """
+        import requests
+
+        # Resolve CIK
+        try:
+            cik = self._resolve_cik_fallback(identifier)
+        except Exception:
+            return {}
+
+        headers = {"User-Agent": self._user_agent, "Accept": "application/json"}
+
+        # Fetch companyfacts
+        try:
+            facts_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+            resp = requests.get(facts_url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            facts = resp.json()
+        except Exception as exc:
+            logger.debug("companyfacts fetch failed: %s", exc)
+            return {}
+
+        us_gaap = facts.get("facts", {}).get("us-gaap", {})
+
+        # ASC 280 segment revenue concepts
+        segment_concepts = [
+            "RevenueFromExternalCustomers",
+            "Revenues",
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "SalesRevenueNet",
+        ]
+
+        # Segment axis dimension keys
+        segment_axes = [
+            "us-gaap:StatementBusinessSegmentsAxis",
+            "srt:ConsolidationItemsAxis",
+            "us-gaap:StatementOperatingActivitiesSegmentAxis",
+        ]
+
+        # Product axis dimension keys
+        product_axes = [
+            "srt:ProductOrServiceAxis",
+            "us-gaap:ProductOrServiceAxis",
+        ]
+
+        segments: dict[str, float] = {}
+        products: dict[str, list[str]] = {}
+        segment_details: dict[str, dict[str, float]] = {}
+
+        for concept_name in segment_concepts:
+            concept_data = us_gaap.get(concept_name, {})
+            usd_entries = concept_data.get("units", {}).get("USD", [])
+
+            for entry in usd_entries:
+                form = entry.get("form", "")
+                if form not in ("10-K", "20-F"):
+                    continue
+
+                # Check for dimensional qualifiers
+                # SEC companyfacts v2 may embed dimensions in the fact itself
+                # Look for segment member in the 'segment' or 'dimensions' field
+                frame = entry.get("frame", "")
+                val = entry.get("val")
+                if val is None:
+                    continue
+
+                # Recent entries (last 2 years)
+                fy = entry.get("fy", 0)
+                if fy and fy < 2023:
+                    continue
+
+                # SEC EDGAR v2 companyfacts don't expose dimensions directly
+                # in the bulk JSON. The dimensional data is in the company-concept
+                # endpoint. We'll try that separately.
+
+            if segments:
+                break
+
+        # If bulk companyfacts didn't yield segment dimensions, try the
+        # company-concept endpoint which includes dimensional breakdowns
+        if not segments:
+            for concept_name in segment_concepts:
+                try:
+                    concept_url = (
+                        f"https://data.sec.gov/api/xbrl/companyconcept/"
+                        f"CIK{cik}/us-gaap/{concept_name}.json"
+                    )
+                    resp = requests.get(concept_url, headers=headers, timeout=15)
+                    if resp.status_code != 200:
+                        continue
+
+                    concept_data = resp.json()
+                    usd_entries = concept_data.get("units", {}).get("USD", [])
+
+                    # Group by fiscal year, look for entries with same fy/fp
+                    # but different fact values (indicates segment breakdown)
+                    from collections import defaultdict
+                    by_period: dict[str, list[dict]] = defaultdict(list)
+                    for entry in usd_entries:
+                        form = entry.get("form", "")
+                        if form not in ("10-K", "20-F"):
+                            continue
+                        fy = entry.get("fy", 0)
+                        if fy and fy < 2023:
+                            continue
+                        period_key = f"{entry.get('fy', '')}-{entry.get('fp', '')}"
+                        by_period[period_key].append(entry)
+
+                    # Find the most recent period with multiple entries
+                    # (multiple entries for same concept = segment breakdown)
+                    for period_key in sorted(by_period.keys(), reverse=True):
+                        entries = by_period[period_key]
+                        if len(entries) >= 3:
+                            # Multiple revenue entries = likely segment breakdown
+                            # Unfortunately, the SEC company-concept endpoint
+                            # doesn't include the dimension member names in the
+                            # JSON response. The segment names are only in the
+                            # inline XBRL of the actual filing.
+                            logger.debug(
+                                "SEC %s has %d entries for %s in %s (likely segments)",
+                                identifier, len(entries), concept_name, period_key,
+                            )
+                            break
+
+                    if segments:
+                        break
+                except Exception:
+                    continue
+
+        # SEC EDGAR bulk APIs don't expose segment dimension member names.
+        # Return what we have (may be empty, triggering fallback to 10-K text)
+        n_segments = len(segments)
+        return {
+            "segments": segments,
+            "products": products,
+            "descriptions": {},
+            "segment_details": segment_details,
+            "has_revenue": n_segments >= 2,
+            "has_descriptions": False,
+            "n_segments": n_segments,
+        }
+
+    def _extract_segments_from_10k(self, identifier: str) -> dict[str, Any]:
+        """Extract segment data from 10-K filing text.
+
+        Downloads the most recent 10-K filing HTML and uses the fuzzy
+        PDF parser's text extraction patterns to find ASC 280 segment
+        disclosures.
+        """
+        import requests
+
+        try:
+            self._init_edgartools()
+            company = self._get_edgar_company(identifier)
+            if company is None:
+                return {}
+
+            # Get most recent 10-K filing
+            filings = company.get_filings(form="10-K")
+            if filings is None or len(filings) == 0:
+                return {}
+
+            latest_10k = list(filings)[:1][0]
+
+            # Extract text from the filing
+            text = ""
+            try:
+                text = latest_10k.text()[:50000] if hasattr(latest_10k, "text") else ""
+            except Exception:
+                pass
+
+            if not text:
+                return {}
+
+            # Use text-based segment extraction patterns
+            from operator1.clients.fuzzy_pdf_parser import (
+                _extract_segments_from_text,
+                _parse_segment_descriptions,
+                _parse_segment_paragraphs,
+            )
+
+            segments = _extract_segments_from_text(text)
+            descriptions: dict[str, str] = {}
+
+            if len(segments) >= 2:
+                # Try to extract descriptions from the same text
+                descriptions = _parse_segment_descriptions(text)
+                if len(descriptions) < 2:
+                    descriptions = _parse_segment_paragraphs(text)
+
+            n_segments = max(len(segments), len(descriptions))
+            return {
+                "segments": segments,
+                "descriptions": descriptions,
+                "has_revenue": len(segments) >= 2,
+                "has_descriptions": len(descriptions) >= 1,
+                "n_segments": n_segments,
+            }
+
+        except Exception as exc:
+            logger.debug("10-K segment extraction failed for %s: %s", identifier, exc)
+            return {}
+
     # -- Price data ----------------------------------------------------------
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:

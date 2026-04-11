@@ -1137,6 +1137,30 @@ _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
         "información por segmentos", "segmentos operativos",
         "ingresos por segmento",
     ],
+    "br_cvm": [
+        "informações por segmento", "segmentos operacionais",
+        "receita por segmento", "cpc 22", "ifrs 8",
+        "segmentos reportáveis", "informação por segmento",
+        "receita líquida por segmento", "resultado por segmento",
+        "exploração e produção",  # Petrobras segment name
+        "refino e comercialização",  # Petrobras segment name
+        "gás e energia",  # Petrobras segment name
+        "distribuição",  # Petrobras/fuel retail segment
+        "receita intersegmentos", "eliminações entre segmentos",
+        "notas explicativas",  # Notes section where segments live
+    ],
+    "ch_six": [
+        "segment information", "operating segments", "ifrs 8",
+        "reportable segments", "revenue by division",
+        "sales by division", "net revenue by division",
+        "divisional results", "business area results",
+        "pharma", "diagnostics",  # Roche segments
+        "innovative medicines", "sandoz",  # Novartis segments
+        "zone", "nutrition", "health science",  # Nestle segments
+        "power grids", "electrification",  # ABB segments
+        "reinsurance", "corporate solutions",  # Swiss Re segments
+        "global wealth management", "investment bank",  # UBS segments
+    ],
 }
 
 # Labels that indicate a row is a segment total or header (not an individual segment)
@@ -1228,6 +1252,17 @@ _SEGMENT_EXTRACTION_CONFIG: dict[str, dict[str, Any]] = {
     "mx_bmv": {
         "prefer_text": False,
         "min_page_score": 2,
+    },
+    "br_cvm": {
+        "camelot_flavor": "stream",
+        "prefer_text": False,  # Brazilian DFP reports have well-structured IFRS tables
+        "min_page_score": 2,  # Strict -- DFP reports are 200+ pages, many mention "segmento"
+        "max_pages": 15,  # Notes section is long; check enough pages for CPC 22 disclosure
+    },
+    "ch_six": {
+        "prefer_text": True,  # Swiss annual reports embed segment data in prose (Nestle, Roche, Novartis)
+        "min_page_score": 2,  # Swiss reports are 100+ pages; filter noise
+        "max_pages": 15,
     },
 }
 
@@ -1980,6 +2015,25 @@ _PRODUCT_DESC_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
         "results by business segment",
         "personal & commercial banking",  # Canadian bank segment names
         "wealth management", "capital markets",
+    ],
+    "br_cvm": [
+        "informações por segmento", "segmentos operacionais",
+        "cpc 22", "ifrs 8", "notas explicativas",
+        "segmentos reportáveis", "descrição dos segmentos",
+        "exploração e produção",  # Petrobras E&P
+        "refino", "gás e energia", "distribuição",
+        "natureza dos produtos e serviços",
+        "segment includes", "segment comprises",
+    ],
+    "ch_six": [
+        "segment information", "operating segments", "ifrs 8",
+        "reportable segments", "description of segments",
+        "nature of products and services",
+        "divisional results", "business area results",
+        "segment includes", "segment comprises",
+        "pharma", "diagnostics",  # Roche
+        "innovative medicines",  # Novartis
+        "principal activities of each segment",
     ],
 }
 
