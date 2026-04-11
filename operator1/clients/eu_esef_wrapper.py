@@ -960,6 +960,187 @@ class EUEsefClient:
 
         return pd.DataFrame()
 
+    # -- Segment / product data extraction -----------------------------------
+
+    def extract_segment_data(self, identifier: str) -> dict[str, Any]:
+        """Extract IFRS 8 segment revenue from ESEF XBRL JSON dimensional facts.
+
+        The standard ``_extract_ifrs_facts()`` function SKIPS facts with >4
+        dimensions (line 291-296) to avoid double-counting aggregate totals.
+        Those extra-dimensional facts ARE the segment breakdowns.
+
+        This method specifically collects facts where the 5th+ dimension
+        is a segment axis (``OperatingSegmentsAxis``, ``ProductOrServiceAxis``,
+        ``SegmentsAxis``), extracting segment member names and revenue values.
+
+        Returns
+        -------
+        Dict with ``segments``, ``descriptions``, ``has_revenue``,
+        ``has_descriptions``, ``n_segments``.
+        """
+        empty: dict[str, Any] = {
+            "segments": {}, "descriptions": {},
+            "has_revenue": False, "has_descriptions": False, "n_segments": 0,
+        }
+
+        entity_id = self._find_entity_id(identifier)
+        if not entity_id:
+            return empty
+
+        entity_filings = self._get_entity_filings(entity_id)
+        if not entity_filings:
+            return empty
+
+        # Download the most recent XBRL JSON
+        for filing in entity_filings[:3]:
+            attrs = filing.get("attributes", {})
+            json_url = attrs.get("json_url", "")
+            if not json_url:
+                continue
+
+            xbrl_data = _download_xbrl_json(json_url)
+            if not xbrl_data:
+                continue
+
+            segments = self._extract_segments_from_xbrl_dimensions(xbrl_data)
+            if segments.get("n_segments", 0) >= 2:
+                segments["source"] = "esef_xbrl_ifrs8_dimensions"
+                logger.info(
+                    "ESEF segment data for %s: %d segments from XBRL dimensions",
+                    identifier, segments["n_segments"],
+                )
+                return segments
+
+            time.sleep(0.5)
+
+        return empty
+
+    @staticmethod
+    def _extract_segments_from_xbrl_dimensions(xbrl_data: dict) -> dict[str, Any]:
+        """Extract IFRS 8 segment data from XBRL JSON dimensional facts.
+
+        ESEF XBRL JSON (OIM format) facts with segment dimensions have >4
+        keys in their ``dimensions`` dict. The extra keys are segment axes:
+
+        - ``ifrs-full:OperatingSegmentsAxis`` -> segment member name
+        - ``ifrs-full:ProductsAndServicesAxis`` -> product member name
+        - ``ifrs-full:SegmentsAxis`` -> generic segment member
+        - ``srt:ProductOrServiceAxis`` -> SRT product axis
+
+        The segment member value IS the segment/product name, formatted as
+        an IFRS member reference like ``company:UpstreamMember`` or
+        ``ifrs-full:AllOtherSegmentsMember``.
+        """
+        import re
+
+        facts = xbrl_data.get("facts", {})
+
+        # IFRS 8 segment axes to look for
+        segment_axes = {
+            "ifrs-full:OperatingSegmentsAxis",
+            "ifrs-full:SegmentsAxis",
+            "ifrs-full:ProductsAndServicesAxis",
+            "srt:ProductOrServiceAxis",
+        }
+
+        # Revenue concepts to extract per segment
+        revenue_concepts = {
+            "ifrs-full:Revenue",
+            "ifrs-full:RevenueFromExternalCustomers",
+            "ifrs-full:RevenueFromContractsWithCustomers",
+        }
+
+        # Additional metrics to extract per segment
+        detail_concepts = {
+            "ifrs-full:ProfitLossFromOperatingActivities": "operating_profit",
+            "ifrs-full:Assets": "total_assets",
+            "ifrs-full:DepreciationAndAmortisationExpense": "depreciation",
+        }
+
+        segments: dict[str, float] = {}
+        segment_details: dict[str, dict[str, float]] = {}
+
+        for fact_id, fact in facts.items():
+            dims = fact.get("dimensions", {})
+            concept = dims.get("concept", "")
+
+            # Only process facts with >4 dimensions (segment-qualified)
+            if len(dims) <= 4:
+                continue
+
+            # Find which segment axis is present
+            seg_member = ""
+            for axis in segment_axes:
+                if axis in dims:
+                    raw_member = dims[axis]
+                    # Clean member name: "company:UpstreamMember" -> "Upstream"
+                    seg_member = re.sub(r"^[^:]+:", "", str(raw_member))
+                    seg_member = re.sub(r"Member$", "", seg_member)
+                    seg_member = re.sub(r"([a-z])([A-Z])", r"\1 \2", seg_member)
+                    seg_member = seg_member.strip()
+                    break
+
+            if not seg_member or len(seg_member) < 2:
+                continue
+
+            # Skip generic "all other segments" and elimination members
+            skip_members = {
+                "all other segments", "unallocated", "eliminations",
+                "corporate", "intersegment", "reconciliation",
+                "all other", "head office",
+            }
+            if seg_member.lower() in skip_members:
+                continue
+
+            # Parse value
+            value_str = fact.get("value", "")
+            try:
+                value = float(value_str)
+            except (ValueError, TypeError):
+                continue
+
+            # Extract revenue per segment
+            if concept in revenue_concepts:
+                # Keep the largest revenue value per segment (most recent period)
+                if seg_member not in segments or abs(value) > abs(segments[seg_member]):
+                    segments[seg_member] = value
+
+            # Extract additional metrics
+            canonical = detail_concepts.get(concept)
+            if canonical:
+                if seg_member not in segment_details:
+                    segment_details[seg_member] = {}
+                segment_details[seg_member][canonical] = value
+
+        # Build descriptions from segment names + details
+        descriptions: dict[str, str] = {}
+        for seg_name in set(list(segments.keys()) + list(segment_details.keys())):
+            details = segment_details.get(seg_name, {})
+            parts: list[str] = []
+            if seg_name in segments:
+                parts.append(f"Revenue: {segments[seg_name]:,.0f}")
+            for metric, val in details.items():
+                parts.append(f"{metric}: {val:,.0f}")
+            if parts:
+                descriptions[seg_name] = "; ".join(parts)
+
+        n_segments = max(len(segments), len(segment_details))
+
+        if n_segments > 0:
+            logger.info(
+                "ESEF XBRL segments: %d segments, %d with revenue, %d with details",
+                n_segments, len(segments), len(segment_details),
+            )
+
+        return {
+            "segments": segments,
+            "descriptions": descriptions,
+            "segment_details": segment_details,
+            "has_revenue": len(segments) >= 2,
+            "has_descriptions": len(descriptions) >= 1,
+            "n_segments": n_segments,
+        }
+
     # -- Price data ----------------------------------------------------------
 
     def get_quotes(self, identifier: str) -> pd.DataFrame:
