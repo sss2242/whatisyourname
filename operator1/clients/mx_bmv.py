@@ -663,7 +663,7 @@ class MXBmvClient:
         transactions: list[dict[str, Any]] = []
         try:
             # BMV search API can find insider disclosure filings
-            token = self._get_token()
+            token = _token_manager.get_token()
             if not token:
                 return transactions
             # Search for insider-related filings
