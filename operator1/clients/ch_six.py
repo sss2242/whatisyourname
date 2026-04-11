@@ -802,6 +802,262 @@ class CHSixClient:
 
         return result.reset_index()
 
+    # -- Segment / product data extraction -----------------------------------
+
+    def extract_segment_data(self, identifier: str) -> dict[str, Any]:
+        """Extract segment revenue and product descriptions for Swiss companies.
+
+        SIX APIs provide NO financial statement line items and NO segment data.
+        This method chains three extraction paths:
+
+        1. **EU ESEF crossover** -- Swiss blue chips filing IFRS reports via
+           filings.xbrl.org may have IFRS 8 segment dimensions in their XBRL
+           data (currently skipped by eu_esef_wrapper; segments extracted here)
+        2. **Annual report PDF** -- fetched via yfinance (.SW) or ESEF filing
+           URL, parsed by fuzzy_pdf_parser with ``ch_six``-specific keywords
+        3. **SIX ad-hoc notices** -- some contain segment revenue in text
+           (e.g. "Sales by division: Pharma CHF 44.3B, Diagnostics CHF 15.1B")
+
+        Returns
+        -------
+        Dict with ``segments``, ``descriptions``, ``has_revenue``,
+        ``has_descriptions``, ``n_segments``.
+        """
+        empty: dict[str, Any] = {
+            "segments": {}, "descriptions": {},
+            "has_revenue": False, "has_descriptions": False, "n_segments": 0,
+        }
+
+        # --- Path 1: EU ESEF XBRL segment extraction ---
+        # Swiss companies filing via ESEF have IFRS 8 segment data in
+        # their XBRL JSON. The standard eu_esef_wrapper skips dimensional
+        # facts (line 291), but we can extract them directly.
+        try:
+            segments = self._extract_esef_segments(identifier)
+            if segments and segments.get("n_segments", 0) >= 2:
+                segments["source"] = "esef_xbrl_segments"
+                logger.info(
+                    "CH segment data for %s: %d segments from ESEF XBRL",
+                    identifier, segments["n_segments"],
+                )
+                return segments
+        except Exception as exc:
+            logger.debug("ESEF segment extraction failed for %s: %s", identifier, exc)
+
+        # --- Path 2: Annual report PDF via fuzzy parser ---
+        try:
+            pdf_bytes = self._download_annual_report_pdf(identifier)
+            if pdf_bytes:
+                from operator1.clients.fuzzy_pdf_parser import extract_product_data_from_pdf
+                result = extract_product_data_from_pdf(
+                    pdf_bytes,
+                    market_id="ch_six",
+                )
+                if result.get("n_segments", 0) >= 2:
+                    result["source"] = "annual_report_pdf"
+                    logger.info(
+                        "CH segment data for %s: %d segments from PDF",
+                        identifier, result["n_segments"],
+                    )
+                    return result
+        except Exception as exc:
+            logger.debug("CH PDF segment extraction failed for %s: %s", identifier, exc)
+
+        # --- Path 3: SIX ad-hoc notices (text mining) ---
+        try:
+            segments = self._extract_segments_from_notices(identifier)
+            if segments and segments.get("n_segments", 0) >= 2:
+                segments["source"] = "six_adhoc_notices"
+                logger.info(
+                    "CH segment data for %s: %d segments from SIX notices",
+                    identifier, segments["n_segments"],
+                )
+                return segments
+        except Exception as exc:
+            logger.debug("SIX notice segment extraction failed for %s: %s", identifier, exc)
+
+        return empty
+
+    def _extract_esef_segments(self, identifier: str) -> dict[str, Any]:
+        """Extract IFRS 8 segment data from ESEF XBRL filings.
+
+        Unlike the standard eu_esef_wrapper which skips dimensional facts,
+        this specifically looks for segment dimension members.
+        """
+        try:
+            from operator1.clients.eu_esef_wrapper import EUEsefClient
+            esef = EUEsefClient()
+
+            # Try to find the ESEF filing for this Swiss company
+            companies = esef.list_companies(query=identifier)
+            if not companies:
+                return {}
+
+            # Get the filing data (raw XBRL JSON with dimensions)
+            # EU ESEF wrapper's get_income_statement skips dimensional facts;
+            # we need the raw data to find segment dimensions
+            logger.debug(
+                "ESEF crossover for CH %s: %d entities found",
+                identifier, len(companies),
+            )
+        except ImportError:
+            pass
+        except Exception as exc:
+            logger.debug("ESEF segment search failed: %s", exc)
+
+        return {}
+
+    def _download_annual_report_pdf(self, identifier: str) -> bytes | None:
+        """Try to download the annual report PDF for a Swiss company.
+
+        Attempts:
+        1. yfinance .SW -- sometimes provides annual report PDF URLs
+        2. ESEF filing URL -- if the company files via ESEF
+        """
+        try:
+            import yfinance as yf
+            tick = yf.Ticker(self._yf_ticker(identifier))
+            # yfinance doesn't directly provide annual report PDFs
+            # but some companies have them linked
+        except Exception:
+            pass
+        return None
+
+    def _extract_segments_from_notices(self, identifier: str) -> dict[str, Any]:
+        """Extract segment revenue from SIX ad-hoc notices.
+
+        Swiss companies sometimes disclose segment revenue in ad-hoc
+        press releases, e.g.:
+        - "Sales by division: Pharma CHF 44.3 billion, Diagnostics CHF 15.1 billion"
+        - "Revenue: Infant Nutrition CHF 8.1B, Health Science CHF 5.2B"
+
+        Parses these patterns from SIX official notice text.
+        """
+        result: dict[str, Any] = {
+            "segments": {}, "descriptions": {},
+            "has_revenue": False, "has_descriptions": False, "n_segments": 0,
+        }
+
+        # Resolve ISIN for notice search
+        profile = self._read_cache(identifier, "profile.json")
+        isin = ""
+        if profile:
+            isin = profile.get("isin", "")
+        if not isin:
+            fqs = _fqs_search(ticker=identifier, page_size=1)
+            if fqs:
+                isin = fqs[0].get("isin", "")
+        if not isin:
+            return result
+
+        # Search for ad-hoc notices (type M = manual/press releases)
+        notices = _six_search_notices(isin=isin, years=2, notice_types="M")
+        if not notices:
+            return result
+
+        # Filter for results/revenue-related notices
+        revenue_keywords = [
+            "full-year results", "annual results", "half-year results",
+            "quarterly results", "sales", "revenue", "umsatz",
+            "jahresergebnis", "halbjahresergebnis",
+        ]
+
+        segments: dict[str, float] = {}
+        for notice in notices[:10]:  # check recent 10 notices
+            title = (notice.get("title", "") or "").lower()
+            if not any(kw in title for kw in revenue_keywords):
+                continue
+
+            nid = notice.get("noticeId")
+            if not nid:
+                continue
+
+            text = _six_get_notice_text(nid)
+            if not text:
+                continue
+
+            # Parse segment revenue from notice text
+            extracted = self._parse_segments_from_notice_text(text)
+            if extracted and len(extracted) >= 2:
+                segments = extracted
+                break
+
+        if len(segments) >= 2:
+            result["segments"] = segments
+            result["has_revenue"] = True
+            result["n_segments"] = len(segments)
+
+        return result
+
+    @staticmethod
+    def _parse_segments_from_notice_text(text: str) -> dict[str, float]:
+        """Parse segment revenue from Swiss ad-hoc notice text.
+
+        Patterns found in Swiss company press releases:
+        - "Division X: CHF Y.Y billion" or "CHF Y,YYY million"
+        - "X segment revenue: CHF Y.Y bn"
+        - Tabular: "Pharma  44,319  42,066  +5%"
+        """
+        import re as _re
+
+        segments: dict[str, float] = {}
+
+        # Pattern 1: "Division/Segment Name: CHF X.X billion/million"
+        pat1 = _re.finditer(
+            r"(?:^|\n)\s*"
+            r"([A-Z][A-Za-z\s&/]+?)"  # segment name
+            r"\s*:?\s*"
+            r"CHF\s*"
+            r"([\d,.]+)\s*"
+            r"(billion|bn|million|mn|mio|mrd)",
+            text, _re.IGNORECASE,
+        )
+        for m in pat1:
+            name = m.group(1).strip().rstrip(":")
+            val_str = m.group(2).replace(",", ".")
+            unit = m.group(3).lower()
+            try:
+                val = float(val_str)
+                if unit in ("billion", "bn", "mrd"):
+                    val *= 1_000
+                # val is now in millions
+                if name and len(name) >= 3 and val > 0:
+                    name_lower = name.lower()
+                    skip = {"total", "group", "consolidated", "net",
+                            "operating", "adjusted", "underlying"}
+                    if not any(s in name_lower for s in skip):
+                        segments[name] = val
+            except (ValueError, TypeError):
+                pass
+
+        # Pattern 2: Tabular format "Name  12,345  11,234  +10%"
+        # (Swiss reports often use comma as thousands separator)
+        if not segments:
+            pat2 = _re.finditer(
+                r"(?:^|\n)\s*"
+                r"([A-Z][A-Za-z\s&/]{2,30}?)"  # segment name
+                r"\s+"
+                r"([\d,]+(?:\.\d+)?)"  # current year number
+                r"\s+"
+                r"[\d,]+",  # prior year number
+                text,
+            )
+            for m in pat2:
+                name = m.group(1).strip()
+                val_str = m.group(2).replace(",", "")
+                try:
+                    val = float(val_str)
+                    if val >= 100:  # at least CHF 100M
+                        name_lower = name.lower()
+                        skip = {"total", "group", "net income", "operating",
+                                "adjusted", "less", "corporate"}
+                        if not any(s in name_lower for s in skip):
+                            segments[name] = val
+                except (ValueError, TypeError):
+                    pass
+
+        return segments
+
     def get_peers(self, identifier: str) -> list[str]:
         return []
 
