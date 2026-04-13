@@ -2635,3 +2635,101 @@ def try_shareholding_extraction(
         logger.debug("Shareholding extraction pipeline failed for %s/%s: %s",
                      market_id, ticker, exc)
         return []
+
+
+# ---------------------------------------------------------------------------
+# Product segment extraction via filing discovery + fuzzy PDF parser
+# ---------------------------------------------------------------------------
+
+_EMPTY_SEGMENT_RESULT: dict = {
+    "n_segments": 0,
+    "segments": {},
+    "descriptions": {},
+    "has_revenue": False,
+    "has_descriptions": False,
+}
+
+
+def try_segment_extraction(
+    ticker: str,
+    market_id: str,
+    llm_client=None,
+) -> dict:
+    """Extract product segment data from PDF filings via fuzzy parser.
+
+    Chains:  discover filings -> download PDF -> extract_segments_from_pdf().
+    Falls back gracefully if any step fails.
+
+    Parameters
+    ----------
+    ticker:
+        Company ticker or identifier.
+    market_id:
+        Market ID for discoverer selection and market-specific keywords.
+    llm_client:
+        Optional LLM client (unused; kept for API consistency).
+
+    Returns
+    -------
+    Segment data dict with ``segments``, ``descriptions``, ``n_segments``,
+    ``has_revenue``, ``has_descriptions``, ``source`` keys.
+    """
+    try:
+        from operator1.clients.fuzzy_pdf_parser import extract_segments_from_pdf
+    except ImportError:
+        logger.debug("fuzzy_pdf_parser not available for segment extraction")
+        return dict(_EMPTY_SEGMENT_RESULT)
+
+    discoverer = _get_discoverer(market_id)
+    if discoverer is None:
+        return dict(_EMPTY_SEGMENT_RESULT)
+
+    try:
+        discovery = discoverer.discover_filings(ticker, years=2)
+        if not discovery or not discovery.filings:
+            return dict(_EMPTY_SEGMENT_RESULT)
+
+        # Try annual reports first (most likely to contain segment data),
+        # then fall back to quarterly/interim filings.
+        annual = [f for f in discovery.filings if getattr(f, "filing_type", "") in ("annual", "20-F", "10-K")]
+        quarterly = [f for f in discovery.filings if f not in annual]
+        candidates = (annual + quarterly)[:5]
+
+        for filing in candidates:
+            try:
+                pdf_bytes = discoverer.download_filing(filing)
+                if not pdf_bytes or len(pdf_bytes) < 1000:
+                    continue
+
+                # Validate PDF magic bytes
+                if pdf_bytes[:4] != b"%PDF":
+                    continue
+
+                result = extract_segments_from_pdf(
+                    pdf_bytes,
+                    market_id=market_id,
+                    filing_date=getattr(filing, "filing_date", None),
+                )
+                if result and result.get("n_segments", 0) >= 2:
+                    result["source"] = f"pdf_{market_id}"
+                    logger.info(
+                        "Segment extraction via PDF for %s/%s: %d segments from %s",
+                        market_id, ticker, result["n_segments"],
+                        getattr(filing, "title", "unknown")[:40],
+                    )
+                    return result
+            except Exception as exc:
+                logger.debug(
+                    "Segment extraction from filing %s failed: %s",
+                    getattr(filing, "title", "?")[:30], exc,
+                )
+                continue
+
+        return dict(_EMPTY_SEGMENT_RESULT)
+
+    except Exception as exc:
+        logger.debug(
+            "Segment extraction pipeline failed for %s/%s: %s",
+            market_id, ticker, exc,
+        )
+        return dict(_EMPTY_SEGMENT_RESULT)

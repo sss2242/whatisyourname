@@ -2034,6 +2034,30 @@ Non-interactive examples:
         logger.warning("Product catalyst detection failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 5i.6: Product segment extraction + cache injection
+    # ------------------------------------------------------------------
+    # Must run BEFORE Step 6 (temporal models) so that segment_hhi,
+    # cannibalization_rate, network_effect_score, etc. exist in cache
+    # when _extra_vars is built and when Monte Carlo checks segment_hhi.
+    _seg_result: dict = {}
+    try:
+        if hasattr(pit_client, "extract_segment_data"):
+            _seg_result = pit_client.extract_segment_data(company) or {}
+            if _seg_result.get("n_segments", 0) >= 2:
+                logger.info(
+                    "Segments extracted: %d segments for %s",
+                    _seg_result["n_segments"], company,
+                )
+                # Inject product metrics into cache for temporal models
+                try:
+                    from operator1.features.product_metrics import compute_product_metrics
+                    cache = compute_product_metrics(cache, _seg_result)
+                except Exception as _pm_exc:
+                    logger.debug("Product metrics computation failed: %s", _pm_exc)
+    except Exception as _seg_exc:
+        logger.debug("Segment extraction failed: %s", _seg_exc)
+
+    # ------------------------------------------------------------------
     # Step 5j: Adaptive threshold calibration
     # ------------------------------------------------------------------
     # Replaces fixed textbook survival thresholds with peer-calibrated,
@@ -3646,42 +3670,30 @@ Non-interactive examples:
         else:
             profile["product_catalysts"] = {"available": False}
 
-        # Product segment data -- extracted from per-market structured sources or PDFs.
-        # Uses the PIT client's extract_segment_data() method which chains:
-        #   - XBRL structured data (BMV JSON, Tadawul HTML, ESEF dimensions)
-        #   - Annual report PDF via fuzzy_pdf_parser (BR CVM, CH SIX, AU, etc.)
-        #   - Exchange notice text mining (CH SIX ad-hoc)
+        # Product segment data -- reuse _seg_result from Step 5i.6
+        # (extraction + cache injection already happened before temporal models).
         try:
-            if hasattr(pit_client, "extract_segment_data"):
-                _seg_result = pit_client.extract_segment_data(company)
-                if _seg_result and _seg_result.get("n_segments", 0) >= 2:
-                    # Compute dominant segment
-                    _seg_rev = _seg_result.get("segments", {})
-                    _dominant = max(_seg_rev, key=_seg_rev.get) if _seg_rev else ""
-                    _total_rev = sum(_seg_rev.values()) if _seg_rev else 0
-                    _dom_pct = _seg_rev.get(_dominant, 0) / _total_rev if _total_rev > 0 else 0
+            if _seg_result and _seg_result.get("n_segments", 0) >= 2:
+                _seg_rev = _seg_result.get("segments", {})
+                _dominant = max(_seg_rev, key=_seg_rev.get) if _seg_rev else ""
+                _total_rev = sum(_seg_rev.values()) if _seg_rev else 0
+                _dom_pct = _seg_rev.get(_dominant, 0) / _total_rev if _total_rev > 0 else 0
 
-                    profile["product_segments"] = {
-                        "available": True,
-                        "segments": _seg_result.get("segments", {}),
-                        "descriptions": _seg_result.get("descriptions", {}),
-                        "n_segments": _seg_result.get("n_segments", 0),
-                        "has_revenue": _seg_result.get("has_revenue", False),
-                        "has_descriptions": _seg_result.get("has_descriptions", False),
-                        "dominant_segment": _dominant,
-                        "dominant_segment_pct": round(_dom_pct, 4),
-                        "source": _seg_result.get("source", "unknown"),
-                    }
-                    logger.info(
-                        "Product segments for %s: %d segments, dominant=%s (%.0f%%)",
-                        company, _seg_result["n_segments"], _dominant, _dom_pct * 100,
-                    )
-                else:
-                    profile["product_segments"] = {"available": False}
+                profile["product_segments"] = {
+                    "available": True,
+                    "segments": _seg_result.get("segments", {}),
+                    "descriptions": _seg_result.get("descriptions", {}),
+                    "n_segments": _seg_result.get("n_segments", 0),
+                    "has_revenue": _seg_result.get("has_revenue", False),
+                    "has_descriptions": _seg_result.get("has_descriptions", False),
+                    "dominant_segment": _dominant,
+                    "dominant_segment_pct": round(_dom_pct, 4),
+                    "source": _seg_result.get("source", "unknown"),
+                }
             else:
                 profile["product_segments"] = {"available": False}
         except Exception as _seg_exc:
-            logger.debug("Product segment extraction failed: %s", _seg_exc)
+            logger.debug("Product segment profile injection failed: %s", _seg_exc)
             profile["product_segments"] = {"available": False}
 
         # Inject reconciliation report

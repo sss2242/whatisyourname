@@ -1155,3 +1155,44 @@ class SATadawulClient:
         except Exception as exc:
             logger.debug("Tadawul board report fetch failed for %s: %s", identifier, exc)
         return transactions
+
+    def extract_segment_data(self, identifier: str) -> dict[str, Any]:
+        """Extract IFRS 8 segment revenue from Tadawul XBRL HTML.
+
+        Reuses the existing XBRL download path (``_get_xbrl_links`` +
+        ``_fetch_xbrl_financials``) and applies the segment-specific
+        parser ``_extract_segment_revenue_from_xbrl`` to each HTML.
+        """
+        try:
+            s = _get_session()
+            xbrl_links = _get_xbrl_links(identifier.upper(), s=s)
+            if not xbrl_links:
+                return {"n_segments": 0, "segments": {}, "descriptions": {}}
+
+            # Try the most recent XBRL HTML file for segment data
+            for link_info in xbrl_links[:3]:
+                url = link_info.get("url", "")
+                if not url:
+                    continue
+                full_url = url if url.startswith("http") else f"https://www.saudiexchange.sa{url}"
+                try:
+                    r = s.get(full_url, timeout=20)
+                    if r.status_code != 200 or len(r.text) < 500:
+                        continue
+                    segments = _extract_segment_revenue_from_xbrl(r.text)
+                    if segments and len(segments) >= 2:
+                        return {
+                            "n_segments": len(segments),
+                            "segments": segments,
+                            "descriptions": {},
+                            "has_revenue": True,
+                            "has_descriptions": False,
+                            "source": "tadawul_xbrl",
+                        }
+                except Exception:
+                    continue
+
+            return {"n_segments": 0, "segments": {}, "descriptions": {}}
+        except Exception as exc:
+            logger.debug("Tadawul segment extraction failed for %s: %s", identifier, exc)
+            return {"n_segments": 0, "segments": {}, "descriptions": {}}

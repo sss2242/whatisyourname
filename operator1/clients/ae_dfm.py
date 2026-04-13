@@ -611,3 +611,20 @@ class AEDfmClient:
         except Exception as exc:
             logger.debug("DFM eFsah insider search failed for %s: %s", identifier, exc)
         return transactions
+
+    def extract_segment_data(self, identifier: str) -> dict:
+        """Extract product segment data from PDF filings via fuzzy parser.
+
+        Uses the filing discovery + fuzzy_pdf_parser pipeline with
+        market-specific segment keywords for ae_dfm.
+        """
+        try:
+            from operator1.clients.filing_discoverer import try_segment_extraction
+            return try_segment_extraction(identifier, "ae_dfm")
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).debug(
+                "AEDfmClient segment extraction failed for %s: %s", identifier, exc,
+            )
+            return {"n_segments": 0, "segments": {}, "descriptions": {}}
+
