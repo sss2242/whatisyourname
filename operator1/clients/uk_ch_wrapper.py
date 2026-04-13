@@ -1051,3 +1051,130 @@ class UKCompaniesHouseClient:
             return data.get("items", []) if isinstance(data, dict) else []
         except Exception:
             return []
+
+    def extract_segment_data(self, identifier: str) -> dict[str, Any]:
+        """Extract product segment data for UK companies.
+
+        Uses a dual-path strategy:
+
+        1. **ESEF XBRL crossover** (primary): Most FTSE companies also file
+           via ESEF (EU regulation).  The ``EUEsefClient.extract_segment_data()``
+           parses IFRS 8 dimensional facts from filings.xbrl.org -- structured
+           XBRL data with no text extraction issues.
+
+        2. **Companies House PDF** (fallback): Downloads the annual accounts
+           PDF and extracts segment data using the fuzzy PDF parser.  Only
+           works for PDFs with extractable text (not scanned/image-based).
+
+        Parameters
+        ----------
+        identifier:
+            Company number (e.g. ``"00041424"`` for Unilever PLC).
+
+        Returns
+        -------
+        Standard segment dict with ``segments``, ``descriptions``,
+        ``n_segments``, ``has_revenue``, ``has_descriptions``, ``source``.
+        """
+        empty: dict[str, Any] = {"n_segments": 0, "segments": {}, "descriptions": {}}
+
+        # Path 1: ESEF XBRL crossover (most reliable for large UK companies)
+        try:
+            profile = self.get_profile(identifier)
+            company_name = profile.get("name", "")
+            if company_name:
+                from operator1.clients.eu_esef_wrapper import EUEsefClient
+                esef_client = EUEsefClient(country_code="GB", market_id="uk_companies_house")
+                esef_result = esef_client.extract_segment_data(company_name)
+                if esef_result and esef_result.get("n_segments", 0) >= 2:
+                    esef_result["source"] = "esef_xbrl_crossover"
+                    logger.info(
+                        "UK segment extraction via ESEF crossover for %s: %d segments",
+                        company_name, esef_result["n_segments"],
+                    )
+                    return esef_result
+        except Exception as exc:
+            logger.debug("UK ESEF crossover segment extraction failed: %s", exc)
+
+        # Path 2: Companies House PDF (fallback for non-ESEF filers)
+        try:
+            return self._extract_segments_from_pdf(identifier)
+        except Exception as exc:
+            logger.debug("UK PDF segment extraction failed for %s: %s", identifier, exc)
+            return empty
+
+    def _extract_segments_from_pdf(self, identifier: str) -> dict[str, Any]:
+        """Download annual accounts PDF and extract segment data."""
+        import requests as _requests
+        import base64
+
+        empty: dict[str, Any] = {"n_segments": 0, "segments": {}, "descriptions": {}}
+
+        # Get filing history (accounts only)
+        try:
+            data = self._get(
+                f"/company/{identifier}/filing-history",
+                params={"category": "accounts", "items_per_page": 5},
+            )
+            items = data.get("items", []) if isinstance(data, dict) else []
+        except Exception:
+            return empty
+
+        # Find annual accounts (skip interim)
+        annual_filings = [
+            f for f in items
+            if "group" in f.get("description", "") or "full" in f.get("description", "")
+        ]
+        if not annual_filings:
+            annual_filings = items[:3]
+
+        auth_headers: dict[str, str] = {"User-Agent": "Operator1/1.0"}
+        if self._api_key:
+            encoded = base64.b64encode(f"{self._api_key}:".encode()).decode()
+            auth_headers["Authorization"] = f"Basic {encoded}"
+
+        # Try to download and parse PDF from each filing
+        for filing in annual_filings[:3]:
+            tx_id = filing.get("transaction_id", "")
+            if not tx_id:
+                continue
+
+            try:
+                # Download via find-and-update URL
+                doc_url = (
+                    f"https://find-and-update.company-information.service.gov.uk"
+                    f"/company/{identifier}/filing-history/{tx_id}/document"
+                )
+                resp = _requests.get(
+                    doc_url,
+                    headers={**auth_headers, "Accept": "application/pdf"},
+                    timeout=60,
+                    allow_redirects=True,
+                )
+                if resp.status_code != 200 or len(resp.content) < 5000:
+                    continue
+                if resp.content[:4] != b"%PDF":
+                    continue
+
+                # Parse segment data from PDF
+                from operator1.clients.fuzzy_pdf_parser import extract_segments_from_pdf
+                result = extract_segments_from_pdf(
+                    resp.content,
+                    market_id="uk_companies_house",
+                    filing_date=filing.get("date"),
+                )
+                if result and result.get("n_segments", 0) >= 2:
+                    result["source"] = "companies_house_pdf"
+                    logger.info(
+                        "UK segment extraction for %s: %d segments from %s filing",
+                        identifier, result["n_segments"], filing.get("date", ""),
+                    )
+                    return result
+            except Exception as exc:
+                logger.debug(
+                    "UK PDF segment extraction failed for %s/%s: %s",
+                    identifier, tx_id, exc,
+                )
+                continue
+
+        return empty

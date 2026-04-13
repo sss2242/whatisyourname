@@ -1054,6 +1054,19 @@ _SEGMENT_KEYWORDS = [
 
 # Per-market segment keywords
 _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
+    "uk_companies_house": [
+        "segment information", "operating segments", "ifrs 8",
+        "reportable segments", "revenue by segment",
+        "segment revenue", "business segments",
+        "geographical segments", "revenue from external customers",
+        "beauty & wellbeing", "personal care",  # Unilever segment names
+        "home care", "nutrition", "ice cream",  # Unilever segment names
+        "upstream", "downstream", "customers & products",  # BP segment names
+        "uk & roi", "central europe", "booker",  # Tesco segment names
+        "revenue by operating segment",
+        "segment reporting", "segment results",
+        "business review",  # UK annual report section header
+    ],
     "in_bse": [
         "segment reporting as per ind as 108", "segment wise revenue",
         "segment wise results", "business segment", "geographical segment",
@@ -1210,6 +1223,11 @@ _SEGMENT_SKIP_LABELS = {
 #
 # "max_pages": Maximum number of candidate pages to process. Default 10.
 _SEGMENT_EXTRACTION_CONFIG: dict[str, dict[str, Any]] = {
+    "uk_companies_house": {
+        "prefer_text": True,  # UK annual reports: segment data in IFRS 8 notes section
+        "min_page_score": 2,  # UK reports are 200+ pages; filter noise
+        "max_pages": 15,
+    },
     "au_asx": {
         "prefer_text": True,  # BHP/mining: "Total X" lines are most reliable
         "min_page_score": 1,
@@ -1265,6 +1283,111 @@ _SEGMENT_EXTRACTION_CONFIG: dict[str, dict[str, Any]] = {
         "max_pages": 15,
     },
 }
+
+
+def _ocr_extract_segments(
+    pdf_bytes: bytes,
+    keywords: list[str],
+    min_page_score: int = 1,
+    max_pages: int = 10,
+    market_id: str = "",
+) -> dict[str, float]:
+    """OCR image-based PDF pages with docTR and extract segment data.
+
+    Used as a fallback when pdfplumber returns zero text (image-based PDFs
+    like UK Companies House annual reports from large FTSE companies).
+
+    Strategy:
+    1. Render ALL pages to low-res images with pypdfium2 (fast: ~0.1s/page)
+    2. OCR each page with docTR (slower: ~1-2s/page, but accurate)
+    3. Score OCR'd text for segment keywords
+    4. Run ``_extract_segments_from_text()`` on the best pages
+
+    Dependencies: ``python-doctr``, ``pypdfium2`` (both optional, graceful fallback).
+    """
+    try:
+        import pypdfium2 as pdfium
+        import numpy as np
+        from doctr.models import ocr_predictor
+    except ImportError as exc:
+        logger.debug("docTR OCR not available for image PDF: %s", exc)
+        return {}
+
+    segments: dict[str, float] = {}
+
+    try:
+        pdf = pdfium.PdfDocument(pdf_bytes)
+        n_pages = len(pdf)
+        logger.info("OCR scanning %d pages for segment data...", n_pages)
+
+        # Load OCR model once
+        model = ocr_predictor(det_arch="db_resnet50", reco_arch="crnn_vgg16_bn", pretrained=True)
+
+        # Phase 1: OCR all pages, score for segment keywords
+        page_texts: dict[int, str] = {}
+        scored_pages: list[tuple[int, int]] = []
+
+        for pg_num in range(n_pages):
+            try:
+                page = pdf[pg_num]
+                bitmap = page.render(scale=2)  # 2x resolution for OCR accuracy
+                img = bitmap.to_pil()
+                img_arr = np.array(img)
+
+                result = model([img_arr])
+
+                text = ""
+                for ocr_page in result.pages:
+                    for block in ocr_page.blocks:
+                        for line in block.lines:
+                            text += " ".join(w.value for w in line.words) + "\n"
+
+                if len(text.strip()) < 20:
+                    continue
+
+                page_texts[pg_num] = text
+                lower = text.lower()
+                score = sum(1 for kw in keywords if kw in lower)
+                if score >= min_page_score:
+                    scored_pages.append((pg_num, score))
+            except Exception as exc:
+                logger.debug("OCR page %d failed: %s", pg_num, exc)
+                continue
+
+        scored_pages.sort(key=lambda x: -x[1])
+
+        if not scored_pages:
+            logger.info("OCR: no pages scored above threshold %d", min_page_score)
+            return {}
+
+        logger.info(
+            "OCR: %d pages scored, top page %d (score=%d), processing top %d",
+            len(scored_pages), scored_pages[0][0], scored_pages[0][1], max_pages,
+        )
+
+        # Phase 2: Extract segments from best pages using text parser
+        for pg_num, score in scored_pages[:max_pages]:
+            text = page_texts.get(pg_num, "")
+            if not text:
+                continue
+
+            extracted = _extract_segments_from_text(text)
+            if extracted and len(extracted) > len(segments):
+                segments = extracted
+
+            if len(segments) >= 3:
+                break
+
+        if len(segments) >= 2:
+            logger.info(
+                "OCR segment extraction: %d segments from %d pages (%s)",
+                len(segments), len(scored_pages), market_id or "unknown",
+            )
+
+    except Exception as exc:
+        logger.debug("OCR segment extraction failed: %s", exc)
+
+    return segments
 
 
 def extract_segments_from_pdf(
@@ -1323,6 +1446,24 @@ def extract_segments_from_pdf(
 
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as doc:
+            # Check if this is an image-based PDF (no extractable text).
+            # Sample 5 pages -- if all return empty text, use docTR OCR.
+            _sample_pages = [0, len(doc.pages) // 4, len(doc.pages) // 2,
+                             3 * len(doc.pages) // 4, len(doc.pages) - 1]
+            _has_text = any(
+                len((doc.pages[p].extract_text() or "").strip()) > 20
+                for p in _sample_pages if p < len(doc.pages)
+            )
+            if not _has_text:
+                logger.info(
+                    "Image-based PDF detected (%d pages, no extractable text). "
+                    "Attempting docTR OCR...",
+                    len(doc.pages),
+                )
+                ocr_segments = _ocr_extract_segments(pdf_bytes, keywords, min_page_score, max_pages, market_id)
+                if ocr_segments and len(ocr_segments) >= 2:
+                    return ocr_segments
+
             # Score pages for segment content using per-market keyword list
             seg_pages: list[tuple[int, int]] = []
             for i, page in enumerate(doc.pages):

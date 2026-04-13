@@ -676,6 +676,18 @@ class MXBmvClient:
             logger.debug("BMV insider transaction search failed for %s: %s", identifier, exc)
         return transactions
 
+    def extract_segment_data(self, identifier: str) -> dict[str, Any]:
+        """Extract IFRS 8 segment data from BMV XBRL JSON ZIPs.
+
+        Delegates to the standalone ``extract_bmv_segment_data()`` function
+        which downloads recent XBRL ZIPs and extracts segment information.
+        """
+        try:
+            return extract_bmv_segment_data(identifier)
+        except Exception as exc:
+            logger.debug("BMV segment extraction failed for %s: %s", identifier, exc)
+            return {"n_segments": 0, "segments": {}, "descriptions": {}}
+
 
 # ---------------------------------------------------------------------------
 # BMV XBRL Financial Data Extraction (fast path, no LLM needed)

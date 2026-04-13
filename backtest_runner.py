@@ -451,6 +451,16 @@ def run_stage1(state: BacktestState) -> None:
     except Exception:
         pass
 
+    # Product segment extraction (for product_metrics cache columns)
+    _seg_result: dict = {}
+    try:
+        if hasattr(pit_client, "extract_segment_data"):
+            _seg_result = pit_client.extract_segment_data(identifier) or {}
+            if _seg_result.get("n_segments", 0) >= 2:
+                logger.info("Segments: %d segments extracted", _seg_result["n_segments"])
+    except Exception as exc:
+        logger.debug("Segment extraction skipped: %s", exc)
+
     # Fetch financial data (parallel)
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -1041,6 +1051,14 @@ def run_stage1(state: BacktestState) -> None:
                 logger.info("Ownership contagion: MHHI=%.3f", state.contagion_result.mhhi_delta)
         except Exception as exc:
             logger.debug("Ownership contagion skipped: %s", exc)
+
+    # Product segment metrics (for _extra_vars + MC concentration risk)
+    if _seg_result and _seg_result.get("n_segments", 0) >= 2:
+        try:
+            from operator1.features.product_metrics import compute_product_metrics
+            cache = compute_product_metrics(cache, _seg_result)
+        except Exception as exc:
+            logger.debug("Product metrics computation failed: %s", exc)
 
     state.cache = cache
     state.save_sub("1")

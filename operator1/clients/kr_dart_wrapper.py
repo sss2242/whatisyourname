@@ -1350,3 +1350,244 @@ class KRDartClient:
             )
 
         return transactions
+
+    # ------------------------------------------------------------------
+    # Product segment extraction from DART XBRL
+    # ------------------------------------------------------------------
+
+    def extract_segment_data(self, identifier: str) -> dict:
+        """Extract IFRS 8 / K-IFRS operating segment revenue from DART XBRL.
+
+        Downloads the XBRL ZIP for the most recent annual report, parses
+        the instance document for Revenue facts with operating segment
+        dimension members, and resolves human-readable names from the
+        English label linkbase.
+
+        Parameters
+        ----------
+        identifier:
+            Stock code (e.g. ``"005930"``) or company name.
+
+        Returns
+        -------
+        Standard segment dict with ``segments``, ``descriptions``,
+        ``n_segments``, ``has_revenue``, ``has_descriptions``, ``source``.
+        """
+        empty = {"n_segments": 0, "segments": {}, "descriptions": {}}
+        try:
+            return self._extract_segments_from_xbrl(identifier)
+        except Exception as exc:
+            logger.debug("KR DART segment extraction failed for %s: %s", identifier, exc)
+            return empty
+
+    def _extract_segments_from_xbrl(self, identifier: str) -> dict:
+        """Internal: download XBRL ZIP and parse segment revenue."""
+        import re
+        import zipfile
+        import io
+        import xml.etree.ElementTree as ET
+
+        empty = {"n_segments": 0, "segments": {}, "descriptions": {}}
+
+        corp_code = self._resolve_corp_code(identifier)
+        if not corp_code:
+            return empty
+
+        # Find most recent annual report receipt number
+        rcept_no = self._find_annual_rcept_no(corp_code)
+        if not rcept_no:
+            return empty
+
+        # Download XBRL ZIP
+        r = requests.get(
+            f"{_DART_BASE}/fnlttXbrl.xml",
+            params={"crtfc_key": self._api_key, "rcept_no": rcept_no},
+            timeout=30,
+        )
+        if r.status_code != 200 or r.content[:2] != b"PK":
+            return empty
+
+        zf = zipfile.ZipFile(io.BytesIO(r.content))
+
+        # Find instance document (.xbrl)
+        xbrl_files = [n for n in zf.namelist() if n.endswith(".xbrl")]
+        if not xbrl_files:
+            return empty
+
+        xbrl_content = zf.read(xbrl_files[0]).decode("utf-8", errors="replace")
+        tree = ET.fromstring(xbrl_content)
+
+        nsmap = {
+            "xbrli": "http://www.xbrl.org/2003/instance",
+            "xbrldi": "http://xbrl.org/2006/xbrldi",
+        }
+
+        # 1. Collect contexts with operating segment dimensions
+        segment_contexts: dict[str, str] = {}  # context_id -> member_name
+        for ctx in tree.findall(".//xbrli:context", nsmap):
+            ctx_id = ctx.get("id", "")
+            seg = ctx.find(".//xbrli:segment", nsmap)
+            if seg is None:
+                continue
+            for dim in seg.findall(".//xbrldi:explicitMember", nsmap):
+                dim_name = dim.get("dimension", "")
+                member = dim.text or ""
+                if "SegmentConsolidationItemsAxis" in dim_name:
+                    # Only keep OperatingSegments members (not reconciling items)
+                    if "OperatingSegments" in member and "Member" in member:
+                        segment_contexts[ctx_id] = member
+
+        if not segment_contexts:
+            return empty
+
+        # 2. Find Revenue facts for the CURRENT fiscal year (CFY prefix)
+        revenue_by_member: dict[str, float] = {}
+        for elem in tree:
+            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            if tag != "Revenue":
+                continue
+            ctx_ref = elem.get("contextRef", "")
+            if ctx_ref not in segment_contexts:
+                continue
+            # Prefer current year (CFY) over prior year (PFY)
+            if "CFY" not in ctx_ref and "Consolidated" not in ctx_ref:
+                continue
+            # Prefer consolidated over separate
+            if "SeparateMember" in ctx_ref:
+                continue
+            member = segment_contexts[ctx_ref]
+            try:
+                val = float(elem.text or "0")
+                revenue_by_member[member] = val
+            except (ValueError, TypeError):
+                pass
+
+        # Deduplicate: if both consolidated and separate exist, keep consolidated
+        if not revenue_by_member:
+            # Fallback: try all contexts (not just CFY/Consolidated)
+            for elem in tree:
+                tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                if tag != "Revenue":
+                    continue
+                ctx_ref = elem.get("contextRef", "")
+                if ctx_ref in segment_contexts:
+                    member = segment_contexts[ctx_ref]
+                    if member not in revenue_by_member:
+                        try:
+                            val = float(elem.text or "0")
+                            revenue_by_member[member] = val
+                        except (ValueError, TypeError):
+                            pass
+
+        if len(revenue_by_member) < 2:
+            return empty
+
+        # 3. Resolve member names to human-readable labels
+        label_map = self._parse_xbrl_labels(zf)
+
+        segments: dict[str, float] = {}
+        for member, rev in revenue_by_member.items():
+            # Skip reconciling/elimination items (negative values)
+            if "MaterialReconciling" in member:
+                continue
+            # Extract short name from member URI
+            short = self._extract_segment_short_name(member, label_map)
+            if short and abs(rev) > 0:
+                segments[short] = rev
+
+        if len(segments) < 2:
+            return empty
+
+        return {
+            "n_segments": len(segments),
+            "segments": segments,
+            "descriptions": {},
+            "has_revenue": True,
+            "has_descriptions": False,
+            "source": "dart_xbrl",
+        }
+
+    def _find_annual_rcept_no(self, corp_code: str) -> str:
+        """Find the most recent annual report receipt number."""
+        import datetime
+        now = datetime.date.today()
+        # Search last 2 years for annual reports
+        for year_offset in range(0, 3):
+            year = now.year - year_offset
+            try:
+                r = requests.get(
+                    f"{_DART_BASE}/list.json",
+                    params={
+                        "crtfc_key": self._api_key,
+                        "corp_code": corp_code,
+                        "bgn_de": f"{year}0101",
+                        "end_de": f"{year}1231",
+                        "pblntf_ty": "A",
+                        "page_count": 10,
+                    },
+                    timeout=15,
+                )
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                if data.get("status") != "000" or not data.get("list"):
+                    continue
+                # Find annual report (사업보고서)
+                for item in data["list"]:
+                    report_nm = item.get("report_nm", "")
+                    if "사업보고서" in report_nm:
+                        return item.get("rcept_no", "")
+            except Exception:
+                continue
+        return ""
+
+    @staticmethod
+    def _parse_xbrl_labels(zf) -> dict[str, str]:
+        """Parse English labels from XBRL label linkbase ZIP entry."""
+        import xml.etree.ElementTree as ET
+        label_map: dict[str, str] = {}
+        en_files = [n for n in zf.namelist() if "lab-en" in n]
+        if not en_files:
+            return label_map
+        try:
+            content = zf.read(en_files[0]).decode("utf-8", errors="replace")
+            tree = ET.fromstring(content)
+            ns = {"link": "http://www.xbrl.org/2003/linkbase", "xlink": "http://www.w3.org/1999/xlink"}
+            for label in tree.findall(".//link:label", ns):
+                text = (label.text or "").strip()
+                label_id = label.get("{http://www.w3.org/1999/xlink}label", "")
+                if text and "[member]" in text.lower():
+                    # Strip " [member]" suffix
+                    clean = text.replace(" [member]", "").replace(" [Member]", "").strip()
+                    label_map[label_id] = clean
+        except Exception:
+            pass
+        return label_map
+
+    @staticmethod
+    def _extract_segment_short_name(member: str, label_map: dict[str, str]) -> str:
+        """Extract a human-readable segment name from a member URI.
+
+        Tries English label map first, then falls back to parsing the URI.
+        """
+        import re
+        # Try label map: match on member name fragment
+        # Member format: entity00126380:DsDivisionMemberOfOperatingSegments...
+        member_local = member.split(":")[-1] if ":" in member else member
+        for label_id, label_text in label_map.items():
+            # Check if the member name fragment appears in the label ID
+            # E.g. "DsDivision" in the label ID for "DS Division [member]"
+            short_prefix = member_local.split("Member")[0] if "Member" in member_local else member_local
+            if short_prefix.lower() in label_id.lower():
+                return label_text
+
+        # Fallback: extract from URI pattern
+        # entity00126380:DsDivisionMemberOfOperatingSegments... -> "DS Division"
+        m = re.match(r".*?:(\w+?)(?:Division|Segment)?Member", member)
+        if m:
+            name = m.group(1)
+            # CamelCase to spaces
+            spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", name)
+            return spaced.strip()
+
+        return member_local[:30] if member_local else ""

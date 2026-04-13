@@ -1131,3 +1131,20 @@ class SGSgxClient:
                 identifier, exc,
             )
         return transactions
+
+    def extract_segment_data(self, identifier: str) -> dict:
+        """Extract product segment data from PDF filings via fuzzy parser.
+
+        Uses the filing discovery + fuzzy_pdf_parser pipeline with
+        market-specific segment keywords for sg_sgx.
+        """
+        try:
+            from operator1.clients.filing_discoverer import try_segment_extraction
+            return try_segment_extraction(identifier, "sg_sgx")
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).debug(
+                "SGSgxClient segment extraction failed for %s: %s", identifier, exc,
+            )
+            return {"n_segments": 0, "segments": {}, "descriptions": {}}
+
