@@ -1054,6 +1054,19 @@ _SEGMENT_KEYWORDS = [
 
 # Per-market segment keywords
 _SEGMENT_KEYWORDS_BY_MARKET: dict[str, list[str]] = {
+    "uk_companies_house": [
+        "segment information", "operating segments", "ifrs 8",
+        "reportable segments", "revenue by segment",
+        "segment revenue", "business segments",
+        "geographical segments", "revenue from external customers",
+        "beauty & wellbeing", "personal care",  # Unilever segment names
+        "home care", "nutrition", "ice cream",  # Unilever segment names
+        "upstream", "downstream", "customers & products",  # BP segment names
+        "uk & roi", "central europe", "booker",  # Tesco segment names
+        "revenue by operating segment",
+        "segment reporting", "segment results",
+        "business review",  # UK annual report section header
+    ],
     "in_bse": [
         "segment reporting as per ind as 108", "segment wise revenue",
         "segment wise results", "business segment", "geographical segment",
