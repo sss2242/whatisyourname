@@ -2567,7 +2567,7 @@ def try_shareholding_extraction(
     -------
     List of holder dicts with: name, shares, percentage, holder_type, source.
     """
-    discoverer = _get_discoverer(market_id)
+    discoverer = get_discoverer(market_id)
     if discoverer is None:
         return []
 
@@ -2680,7 +2680,7 @@ def try_segment_extraction(
         logger.debug("fuzzy_pdf_parser not available for segment extraction")
         return dict(_EMPTY_SEGMENT_RESULT)
 
-    discoverer = _get_discoverer(market_id)
+    discoverer = get_discoverer(market_id)
     if discoverer is None:
         return dict(_EMPTY_SEGMENT_RESULT)
 
