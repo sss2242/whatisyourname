@@ -49,6 +49,9 @@ camelot-py[base]==1.0.9    # High-accuracy PDF table extraction (MIT)
 # EU ESEF XBRL filings
 xbrl-filings-api==1.0          # filings.xbrl.org Python client (entity search, filing download)
 
+# OCR for image-based PDFs (UK Companies House, etc.)
+python-doctr>=1.0            # docTR deep learning OCR (Mindee) for image-based PDF extraction
+
 # WAF bypass and scraping
 curl_cffi>=0.13              # Chrome TLS impersonation for Tadawul, MOPS WAF bypass
 onnxruntime>=1.19            # ONNX neural net for Bundesanzeiger CAPTCHA solving
