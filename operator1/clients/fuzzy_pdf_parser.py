@@ -1291,17 +1291,24 @@ def _ocr_extract_segments(
     min_page_score: int = 1,
     max_pages: int = 10,
     market_id: str = "",
+    batch_size: int = 50,
 ) -> dict[str, float]:
     """OCR image-based PDF pages with docTR and extract segment data.
 
     Used as a fallback when pdfplumber returns zero text (image-based PDFs
     like UK Companies House annual reports from large FTSE companies).
 
-    Strategy:
-    1. Render ALL pages to low-res images with pypdfium2 (fast: ~0.1s/page)
-    2. OCR each page with docTR (slower: ~1-2s/page, but accurate)
+    Strategy -- **batched processing** (50 pages at a time):
+    1. Split the PDF into batches of ``batch_size`` pages (default 50)
+    2. For each batch: render pages to images with pypdfium2, OCR with docTR
     3. Score OCR'd text for segment keywords
-    4. Run ``_extract_segments_from_text()`` on the best pages
+    4. After each batch: attempt extraction on the best pages found so far
+    5. **Early exit** when >= 3 segments are found (avoids OCR'ing the entire PDF)
+
+    A 260-page PDF (e.g. Unilever annual report) is processed as:
+    batch 1 (pages 0-49), batch 2 (pages 50-99), ... up to batch 6 (pages 250-259).
+    Segment data typically appears in the first 30-60% of an annual report, so
+    most runs exit after 2-3 batches (~100-150 pages, ~2-3 minutes).
 
     Dependencies: ``python-doctr``, ``pypdfium2`` (both optional, graceful fallback).
     """
@@ -1318,69 +1325,117 @@ def _ocr_extract_segments(
     try:
         pdf = pdfium.PdfDocument(pdf_bytes)
         n_pages = len(pdf)
-        logger.info("OCR scanning %d pages for segment data...", n_pages)
+        n_batches = (n_pages + batch_size - 1) // batch_size
+        logger.info(
+            "OCR scanning %d pages in %d batches of %d for segment data...",
+            n_pages, n_batches, batch_size,
+        )
 
-        # Load OCR model once
+        # Load OCR model once (expensive -- reused across all batches)
         model = ocr_predictor(det_arch="db_resnet50", reco_arch="crnn_vgg16_bn", pretrained=True)
 
-        # Phase 1: OCR all pages, score for segment keywords
+        # Accumulate results across batches
         page_texts: dict[int, str] = {}
         scored_pages: list[tuple[int, int]] = []
 
-        for pg_num in range(n_pages):
-            try:
-                page = pdf[pg_num]
-                bitmap = page.render(scale=2)  # 2x resolution for OCR accuracy
-                img = bitmap.to_pil()
-                img_arr = np.array(img)
+        for batch_idx in range(n_batches):
+            batch_start = batch_idx * batch_size
+            batch_end = min(batch_start + batch_size, n_pages)
+            batch_scored_count = 0
 
-                result = model([img_arr])
+            logger.info(
+                "OCR batch %d/%d: pages %d-%d",
+                batch_idx + 1, n_batches, batch_start, batch_end - 1,
+            )
 
-                text = ""
-                for ocr_page in result.pages:
-                    for block in ocr_page.blocks:
-                        for line in block.lines:
-                            text += " ".join(w.value for w in line.words) + "\n"
+            for pg_num in range(batch_start, batch_end):
+                try:
+                    page = pdf[pg_num]
+                    bitmap = page.render(scale=2)  # 2x resolution for OCR accuracy
+                    img = bitmap.to_pil()
+                    img_arr = np.array(img)
 
-                if len(text.strip()) < 20:
+                    result = model([img_arr])
+
+                    text = ""
+                    for ocr_page in result.pages:
+                        for block in ocr_page.blocks:
+                            for line in block.lines:
+                                text += " ".join(w.value for w in line.words) + "\n"
+
+                    if len(text.strip()) < 20:
+                        continue
+
+                    page_texts[pg_num] = text
+                    lower = text.lower()
+                    score = sum(1 for kw in keywords if kw in lower)
+                    if score >= min_page_score:
+                        scored_pages.append((pg_num, score))
+                        batch_scored_count += 1
+                except Exception as exc:
+                    logger.debug("OCR page %d failed: %s", pg_num, exc)
                     continue
 
-                page_texts[pg_num] = text
-                lower = text.lower()
-                score = sum(1 for kw in keywords if kw in lower)
-                if score >= min_page_score:
-                    scored_pages.append((pg_num, score))
-            except Exception as exc:
-                logger.debug("OCR page %d failed: %s", pg_num, exc)
-                continue
+            logger.info(
+                "OCR batch %d/%d complete: %d pages scored in this batch, %d total scored",
+                batch_idx + 1, n_batches, batch_scored_count, len(scored_pages),
+            )
 
-        scored_pages.sort(key=lambda x: -x[1])
+            # After each batch: try extraction on best pages found so far.
+            # Re-sort by score descending across ALL batches processed.
+            if scored_pages:
+                scored_pages.sort(key=lambda x: -x[1])
+
+                for pg_num, score in scored_pages[:max_pages]:
+                    text = page_texts.get(pg_num, "")
+                    if not text:
+                        continue
+
+                    extracted = _extract_segments_from_text(text)
+                    if extracted and len(extracted) > len(segments):
+                        segments = extracted
+
+                    if len(segments) >= 3:
+                        break
+
+            # Early exit: stop processing further batches once we have
+            # enough segments. Segment tables usually appear in the notes
+            # to financial statements (first 40-60% of annual reports).
+            if len(segments) >= 3:
+                logger.info(
+                    "OCR early exit after batch %d/%d: %d segments found",
+                    batch_idx + 1, n_batches, len(segments),
+                )
+                break
+
+        # Final attempt if we finished all batches without early exit
+        if not segments and scored_pages:
+            scored_pages.sort(key=lambda x: -x[1])
+            logger.info(
+                "OCR: %d pages scored across all batches, top page %d (score=%d), "
+                "processing top %d",
+                len(scored_pages), scored_pages[0][0], scored_pages[0][1], max_pages,
+            )
+
+            for pg_num, score in scored_pages[:max_pages]:
+                text = page_texts.get(pg_num, "")
+                if not text:
+                    continue
+
+                extracted = _extract_segments_from_text(text)
+                if extracted and len(extracted) > len(segments):
+                    segments = extracted
+
+                if len(segments) >= 3:
+                    break
 
         if not scored_pages:
             logger.info("OCR: no pages scored above threshold %d", min_page_score)
             return {}
 
-        logger.info(
-            "OCR: %d pages scored, top page %d (score=%d), processing top %d",
-            len(scored_pages), scored_pages[0][0], scored_pages[0][1], max_pages,
-        )
-
-        # Phase 2: Extract segments from best pages using text parser
-        for pg_num, score in scored_pages[:max_pages]:
-            text = page_texts.get(pg_num, "")
-            if not text:
-                continue
-
-            extracted = _extract_segments_from_text(text)
-            if extracted and len(extracted) > len(segments):
-                segments = extracted
-
-            if len(segments) >= 3:
-                break
-
         if len(segments) >= 2:
             logger.info(
-                "OCR segment extraction: %d segments from %d pages (%s)",
+                "OCR segment extraction: %d segments from %d scored pages (%s)",
                 len(segments), len(scored_pages), market_id or "unknown",
             )
 
