@@ -715,3 +715,116 @@ class JPJquantsClient:
         # Would require EDINET filing discovery for 大量保有報告書 (large holder reports).
         logger.debug("JP insider transactions not available natively for %s", identifier)
         return transactions
+
+    # ------------------------------------------------------------------
+    # Segment / product data extraction
+    # ------------------------------------------------------------------
+
+    # Major Japanese companies with NYSE/NASDAQ ADR listings.
+    # Used for SEC EDGAR 20-F segment extraction fallback.
+    _JP_ADR_MAP: dict[str, str] = {
+        "7203": "TM",      # Toyota Motor
+        "6758": "SONY",    # Sony Group
+        "7267": "HMC",     # Honda Motor
+        "8306": "MUFG",    # Mitsubishi UFJ Financial
+        "4502": "TAK",     # Takeda Pharmaceutical
+        "7751": "CAJ",     # Canon
+        "8604": "NMR",     # Nomura Holdings
+        "9984": "SFTBY",   # SoftBank Group
+        "6501": "HTHIY",   # Hitachi
+        "6902": "DNZOY",   # Denso
+        "8316": "SMFG",    # Sumitomo Mitsui Financial
+        "6861": "KYOCY",   # Keyence
+        "9432": "NTTYY",   # NTT (Nippon Telegraph)
+        "6367": "DKILY",   # Daikin Industries
+        "4503": "ALPMY",   # Astellas Pharma
+        "6752": "PCRFY",   # Panasonic
+        "7741": "HOCPY",   # HOYA
+        "6594": "NIDEY",   # Nidec
+        "8058": "MSBHF",   # Mitsubishi Corp
+        "8001": "ITOCY",   # Itochu
+        "7974": "NTDOY",   # Nintendo
+        "4519": "CHUGF",   # Chugai Pharmaceutical
+        "6301": "KMTUY",   # Komatsu
+        "8766": "TKOMY",   # Tokio Marine
+        "9433": "KDDIY",   # KDDI
+        "6857": "ASMLY",   # Advantest
+        "3382": "SVNDY",   # Seven & i Holdings
+        "4568": "DSKYF",   # Daiichi Sankyo
+        "9983": "FRCOY",   # Fast Retailing (Uniqlo)
+        "6723": "RNECY",   # Renesas Electronics
+    }
+
+    @property
+    def market_id(self) -> str:
+        return "jp_jquants"
+
+    def extract_segment_data(self, identifier: str) -> dict[str, Any]:
+        """Extract product segment data for Japanese companies.
+
+        Uses a dual-path strategy:
+
+        1. **SEC EDGAR 20-F** (primary for ADR-listed companies): Major
+           Japanese companies file 20-F annual reports on SEC EDGAR which
+           contain IFRS 8 segment revenue breakdowns. The US EDGAR client
+           extracts segment data from XBRL dimensions and filing text.
+
+        2. **J-Quants sector peers** (fallback): When no ADR listing exists,
+           returns empty -- EDINET requires a paid subscription key and
+           J-Quants does not provide segment data.
+
+        Parameters
+        ----------
+        identifier:
+            J-Quants ticker code (4 digits, e.g. ``"7203"`` for Toyota).
+
+        Returns
+        -------
+        Standard segment dict with ``segments``, ``descriptions``,
+        ``n_segments``, ``has_revenue``, ``has_descriptions``, ``source``.
+        """
+        empty: dict[str, Any] = {
+            "n_segments": 0, "segments": {}, "descriptions": {},
+            "has_revenue": False, "has_descriptions": False,
+        }
+
+        code = identifier.strip()[:4]
+
+        # Path 1: SEC EDGAR 20-F for ADR-listed companies
+        adr_ticker = self._JP_ADR_MAP.get(code, "")
+        if adr_ticker:
+            try:
+                import os
+                # Ensure EDGAR identity is set (required for SEC API)
+                if not os.environ.get("EDGAR_IDENTITY"):
+                    os.environ["EDGAR_IDENTITY"] = "operator1@example.com"
+
+                from operator1.clients.us_edgar import USEdgarClient
+                edgar = USEdgarClient()
+                result = edgar.extract_segment_data(adr_ticker)
+                if result and result.get("n_segments", 0) >= 2:
+                    result["source"] = "sec_edgar_20f_adr"
+                    # Get company name for logging
+                    profile = self.get_profile(code)
+                    company_name = profile.get("name", code)
+                    logger.info(
+                        "JP segment extraction via SEC EDGAR 20-F for %s (%s -> %s): %d segments",
+                        company_name, code, adr_ticker, result["n_segments"],
+                    )
+                    return result
+            except Exception as exc:
+                logger.debug(
+                    "JP SEC EDGAR ADR segment extraction failed for %s (%s): %s",
+                    code, adr_ticker, exc,
+                )
+
+        # Path 2: EDINET XBRL (requires subscription key -- not available)
+        # J-Quants does not provide segment data.
+        # EDINET API requires a paid subscription key since 2024.
+        # When an EDINET key becomes available, add XBRL segment parsing here.
+        logger.debug(
+            "JP segment extraction: no ADR mapping for %s (EDINET requires subscription key)",
+            code,
+        )
+
+        return empty
