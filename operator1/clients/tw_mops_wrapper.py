@@ -906,3 +906,107 @@ class TWMopsClient:
         except Exception as exc:
             logger.debug("TWSE t187ap12 failed for %s: %s", identifier, exc)
         return transactions
+
+    # ------------------------------------------------------------------
+    # Product segment extraction (SEC EDGAR ADR + MOPS PDF fallback)
+    # ------------------------------------------------------------------
+
+    # Major Taiwanese companies with NYSE/NASDAQ ADR listings.
+    # These file 20-F annual reports with IFRS 8 segment breakdowns
+    # that can be extracted via SEC EDGAR's XBRL/text parsing.
+    _TW_ADR_MAP: dict[str, str] = {
+        "2330": "TSM",    # TSMC
+        "2303": "UMC",    # UMC
+        "3711": "ASX",    # ASE Technology
+        "2412": "CHT",    # Chunghwa Telecom
+        "2379": "SIMO",   # Silicon Motion
+        "6770": "PCTEF",  # eMemory Technology (OTC)
+        "5765": None,     # placeholder for future ADR discovery
+    }
+
+    def extract_segment_data(self, identifier: str) -> dict[str, Any]:
+        """Extract product segment data for Taiwanese companies.
+
+        The MOPS XBRL platform (``t164sb01``) returns CONDENSED financial
+        statements only -- balance sheet, income statement, cash flow, and
+        equity changes.  It does NOT include IFRS 8 segment disclosure
+        notes.  The TIFRS taxonomy uses generic ``tifrs-notes:Amount2``
+        tags for all note values, and segment names appear only in
+        surrounding Chinese narrative text (``ix:nonNumeric`` tags with
+        ``tifrs-notes:Description``), making structured extraction from
+        the XBRL impossible without NLP.
+
+        **Taxonomy finding**: Zero ``OperatingSegmentAxis``,
+        ``SegmentAxis``, ``ProductAxis``, or ``DisclosureOfOperatingSegment``
+        tags exist in the MOPS XBRL output.  Zero dimensional members
+        for segments.  The only dimension in the XBRL is
+        ``ComponentsOfEquityAxis`` for equity statement items.
+
+        Implementation uses two extraction paths:
+
+        1. **SEC EDGAR ADR fallback** (primary): ~20 major TW companies
+           have NYSE/NASDAQ ADR listings and file 20-F annual reports
+           containing IFRS 8 segment breakdowns with XBRL dimensional
+           qualifiers.  Uses ``USEdgarClient.extract_segment_data()``.
+
+        2. **MOPS annual report PDF** (secondary): For companies without
+           US ADRs, uses the filing discovery + fuzzy PDF parser pipeline
+           with Traditional Chinese segment keywords.
+
+        Returns
+        -------
+        Standard segment dict with ``segments``, ``descriptions``,
+        ``n_segments``, ``has_revenue``, ``has_descriptions``, ``source``.
+        """
+        empty: dict[str, Any] = {
+            "n_segments": 0, "segments": {}, "descriptions": {},
+            "has_revenue": False, "has_descriptions": False,
+        }
+        code = identifier.strip()
+
+        # --- Path 1: SEC EDGAR ADR fallback ---
+        adr_ticker = self._TW_ADR_MAP.get(code)
+        if adr_ticker:
+            try:
+                from operator1.clients.us_edgar import USEdgarClient
+                edgar = USEdgarClient()
+                result = edgar.extract_segment_data(adr_ticker)
+                if result and result.get("n_segments", 0) >= 2:
+                    result["source"] = "sec_edgar_20f_adr"
+                    logger.info(
+                        "TW segment extraction via SEC EDGAR ADR for %s -> %s: %d segments",
+                        code, adr_ticker, result["n_segments"],
+                    )
+                    return result
+            except Exception as exc:
+                logger.debug(
+                    "TW SEC EDGAR ADR segment extraction failed for %s (%s): %s",
+                    code, adr_ticker, exc,
+                )
+
+        # --- Path 2: MOPS annual report PDF via filing discovery ---
+        # Uses the generic try_segment_extraction() which chains:
+        # discover filings -> download PDF -> extract_segments_from_pdf()
+        # with Traditional Chinese segment keywords.
+        try:
+            from operator1.clients.filing_discoverer import try_segment_extraction
+            result = try_segment_extraction(code, "tw_mops")
+            if result and result.get("n_segments", 0) >= 2:
+                result["source"] = "mops_annual_report_pdf"
+                logger.info(
+                    "TW segment extraction via MOPS PDF for %s: %d segments",
+                    code, result["n_segments"],
+                )
+                return result
+        except Exception as exc:
+            logger.debug(
+                "TW MOPS PDF segment extraction failed for %s: %s",
+                code, exc,
+            )
+
+        logger.info(
+            "TW segment extraction: no segment data found for %s "
+            "(no ADR mapping and PDF extraction unavailable)",
+            code,
+        )
+        return empty
