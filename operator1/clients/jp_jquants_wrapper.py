@@ -715,3 +715,259 @@ class JPJquantsClient:
         # Would require EDINET filing discovery for 大量保有報告書 (large holder reports).
         logger.debug("JP insider transactions not available natively for %s", identifier)
         return transactions
+
+    # ------------------------------------------------------------------
+    # Segment / product data extraction
+    # ------------------------------------------------------------------
+
+    # Major Japanese companies with NYSE/NASDAQ ADR listings.
+    # Used for SEC EDGAR 20-F segment extraction fallback.
+    _JP_ADR_MAP: dict[str, str] = {
+        "7203": "TM",      # Toyota Motor
+        "6758": "SONY",    # Sony Group
+        "7267": "HMC",     # Honda Motor
+        "8306": "MUFG",    # Mitsubishi UFJ Financial
+        "4502": "TAK",     # Takeda Pharmaceutical
+        "7751": "CAJ",     # Canon
+        "8604": "NMR",     # Nomura Holdings
+        "9984": "SFTBY",   # SoftBank Group
+        "6501": "HTHIY",   # Hitachi
+        "6902": "DNZOY",   # Denso
+        "8316": "SMFG",    # Sumitomo Mitsui Financial
+        "6861": "KYOCY",   # Keyence
+        "9432": "NTTYY",   # NTT (Nippon Telegraph)
+        "6367": "DKILY",   # Daikin Industries
+        "4503": "ALPMY",   # Astellas Pharma
+        "6752": "PCRFY",   # Panasonic
+        "7741": "HOCPY",   # HOYA
+        "6594": "NIDEY",   # Nidec
+        "8058": "MSBHF",   # Mitsubishi Corp
+        "8001": "ITOCY",   # Itochu
+        "7974": "NTDOY",   # Nintendo
+        "4519": "CHUGF",   # Chugai Pharmaceutical
+        "6301": "KMTUY",   # Komatsu
+        "8766": "TKOMY",   # Tokio Marine
+        "9433": "KDDIY",   # KDDI
+        "6857": "ASMLY",   # Advantest
+        "3382": "SVNDY",   # Seven & i Holdings
+        "4568": "DSKYF",   # Daiichi Sankyo
+        "9983": "FRCOY",   # Fast Retailing (Uniqlo)
+        "6723": "RNECY",   # Renesas Electronics
+    }
+
+    @property
+    def market_id(self) -> str:
+        return "jp_jquants"
+
+    def extract_segment_data(self, identifier: str) -> dict[str, Any]:
+        """Extract product segment data for Japanese companies.
+
+        Uses a three-path strategy:
+
+        1. **IRBank** (primary): Free, no auth. Scrapes segment revenue
+           tables from ``irbank.net/{ticker}/segment``. IRBank aggregates
+           EDINET XBRL filings into structured HTML tables with segment
+           names and annual revenue in Japanese format (兆/億/万).
+           Works for all ~3,800 TSE-listed companies.
+
+        2. **SEC EDGAR 20-F** (fallback for ADR-listed companies): Major
+           Japanese companies with NYSE ADRs file 20-F annual reports
+           containing IFRS 8 segment breakdowns.
+
+        3. **EDINET XBRL** (future): Requires paid subscription key.
+
+        Parameters
+        ----------
+        identifier:
+            J-Quants ticker code (4 digits, e.g. ``"7203"`` for Toyota).
+
+        Returns
+        -------
+        Standard segment dict with ``segments``, ``descriptions``,
+        ``n_segments``, ``has_revenue``, ``has_descriptions``, ``source``.
+        """
+        empty: dict[str, Any] = {
+            "n_segments": 0, "segments": {}, "descriptions": {},
+            "has_revenue": False, "has_descriptions": False,
+        }
+
+        code = identifier.strip()[:4]
+
+        # Path 1: IRBank segment tables (free, no auth, all TSE companies)
+        try:
+            result = self._extract_segments_from_irbank(code)
+            if result and result.get("n_segments", 0) >= 2:
+                return result
+        except Exception as exc:
+            logger.debug("JP IRBank segment extraction failed for %s: %s", code, exc)
+
+        # Path 2: SEC EDGAR 20-F for ADR-listed companies
+        adr_ticker = self._JP_ADR_MAP.get(code, "")
+        if adr_ticker:
+            try:
+                import os
+                if not os.environ.get("EDGAR_IDENTITY"):
+                    os.environ["EDGAR_IDENTITY"] = "operator1@example.com"
+
+                from operator1.clients.us_edgar import USEdgarClient
+                edgar = USEdgarClient()
+                result = edgar.extract_segment_data(adr_ticker)
+                if result and result.get("n_segments", 0) >= 2:
+                    result["source"] = "sec_edgar_20f_adr"
+                    logger.info(
+                        "JP segment extraction via SEC EDGAR 20-F for %s -> %s: %d segments",
+                        code, adr_ticker, result["n_segments"],
+                    )
+                    return result
+            except Exception as exc:
+                logger.debug(
+                    "JP SEC EDGAR ADR segment extraction failed for %s (%s): %s",
+                    code, adr_ticker, exc,
+                )
+
+        return empty
+
+    @staticmethod
+    def _parse_jp_number(text: str) -> float | None:
+        """Parse Japanese number format to float.
+
+        Handles: 2.14兆 (2.14 trillion), 4796億 (479.6 billion),
+        1234万 (12.34 million), plain numbers, and percentage suffixes.
+
+        Returns value in yen (not scaled).
+        """
+        import re
+
+        if not text or not isinstance(text, str):
+            return None
+
+        # Remove whitespace, commas, and YoY growth rates like "+7.9%"
+        s = text.strip()
+        # Strip trailing growth rate (e.g. " -1.6%", " +7.9%")
+        s = re.sub(r'\s*[+\-][\d.]+%$', '', s)
+        s = s.replace(',', '').replace(' ', '')
+
+        if not s:
+            return None
+
+        # Japanese unit multipliers
+        multipliers = {
+            '兆': 1_000_000_000_000,   # trillion (10^12)
+            '億': 100_000_000,          # hundred million (10^8)
+            '万': 10_000,               # ten thousand (10^4)
+        }
+
+        for unit, mult in multipliers.items():
+            if unit in s:
+                num_str = s.replace(unit, '').strip()
+                try:
+                    return float(num_str) * mult
+                except ValueError:
+                    return None
+
+        # Plain number (no unit)
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    def _extract_segments_from_irbank(self, ticker_code: str) -> dict[str, Any]:
+        """Extract segment revenue from IRBank HTML tables.
+
+        IRBank (irbank.net) aggregates EDINET XBRL filings into
+        structured HTML tables. The segment page shows annual revenue
+        per segment in Japanese format.
+
+        URL pattern: ``https://irbank.net/{ticker_code}/segment``
+
+        Table 0 layout (annual summary):
+        - Row 0: headers (科目, 年度, segment1_name, segment2_name, ...)
+        - Rows 1+: (metric_name, fiscal_year, segment1_value, segment2_value, ...)
+        - metric_name includes: 営業収益 (revenue), 営業利益 (operating profit), etc.
+        - Values in Japanese format: 2.14兆, 4796億, etc.
+
+        Parameters
+        ----------
+        ticker_code:
+            4-digit J-Quants ticker code (e.g. ``"7203"``).
+
+        Returns
+        -------
+        Standard segment dict, or empty dict if extraction fails.
+        """
+        import io
+        import requests as _requests
+
+        url = f"https://irbank.net/{ticker_code}/segment"
+        try:
+            resp = _requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"},
+                timeout=15,
+            )
+            if resp.status_code != 200 or len(resp.text) < 1000:
+                return {}
+        except Exception as exc:
+            logger.debug("IRBank request failed for %s: %s", ticker_code, exc)
+            return {}
+
+        try:
+            tables = pd.read_html(io.StringIO(resp.text))
+        except Exception:
+            return {}
+
+        if not tables:
+            return {}
+
+        # Table 0 is the annual summary with segments as columns
+        df = tables[0]
+        if df.empty or len(df.columns) < 3:
+            return {}
+
+        # Columns: [科目, 年度, segment1, segment2, ...]
+        # First two columns are metric name and fiscal year
+        segment_names = [str(c) for c in df.columns[2:]]
+
+        # Filter to revenue rows (営業収益 = operating revenue, 売上高 = sales)
+        revenue_keywords = ["営業収益", "売上高", "売上収益", "収益"]
+        revenue_rows = df[df.iloc[:, 0].astype(str).apply(
+            lambda x: any(kw in x for kw in revenue_keywords)
+        )]
+
+        if revenue_rows.empty:
+            # Try first data row as fallback
+            revenue_rows = df.iloc[:1]
+
+        if revenue_rows.empty:
+            return {}
+
+        # Take the most recent year (last row in revenue_rows)
+        latest = revenue_rows.iloc[-1]
+        fiscal_year = str(latest.iloc[1]) if len(latest) > 1 else ""
+
+        segments: dict[str, float] = {}
+        for i, seg_name in enumerate(segment_names):
+            col_idx = i + 2
+            if col_idx >= len(latest):
+                continue
+            val = self._parse_jp_number(str(latest.iloc[col_idx]))
+            if val is not None and val > 0:
+                segments[seg_name] = val
+
+        if len(segments) < 2:
+            return {}
+
+        logger.info(
+            "JP segment extraction via IRBank for %s (%s): %d segments",
+            ticker_code, fiscal_year, len(segments),
+        )
+
+        return {
+            "segments": segments,
+            "descriptions": {},
+            "has_revenue": True,
+            "has_descriptions": False,
+            "n_segments": len(segments),
+            "source": "irbank",
+            "fiscal_year": fiscal_year,
+        }

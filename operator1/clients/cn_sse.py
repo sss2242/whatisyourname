@@ -843,3 +843,123 @@ class CNSseClient:
             logger.debug("akshare insider transaction lookup failed for %s: %s", identifier, exc)
 
         return transactions
+
+    # -- Segment / product data extraction -----------------------------------
+
+    def _to_em_symbol(self, identifier: str) -> str:
+        """Convert ticker to EastMoney format (SH600519 or SZ002594)."""
+        code = self._sina_code(identifier)
+        if code.startswith("6"):
+            return f"SH{code}"
+        elif code.startswith(("0", "3")):
+            return f"SZ{code}"
+        return f"SH{code}"
+
+    def extract_segment_data(self, identifier: str) -> dict[str, Any]:
+        """Extract product segment data from akshare/EastMoney (stock_zygc_em).
+
+        Uses the EastMoney 主营构成 (main business composition) API which
+        provides revenue breakdown by product (按产品分类), by industry
+        (按行业分类), and by geography (按地区分类).
+
+        Prefers product-level classification (按产品分类). Falls back to
+        industry classification (按行业分类) if no product breakdown exists.
+
+        Parameters
+        ----------
+        identifier:
+            Stock code (e.g. ``"600519"``, ``"002594"``).
+
+        Returns
+        -------
+        Standard segment dict with ``segments``, ``descriptions``,
+        ``n_segments``, ``has_revenue``, ``has_descriptions``, ``source``.
+        """
+        empty: dict[str, Any] = {
+            "n_segments": 0, "segments": {}, "descriptions": {},
+            "has_revenue": False, "has_descriptions": False,
+        }
+
+        try:
+            import akshare as ak
+        except ImportError:
+            logger.debug("akshare not installed -- cannot extract CN segment data")
+            return empty
+
+        em_symbol = self._to_em_symbol(identifier)
+
+        try:
+            df = ak.stock_zygc_em(symbol=em_symbol)
+        except Exception as exc:
+            logger.debug("akshare stock_zygc_em failed for %s: %s", em_symbol, exc)
+            return empty
+
+        if df is None or df.empty:
+            return empty
+
+        # Get the most recent annual report date (year-end: MM-DD = 12-31)
+        if "报告日期" not in df.columns:
+            return empty
+
+        df["报告日期"] = pd.to_datetime(df["报告日期"], errors="coerce")
+        df = df.dropna(subset=["报告日期"])
+        if df.empty:
+            return empty
+
+        # Prefer annual reports (12-31) over quarterly
+        annual = df[df["报告日期"].dt.month == 12]
+        if not annual.empty:
+            latest_date = annual["报告日期"].max()
+        else:
+            latest_date = df["报告日期"].max()
+
+        latest = df[df["报告日期"] == latest_date]
+
+        # Prefer product classification (按产品分类) over industry (按行业分类)
+        classification_col = "分类类型"
+        if classification_col not in latest.columns:
+            return empty
+
+        segments: dict[str, float] = {}
+        for class_type in ["按产品分类", "按行业分类"]:
+            subset = latest[latest[classification_col] == class_type]
+            if len(subset) < 2:
+                continue
+
+            for _, row in subset.iterrows():
+                name = str(row.get("主营构成", "")).strip()
+                revenue = row.get("主营收入")
+
+                # Skip "其他(补充)" (supplementary other) entries
+                if not name or "补充" in name:
+                    continue
+
+                if revenue is not None and not pd.isna(revenue):
+                    try:
+                        rev_float = float(revenue)
+                        if rev_float > 0:
+                            segments[name] = rev_float
+                    except (ValueError, TypeError):
+                        continue
+
+            if len(segments) >= 2:
+                break
+
+        if len(segments) < 2:
+            return empty
+
+        fiscal_year = latest_date.strftime("%Y-%m-%d")
+        logger.info(
+            "CN segment extraction via akshare/EastMoney for %s (%s): %d segments",
+            identifier, fiscal_year, len(segments),
+        )
+
+        return {
+            "segments": segments,
+            "descriptions": {},
+            "has_revenue": True,
+            "has_descriptions": False,
+            "n_segments": len(segments),
+            "source": "akshare_eastmoney_zygc",
+            "fiscal_year": fiscal_year,
+        }

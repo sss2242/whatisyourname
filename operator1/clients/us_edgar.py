@@ -735,11 +735,14 @@ class USEdgarClient:
         }
 
     def _extract_segments_from_10k(self, identifier: str) -> dict[str, Any]:
-        """Extract segment data from 10-K filing text.
+        """Extract segment data from 10-K or 20-F filing text.
 
-        Downloads the most recent 10-K filing HTML and uses the fuzzy
-        PDF parser's text extraction patterns to find ASC 280 segment
-        disclosures.
+        Downloads the most recent annual filing HTML and uses the fuzzy
+        PDF parser's text extraction patterns to find ASC 280 / IFRS 8
+        segment disclosures.
+
+        Tries 10-K first (US domestic filers), then 20-F (foreign filers
+        like Toyota, Sony, Honda that have US ADR listings).
         """
         import requests
 
@@ -749,12 +752,16 @@ class USEdgarClient:
             if company is None:
                 return {}
 
-            # Get most recent 10-K filing
-            filings = company.get_filings(form="10-K")
-            if filings is None or len(filings) == 0:
+            # Get most recent annual filing: 10-K (domestic) or 20-F (foreign ADR)
+            latest_10k = None
+            for form_type in ("10-K", "20-F"):
+                filings = company.get_filings(form=form_type)
+                if filings is not None and len(filings) > 0:
+                    latest_10k = list(filings)[:1][0]
+                    logger.debug("Found %s filing for %s: %s", form_type, identifier, latest_10k.filing_date)
+                    break
+            if latest_10k is None:
                 return {}
-
-            latest_10k = list(filings)[:1][0]
 
             # Extract text from the filing
             text = ""
