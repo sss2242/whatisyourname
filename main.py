@@ -3737,6 +3737,13 @@ Non-interactive examples:
         else:
             profile["corporate_structure"] = {"available": False}
 
+        # Inject linked entity conflict data into profile
+        # (Bug fix: linked_conflict was passed to inject_conflict_risk_into_cache
+        # but never injected into the profile dict, so report_generator's
+        # geopolitical risk section silently returned empty for linked fields.)
+        if linked_conflict and isinstance(linked_conflict, dict):
+            profile.setdefault("conflict_risk", {})["linked_conflict"] = linked_conflict
+
         # Inject institutional/major holders
         if target_holders:
             profile["institutional_holders"] = {
