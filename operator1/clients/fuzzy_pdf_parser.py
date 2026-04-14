@@ -1350,25 +1350,26 @@ def _ocr_extract_segments(
     max_pages: int = 10,
     market_id: str = "",
     batch_size: int = 50,
+    max_batches_per_run: int = 1,
 ) -> dict[str, float]:
     """OCR image-based PDF pages with docTR and extract segment data.
 
     Used as a fallback when pdfplumber returns zero text (image-based PDFs
     like UK Companies House annual reports from large FTSE companies).
 
-    Strategy -- **batched processing** (50 pages at a time) with **disk caching**:
+    Strategy -- **one batch per invocation** with **disk caching**:
     1. Check disk cache for previously OCR'd pages (resume after timeout)
-    2. Split remaining pages into batches of ``batch_size`` (default 50)
-    3. For each batch: render pages to images with pypdfium2, OCR with docTR
-    4. **Save OCR'd text to disk after each batch** (``cache/ocr_pages/<hash>.json``)
-    5. Score OCR'd text for segment keywords
-    6. After each batch: attempt extraction on the best pages found so far
-    7. **Early exit** when >= 3 segments are found (avoids OCR'ing the entire PDF)
+    2. Process ``max_batches_per_run`` batches of ``batch_size`` pages (default: 1 batch of 50)
+    3. **Save OCR'd text to disk after each batch** (``cache/ocr_pages/<hash>.json``)
+    4. Score all OCR'd pages (including previously cached) for segment keywords
+    5. Attempt extraction on the best-scored pages
+    6. **Early exit** when >= 3 segments are found
+    7. Return -- caller re-invokes to process the next batch from cache
 
-    On re-run (e.g. after a timeout), previously OCR'd pages are loaded from
-    the disk cache and only un-processed pages are OCR'd. This means a 260-page
-    PDF that timed out after batch 3 (page 149) will resume from page 150 on
-    the next invocation.
+    Each invocation processes only ``max_batches_per_run`` batches (default 1),
+    making it safe for environments with strict timeouts. A 303-page PDF
+    with ``batch_size=50`` requires 7 invocations (7 batches). With
+    ``max_batches_per_run=0``, all batches are processed in one call.
 
     Dependencies: ``python-doctr``, ``pypdfium2`` (both optional, graceful fallback).
     """
@@ -1406,15 +1407,22 @@ def _ocr_extract_segments(
             remaining_pages = n_pages - remaining_start
             n_batches = (remaining_pages + batch_size - 1) // batch_size if remaining_pages > 0 else 0
 
+            # Limit batches per invocation (0 = unlimited)
+            if max_batches_per_run > 0:
+                batches_to_run = min(n_batches, max_batches_per_run)
+            else:
+                batches_to_run = n_batches
+
             logger.info(
-                "OCR scanning %d remaining pages (of %d total) in %d batches of %d...",
-                remaining_pages, n_pages, n_batches, batch_size,
+                "OCR scanning %d remaining pages (of %d total) in %d batches of %d "
+                "(running %d batch(es) this invocation)...",
+                remaining_pages, n_pages, n_batches, batch_size, batches_to_run,
             )
 
             # Load OCR model once (expensive -- reused across all batches)
             model = ocr_predictor(det_arch="db_resnet50", reco_arch="crnn_vgg16_bn", pretrained=True)
 
-            for batch_idx in range(n_batches):
+            for batch_idx in range(batches_to_run):
                 batch_start = remaining_start + batch_idx * batch_size
                 batch_end = min(batch_start + batch_size, n_pages)
                 batch_scored_count = 0
