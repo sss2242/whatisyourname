@@ -675,6 +675,48 @@ class CLCmfClient:
             "inst_holder_count": len(holders),
         }])
 
+    def extract_segment_data(self, identifier: str) -> dict[str, Any]:
+        """Extract product segment data for Chilean companies via US ADR.
+
+        CMF data services are down since 2025 (all opendata/FECU endpoints
+        return 404). Segment data (IFRS 8) would be in the notes to
+        financial statements, which CMF no longer serves.
+
+        Uses the same US ADR fallback chain as financial statements:
+        SEC EDGAR 20-F/10-K segment extraction for companies with NYSE ADRs
+        (SQM, LATAM, Santander Chile, BCH, CCU, Enel Chile, Cencosud).
+        """
+        empty: dict[str, Any] = {
+            "n_segments": 0, "segments": {}, "descriptions": {},
+            "has_revenue": False, "has_descriptions": False,
+        }
+
+        adr_ticker = _resolve_adr_ticker(identifier)
+        if not adr_ticker:
+            logger.debug(
+                "CL segment: no US ADR found for '%s'", identifier,
+            )
+            return empty
+
+        try:
+            from operator1.clients.us_edgar import USEdgarClient
+            edgar = USEdgarClient()
+            result = edgar.extract_segment_data(adr_ticker)
+            if result and result.get("n_segments", 0) >= 2:
+                result["source"] = f"sec_edgar_adr ({adr_ticker})"
+                logger.info(
+                    "CL segment extraction via ADR for %s -> %s: %d segments",
+                    identifier, adr_ticker, result["n_segments"],
+                )
+                return result
+        except Exception as exc:
+            logger.debug(
+                "CL SEC EDGAR ADR segment extraction failed for %s (%s): %s",
+                identifier, adr_ticker, exc,
+            )
+
+        return empty
+
     def get_insider_transactions(self, identifier: str) -> list[dict[str, Any]]:
         """Fetch insider transactions via US EDGAR ADR fallback.
 
