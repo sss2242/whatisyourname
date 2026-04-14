@@ -28,6 +28,7 @@ from __future__ import annotations
 import io
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -1285,6 +1286,63 @@ _SEGMENT_EXTRACTION_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 
+def _ocr_cache_path(pdf_bytes: bytes) -> Path:
+    """Return the disk cache path for OCR'd page text keyed by PDF hash."""
+    import hashlib
+    pdf_hash = hashlib.sha256(pdf_bytes[:8192]).hexdigest()[:16]
+    return Path("cache") / "ocr_pages" / f"{pdf_hash}.json"
+
+
+def _load_ocr_cache(pdf_bytes: bytes) -> dict[str, Any]:
+    """Load cached OCR page texts from disk (if available).
+
+    Returns a dict with ``page_texts`` (dict[int, str]) and
+    ``last_page_processed`` (int) so the OCR can resume from where it
+    left off after a timeout.
+    """
+    import json as _json
+
+    cache_file = _ocr_cache_path(pdf_bytes)
+    if not cache_file.exists():
+        return {}
+    try:
+        data = _json.loads(cache_file.read_text(encoding="utf-8"))
+        # Convert string keys back to int (JSON keys are always strings)
+        page_texts = {int(k): v for k, v in data.get("page_texts", {}).items()}
+        return {
+            "page_texts": page_texts,
+            "last_page_processed": data.get("last_page_processed", -1),
+            "n_pages": data.get("n_pages", 0),
+        }
+    except Exception:
+        return {}
+
+
+def _save_ocr_cache(
+    pdf_bytes: bytes,
+    page_texts: dict[int, str],
+    last_page_processed: int,
+    n_pages: int,
+) -> None:
+    """Persist OCR'd page texts to disk for resume-on-timeout.
+
+    Saved after each batch so that a re-run can skip already-OCR'd pages.
+    """
+    import json as _json
+
+    cache_file = _ocr_cache_path(pdf_bytes)
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = {
+            "page_texts": {str(k): v for k, v in page_texts.items()},
+            "last_page_processed": last_page_processed,
+            "n_pages": n_pages,
+        }
+        cache_file.write_text(_json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        logger.debug("Failed to save OCR cache: %s", exc)
+
+
 def _ocr_extract_segments(
     pdf_bytes: bytes,
     keywords: list[str],
@@ -1298,17 +1356,19 @@ def _ocr_extract_segments(
     Used as a fallback when pdfplumber returns zero text (image-based PDFs
     like UK Companies House annual reports from large FTSE companies).
 
-    Strategy -- **batched processing** (50 pages at a time):
-    1. Split the PDF into batches of ``batch_size`` pages (default 50)
-    2. For each batch: render pages to images with pypdfium2, OCR with docTR
-    3. Score OCR'd text for segment keywords
-    4. After each batch: attempt extraction on the best pages found so far
-    5. **Early exit** when >= 3 segments are found (avoids OCR'ing the entire PDF)
+    Strategy -- **batched processing** (50 pages at a time) with **disk caching**:
+    1. Check disk cache for previously OCR'd pages (resume after timeout)
+    2. Split remaining pages into batches of ``batch_size`` (default 50)
+    3. For each batch: render pages to images with pypdfium2, OCR with docTR
+    4. **Save OCR'd text to disk after each batch** (``cache/ocr_pages/<hash>.json``)
+    5. Score OCR'd text for segment keywords
+    6. After each batch: attempt extraction on the best pages found so far
+    7. **Early exit** when >= 3 segments are found (avoids OCR'ing the entire PDF)
 
-    A 260-page PDF (e.g. Unilever annual report) is processed as:
-    batch 1 (pages 0-49), batch 2 (pages 50-99), ... up to batch 6 (pages 250-259).
-    Segment data typically appears in the first 30-60% of an annual report, so
-    most runs exit after 2-3 batches (~100-150 pages, ~2-3 minutes).
+    On re-run (e.g. after a timeout), previously OCR'd pages are loaded from
+    the disk cache and only un-processed pages are OCR'd. This means a 260-page
+    PDF that timed out after batch 3 (page 149) will resume from page 150 on
+    the next invocation.
 
     Dependencies: ``python-doctr``, ``pypdfium2`` (both optional, graceful fallback).
     """
@@ -1325,66 +1385,129 @@ def _ocr_extract_segments(
     try:
         pdf = pdfium.PdfDocument(pdf_bytes)
         n_pages = len(pdf)
-        n_batches = (n_pages + batch_size - 1) // batch_size
-        logger.info(
-            "OCR scanning %d pages in %d batches of %d for segment data...",
-            n_pages, n_batches, batch_size,
-        )
 
-        # Load OCR model once (expensive -- reused across all batches)
-        model = ocr_predictor(det_arch="db_resnet50", reco_arch="crnn_vgg16_bn", pretrained=True)
+        # Load cached OCR results from a previous (possibly timed-out) run
+        cached = _load_ocr_cache(pdf_bytes)
+        page_texts: dict[int, str] = cached.get("page_texts", {})
+        resume_from = cached.get("last_page_processed", -1) + 1
 
-        # Accumulate results across batches
-        page_texts: dict[int, str] = {}
-        scored_pages: list[tuple[int, int]] = []
-
-        for batch_idx in range(n_batches):
-            batch_start = batch_idx * batch_size
-            batch_end = min(batch_start + batch_size, n_pages)
-            batch_scored_count = 0
-
+        if page_texts:
             logger.info(
-                "OCR batch %d/%d: pages %d-%d",
-                batch_idx + 1, n_batches, batch_start, batch_end - 1,
+                "OCR cache hit: %d pages already OCR'd (resuming from page %d of %d)",
+                len(page_texts), resume_from, n_pages,
             )
 
-            for pg_num in range(batch_start, batch_end):
-                try:
-                    page = pdf[pg_num]
-                    bitmap = page.render(scale=2)  # 2x resolution for OCR accuracy
-                    img = bitmap.to_pil()
-                    img_arr = np.array(img)
+        # If all pages are already cached, skip directly to extraction
+        if resume_from >= n_pages and page_texts:
+            logger.info("OCR cache complete: all %d pages already processed", n_pages)
+        else:
+            # Determine which pages still need OCR
+            remaining_start = max(resume_from, 0)
+            remaining_pages = n_pages - remaining_start
+            n_batches = (remaining_pages + batch_size - 1) // batch_size if remaining_pages > 0 else 0
 
-                    result = model([img_arr])
+            logger.info(
+                "OCR scanning %d remaining pages (of %d total) in %d batches of %d...",
+                remaining_pages, n_pages, n_batches, batch_size,
+            )
 
-                    text = ""
-                    for ocr_page in result.pages:
-                        for block in ocr_page.blocks:
-                            for line in block.lines:
-                                text += " ".join(w.value for w in line.words) + "\n"
+            # Load OCR model once (expensive -- reused across all batches)
+            model = ocr_predictor(det_arch="db_resnet50", reco_arch="crnn_vgg16_bn", pretrained=True)
 
-                    if len(text.strip()) < 20:
+            for batch_idx in range(n_batches):
+                batch_start = remaining_start + batch_idx * batch_size
+                batch_end = min(batch_start + batch_size, n_pages)
+                batch_scored_count = 0
+
+                logger.info(
+                    "OCR batch %d/%d: pages %d-%d",
+                    batch_idx + 1, n_batches, batch_start, batch_end - 1,
+                )
+
+                for pg_num in range(batch_start, batch_end):
+                    # Skip pages already in cache
+                    if pg_num in page_texts:
                         continue
 
-                    page_texts[pg_num] = text
+                    try:
+                        page = pdf[pg_num]
+                        bitmap = page.render(scale=2)  # 2x resolution for OCR accuracy
+                        img = bitmap.to_pil()
+                        img_arr = np.array(img)
+
+                        result = model([img_arr])
+
+                        text = ""
+                        for ocr_page in result.pages:
+                            for block in ocr_page.blocks:
+                                for line in block.lines:
+                                    text += " ".join(w.value for w in line.words) + "\n"
+
+                        if len(text.strip()) < 20:
+                            continue
+
+                        page_texts[pg_num] = text
+                    except Exception as exc:
+                        logger.debug("OCR page %d failed: %s", pg_num, exc)
+                        continue
+
+                # Save OCR cache after each batch (enables resume on timeout)
+                _save_ocr_cache(pdf_bytes, page_texts, batch_end - 1, n_pages)
+
+                logger.info(
+                    "OCR batch %d/%d complete: %d total pages OCR'd (saved to cache)",
+                    batch_idx + 1, n_batches, len(page_texts),
+                )
+
+                # Score all OCR'd pages and try extraction
+                scored_pages: list[tuple[int, int]] = []
+                for pg_num, text in page_texts.items():
                     lower = text.lower()
                     score = sum(1 for kw in keywords if kw in lower)
                     if score >= min_page_score:
                         scored_pages.append((pg_num, score))
-                        batch_scored_count += 1
-                except Exception as exc:
-                    logger.debug("OCR page %d failed: %s", pg_num, exc)
-                    continue
 
-            logger.info(
-                "OCR batch %d/%d complete: %d pages scored in this batch, %d total scored",
-                batch_idx + 1, n_batches, batch_scored_count, len(scored_pages),
-            )
+                if scored_pages:
+                    scored_pages.sort(key=lambda x: -x[1])
 
-            # After each batch: try extraction on best pages found so far.
-            # Re-sort by score descending across ALL batches processed.
+                    for pg_num, score in scored_pages[:max_pages]:
+                        text = page_texts.get(pg_num, "")
+                        if not text:
+                            continue
+
+                        extracted = _extract_segments_from_text(text)
+                        if extracted and len(extracted) > len(segments):
+                            segments = extracted
+
+                        if len(segments) >= 3:
+                            break
+
+                # Early exit: stop processing further batches once we have
+                # enough segments.
+                if len(segments) >= 3:
+                    logger.info(
+                        "OCR early exit after batch %d/%d: %d segments found",
+                        batch_idx + 1, n_batches, len(segments),
+                    )
+                    break
+
+        # Final extraction attempt using all cached page texts (including
+        # pages from previous runs loaded via _load_ocr_cache).
+        if not segments and page_texts:
+            scored_pages = []
+            for pg_num, text in page_texts.items():
+                lower = text.lower()
+                score = sum(1 for kw in keywords if kw in lower)
+                if score >= min_page_score:
+                    scored_pages.append((pg_num, score))
+
             if scored_pages:
                 scored_pages.sort(key=lambda x: -x[1])
+                logger.info(
+                    "OCR: %d pages scored across all cached text, top page %d (score=%d), "
+                    "processing top %d",
+                    len(scored_pages), scored_pages[0][0], scored_pages[0][1], max_pages,
+                )
 
                 for pg_num, score in scored_pages[:max_pages]:
                     text = page_texts.get(pg_num, "")
@@ -1398,45 +1521,14 @@ def _ocr_extract_segments(
                     if len(segments) >= 3:
                         break
 
-            # Early exit: stop processing further batches once we have
-            # enough segments. Segment tables usually appear in the notes
-            # to financial statements (first 40-60% of annual reports).
-            if len(segments) >= 3:
-                logger.info(
-                    "OCR early exit after batch %d/%d: %d segments found",
-                    batch_idx + 1, n_batches, len(segments),
-                )
-                break
-
-        # Final attempt if we finished all batches without early exit
-        if not segments and scored_pages:
-            scored_pages.sort(key=lambda x: -x[1])
-            logger.info(
-                "OCR: %d pages scored across all batches, top page %d (score=%d), "
-                "processing top %d",
-                len(scored_pages), scored_pages[0][0], scored_pages[0][1], max_pages,
-            )
-
-            for pg_num, score in scored_pages[:max_pages]:
-                text = page_texts.get(pg_num, "")
-                if not text:
-                    continue
-
-                extracted = _extract_segments_from_text(text)
-                if extracted and len(extracted) > len(segments):
-                    segments = extracted
-
-                if len(segments) >= 3:
-                    break
-
-        if not scored_pages:
-            logger.info("OCR: no pages scored above threshold %d", min_page_score)
+        if not page_texts:
+            logger.info("OCR: no pages produced text above threshold")
             return {}
 
         if len(segments) >= 2:
             logger.info(
-                "OCR segment extraction: %d segments from %d scored pages (%s)",
-                len(segments), len(scored_pages), market_id or "unknown",
+                "OCR segment extraction: %d segments from %d OCR'd pages (%s)",
+                len(segments), len(page_texts), market_id or "unknown",
             )
 
     except Exception as exc:
