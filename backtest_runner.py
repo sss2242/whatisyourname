@@ -999,8 +999,45 @@ def run_stage1(state: BacktestState) -> None:
                 if col in etl.columns and col not in cache.columns:
                     cache[col] = etl[col].reindex(cache.index)
             logger.info("Enriched timeline: intensity=%.3f", state.enriched_timeline_result.mean_intensity)
+
+        # ChangeFinder online change point scores (no look-ahead)
+        try:
+            from operator1.models.regime_detector import compute_online_change_scores
+            _regime_target = "equity_change_rate" if state._is_private else "return_1d"
+            _ret_for_cf = cache.get(_regime_target)
+            if _ret_for_cf is not None and _ret_for_cf.notna().sum() > 30:
+                _cf_scores = compute_online_change_scores(_ret_for_cf.fillna(0).values)
+                if _cf_scores is not None:
+                    cache["online_change_score"] = _cf_scores
+        except Exception:
+            pass
     except Exception as exc:
         logger.warning("Enriched timeline failed: %s", exc)
+
+    # Linked entity conflict propagation
+    if state.conflict_result is not None and state.relationships:
+        try:
+            from operator1.features.conflict_risk import assess_linked_entity_conflict
+            state.linked_conflict = assess_linked_entity_conflict(
+                linked_entities=state.relationships,
+                target_conflict=state.conflict_result,
+            )
+        except Exception:
+            pass
+
+    # Supply chain stress
+    try:
+        from operator1.features.conflict_risk import compute_supply_chain_stress
+        _scs = compute_supply_chain_stress(
+            conflict_result=state.conflict_result,
+            linked_caches=state.linked_caches if state.linked_caches else None,
+            relationships=state.relationships if state.relationships else None,
+        )
+        if _scs and _scs.get("available"):
+            cache["supply_chain_stress_flag"] = int(_scs["supply_chain_stress_flag"])
+            cache["supply_chain_stress_score"] = _scs["supply_chain_stress_score"]
+    except Exception:
+        pass
 
     # Linked aggregates (requires linked_caches from entity fetch above)
     if state.linked_caches:
@@ -1391,6 +1428,31 @@ def run_stage2c(state: BacktestState) -> None:
     except Exception:
         pass
 
+    # Sobol -> Hierarchy feedback loop
+    try:
+        from operator1.models.sensitivity import adjust_hierarchy_from_sobol
+        _adj = adjust_hierarchy_from_sobol(state.sobol_result, state.weights)
+        if _adj != state.weights:
+            state.weights = _adj
+    except Exception:
+        pass
+
+    # Time-varying Granger causality
+    try:
+        from operator1.models.granger_causality import compute_time_varying_granger
+        _gc_vars = [c for c in cache.columns if cache[c].dtype in ("float64", "float32") and cache[c].notna().sum() > 50][:15]
+        if _gc_vars:
+            state._tv_granger_result = compute_time_varying_granger(cache, variables=_gc_vars)
+    except Exception:
+        pass
+
+    # Multivariate Monte Carlo
+    try:
+        from operator1.models.monte_carlo import run_multivariate_monte_carlo
+        state._mv_mc_result = run_multivariate_monte_carlo(cache)
+    except Exception:
+        pass
+
     # OHLC predictor
     try:
         from operator1.models.ohlc_predictor import predict_ohlc_series
@@ -1400,8 +1462,35 @@ def run_stage2c(state: BacktestState) -> None:
             cache, forecast_result=state.forecast_result, mc_result=state.mc_result,
             pattern_drift_multiplier=state._pattern_drift, cycle_result=state.cycle_result,
         )
+        # Predicted OHLC patterns
+        if state.ohlc_result and state.ohlc_result.fitted and state.pattern_result is not None:
+            try:
+                from operator1.models.pattern_detector import detect_patterns_on_predicted_ohlc
+                _last_candle = None
+                if "close" in cache.columns and "open" in cache.columns:
+                    _last_candle = {
+                        "open": float(cache["open"].iloc[-1]) if cache["open"].notna().any() else None,
+                        "high": float(cache["high"].iloc[-1]) if "high" in cache.columns and cache["high"].notna().any() else None,
+                        "low": float(cache["low"].iloc[-1]) if "low" in cache.columns and cache["low"].notna().any() else None,
+                        "close": float(cache["close"].iloc[-1]) if cache["close"].notna().any() else None,
+                    }
+                _pred_patterns = detect_patterns_on_predicted_ohlc(state.ohlc_result, _last_candle)
+                if _pred_patterns:
+                    state.pattern_result.predicted_patterns_week = _pred_patterns
+            except Exception:
+                pass
     except Exception:
         pass
+
+    # E2: Anticipated survival (path-wise MC trigger checking)
+    if state.mc_result is not None:
+        try:
+            from operator1.models.monte_carlo import compute_anticipated_survival
+            for _h_label, _h_days in [("63d", 63), ("252d", 252)]:
+                _as_prob = compute_anticipated_survival(cache, state.mc_result, horizon_days=_h_days)
+                state.mc_result.anticipated_survival[_h_label] = _as_prob
+        except Exception:
+            pass
 
     state.cache = cache
     state.save_sub("2c")

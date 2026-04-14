@@ -906,3 +906,197 @@ class TWMopsClient:
         except Exception as exc:
             logger.debug("TWSE t187ap12 failed for %s: %s", identifier, exc)
         return transactions
+
+    # ------------------------------------------------------------------
+    # Product segment extraction
+    # ------------------------------------------------------------------
+    # Primary: TWSE annual report (年報) PDF from doc.twse.com.tw
+    # Fallback: SEC EDGAR ADR (for ~5 companies with US ADR listings)
+    #
+    # TIFRS taxonomy analysis confirmed:
+    #   - MOPS XBRL (t164sb01) has NO segment data at all
+    #   - Zero OperatingSegmentAxis/SegmentAxis/ProductAxis tags
+    #   - Zero dimensional members for segments
+    #   - Only revenue code is 4000 (total) -- no 4100/4200 sub-codes
+    #   - tifrs-notes:Amount2 is generic (shared with all notes)
+    #   - No free TW API provides structured segment data (MOPS API,
+    #     TWSE OpenData, FinMind, GoodInfo, Statementdog all probed)
+    #   - Segment data exists ONLY in annual report PDF notes (年報附註)
+    #
+    # Filing discovery pattern (doc.twse.com.tw):
+    #   1. POST step=1 mtype=F -> file listing with readfile2() calls
+    #   2. Filter for F04 suffix (年報 = annual report)
+    #   3. POST step=9 -> HTML with /pdf/{filename}.pdf link
+    #   4. GET the PDF -> 5-15MB annual report
+    #   5. Extract segments via fuzzy_pdf_parser
+
+    _DOC_TWSE_BASE = "https://doc.twse.com.tw"
+
+    # SEC EDGAR ADR map (fallback only)
+    _TW_ADR_MAP: dict[str, str] = {
+        "2330": "TSM",    # TSMC
+        "2303": "UMC",    # UMC
+        "3711": "ASX",    # ASE Technology
+        "2412": "CHT",    # Chunghwa Telecom
+        "2379": "SIMO",   # Silicon Motion
+    }
+
+    def _fetch_annual_report_pdf(self, co_id: str) -> bytes | None:
+        """Download the latest annual report PDF from doc.twse.com.tw.
+
+        Two-step download pattern (like SGX Pattern 2):
+        1. POST step=1 mtype=F -> HTML with readfile2() JS calls
+        2. Filter for F04 suffix (年報 = annual report)
+        3. POST step=9 with filename -> HTML redirect page
+        4. Extract /pdf/... URL from redirect page
+        5. GET the actual PDF
+
+        Returns raw PDF bytes, or None if not found.
+        """
+        session = self._get_or_create_session()
+        current_roc = _ce_to_roc(date.today().year)
+
+        # Try current and prior year
+        for year_offset in range(0, 3):
+            roc_year = str(current_roc - year_offset)
+
+            try:
+                # Step 1: Get filing listing
+                r = session.post(
+                    f"{self._DOC_TWSE_BASE}/server-java/t57sb01",
+                    data={
+                        "step": "1", "co_id": co_id,
+                        "year": roc_year, "seamon": "",
+                        "mtype": "F", "dtype": "",
+                    },
+                    timeout=20,
+                )
+                text = r.content.decode("big5", errors="replace")
+
+                # Step 2: Find annual report (F04 suffix) from readfile2() calls
+                filings = re.findall(
+                    r'readfile2\("F","' + co_id + r'","([^"]+F04[^"]*\.pdf)"\)',
+                    text,
+                )
+                if not filings:
+                    # Also try any PDF with the company code
+                    filings = re.findall(
+                        r'readfile2\("F","' + co_id + r'","([^"]+\.pdf)"\)',
+                        text,
+                    )
+                    # Prefer F04 (annual report) files
+                    f04 = [f for f in filings if "F04" in f]
+                    if f04:
+                        filings = f04
+
+                if not filings:
+                    continue
+
+                # Step 3: Download the PDF (two-step: get redirect, then PDF)
+                filename = filings[0]
+                r2 = session.post(
+                    f"{self._DOC_TWSE_BASE}/server-java/t57sb01",
+                    data={
+                        "step": "9", "kind": "F",
+                        "co_id": co_id, "filename": filename,
+                    },
+                    timeout=30,
+                )
+                text2 = r2.content.decode("big5", errors="replace")
+
+                # Step 4: Extract PDF URL from redirect page
+                pdf_match = re.search(r"href='(/pdf/[^']+\.pdf)'", text2)
+                if not pdf_match:
+                    pdf_match = re.search(r'href="(/pdf/[^"]+\.pdf)"', text2)
+                if not pdf_match:
+                    continue
+
+                pdf_url = f"{self._DOC_TWSE_BASE}{pdf_match.group(1)}"
+
+                # Step 5: Download actual PDF
+                r3 = session.get(pdf_url, timeout=120)
+                if r3.content[:4] == b"%PDF" and len(r3.content) > 50_000:
+                    logger.info(
+                        "TW annual report PDF downloaded for %s: %s (%d bytes)",
+                        co_id, filename, len(r3.content),
+                    )
+                    return r3.content
+
+            except Exception as exc:
+                logger.debug(
+                    "TW annual report PDF fetch failed for %s (year %s): %s",
+                    co_id, roc_year, exc,
+                )
+            time.sleep(_REQUEST_DELAY_S)
+
+        return None
+
+    def extract_segment_data(self, identifier: str) -> dict[str, Any]:
+        """Extract product segment data for Taiwanese companies.
+
+        **Primary: TWSE annual report PDF** from ``doc.twse.com.tw``.
+        Taiwan companies upload their annual report (年報) to TWSE.
+        The annual report contains IFRS 8 segment notes with revenue
+        breakdowns by product/platform/geography. Downloaded via a
+        two-step pattern (filing list -> redirect -> PDF) and parsed
+        by the fuzzy PDF parser with Traditional Chinese keywords.
+
+        **Fallback: SEC EDGAR ADR** for ~5 major companies with US
+        ADR listings (TSM, UMC, ASX, CHT, SIMO).
+
+        Returns
+        -------
+        Standard segment dict with ``segments``, ``descriptions``,
+        ``n_segments``, ``has_revenue``, ``has_descriptions``, ``source``.
+        """
+        empty: dict[str, Any] = {
+            "n_segments": 0, "segments": {}, "descriptions": {},
+            "has_revenue": False, "has_descriptions": False,
+        }
+        code = identifier.strip()
+
+        # --- Path 1 (primary): TWSE annual report PDF ---
+        try:
+            pdf_bytes = self._fetch_annual_report_pdf(code)
+            if pdf_bytes:
+                from operator1.clients.fuzzy_pdf_parser import extract_segments_from_pdf
+                result = extract_segments_from_pdf(
+                    pdf_bytes, market_id="tw_mops",
+                )
+                if result and result.get("n_segments", 0) >= 2:
+                    result["source"] = "twse_annual_report_pdf"
+                    logger.info(
+                        "TW segment extraction via annual report PDF for %s: %d segments",
+                        code, result["n_segments"],
+                    )
+                    return result
+        except Exception as exc:
+            logger.debug(
+                "TW annual report segment extraction failed for %s: %s",
+                code, exc,
+            )
+
+        # --- Path 2 (fallback): SEC EDGAR ADR ---
+        adr_ticker = self._TW_ADR_MAP.get(code)
+        if adr_ticker:
+            try:
+                from operator1.clients.us_edgar import USEdgarClient
+                edgar = USEdgarClient()
+                result = edgar.extract_segment_data(adr_ticker)
+                if result and result.get("n_segments", 0) >= 2:
+                    result["source"] = "sec_edgar_20f_adr"
+                    logger.info(
+                        "TW segment extraction via SEC EDGAR ADR for %s -> %s: %d segments",
+                        code, adr_ticker, result["n_segments"],
+                    )
+                    return result
+            except Exception as exc:
+                logger.debug(
+                    "TW SEC EDGAR ADR segment extraction failed for %s (%s): %s",
+                    code, adr_ticker, exc,
+                )
+
+        logger.info(
+            "TW segment extraction: no data found for %s", code,
+        )
+        return empty

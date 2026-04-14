@@ -1175,6 +1175,9 @@ def render_scoring_weights():
         wt_conformal = ui.tab("Conformal", icon="show_chart")
         wt_freq = ui.tab("Frequency", icon="speed")
         wt_uss = ui.tab("USS", icon="shield")
+        wt_fuzzy = ui.tab("Fuzzy Prot.", icon="security")
+        wt_mc_surv = ui.tab("MC Overrides", icon="emergency")
+        wt_affinity = ui.tab("Affinity", icon="auto_graph")
 
     with ui.tab_panels(weight_tabs, value=wt_survival).classes("w-full"):
 
@@ -1444,6 +1447,60 @@ def render_scoring_weights():
                             ui.label(label).classes("text-xs text-gray-400")
                             inp = ui.number(value=params.get(key, default), step=1).classes("w-24")
                             weight_inputs[f"uss_model_switching.{regime}.{key}"] = inp
+
+        # --- Fuzzy Protection ---
+        with ui.tab_panel(wt_fuzzy):
+            ui.label("Fuzzy Protection Parameters").classes("text-lg font-bold mb-2")
+            ui.label("Sector strategicness membership and defuzzification settings.").classes("text-gray-400 text-sm mb-3")
+            fp = sw.get("fuzzy_protection", {})
+            for key, default, label in [
+                ("sector_high_threshold", 0.7, "Sector high threshold"),
+                ("sector_medium_threshold", 0.4, "Sector medium threshold"),
+                ("economic_significance_cap", 0.01, "Economic significance cap (mkt_cap/GDP)"),
+                ("policy_responsiveness_window", 252, "Policy responsiveness window (days)"),
+                ("defuzzification_method", "centroid", "Defuzzification method"),
+            ]:
+                with ui.row().classes("items-center gap-4 mb-2"):
+                    ui.label(label).classes("w-64 text-sm")
+                    if isinstance(default, str):
+                        inp = ui.input(value=fp.get(key, default)).classes("w-32")
+                    else:
+                        inp = ui.number(value=fp.get(key, default), step=0.01, format="%.3f").classes("w-32")
+                    weight_inputs[f"fuzzy_protection.{key}"] = inp
+
+        # --- MC Survival Overrides ---
+        with ui.tab_panel(wt_mc_surv):
+            ui.label("Monte Carlo Survival Overrides").classes("text-lg font-bold mb-2")
+            ui.label("Per-regime MC parameter overrides (paths, tilt, horizons).").classes("text-gray-400 text-sm mb-3")
+            mc_ov = sw.get("monte_carlo_survival_overrides", {})
+            for regime in ["company_survival", "extreme_survival"]:
+                params = mc_ov.get(regime, {})
+                ui.label(regime.replace("_", " ").title()).classes("text-md font-bold mt-3 mb-1 monokai-purple")
+                with ui.row().classes("gap-3"):
+                    for key, default, label in [
+                        ("n_paths", 20000, "MC paths"),
+                        ("importance_tilt", 2.0, "Importance tilt"),
+                    ]:
+                        with ui.column().classes("items-center"):
+                            ui.label(label).classes("text-xs text-gray-400")
+                            inp = ui.number(value=params.get(key, default), step=1 if key == "n_paths" else 0.1).classes("w-24")
+                            weight_inputs[f"monte_carlo_survival_overrides.{regime}.{key}"] = inp
+
+        # --- Model Regime Affinity ---
+        with ui.tab_panel(wt_affinity):
+            ui.label("Model Regime Affinity Weights").classes("text-lg font-bold mb-2")
+            ui.label("Per-model weight multiplier by regime (1.0 = neutral).").classes("text-gray-400 text-sm mb-3")
+            mra = sw.get("model_regime_affinity", {})
+            models = ["kalman", "garch", "var", "lstm", "tree", "baseline"]
+            for regime in ["normal", "company_survival", "extreme_survival"]:
+                regime_vals = mra.get(regime, {})
+                ui.label(regime.replace("_", " ").title()).classes("text-md font-bold mt-3 mb-1 monokai-purple")
+                with ui.row().classes("gap-3"):
+                    for model in models:
+                        with ui.column().classes("items-center"):
+                            ui.label(model.title()[:8]).classes("text-xs text-gray-400")
+                            inp = ui.number(value=regime_vals.get(model, 1.0), step=0.1, format="%.1f").classes("w-16")
+                            weight_inputs[f"model_regime_affinity.{regime}.{model}"] = inp
 
     # --- Save / Reset buttons ---
     ui.separator().classes("my-4")

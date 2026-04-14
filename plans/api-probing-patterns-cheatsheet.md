@@ -119,6 +119,52 @@ r = s.get(profile_base + "p0/IZ7_.../NJstatementsTabData=/",
 
 ---
 
+## Pattern 5: ASX MarkitDigital (Third-Party Exchange Data Provider)
+
+**When to use:** Exchange outsources its data API to a third-party provider (MarkitDigital, Refinitiv, FactSet). The third-party API is public, versioned, and JSON-based but lives on a different domain from the exchange website.
+
+**Key steps:**
+1. **Identify the actual API domain**: The exchange website (asx.com.au) may return 404 on old API paths. The real API lives on a provider domain (asx.api.markitdigital.com). Find it by inspecting the exchange website's network requests
+2. **Versioned REST endpoints**: Provider APIs use versioned paths like `/asx-research/1.0/companies/{ticker}/header`. Try version bumps (`1.0`, `1.1`, `2.0`) when endpoints fail
+3. **Full directory fetch + client-side search**: The directory endpoint (`/companies/directory`) returns ALL companies in one paginated call. No server-side search parameter -- filter locally by ticker/name substring match
+4. **Announcement-based filing discovery**: The announcements endpoint (`/companies/{ticker}/announcements`) returns filing metadata (headline, date, documentKey). Filter by announcement type keywords ("PERIODIC REPORTS", "ANNUAL REPORT", "substantial holder"). Note: some APIs hard-cap results (ASX returns max 5 items regardless of `count` param)
+5. **Two-step document download**: Announcements return document keys, not direct PDF URLs. First GET the document page (HTML), then extract the actual PDF link from it. Validate PDF magic bytes (`%PDF`) before processing
+6. **Headline parsing for holder data**: Substantial holder notices and director interest changes are announced via headlines. Parse holder names and percentages from headline text using regex (e.g., "Becoming a substantial holder from BlackRock" -> name=BlackRock)
+7. **Multi-source holder strategy**: MarketScreener (primary, global coverage) -> Exchange announcements (fallback, limited to >5% holders) -> PDF extraction (last resort). This pattern applies to any exchange where holder APIs are limited
+
+**Code location:** `operator1/clients/au_asx.py`
+
+```python
+# Directory fetch (full list, client-side search)
+resp = requests.get(f"{MARKIT_BASE}/companies/directory",
+    params={"page": 0, "itemsPerPage": 2500},
+    headers={"Accept": "application/json", "User-Agent": "Operator1/1.0"},
+    timeout=20)
+items = resp.json()["data"]["items"]
+
+# Profile from header endpoint
+resp = requests.get(f"{MARKIT_BASE}/companies/{ticker}/header",
+    headers=HEADERS, timeout=10)
+data = resp.json()["data"]
+# Fields: displayName, sector, industryGroup, marketCap, dateListed
+
+# Announcement-based filing discovery
+resp = requests.get(f"{MARKIT_BASE}/companies/{ticker}/announcements",
+    params={"count": "50"},
+    headers=HEADERS, timeout=15)
+items = resp.json()["data"]["items"]
+# Filter: headline contains "substantial", "annual report", "appendix 3y"
+
+# Holder extraction from announcement headlines
+import re
+for item in items:
+    headline = item["headline"]
+    name_match = re.search(r"(?:from|by|for)\s+([A-Z][\w\s&]+?)(?:\s*-|\s*$)", headline)
+    pct_match = re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", headline)
+```
+
+---
+
 ## CRITICAL: Mix All Patterns Together
 
 **Do NOT use patterns in isolation.** Real-world probing requires combining
@@ -132,6 +178,7 @@ A single probe script might use:
 - **Pattern 4** (curl_cffi) if any endpoint returns 403 from WAF
 - **Pattern 1** (date-windowed) if results are empty for large date ranges
 - **Pattern 3** (token) if you discover a gateway token endpoint
+- **Pattern 5** (third-party provider) if the exchange outsources its API to MarkitDigital/Refinitiv
 
 ```python
 import requests
