@@ -1189,10 +1189,10 @@ def _init_extra_vars(state: BacktestState) -> None:
     ]
 
 
-def run_stage2a(state: BacktestState) -> None:
-    """Stage 2a: Regime detection + causality + cycle/pattern + forecasting."""
+def run_stage2a1(state: BacktestState) -> None:
+    """Stage 2a1: Regime detection + causality + cycle/pattern + synergies."""
     logger.info("=" * 60)
-    logger.info("STAGE 2a: Regime + Causality + Forecasting")
+    logger.info("STAGE 2a1: Regime + Causality + Patterns")
     logger.info("=" * 60)
 
     cache = state.cache
@@ -1268,7 +1268,24 @@ def run_stage2a(state: BacktestState) -> None:
     except Exception:
         pass
 
-    # Forecasting
+    state.cache = cache
+    state.save_sub("2a1")
+    logger.info("STAGE 2a1 COMPLETE")
+
+
+def run_stage2a2(state: BacktestState) -> None:
+    """Stage 2a2: Forecasting (heavyweight, may take >5min)."""
+    logger.info("=" * 60)
+    logger.info("STAGE 2a2: Forecasting")
+    logger.info("=" * 60)
+
+    cache = state.cache
+    if cache is None or cache.empty:
+        raise ValueError("No cache data -- run Stage 2a1 first")
+
+    if not state._extra_vars:
+        _init_extra_vars(state)
+
     try:
         from operator1.models.forecasting import run_forecasting
         cache, state.forecast_result = run_forecasting(
@@ -1280,8 +1297,14 @@ def run_stage2a(state: BacktestState) -> None:
         logger.warning("Forecasting failed: %s", exc)
 
     state.cache = cache
-    state.save_sub("2a")
-    logger.info("STAGE 2a COMPLETE")
+    state.save_sub("2a2")
+    logger.info("STAGE 2a2 COMPLETE")
+
+
+def run_stage2a(state: BacktestState) -> None:
+    """Stage 2a: Regime + causality + forecasting (runs 2a1 + 2a2)."""
+    run_stage2a1(state)
+    run_stage2a2(state)
 
 
 def run_stage2b(state: BacktestState) -> None:
@@ -2576,10 +2599,9 @@ Examples:
 """,
     )
     parser.add_argument("--stage", type=str, default="all",
-                        choices=["1", "2", "2a", "2b", "2c", "2d", "3", "all"],
-                        help="Which stage to run. Stage 2 is split into sub-stages "
-                             "(2a=regime+causality+forecasting, 2b=forward+burnout+MC, "
-                             "2c=ensemble+ML, 2d=USS+multifreq). Use '2' to run all sub-stages.")
+                        choices=["1", "2", "2a", "2a1", "2a2", "2b", "2c", "2d", "3", "all"],
+                        help="Which stage to run. Stage 2a is split into 2a1 (regime+causality+patterns) "
+                             "and 2a2 (forecasting). Use '2a' to run both, '2' for all sub-stages.")
     parser.add_argument("--market", type=str, default="us_sec_edgar",
                         help="Market ID (e.g. us_sec_edgar, kr_dart, jp_jquants)")
     parser.add_argument("--company", type=str, default="AAPL",
@@ -2618,15 +2640,19 @@ Examples:
 
     # Build ordered list of stages to run
     if args.stage == "all":
-        stages = ["1", "2a", "2b", "2c", "2d", "3"]
+        stages = ["1", "2a1", "2a2", "2b", "2c", "2d", "3"]
     elif args.stage == "2":
-        stages = ["2a", "2b", "2c", "2d"]
+        stages = ["2a1", "2a2", "2b", "2c", "2d"]
+    elif args.stage == "2a":
+        stages = ["2a1", "2a2"]
     else:
         stages = [args.stage]
 
     _STAGE_FUNCS = {
         "1": run_stage1,
         "2a": run_stage2a,
+        "2a1": run_stage2a1,
+        "2a2": run_stage2a2,
         "2b": run_stage2b,
         "2c": run_stage2c,
         "2d": run_stage2d,
@@ -2636,7 +2662,9 @@ Examples:
     _STAGE_DEPS = {
         "1": None,
         "2a": 1,
-        "2b": "2a",
+        "2a1": 1,
+        "2a2": "2a1",
+        "2b": "2a2",
         "2c": "2b",
         "2d": "2c",
         "3": "2d",
