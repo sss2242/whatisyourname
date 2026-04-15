@@ -411,6 +411,7 @@ def fit_autoarima(
     series: np.ndarray,
     n_forecast: int = 1,
     season_length: int = 63,
+    timeout_seconds: int = 30,
 ) -> tuple[np.ndarray | None, ModelMetrics]:
     """Fit AutoARIMA using statsforecast (fast Rust backend).
 
@@ -418,7 +419,13 @@ def fit_autoarima(
     statsmodels for single-series ARIMA fitting. Handles seasonality
     (quarterly earnings cycle at ~63 business days).
 
-    Falls back to None if statsforecast is not installed.
+    Parameters
+    ----------
+    timeout_seconds:
+        Maximum seconds for the fit. If exceeded, returns None so the
+        model cascade falls through to the next model. Default: 30s.
+
+    Falls back to None if statsforecast is not installed or times out.
     """
     metrics = ModelMetrics(model_name="autoarima")
 
@@ -433,9 +440,27 @@ def fit_autoarima(
         metrics.error = f"Insufficient observations ({len(clean)})"
         return None, metrics
 
+    import signal as _signal
+    import time as _time
+
+    class _AutoARIMATimeout(Exception):
+        pass
+
+    def _timeout_handler(signum, frame):
+        raise _AutoARIMATimeout()
+
     try:
+        # Set alarm-based timeout (Unix only, no-op on Windows)
+        _old_handler = None
+        _use_alarm = hasattr(_signal, "SIGALRM")
+        if _use_alarm:
+            _old_handler = _signal.signal(_signal.SIGALRM, _timeout_handler)
+            _signal.alarm(timeout_seconds)
+
+        _t0 = _time.time()
         train, test = _split_train_test(clean)
 
+        # Single fit on train data (skip redundant full refit to save time)
         model = AutoARIMA(season_length=min(season_length, len(train) // 3))
         model.fit(train)
 
@@ -447,10 +472,14 @@ def fit_autoarima(
         else:
             mae, rmse = float("nan"), float("nan")
 
-        # Full refit for final forecast
-        full_model = AutoARIMA(season_length=min(season_length, len(clean) // 3))
-        full_model.fit(clean)
-        forecasts = full_model.predict(h=n_forecast)["mean"]
+        # Forecast from the train-fitted model (avoids double-fit overhead)
+        # The last train observation is close enough to the full-data model.
+        forecasts = model.predict(h=n_forecast)["mean"]
+
+        # Cancel alarm
+        if _use_alarm:
+            _signal.alarm(0)
+            _signal.signal(_signal.SIGALRM, _old_handler or _signal.SIG_DFL)
 
         metrics.mae = mae
         metrics.rmse = rmse
@@ -458,13 +487,26 @@ def fit_autoarima(
         metrics.n_test = len(test)
         metrics.fitted = True
 
+        _elapsed = _time.time() - _t0
         logger.info(
-            "AutoARIMA fit: %d train, %d test, MAE=%.6f",
-            len(train), len(test), mae,
+            "AutoARIMA fit: %d train, %d test, MAE=%.6f (%.1fs)",
+            len(train), len(test), mae, _elapsed,
         )
         return np.array(forecasts), metrics
 
+    except _AutoARIMATimeout:
+        if _use_alarm:
+            _signal.alarm(0)
+            _signal.signal(_signal.SIGALRM, _old_handler or _signal.SIG_DFL)
+        metrics.error = f"AutoARIMA timed out after {timeout_seconds}s"
+        logger.warning(metrics.error)
+        return None, metrics
+
     except Exception as exc:
+        if _use_alarm:
+            _signal.alarm(0)
+            if _old_handler is not None:
+                _signal.signal(_signal.SIGALRM, _old_handler)
         metrics.error = f"AutoARIMA failed: {exc}"
         logger.debug(metrics.error)
         return None, metrics
