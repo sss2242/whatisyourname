@@ -2243,6 +2243,8 @@ def _run_bt_mf_D(state: BacktestState) -> None:
 def _run_bt_mf_fuse(state: BacktestState) -> None:
     _bt_mf_fuse(state)
     state.save_sub("2d.mf.fuse")
+    # Also save as "2d" so Stage 3 can load via its dep ("3" -> "2d")
+    state.save_sub("2d")
 
 
 # ---------------------------------------------------------------------------
