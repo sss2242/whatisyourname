@@ -2506,8 +2506,17 @@ Non-interactive examples:
         _pattern_drift = _ps.pattern_drift
         weights = _ps.weights
         regime_detector = _ps.regime_detector
+        # Stage 7 results (if stage spec included them)
+        scenario_result = _ps.scenario_result
+        _retro_params = _ps.retro_params
+        model_diagnostics_result = _ps.model_diagnostics_result
+        multi_frequency_result = _ps.multi_frequency_result
+        hf_result = _ps.hf_result
+        _mode_weights = _ps.mode_weights
+        _tv_granger_result = _ps.tv_granger_result
+        _mv_mc_result = _ps.mv_mc_result
 
-        logger.info("Staged execution complete -- continuing to Step 7")
+        logger.info("Staged execution complete -- continuing to output stages")
 
     elif not args.skip_models:
         logger.info("")

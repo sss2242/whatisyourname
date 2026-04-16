@@ -37,12 +37,14 @@ def _build_registry() -> list[tuple[str, callable]]:
     from operator1.stages.stage4_forecasting import STAGE_4_SUBSTAGES
     from operator1.stages.stage5_forward import STAGE_5_SUBSTAGES
     from operator1.stages.stage6_ensemble import STAGE_6_SUBSTAGES
+    from operator1.stages.stage7_integration import STAGE_7_SUBSTAGES
 
     return (
         STAGE_3_SUBSTAGES
         + STAGE_4_SUBSTAGES
         + STAGE_5_SUBSTAGES
         + STAGE_6_SUBSTAGES
+        + STAGE_7_SUBSTAGES
     )
 
 
