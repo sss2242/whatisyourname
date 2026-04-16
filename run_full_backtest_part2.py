@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-FULL BACKTEST PART 2 of 4: AutoARIMA + Forward Pass + Walk-Forward + Burn-out
+FULL BACKTEST PART 2 of 4: ETS + Forward Pass + Walk-Forward + Burn-out
 ═══════════════════════════════════════════════════════════════════════════════
 
 RUNNING INSTRUCTIONS: See run_full_backtest_part1.py header.
 Requires: cache/backtest_AAPL_2024-12-31/model_state_part1.pkl
 Produces: cache/backtest_AAPL_2024-12-31/model_state_part2.pkl
 
-NOTE: AutoARIMA is the slowest model (~60s per variable). Only run on
-close and return_1d to stay within 300s.
+NOTE: ETS (Exponential Smoothing) replaces AutoARIMA -- 10-50x faster with
+competitive accuracy. Runs on close and return_1d.
 """
 import json, logging, os, pickle, sys, time, warnings
 from pathlib import Path
@@ -28,17 +28,17 @@ results = dict(p1)  # carry forward all part1 results
 t0 = time.time()
 from operator1.models.forecasting import HORIZONS
 
-# ── 1. AutoARIMA on close and return_1d only (2 vars * ~60s = ~120s) ──
+# ── 1. ETS on close and return_1d only (2 vars * ~2-5s = ~10s) ──
 try:
-    from operator1.models.forecasting import fit_autoarima
+    from operator1.models.forecasting import fit_ets
     for var in ["close", "return_1d"]:
         if var in cache.columns and cache[var].notna().sum() >= 50:
             series = cache[var].dropna().values
-            af, am = fit_autoarima(series, n_forecast=252)
+            af, am = fit_ets(series, n_forecast=252)
             if af is not None:
-                results[f"autoarima_{var}"] = {l: float(af[min(h-1,len(af)-1)]) for l,h in HORIZONS.items()}
-                logger.info("AutoARIMA %s: %s", var, {k:f"{v:.4f}" for k,v in results[f"autoarima_{var}"].items()})
-except Exception as e: logger.warning("AutoARIMA: %s", e)
+                results[f"ets_{var}"] = {l: float(af[min(h-1,len(af)-1)]) for l,h in HORIZONS.items()}
+                logger.info("ETS %s: %s", var, {k:f"{v:.4f}" for k,v in results[f"ets_{var}"].items()})
+except Exception as e: logger.warning("ETS: %s", e)
 
 # ── 2. Forward Pass (day-by-day temporal walk) ──
 try:

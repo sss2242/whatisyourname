@@ -13,7 +13,7 @@ RUNNING INSTRUCTIONS (for Roo agents in new chats):
    
 3. Run parts in order (each <300s, saves state for next):
    python run_full_backtest_part1.py   # Regime, Granger, TE, Cycle, Patterns, GARCH, Kalman, XGB
-   python run_full_backtest_part2.py   # AutoARIMA (slowest), Forward Pass, Walk-Forward, Burn-out
+   python run_full_backtest_part2.py   # ETS, Forward Pass, Walk-Forward, Burn-out
    python run_full_backtest_part3.py   # Monte Carlo, Copula, Conformal, DTW, Transformer, Particle Filter
    python run_full_backtest_part4.py   # Prediction Aggregator, SHAP, Sobol, GA, OHLC, Validation vs 2025 actuals
 

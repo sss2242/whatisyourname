@@ -1,7 +1,7 @@
 """Stage 4: Forecasting -- the heavyweight step, isolated for background execution.
 
 Sub-stages:
-  4.1  Forecasting (Kalman + GARCH + VAR + LSTM + Tree + Baseline + AutoARIMA)
+  4.1  Forecasting (Kalman + GARCH + VAR + LSTM + Tree + Baseline + ETS)
 
 This is the slowest stage (~5-10min). It is intentionally isolated as a
 single sub-stage so it can be run via nohup or in a background process

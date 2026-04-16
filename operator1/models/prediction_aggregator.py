@@ -453,7 +453,7 @@ def apply_ic_weighted_calibration(
         "lstm": ["close", "return_1d"],
         "tree": ["close", "return_1d", "fcf_yield", "current_ratio"],
         "baseline": ["close"],
-        "autoarima": ["close", "revenue"],
+        "ets": ["close", "revenue"],
         "transformer": ["close", "return_1d"],
     }
 

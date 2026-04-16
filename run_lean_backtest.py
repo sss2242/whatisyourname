@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lean backtest: skip slow models (AutoARIMA, transformer) to fit in 300s.
+"""Lean backtest: skip slow models (transformer) to fit in 300s.
 
 Loads Stage 1 cache from backtest_runner, runs essential temporal models,
 produces predictions, then validates against 2025 actuals.
