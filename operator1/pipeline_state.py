@@ -300,6 +300,9 @@ class PipelineState:
             "label": resampled.label,
             "n_periods": resampled.n_periods,
             "lookback_years": resampled.lookback_years,
+            "is_partial_last_period": resampled.is_partial_last_period,
+            "original_daily_rows": resampled.original_daily_rows,
+            "resampled_rows": resampled.resampled_rows,
         }
         (d / f"{freq}_meta.json").write_text(_json.dumps(meta, indent=2))
 
@@ -320,6 +323,9 @@ class PipelineState:
             label=meta.get("label", freq),
             n_periods=meta.get("n_periods", len(cache_df)),
             lookback_years=meta.get("lookback_years", 2),
+            is_partial_last_period=meta.get("is_partial_last_period", False),
+            original_daily_rows=meta.get("original_daily_rows", 0),
+            resampled_rows=meta.get("resampled_rows", len(cache_df)),
         )
 
     def save_mf_result(self, freq: str, result) -> None:

@@ -1867,7 +1867,10 @@ def _bt_mf_prep(state: BacktestState) -> None:
             continue
         resampled.cache.to_parquet(_mf_dir / f"{freq}_cache.parquet")
         meta = {"frequency": resampled.frequency, "label": resampled.label,
-                "n_periods": resampled.n_periods, "lookback_years": resampled.lookback_years}
+                "n_periods": resampled.n_periods, "lookback_years": resampled.lookback_years,
+                "is_partial_last_period": resampled.is_partial_last_period,
+                "original_daily_rows": resampled.original_daily_rows,
+                "resampled_rows": resampled.resampled_rows}
         (_mf_dir / f"{freq}_meta.json").write_text(_json.dumps(meta, indent=2))
         logger.info("[%s] Resampled: %d periods", freq, resampled.n_periods)
 
@@ -1889,6 +1892,9 @@ def _bt_mf_run_freq(state: BacktestState, freq: str) -> None:
         cache=cache_df, frequency=meta.get("frequency", freq),
         label=meta.get("label", freq), n_periods=meta.get("n_periods", len(cache_df)),
         lookback_years=meta.get("lookback_years", 2),
+        is_partial_last_period=meta.get("is_partial_last_period", False),
+        original_daily_rows=meta.get("original_daily_rows", 0),
+        resampled_rows=meta.get("resampled_rows", len(cache_df)),
     )
     # Load prior context
     fp = _mf_dir / "frequencies.json"
@@ -2746,7 +2752,10 @@ Examples:
 """,
     )
     parser.add_argument("--stage", type=str, default="all",
-                        choices=["1", "2", "2a", "2a1", "2a2", "2b", "2c", "2d", "3", "all"],
+                        choices=["1", "2", "2a", "2a1", "2a2", "2b", "2c", "2d",
+                                 "2d.mf.prep", "2d.mf.A", "2d.mf.Q", "2d.mf.M",
+                                 "2d.mf.W", "2d.mf.D", "2d.mf.fuse",
+                                 "3", "all"],
                         help="Which stage to run. Stage 2a is split into 2a1 (regime+causality+patterns) "
                              "and 2a2 (forecasting). Use '2a' to run both, '2' for all sub-stages.")
     parser.add_argument("--market", type=str, default="us_sec_edgar",
