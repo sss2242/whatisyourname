@@ -453,6 +453,13 @@ def fit_autoarima(
         # Set alarm-based timeout (Unix only, no-op on Windows)
         _old_handler = None
         _use_alarm = hasattr(_signal, "SIGALRM")
+        # Guard: signal.signal() raises ValueError in non-main threads
+        try:
+            import threading
+            if threading.current_thread() is not threading.main_thread():
+                _use_alarm = False
+        except Exception:
+            pass
         if _use_alarm:
             _old_handler = _signal.signal(_signal.SIGALRM, _timeout_handler)
             _signal.alarm(timeout_seconds)
@@ -460,8 +467,9 @@ def fit_autoarima(
         _t0 = _time.time()
         train, test = _split_train_test(clean)
 
-        # Single fit on train data (skip redundant full refit to save time)
-        model = AutoARIMA(season_length=min(season_length, len(train) // 3))
+        # Fit on train split for validation metrics
+        _sl = min(season_length, len(train) // 3)
+        model = AutoARIMA(season_length=_sl)
         model.fit(train)
 
         # Validation
@@ -472,9 +480,11 @@ def fit_autoarima(
         else:
             mae, rmse = float("nan"), float("nan")
 
-        # Forecast from the train-fitted model (avoids double-fit overhead)
-        # The last train observation is close enough to the full-data model.
-        forecasts = model.predict(h=n_forecast)["mean"]
+        # Refit on full data so predict(h=1) forecasts from the end of the
+        # series, not from the 85th-percentile train/test split boundary.
+        full_model = AutoARIMA(season_length=_sl)
+        full_model.fit(clean)
+        forecasts = full_model.predict(h=n_forecast)["mean"]
 
         # Cancel alarm
         if _use_alarm:

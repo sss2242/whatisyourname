@@ -3353,7 +3353,11 @@ Non-interactive examples:
     # ------------------------------------------------------------------
     # Apply forecast bounding (Dimension 5) and run scenario engine
     # when survival mode is active.
-    if survival_controller is not None and not args.skip_models:
+    # SKIP when --stage was used: the staged runner (Stage 7) already
+    # handled USS, retro calibration, diagnostics, multi-freq, and HF.
+    if args.stage:
+        logger.info("Steps 6-USS through 6-HF: handled by staged runner")
+    elif survival_controller is not None and not args.skip_models:
         # Forecast bounding: apply hard bounds to survival-mode forecasts
         if survival_controller.is_survival and forecast_result is not None:
             try:
@@ -3402,7 +3406,7 @@ Non-interactive examples:
     # model weight matrices that were initially set to fixed defaults.
     # Empirical Bayes: use first-pass data to set second-pass priors.
     _retro_params = None
-    if not args.skip_models:
+    if not args.skip_models and not args.stage:
         try:
             from operator1.analysis.retroactive_calibration import run_retroactive_calibration
 
@@ -3474,7 +3478,7 @@ Non-interactive examples:
     # with cascading context. Each slower frequency's insights constrain
     # the next faster frequency's predictions.
     multi_frequency_result = None
-    if not args.skip_models:
+    if not args.skip_models and not args.stage:
         try:
             from operator1.steps.multi_frequency_runner import run_multi_frequency_pipeline
             from operator1.models.frequency_fusion import fuse_multi_frequency_results
@@ -3515,7 +3519,7 @@ Non-interactive examples:
     # Parallel analytical track: 15 investment-grade metrics across 5 tiers.
     # Reads from raw statement DFs (not the daily cache) for most metrics.
     hf_result = None
-    if not args.skip_models:
+    if not args.skip_models and not args.stage:
         try:
             from operator1.hedge_fund.engine import run_hedge_fund_analysis
 

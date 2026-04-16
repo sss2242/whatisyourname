@@ -92,25 +92,39 @@ def _filter_substages(
     start: str | None,
     end: str | None,
 ) -> list[tuple[str, callable]]:
-    """Filter registry to include sub-stages between start and end (inclusive)."""
+    """Filter registry to include sub-stages between start and end (inclusive).
+
+    Returns an empty list if the spec matches nothing, preventing
+    accidental execution of all stages on typos like ``--stage foo``.
+    """
     if start is None and end is None:
         return registry  # all
 
     # Find start index
-    start_idx = 0
+    start_idx = -1
     if start is not None:
         for i, (sub_id, _) in enumerate(registry):
             if _matches_stage(sub_id, start):
                 start_idx = i
                 break
+        if start_idx == -1:
+            logger.warning("Stage spec '%s' matched no sub-stages", start)
+            return []
+    else:
+        start_idx = 0
 
     # Find end index
-    end_idx = len(registry) - 1
+    end_idx = -1
     if end is not None:
         for i in range(len(registry) - 1, -1, -1):
             if _matches_stage(registry[i][0], end):
                 end_idx = i
                 break
+        if end_idx == -1:
+            logger.warning("Stage spec '%s' matched no sub-stages", end)
+            return []
+    else:
+        end_idx = len(registry) - 1
 
     return registry[start_idx:end_idx + 1]
 
