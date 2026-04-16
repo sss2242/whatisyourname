@@ -105,6 +105,8 @@ class BacktestState:
         self._adaptive_model_params = None
         self._adaptive_tier3 = None
         self._ohlcv_source_label: str = ""
+        self._seg_result: dict = {}
+        self._mode_weights = None
         # Raw statement DataFrames (for multi-frequency Q/A direct construction)
         self._income_df: pd.DataFrame = pd.DataFrame()
         self._balance_df: pd.DataFrame = pd.DataFrame()
@@ -557,6 +559,33 @@ def run_stage1(state: BacktestState) -> None:
     except Exception as exc:
         logger.debug("Benchmark fetch skipped: %s", exc)
 
+    # Fix 10: Implied volatility (IV-RV spread)
+    try:
+        from operator1.clients.ohlcv_provider import fetch_implied_volatility
+        _iv_series = fetch_implied_volatility(ticker)
+        if not _iv_series.empty:
+            _iv_val = float(_iv_series.iloc[0])
+            cache["iv30"] = _iv_val
+            if "volatility_21d" in cache.columns:
+                _rv = cache["volatility_21d"].iloc[-1] if cache["volatility_21d"].notna().any() else 0.0
+                cache["iv_rv_spread"] = _iv_val - float(_rv)
+    except Exception:
+        pass
+
+    # Fix 10: Sector leading indicators
+    try:
+        from operator1.clients.ohlcv_provider import fetch_sector_leading_indicators
+        _sector = state.target_profile.get("sector", "")
+        _leader_df = fetch_sector_leading_indicators(_sector, years=int(state.years))
+        if not _leader_df.empty:
+            _leader_aligned = _leader_df.reindex(cache.index, method="ffill")
+            for _ldr_col in _leader_aligned.columns:
+                _col_name = f"sector_leader_{_ldr_col}"
+                if _col_name not in cache.columns:
+                    cache[_col_name] = _leader_aligned[_ldr_col]
+    except Exception:
+        pass
+
     # Merge statements
     try:
         from operator1.estimation.frequency_interpolator import interpolate_statement_to_daily
@@ -862,11 +891,17 @@ def run_stage1(state: BacktestState) -> None:
     except Exception:
         pass
 
-    # Product catalysts
+    # Product catalysts (Fix 12: pass news_articles from sentiment step)
     try:
         from operator1.features.product_catalysts import detect_product_catalysts
+        _news_articles = []
+        try:
+            _news_articles = _sr.articles if '_sr' in dir() and hasattr(_sr, 'articles') else []
+        except Exception:
+            _news_articles = []
         cache, state.catalyst_result = detect_product_catalysts(
             cache, profile=state.target_profile,
+            news_articles=_news_articles if _news_articles else None,
         )
     except Exception:
         pass
@@ -1089,6 +1124,9 @@ def run_stage1(state: BacktestState) -> None:
         except Exception as exc:
             logger.debug("Ownership contagion skipped: %s", exc)
 
+    # Save segment result for Stage 3 profile injection
+    state._seg_result = _seg_result
+
     # Product segment metrics (for _extra_vars + MC concentration risk)
     if _seg_result and _seg_result.get("n_segments", 0) >= 2:
         try:
@@ -1107,27 +1145,54 @@ def run_stage1(state: BacktestState) -> None:
 # ---------------------------------------------------------------------------
 
 def _init_extra_vars(state: BacktestState) -> None:
-    """Build the _extra_vars list from cache columns."""
+    """Build the _extra_vars list from cache columns.
+
+    Mirrors main.py Step 6 _extra_vars construction (lines 2437-2473).
+    """
     cache = state.cache
-    _linked_prefixes = ("competitors_", "suppliers_", "customers_", "financial_institutions_", "sector_peers_")
+    _linked_prefixes = (
+        "competitors_", "suppliers_", "customers_",
+        "financial_institutions_", "sector_peers_", "industry_peers_",
+        "rel_", "valuation_premium_",
+    )
+    # Columns derived from full-cache HMM that would cause look-ahead
+    # bias if fed as features to the forward pass temporal models.
+    _hmm_lookahead_cols = {
+        "survival_intensity",       # blends rule-based (clean) + HMM (look-ahead)
+        "regime_confidence",        # from HMM posteriors fitted on full cache
+        "regime_transition_prob",   # from enriched timeline using HMM labels
+    }
     state._extra_vars = [
         c for c in cache.columns
-        if (c.startswith("fh_") or c.startswith("sentiment_") or c.startswith("peer_")
-            or c.startswith("macro_") or c.startswith("inst_")
+        if (c.startswith("fh_") or c.startswith("sentiment_")
+            or c.startswith("peer_") or c.startswith("macro_")
+            or c.startswith("inst_")
             or c.startswith("buying_power_") or c.startswith("catalyst_")
             or c.startswith("conflict_") or c.startswith("demand_")
-            or c in ("survival_intensity", "regime_confidence", "regime_transition_prob",
-                     "stability_score_21d", "buying_power_index", "catalyst_score")
+            or c.startswith("merton_") or c.startswith("rv_")
+            or c.startswith("policy_risk_") or c.startswith("sector_leader_")
+            or c.startswith("segment_") or c.startswith("product_")
+            or c.startswith("pricing_") or c.startswith("margin_")
+            or c.startswith("som_") or c.startswith("customer_")
+            or c in ("stability_score_21d",
+                     "buying_power_index", "sector_demand_momentum",
+                     "catalyst_score", "online_change_score",
+                     "iv30", "iv_rv_spread",
+                     "cannibalization_rate", "net_new_revenue_pct",
+                     "network_effect_score", "input_cost_pressure",
+                     "growth_runway_quarters", "maturity_concentration",
+                     "estimated_market_share", "dominant_segment_growth")
             or any(c.startswith(p) for p in _linked_prefixes))
         and cache[c].dtype in ("float64", "float32", "int64")
         and not c.startswith("is_missing_")
+        and c not in _hmm_lookahead_cols
     ]
 
 
-def run_stage2a(state: BacktestState) -> None:
-    """Stage 2a: Regime detection + causality + cycle/pattern + forecasting."""
+def run_stage2a1(state: BacktestState) -> None:
+    """Stage 2a1: Regime detection + causality + cycle/pattern + synergies."""
     logger.info("=" * 60)
-    logger.info("STAGE 2a: Regime + Causality + Forecasting")
+    logger.info("STAGE 2a1: Regime + Causality + Patterns")
     logger.info("=" * 60)
 
     cache = state.cache
@@ -1203,17 +1268,43 @@ def run_stage2a(state: BacktestState) -> None:
     except Exception:
         pass
 
-    # Forecasting
+    state.cache = cache
+    state.save_sub("2a1")
+    logger.info("STAGE 2a1 COMPLETE")
+
+
+def run_stage2a2(state: BacktestState) -> None:
+    """Stage 2a2: Forecasting (heavyweight, may take >5min)."""
+    logger.info("=" * 60)
+    logger.info("STAGE 2a2: Forecasting")
+    logger.info("=" * 60)
+
+    cache = state.cache
+    if cache is None or cache.empty:
+        raise ValueError("No cache data -- run Stage 2a1 first")
+
+    if not state._extra_vars:
+        _init_extra_vars(state)
+
     try:
         from operator1.models.forecasting import run_forecasting
-        cache, state.forecast_result = run_forecasting(cache, extra_variables=state._extra_vars)
+        cache, state.forecast_result = run_forecasting(
+            cache, extra_variables=state._extra_vars,
+            windows=state._adaptive_tier3.windows if state._adaptive_tier3 is not None and state._adaptive_tier3.adapted else None,
+        )
         logger.info("Forecasting complete")
     except Exception as exc:
         logger.warning("Forecasting failed: %s", exc)
 
     state.cache = cache
-    state.save_sub("2a")
-    logger.info("STAGE 2a COMPLETE")
+    state.save_sub("2a2")
+    logger.info("STAGE 2a2 COMPLETE")
+
+
+def run_stage2a(state: BacktestState) -> None:
+    """Stage 2a: Regime + causality + forecasting (runs 2a1 + 2a2)."""
+    run_stage2a1(state)
+    run_stage2a2(state)
 
 
 def run_stage2b(state: BacktestState) -> None:
@@ -1272,10 +1363,88 @@ def run_stage2b(state: BacktestState) -> None:
     # Monte Carlo
     try:
         mc_ret = "equity_change_rate" if state._is_private else "return_1d"
-        state.mc_result = run_monte_carlo(cache, returns_col=mc_ret)
+        _mc_n = (
+            state._adaptive_model_params.mc_n_paths
+            if state._adaptive_model_params is not None and getattr(state._adaptive_model_params, "adapted", False)
+            else 10_000
+        )
+        _mc_tilt = (
+            state._adaptive_model_params.mc_is_tilt
+            if state._adaptive_model_params is not None and getattr(state._adaptive_model_params, "adapted", False)
+            else 1.5
+        )
+        _mc_thresholds = None
+        if state._adaptive_thresholds is not None and state._adaptive_thresholds.adapted:
+            try:
+                from operator1.analysis.adaptive_thresholds import threshold_set_to_mc_dict
+                _mc_thresholds = threshold_set_to_mc_dict(state._adaptive_thresholds)
+            except Exception:
+                pass
+        _burnout_dists = (
+            state.burnout_result.regime_distributions
+            if state.burnout_result is not None and getattr(state.burnout_result, "calibrated", False)
+            else None
+        )
+        state.mc_result = run_monte_carlo(
+            cache, returns_col=mc_ret,
+            n_paths=_mc_n,
+            importance_tilt=_mc_tilt,
+            survival_thresholds=_mc_thresholds,
+            burnout_distributions=_burnout_dists,
+        )
         logger.info("Monte Carlo complete")
     except Exception as exc:
         logger.warning("Monte Carlo failed: %s", exc)
+
+    # Fix 11: segment_hhi MC injection
+    if state.mc_result is not None and "segment_hhi" in cache.columns:
+        _seg_hhi = float(cache["segment_hhi"].iloc[-1]) if cache["segment_hhi"].notna().any() else 0
+        state.mc_result.segment_hhi = _seg_hhi
+        state.mc_result.concentration_risk_flag = _seg_hhi > 0.5
+
+    # Fix 6: FixedShare/MCS pipeline (mode-conditioned weights)
+    state._mode_weights = None
+    try:
+        if state.forward_pass_result is not None and hasattr(state.forward_pass_result, "predictions_log"):
+            from operator1.models.walk_forward import (
+                aggregate_forward_pass_errors,
+                compute_mode_confidence_sets,
+            )
+            from operator1.models.prediction_aggregator import FixedShareForecaster
+
+            _fp_log = getattr(state.forward_pass_result, "predictions_log", [])
+            if _fp_log:
+                _mode_errors = aggregate_forward_pass_errors(_fp_log, cache)
+                if _mode_errors:
+                    _mode_confidence_sets = compute_mode_confidence_sets(_mode_errors)
+                    _all_model_names = set()
+                    for mode_models in _mode_errors.values():
+                        _all_model_names.update(mode_models.keys())
+                    if _all_model_names:
+                        _fixed_share = FixedShareForecaster(sorted(_all_model_names))
+                        for mode_models in _mode_errors.values():
+                            _min_len = min(len(v) for v in mode_models.values()) if mode_models else 0
+                            for step in range(min(_min_len, 50)):
+                                step_losses = {
+                                    name: errs[step]
+                                    for name, errs in mode_models.items()
+                                    if step < len(errs)
+                                }
+                                _fixed_share.update(step_losses)
+                        state._mode_weights = {"global": _fixed_share.get_weights()}
+    except Exception:
+        pass
+
+    # Merge burn-out regime weights into mode_weights
+    if (
+        state.burnout_result is not None
+        and getattr(state.burnout_result, "calibrated", False)
+        and state.burnout_result.regime_weights
+    ):
+        if state._mode_weights is None:
+            state._mode_weights = {}
+        for regime, model_weights in state.burnout_result.regime_weights.items():
+            state._mode_weights[regime] = model_weights
 
     # Regime shift prediction
     try:
@@ -1345,17 +1514,23 @@ def run_stage2c(state: BacktestState) -> None:
     except Exception:
         pass
 
-    # Conformal prediction
+    # Conformal prediction (Fix 7: reuse forward pass calibrator when available)
     try:
         from operator1.models.conformal import ConformalPIDCalibrator, ConformalCalibrator, build_conformal_result
         if state.forecast_result is not None:
-            try:
-                calibrator = ConformalPIDCalibrator(target_coverage=0.9)
-            except Exception:
-                calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
-            if hasattr(state.forecast_result, "residuals") and state.forecast_result.residuals:
-                for r in state.forecast_result.residuals:
-                    calibrator.update(r)
+            calibrator = None
+            if (state.forward_pass_result is not None
+                    and hasattr(state.forward_pass_result, "conformal_calibrator")
+                    and state.forward_pass_result.conformal_calibrator is not None):
+                calibrator = state.forward_pass_result.conformal_calibrator
+            else:
+                try:
+                    calibrator = ConformalPIDCalibrator(target_coverage=0.9)
+                except Exception:
+                    calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
+                if hasattr(state.forecast_result, "residuals") and state.forecast_result.residuals:
+                    for r in state.forecast_result.residuals:
+                        calibrator.update(r)
             nested = {}
             if hasattr(state.forecast_result, "forecasts"):
                 for var, vf in state.forecast_result.forecasts.items():
@@ -1364,6 +1539,26 @@ def run_stage2c(state: BacktestState) -> None:
             state.conformal_result = build_conformal_result(
                 calibrator, forecasts=nested, horizons={"1d": 1, "5d": 5, "21d": 21, "252d": 252},
             )
+
+            # Fix 8: G1 Quantile Regression for asymmetric intervals
+            try:
+                from operator1.models.conformal import QuantileRegressionCalibrator
+                _qr_cal = QuantileRegressionCalibrator(lower_quantile=0.05, upper_quantile=0.95)
+                _residuals_list = list(state.forecast_result.residuals) if hasattr(state.forecast_result, "residuals") and state.forecast_result.residuals else []
+                if len(_residuals_list) >= _qr_cal._min_samples:
+                    if _qr_cal.fit(_residuals_list):
+                        if state.conformal_result is not None and hasattr(state.conformal_result, "intervals"):
+                            for var, horizons_dict in state.conformal_result.intervals.items():
+                                if isinstance(horizons_dict, dict):
+                                    for h, interval in horizons_dict.items():
+                                        pf = getattr(interval, "point_forecast", None) or getattr(interval, "forecast", None)
+                                        if pf is not None:
+                                            _lo, _hi = _qr_cal.predict_interval(float(pf))
+                                            if _lo is not None and _hi is not None:
+                                                if hasattr(interval, "lower"): interval.lower = _lo
+                                                if hasattr(interval, "upper"): interval.upper = _hi
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -1379,11 +1574,14 @@ def run_stage2c(state: BacktestState) -> None:
     except Exception:
         pass
 
-    # Prediction aggregation
+    # Prediction aggregation (Fix 3: pass mode_weights, signal_ic, prediction_log)
     if state.forecast_result is not None:
         try:
             state.pred_result = run_prediction_aggregation(
                 cache, state.forecast_result, state.mc_result,
+                mode_weights=getattr(state, "_mode_weights", None),
+                signal_ic_result=state.signal_ic_result,
+                prediction_log_summary=state.prediction_log_summary,
                 conformal_result=state.conformal_result,
                 dual_regime_result=state.dual_regime_result,
                 copula_result=state.copula_result,
@@ -1395,6 +1593,27 @@ def run_stage2c(state: BacktestState) -> None:
             logger.info("Predictions aggregated")
         except Exception as exc:
             logger.warning("Prediction aggregation failed: %s", exc)
+
+    # Fix 9: USS aggregated prediction bounding
+    if (state.survival_controller is not None
+            and state.survival_controller.is_survival
+            and state.pred_result is not None
+            and hasattr(state.pred_result, "predictions")):
+        try:
+            from operator1.analysis.survival_regime_controller import bound_survival_forecast
+            for var, horizons_dict in state.pred_result.predictions.items():
+                if isinstance(horizons_dict, dict):
+                    for h, hp in horizons_dict.items():
+                        pf = getattr(hp, "point_forecast", None)
+                        if pf is not None:
+                            bounded = bound_survival_forecast(
+                                var, float(pf), cache,
+                                state.survival_controller.current_regime,
+                            )
+                            if bounded != float(pf):
+                                hp.point_forecast = bounded
+        except Exception:
+            pass
 
     # SHAP
     try:
@@ -1759,6 +1978,247 @@ def run_stage3(state: BacktestState) -> None:
             profile["prediction_log"] = state.prediction_log_summary
         else:
             profile["prediction_log"] = {"n_filled": 0, "total_predictions": 0}
+
+        # ---------------------------------------------------------------
+        # Fix 13: Inject 17 missing profile sections (parity with main.py)
+        # ---------------------------------------------------------------
+
+        # 1. meta
+        profile.setdefault("meta", {})
+        profile["meta"]["market_id"] = state.market_id
+        profile["meta"]["pit_source"] = True
+        profile["meta"]["ohlcv_source"] = state._ohlcv_source_label
+        profile["meta"]["is_private_company"] = state._is_private
+        _has_ohlcv = "close" in cache.columns and cache["close"].notna().sum() >= 5
+        profile["meta"]["has_ohlcv"] = _has_ohlcv
+
+        # 2. enriched_survival_timeline
+        if state.enriched_timeline_result and state.enriched_timeline_result.fitted:
+            profile["enriched_survival_timeline"] = {
+                "available": True,
+                "regime_available": state.enriched_timeline_result.regime_available,
+                "mean_intensity": state.enriched_timeline_result.mean_intensity,
+                "combined_state_distribution": state.enriched_timeline_result.combined_state_distribution,
+                "base_n_switches": state.enriched_timeline_result.base.n_switches,
+                "base_mean_stability": state.enriched_timeline_result.base.mean_stability,
+            }
+        else:
+            profile["enriched_survival_timeline"] = {"available": False}
+
+        # 3. filing_calendar
+        if state.filing_calendar_result is not None:
+            profile["filing_calendar"] = {
+                "available": True,
+                "expected_frequency": state.filing_calendar_result.expected_frequency,
+                "detected_frequency": state.filing_calendar_result.detected_frequency,
+                "expected_filings_2yr": state.filing_calendar_result.expected_filings_2yr,
+                "actual_filings_2yr": state.filing_calendar_result.actual_filings_2yr,
+                "coverage_ratio": round(state.filing_calendar_result.coverage_ratio, 3),
+                "latest_filing_age_days": state.filing_calendar_result.latest_filing_age_days,
+                "is_stale": state.filing_calendar_result.is_stale,
+                "gaps": state.filing_calendar_result.gaps,
+            }
+        else:
+            profile["filing_calendar"] = {"available": False}
+
+        # 4. economic_plane
+        try:
+            from operator1.analysis.economic_planes import classify_economic_plane
+            profile["economic_plane"] = classify_economic_plane(
+                sector=state.target_profile.get("sector"),
+                industry=state.target_profile.get("industry"),
+            )
+        except Exception:
+            profile["economic_plane"] = {"primary_plane": "unknown", "secondary_planes": []}
+
+        # 5. corporate_structure
+        _parent_list = state.relationships.get("parent_companies", [])
+        _sub_list = state.relationships.get("subsidiaries", [])
+        if _parent_list or _sub_list:
+            _parent_dicts = [{"name": p.get("name", ""), "lei": p.get("lei", ""), "country": p.get("country", "")} for p in _parent_list if isinstance(p, dict)]
+            _sub_dicts = [{"name": s.get("name", ""), "lei": s.get("lei", ""), "country": s.get("country", "")} for s in _sub_list if isinstance(s, dict)]
+            _sub_countries = sorted({s.get("country", "") for s in _sub_list if isinstance(s, dict) and s.get("country")})
+            profile["corporate_structure"] = {
+                "available": True, "source": "gleif",
+                "parent_companies": _parent_dicts, "n_parents": len(_parent_dicts),
+                "subsidiaries": _sub_dicts[:10], "n_subsidiaries": len(_sub_dicts),
+                "subsidiaries_countries": _sub_countries, "cross_border": len(_sub_countries) > 1,
+            }
+        else:
+            profile["corporate_structure"] = {"available": False}
+
+        # 6. institutional_holders
+        if state.target_holders:
+            profile["institutional_holders"] = {"available": True, "holders": state.target_holders[:10], "total_holders": len(state.target_holders)}
+        else:
+            profile["institutional_holders"] = {"available": False}
+
+        # 7. institutional_ownership_analysis
+        _inst_analysis = {"available": False}
+        try:
+            _has_contagion = state.contagion_result is not None and state.contagion_result.available
+            _has_flow = "inst_flow_momentum" in cache.columns and cache["inst_flow_momentum"].notna().any()
+            if _has_contagion or _has_flow:
+                _inst_analysis = {"available": True}
+                if _has_contagion:
+                    _inst_analysis["contagion"] = {
+                        "mhhi_delta": _safe_float(state.contagion_result.mhhi_delta),
+                        "crowding_score": _safe_float(state.contagion_result.crowding_score),
+                        "n_shared": state.contagion_result.n_shared_institutions,
+                    }
+                if _has_flow:
+                    _latest = cache.iloc[-1]
+                    _inst_analysis["flow"] = {
+                        "momentum_latest": _safe_float(_latest.get("inst_flow_momentum")),
+                        "momentum_label": str(_latest.get("inst_flow_momentum_label", "unknown")),
+                    }
+        except Exception:
+            pass
+        profile["institutional_ownership_analysis"] = _inst_analysis
+
+        # 8. macro_indicators
+        if state.macro_data:
+            macro_summary = {}
+            for indicator, series in state.macro_data.items():
+                if series is not None and not series.empty:
+                    macro_summary[indicator] = {
+                        "latest_value": float(series.iloc[-1]),
+                        "latest_date": str(series.index[-1].date()),
+                        "observations": len(series),
+                    }
+            profile["macro_indicators"] = macro_summary
+
+        # 9. market_buying_power
+        if state.buying_power_result is not None and state.buying_power_result.available:
+            profile["market_buying_power"] = {
+                "available": True,
+                "buying_power_index": state.buying_power_result.buying_power_index,
+                "sector_demand_momentum": state.buying_power_result.sector_demand_momentum,
+                "demand_risk_flag": state.buying_power_result.demand_risk_flag,
+            }
+        else:
+            profile["market_buying_power"] = {"available": False}
+
+        # 10. supply_chain_stress
+        if "supply_chain_stress_flag" in cache.columns:
+            profile["supply_chain_stress"] = {
+                "available": True,
+                "supply_chain_stress_flag": bool(cache["supply_chain_stress_flag"].iloc[-1]),
+                "supply_chain_stress_score": _safe_float(cache.get("supply_chain_stress_score", pd.Series([0])).iloc[-1]),
+            }
+        else:
+            profile["supply_chain_stress"] = {"available": False}
+
+        # 11. product_catalysts
+        if state.catalyst_result is not None and state.catalyst_result.available:
+            profile["product_catalysts"] = {
+                "available": True,
+                "catalyst_score": state.catalyst_result.catalyst_score,
+                "catalyst_type": state.catalyst_result.catalyst_type,
+                "rnd_acceleration": state.catalyst_result.rnd_acceleration,
+                "news_catalyst_score": state.catalyst_result.news_catalyst_score,
+            }
+        else:
+            profile["product_catalysts"] = {"available": False}
+
+        # 12. product_segments
+        _seg = state._seg_result
+        if _seg and _seg.get("n_segments", 0) >= 2:
+            _seg_rev = _seg.get("segments", {})
+            _dominant = max(_seg_rev, key=_seg_rev.get) if _seg_rev else ""
+            _total_rev = sum(_seg_rev.values()) if _seg_rev else 0
+            _dom_pct = _seg_rev.get(_dominant, 0) / _total_rev if _total_rev > 0 else 0
+            profile["product_segments"] = {
+                "available": True, "segments": _seg.get("segments", {}),
+                "n_segments": _seg.get("n_segments", 0),
+                "dominant_segment": _dominant, "dominant_segment_pct": round(_dom_pct, 4),
+            }
+        else:
+            profile["product_segments"] = {"available": False}
+
+        # 13. model_diagnostics (computed in Stage 2d)
+        # model_diagnostics_result is local to run_stage2d; use profile injection if available
+        profile.setdefault("model_diagnostics", {"available": False})
+
+        # 14. ohlc_predictions
+        if state.ohlc_result is not None and state.ohlc_result.fitted:
+            try:
+                from operator1.models.ohlc_predictor import format_ohlc_for_profile
+                profile["ohlc_predictions"] = format_ohlc_for_profile(state.ohlc_result)
+            except Exception:
+                profile["ohlc_predictions"] = {"available": False}
+        else:
+            profile["ohlc_predictions"] = {"available": False}
+
+        # 15. predicted_regime_shifts (computed in Stage 2b, stored as local)
+        profile.setdefault("predicted_regime_shifts", {"available": False})
+
+        # 16. extended_models
+        if "extended_models" not in profile:
+            profile["extended_models"] = {}
+        if state.transfer_entropy_result is not None:
+            profile["extended_models"]["transfer_entropy"] = _available_dict(state.transfer_entropy_result)
+        if state.cycle_result is not None:
+            profile["extended_models"]["cycle_decomposition"] = _available_dict(state.cycle_result)
+        if state.pattern_result is not None:
+            profile["extended_models"]["candlestick_patterns"] = _available_dict(state.pattern_result)
+        if state.copula_result is not None:
+            profile["extended_models"]["copula"] = _available_dict(state.copula_result)
+        if state.conformal_result is not None:
+            profile["extended_models"]["conformal_prediction"] = _available_dict(state.conformal_result)
+        if state.dtw_result is not None:
+            profile["extended_models"]["dtw_analogs"] = _available_dict(state.dtw_result)
+        if state.shap_result is not None:
+            profile["extended_models"]["shap_explanations"] = _available_dict(state.shap_result)
+        if state.sobol_result is not None:
+            profile["extended_models"]["sobol_sensitivity"] = _available_dict(state.sobol_result)
+        if state.particle_filter_result is not None:
+            profile["extended_models"]["particle_filter"] = _available_dict(state.particle_filter_result)
+        if state.transformer_result is not None:
+            profile["extended_models"]["transformer"] = _available_dict(state.transformer_result)
+        if state.granger_result is not None and state.granger_result.fitted:
+            profile["extended_models"]["granger_causality"] = {
+                "available": True,
+                "n_significant_pairs": len(state.granger_result.significant_pairs),
+                "network_density": state.granger_result.network_density,
+            }
+        if state.dual_regime_result is not None and state.dual_regime_result.fitted:
+            profile["extended_models"]["dual_regimes"] = {"available": True}
+        if state.walk_forward_result is not None:
+            profile["extended_models"]["walk_forward"] = {
+                "available": True,
+                "overall_mae": getattr(state.walk_forward_result, "overall_mae", None),
+                "overall_best_model": getattr(state.walk_forward_result, "overall_best_model", None),
+            }
+        if state.burnout_result is not None:
+            profile["extended_models"]["burnout"] = {
+                "available": True,
+                "converged": state.burnout_result.converged,
+                "calibrated": getattr(state.burnout_result, "calibrated", False),
+            }
+        if state.ga_result is not None and state.ga_result.fitted:
+            profile["extended_models"]["genetic_optimizer"] = {"available": True}
+        if state._tv_granger_result is not None and state._tv_granger_result.get("n_windows", 0) > 0:
+            profile["extended_models"]["time_varying_granger"] = {
+                "available": True, "n_windows": state._tv_granger_result["n_windows"],
+            }
+        if state._mv_mc_result is not None and state._mv_mc_result.get("available"):
+            profile["extended_models"]["multivariate_monte_carlo"] = state._mv_mc_result
+
+        # 17. synergies_applied
+        if state._synergy_meta:
+            profile["synergies_applied"] = {
+                "cycle_features_added": state._synergy_meta.get("cycle_features_added", []),
+                "variables_after_pruning": state._synergy_meta.get("variables_after_pruning", 0),
+            }
+
+        # Linked conflict injection
+        if state.linked_conflict and isinstance(state.linked_conflict, dict):
+            profile.setdefault("conflict_risk", {})["linked_conflict"] = state.linked_conflict
+
+        # ---------------------------------------------------------------
+        # End Fix 13
+        # ---------------------------------------------------------------
 
         # Position signal
         try:
@@ -2139,10 +2599,9 @@ Examples:
 """,
     )
     parser.add_argument("--stage", type=str, default="all",
-                        choices=["1", "2", "2a", "2b", "2c", "2d", "3", "all"],
-                        help="Which stage to run. Stage 2 is split into sub-stages "
-                             "(2a=regime+causality+forecasting, 2b=forward+burnout+MC, "
-                             "2c=ensemble+ML, 2d=USS+multifreq). Use '2' to run all sub-stages.")
+                        choices=["1", "2", "2a", "2a1", "2a2", "2b", "2c", "2d", "3", "all"],
+                        help="Which stage to run. Stage 2a is split into 2a1 (regime+causality+patterns) "
+                             "and 2a2 (forecasting). Use '2a' to run both, '2' for all sub-stages.")
     parser.add_argument("--market", type=str, default="us_sec_edgar",
                         help="Market ID (e.g. us_sec_edgar, kr_dart, jp_jquants)")
     parser.add_argument("--company", type=str, default="AAPL",
@@ -2181,15 +2640,19 @@ Examples:
 
     # Build ordered list of stages to run
     if args.stage == "all":
-        stages = ["1", "2a", "2b", "2c", "2d", "3"]
+        stages = ["1", "2a1", "2a2", "2b", "2c", "2d", "3"]
     elif args.stage == "2":
-        stages = ["2a", "2b", "2c", "2d"]
+        stages = ["2a1", "2a2", "2b", "2c", "2d"]
+    elif args.stage == "2a":
+        stages = ["2a1", "2a2"]
     else:
         stages = [args.stage]
 
     _STAGE_FUNCS = {
         "1": run_stage1,
         "2a": run_stage2a,
+        "2a1": run_stage2a1,
+        "2a2": run_stage2a2,
         "2b": run_stage2b,
         "2c": run_stage2c,
         "2d": run_stage2d,
@@ -2199,7 +2662,9 @@ Examples:
     _STAGE_DEPS = {
         "1": None,
         "2a": 1,
-        "2b": "2a",
+        "2a1": 1,
+        "2a2": "2a1",
+        "2b": "2a2",
         "2c": "2b",
         "2d": "2c",
         "3": "2d",
