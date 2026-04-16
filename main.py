@@ -2456,23 +2456,23 @@ Non-interactive examples:
         _ps.fuzzy_result = fuzzy_result
         _ps.relationships = relationships
         _ps.linked_caches = linked_caches
-        _ps.linked_agg_df = linked_agg_df if 'linked_agg_df' in dir() else None
+        _ps.linked_agg_df = locals().get("linked_agg_df")
         _ps.graph_risk_result = graph_risk_result
         _ps.game_theory_result = game_theory_result
-        _ps.contagion_result = contagion_result if 'contagion_result' in dir() else None
+        _ps.contagion_result = locals().get("contagion_result")
         _ps.peer_ranking_result = peer_ranking_result
         _ps.sentiment_result = sentiment_result
         _ps.catalyst_result = catalyst_result
-        _ps.signal_ic_result = signal_ic_result if 'signal_ic_result' in dir() else None
-        _ps.prediction_log_summary = prediction_log_summary if 'prediction_log_summary' in dir() else None
+        _ps.signal_ic_result = locals().get("signal_ic_result")
+        _ps.prediction_log_summary = locals().get("prediction_log_summary")
         _ps.enriched_timeline_result = enriched_timeline_result
         _ps.early_regime_result = early_regime_result
         _ps.regime_detector = regime_detector
-        _ps.survival_controller = survival_controller if 'survival_controller' in dir() else None
+        _ps.survival_controller = locals().get("survival_controller")
         _ps.is_private = _is_private
-        _ps.adaptive_thresholds = _adaptive_thresholds if '_adaptive_thresholds' in dir() else None
-        _ps.adaptive_model_params = _adaptive_model_params if '_adaptive_model_params' in dir() else None
-        _ps.adaptive_tier3 = _adaptive_tier3 if '_adaptive_tier3' in dir() else None
+        _ps.adaptive_thresholds = locals().get("_adaptive_thresholds")
+        _ps.adaptive_model_params = locals().get("_adaptive_model_params")
+        _ps.adaptive_tier3 = locals().get("_adaptive_tier3")
 
         # Save Stage 2 checkpoint (pre-temporal), then run requested stages
         _ps.save("2.9")
@@ -2506,6 +2506,7 @@ Non-interactive examples:
         _pattern_drift = _ps.pattern_drift
         weights = _ps.weights
         regime_detector = _ps.regime_detector
+        _economic_plane = _ps.economic_plane
         # Stage 7 results (if stage spec included them)
         scenario_result = _ps.scenario_result
         _retro_params = _ps.retro_params
