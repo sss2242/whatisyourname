@@ -441,6 +441,24 @@ Non-interactive examples:
         "--verbose", "-v", action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--stage", type=str, default="",
+        help=(
+            "Run specific pipeline stage(s) with checkpoint save/resume. "
+            "Examples: '3' (temporal analysis), '4.1' (forecasting), "
+            "'3-6' (stages 3 through 6), 'all' (all temporal stages 3-6). "
+            "Requires --run-dir for state persistence. "
+            "Stages: 3=temporal, 4=forecasting, 5=forward+MC, 6=ensemble."
+        ),
+    )
+    parser.add_argument(
+        "--run-dir", type=str, default="",
+        help=(
+            "Directory for staged pipeline state checkpoints. "
+            "Used with --stage to save/resume between sub-stages. "
+            "Auto-generated as cache/{company}_{end_date} if not set."
+        ),
+    )
     args = parser.parse_args()
 
     if args.verbose:
@@ -2409,7 +2427,99 @@ Non-interactive examples:
     _synergy_meta = {}
     _pattern_drift = 1.0
 
-    if not args.skip_models:
+    # ------------------------------------------------------------------
+    # Staged execution: when --stage is set, delegate to the stage runner
+    # with per-model sub-stage checkpoint save/resume.
+    # ------------------------------------------------------------------
+    if args.stage and not args.skip_models:
+        from operator1.pipeline_state import PipelineState
+        from operator1.stages.runner import run_stages
+
+        _run_dir = args.run_dir or f"{args.output_dir}/{args.company}_{args.end_date or 'latest'}"
+
+        # Build PipelineState from current local variables
+        _ps = PipelineState(
+            market_id=args.market,
+            company=args.company,
+            end_date=args.end_date,
+            years=args.years,
+            output_dir=_run_dir,
+        )
+        _ps.cache = cache
+        _ps.target_profile = target_profile
+        _ps.income_df = income_df
+        _ps.balance_df = balance_df
+        _ps.cashflow_df = cashflow_df
+        _ps.quotes_df = quotes_df
+        _ps.weights = weights
+        _ps.fh_result = fh_result
+        _ps.fuzzy_result = fuzzy_result
+        _ps.relationships = relationships
+        _ps.linked_caches = linked_caches
+        _ps.linked_agg_df = locals().get("linked_agg_df")
+        _ps.graph_risk_result = graph_risk_result
+        _ps.game_theory_result = game_theory_result
+        _ps.contagion_result = locals().get("contagion_result")
+        _ps.peer_ranking_result = peer_ranking_result
+        _ps.sentiment_result = sentiment_result
+        _ps.catalyst_result = catalyst_result
+        _ps.signal_ic_result = locals().get("signal_ic_result")
+        _ps.prediction_log_summary = locals().get("prediction_log_summary")
+        _ps.enriched_timeline_result = enriched_timeline_result
+        _ps.early_regime_result = early_regime_result
+        _ps.regime_detector = regime_detector
+        _ps.survival_controller = locals().get("survival_controller")
+        _ps.is_private = _is_private
+        _ps.adaptive_thresholds = locals().get("_adaptive_thresholds")
+        _ps.adaptive_model_params = locals().get("_adaptive_model_params")
+        _ps.adaptive_tier3 = locals().get("_adaptive_tier3")
+
+        # Save Stage 2 checkpoint (pre-temporal), then run requested stages
+        _ps.save("2.9")
+        logger.info("Staged execution: running --stage %s", args.stage)
+        run_stages(_ps, args.stage, save_checkpoints=True)
+
+        # Copy results back to local variables for Step 7+8
+        cache = _ps.cache
+        forecast_result = _ps.forecast_result
+        forward_pass_result = _ps.forward_pass_result
+        walk_forward_result = _ps.walk_forward_result
+        burnout_result = _ps.burnout_result
+        mc_result = _ps.mc_result
+        pred_result = _ps.pred_result
+        transfer_entropy_result = _ps.transfer_entropy_result
+        cycle_result = _ps.cycle_result
+        pattern_result = _ps.pattern_result
+        copula_result = _ps.copula_result
+        conformal_result = _ps.conformal_result
+        dtw_result = _ps.dtw_result
+        shap_result = _ps.shap_result
+        sobol_result = _ps.sobol_result
+        particle_filter_result = _ps.particle_filter_result
+        transformer_result = _ps.transformer_result
+        dual_regime_result = _ps.dual_regime_result
+        granger_result = _ps.granger_result
+        ga_result = _ps.ga_result
+        ohlc_result = _ps.ohlc_result
+        regime_shift_result = _ps.regime_shift_result
+        _synergy_meta = _ps.synergy_meta
+        _pattern_drift = _ps.pattern_drift
+        weights = _ps.weights
+        regime_detector = _ps.regime_detector
+        _economic_plane = _ps.economic_plane
+        # Stage 7 results (if stage spec included them)
+        scenario_result = _ps.scenario_result
+        _retro_params = _ps.retro_params
+        model_diagnostics_result = _ps.model_diagnostics_result
+        multi_frequency_result = _ps.multi_frequency_result
+        hf_result = _ps.hf_result
+        _mode_weights = _ps.mode_weights
+        _tv_granger_result = _ps.tv_granger_result
+        _mv_mc_result = _ps.mv_mc_result
+
+        logger.info("Staged execution complete -- continuing to output stages")
+
+    elif not args.skip_models:
         logger.info("")
         logger.info("Step 6: Running temporal models...")
 
@@ -3243,7 +3353,11 @@ Non-interactive examples:
     # ------------------------------------------------------------------
     # Apply forecast bounding (Dimension 5) and run scenario engine
     # when survival mode is active.
-    if survival_controller is not None and not args.skip_models:
+    # SKIP when --stage was used: the staged runner (Stage 7) already
+    # handled USS, retro calibration, diagnostics, multi-freq, and HF.
+    if args.stage:
+        logger.info("Steps 6-USS through 6-HF: handled by staged runner")
+    elif survival_controller is not None and not args.skip_models:
         # Forecast bounding: apply hard bounds to survival-mode forecasts
         if survival_controller.is_survival and forecast_result is not None:
             try:
@@ -3292,7 +3406,7 @@ Non-interactive examples:
     # model weight matrices that were initially set to fixed defaults.
     # Empirical Bayes: use first-pass data to set second-pass priors.
     _retro_params = None
-    if not args.skip_models:
+    if not args.skip_models and not args.stage:
         try:
             from operator1.analysis.retroactive_calibration import run_retroactive_calibration
 
@@ -3364,7 +3478,7 @@ Non-interactive examples:
     # with cascading context. Each slower frequency's insights constrain
     # the next faster frequency's predictions.
     multi_frequency_result = None
-    if not args.skip_models:
+    if not args.skip_models and not args.stage:
         try:
             from operator1.steps.multi_frequency_runner import run_multi_frequency_pipeline
             from operator1.models.frequency_fusion import fuse_multi_frequency_results
@@ -3405,7 +3519,7 @@ Non-interactive examples:
     # Parallel analytical track: 15 investment-grade metrics across 5 tiers.
     # Reads from raw statement DFs (not the daily cache) for most metrics.
     hf_result = None
-    if not args.skip_models:
+    if not args.skip_models and not args.stage:
         try:
             from operator1.hedge_fund.engine import run_hedge_fund_analysis
 
