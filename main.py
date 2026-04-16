@@ -441,6 +441,24 @@ Non-interactive examples:
         "--verbose", "-v", action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--stage", type=str, default="",
+        help=(
+            "Run specific pipeline stage(s) with checkpoint save/resume. "
+            "Examples: '3' (temporal analysis), '4.1' (forecasting), "
+            "'3-6' (stages 3 through 6), 'all' (all temporal stages 3-6). "
+            "Requires --run-dir for state persistence. "
+            "Stages: 3=temporal, 4=forecasting, 5=forward+MC, 6=ensemble."
+        ),
+    )
+    parser.add_argument(
+        "--run-dir", type=str, default="",
+        help=(
+            "Directory for staged pipeline state checkpoints. "
+            "Used with --stage to save/resume between sub-stages. "
+            "Auto-generated as cache/{company}_{end_date} if not set."
+        ),
+    )
     args = parser.parse_args()
 
     if args.verbose:
@@ -2409,7 +2427,89 @@ Non-interactive examples:
     _synergy_meta = {}
     _pattern_drift = 1.0
 
-    if not args.skip_models:
+    # ------------------------------------------------------------------
+    # Staged execution: when --stage is set, delegate to the stage runner
+    # with per-model sub-stage checkpoint save/resume.
+    # ------------------------------------------------------------------
+    if args.stage and not args.skip_models:
+        from operator1.pipeline_state import PipelineState
+        from operator1.stages.runner import run_stages
+
+        _run_dir = args.run_dir or f"{args.output_dir}/{args.company}_{args.end_date or 'latest'}"
+
+        # Build PipelineState from current local variables
+        _ps = PipelineState(
+            market_id=args.market,
+            company=args.company,
+            end_date=args.end_date,
+            years=args.years,
+            output_dir=_run_dir,
+        )
+        _ps.cache = cache
+        _ps.target_profile = target_profile
+        _ps.income_df = income_df
+        _ps.balance_df = balance_df
+        _ps.cashflow_df = cashflow_df
+        _ps.quotes_df = quotes_df
+        _ps.weights = weights
+        _ps.fh_result = fh_result
+        _ps.fuzzy_result = fuzzy_result
+        _ps.relationships = relationships
+        _ps.linked_caches = linked_caches
+        _ps.linked_agg_df = linked_agg_df if 'linked_agg_df' in dir() else None
+        _ps.graph_risk_result = graph_risk_result
+        _ps.game_theory_result = game_theory_result
+        _ps.contagion_result = contagion_result if 'contagion_result' in dir() else None
+        _ps.peer_ranking_result = peer_ranking_result
+        _ps.sentiment_result = sentiment_result
+        _ps.catalyst_result = catalyst_result
+        _ps.signal_ic_result = signal_ic_result if 'signal_ic_result' in dir() else None
+        _ps.prediction_log_summary = prediction_log_summary if 'prediction_log_summary' in dir() else None
+        _ps.enriched_timeline_result = enriched_timeline_result
+        _ps.early_regime_result = early_regime_result
+        _ps.regime_detector = regime_detector
+        _ps.survival_controller = survival_controller if 'survival_controller' in dir() else None
+        _ps.is_private = _is_private
+        _ps.adaptive_thresholds = _adaptive_thresholds if '_adaptive_thresholds' in dir() else None
+        _ps.adaptive_model_params = _adaptive_model_params if '_adaptive_model_params' in dir() else None
+        _ps.adaptive_tier3 = _adaptive_tier3 if '_adaptive_tier3' in dir() else None
+
+        # Save Stage 2 checkpoint (pre-temporal), then run requested stages
+        _ps.save("2.9")
+        logger.info("Staged execution: running --stage %s", args.stage)
+        run_stages(_ps, args.stage, save_checkpoints=True)
+
+        # Copy results back to local variables for Step 7+8
+        cache = _ps.cache
+        forecast_result = _ps.forecast_result
+        forward_pass_result = _ps.forward_pass_result
+        walk_forward_result = _ps.walk_forward_result
+        burnout_result = _ps.burnout_result
+        mc_result = _ps.mc_result
+        pred_result = _ps.pred_result
+        transfer_entropy_result = _ps.transfer_entropy_result
+        cycle_result = _ps.cycle_result
+        pattern_result = _ps.pattern_result
+        copula_result = _ps.copula_result
+        conformal_result = _ps.conformal_result
+        dtw_result = _ps.dtw_result
+        shap_result = _ps.shap_result
+        sobol_result = _ps.sobol_result
+        particle_filter_result = _ps.particle_filter_result
+        transformer_result = _ps.transformer_result
+        dual_regime_result = _ps.dual_regime_result
+        granger_result = _ps.granger_result
+        ga_result = _ps.ga_result
+        ohlc_result = _ps.ohlc_result
+        regime_shift_result = _ps.regime_shift_result
+        _synergy_meta = _ps.synergy_meta
+        _pattern_drift = _ps.pattern_drift
+        weights = _ps.weights
+        regime_detector = _ps.regime_detector
+
+        logger.info("Staged execution complete -- continuing to Step 7")
+
+    elif not args.skip_models:
         logger.info("")
         logger.info("Step 6: Running temporal models...")
 
