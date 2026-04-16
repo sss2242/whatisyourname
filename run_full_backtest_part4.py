@@ -41,7 +41,7 @@ forecast_result.horizons = list(HORIZONS.keys())
 # Collect all model forecasts into ForecastResult
 model_outputs = {}
 for key in results:
-    if key.startswith(("kalman_","xgb_","autoarima_","garch_forecasts","garch_midas")):
+    if key.startswith(("kalman_","xgb_","ets_","garch_forecasts","garch_midas")):
         if key == "garch_forecasts":
             model_outputs["volatility_garch"] = results[key]
         elif key == "garch_midas_forecasts":
@@ -110,7 +110,7 @@ for key in results:
 MODEL_WEIGHTS = {
     "kalman_close": 3.0,
     "xgb_close": 2.5,
-    "autoarima_close": 2.0,
+    "ets_close": 2.0,
 }
 DEFAULT_WEIGHT = 1.0
 

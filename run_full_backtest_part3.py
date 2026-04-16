@@ -56,7 +56,7 @@ try:
     # Build forecasts dict for conformal
     nested = {}
     for key in results:
-        if key.startswith("kalman_") or key.startswith("xgb_") or key.startswith("autoarima_"):
+        if key.startswith("kalman_") or key.startswith("xgb_") or key.startswith("ets_"):
             var = key.split("_", 1)[1]
             if var not in nested: nested[var] = {}
             for h, v in results[key].items():

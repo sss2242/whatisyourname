@@ -403,36 +403,37 @@ def fit_kalman_per_regime(
 
 
 # ---------------------------------------------------------------------------
-# 1a. AutoARIMA via statsforecast (100x faster than statsmodels)
+# 1a. ETS via statsforecast (replaces AutoARIMA -- 10-50x faster, competitive accuracy)
 # ---------------------------------------------------------------------------
 
 
-def fit_autoarima(
+def fit_ets(
     series: np.ndarray,
     n_forecast: int = 1,
     season_length: int = 63,
-    timeout_seconds: int = 30,
 ) -> tuple[np.ndarray | None, ModelMetrics]:
-    """Fit AutoARIMA using statsforecast (fast Rust backend).
+    """Fit ETS (Error-Trend-Seasonality) using statsforecast.
 
-    Automatically selects ARIMA(p,d,q) order via AIC. 100x faster than
-    statsmodels for single-series ARIMA fitting. Handles seasonality
-    (quarterly earnings cycle at ~63 business days).
+    Exponential smoothing state-space model with automatic model selection.
+    Replaces AutoARIMA: 10-50x faster with competitive accuracy on financial
+    time series (M3/M4 competition results show ETS matches or beats ARIMA
+    on average).  Unlike ARIMA's grid search over (p,d,q) orders, ETS
+    selects among 30 model configurations via information criteria in a
+    single pass.
 
-    Parameters
-    ----------
-    timeout_seconds:
-        Maximum seconds for the fit. If exceeded, returns None so the
-        model cascade falls through to the next model. Default: 30s.
+    The Kalman filter already captures the same linear autoregressive
+    dynamics that ARIMA models; ETS adds complementary exponential
+    smoothing dynamics (level, trend, damped trend, seasonality) that
+    the Kalman local-level model does not cover.
 
-    Falls back to None if statsforecast is not installed or times out.
+    Falls back to None if statsforecast is not installed.
     """
-    metrics = ModelMetrics(model_name="autoarima")
+    metrics = ModelMetrics(model_name="ets")
 
     try:
-        from statsforecast.models import AutoARIMA
+        from statsforecast.models import AutoETS
     except ImportError:
-        metrics.error = "statsforecast not installed -- skipping AutoARIMA"
+        metrics.error = "statsforecast not installed -- skipping ETS"
         return None, metrics
 
     clean = series[~np.isnan(series)]
@@ -440,36 +441,15 @@ def fit_autoarima(
         metrics.error = f"Insufficient observations ({len(clean)})"
         return None, metrics
 
-    import signal as _signal
     import time as _time
 
-    class _AutoARIMATimeout(Exception):
-        pass
-
-    def _timeout_handler(signum, frame):
-        raise _AutoARIMATimeout()
-
     try:
-        # Set alarm-based timeout (Unix only, no-op on Windows)
-        _old_handler = None
-        _use_alarm = hasattr(_signal, "SIGALRM")
-        # Guard: signal.signal() raises ValueError in non-main threads
-        try:
-            import threading
-            if threading.current_thread() is not threading.main_thread():
-                _use_alarm = False
-        except Exception:
-            pass
-        if _use_alarm:
-            _old_handler = _signal.signal(_signal.SIGALRM, _timeout_handler)
-            _signal.alarm(timeout_seconds)
-
         _t0 = _time.time()
         train, test = _split_train_test(clean)
 
-        # Fit on train split for validation metrics
         _sl = min(season_length, len(train) // 3)
-        model = AutoARIMA(season_length=_sl)
+        # AutoETS selects best among 30 ETS model configurations via AIC
+        model = AutoETS(season_length=_sl)
         model.fit(train)
 
         # Validation
@@ -482,14 +462,9 @@ def fit_autoarima(
 
         # Refit on full data so predict(h=1) forecasts from the end of the
         # series, not from the 85th-percentile train/test split boundary.
-        full_model = AutoARIMA(season_length=_sl)
+        full_model = AutoETS(season_length=_sl)
         full_model.fit(clean)
         forecasts = full_model.predict(h=n_forecast)["mean"]
-
-        # Cancel alarm
-        if _use_alarm:
-            _signal.alarm(0)
-            _signal.signal(_signal.SIGALRM, _old_handler or _signal.SIG_DFL)
 
         metrics.mae = mae
         metrics.rmse = rmse
@@ -499,25 +474,13 @@ def fit_autoarima(
 
         _elapsed = _time.time() - _t0
         logger.info(
-            "AutoARIMA fit: %d train, %d test, MAE=%.6f (%.1fs)",
+            "ETS fit: %d train, %d test, MAE=%.6f (%.1fs)",
             len(train), len(test), mae, _elapsed,
         )
         return np.array(forecasts), metrics
 
-    except _AutoARIMATimeout:
-        if _use_alarm:
-            _signal.alarm(0)
-            _signal.signal(_signal.SIGALRM, _old_handler or _signal.SIG_DFL)
-        metrics.error = f"AutoARIMA timed out after {timeout_seconds}s"
-        logger.warning(metrics.error)
-        return None, metrics
-
     except Exception as exc:
-        if _use_alarm:
-            _signal.alarm(0)
-            if _old_handler is not None:
-                _signal.signal(_signal.SIGALRM, _old_handler)
-        metrics.error = f"AutoARIMA failed: {exc}"
+        metrics.error = f"ETS failed: {exc}"
         logger.debug(metrics.error)
         return None, metrics
 
@@ -2270,7 +2233,7 @@ def run_forecasting(
             # if the cascade winner was an autoregressive model (Kalman, GARCH, VAR, LSTM)
             _ar_models = {"kalman", "kalman_per_regime", "kalman_burnout", "kalman_dfm",
                           "garch", "var", "ar1", "lstm", "lstm_fallback_gbm",
-                          "lstm_fallback_lr", "autoarima"}
+                          "lstm_fallback_lr", "ets"}
             if best_model_name.lower().split("(")[0] in _ar_models:
                 feat_df = _extract_features(var_name)
                 if not feat_df.empty:
@@ -2290,18 +2253,18 @@ def run_forecasting(
                                 _tree_weight = 0.6 if h == 21 else 0.8
                                 _horizon_forecasts[label] = _tree_weight * _tree_val + (1 - _tree_weight) * _ar_val
 
-            # Also try AutoARIMA for medium horizons (5d-21d) if not already the winner
-            if best_model_name != "autoarima":
-                _arima_fcast, _arima_met = fit_autoarima(
+            # Also try ETS for medium horizons (5d-21d) if not already the winner
+            if best_model_name != "ets":
+                _ets_fcast, _ets_met = fit_ets(
                     series[~np.isnan(series)],
                     n_forecast=max_horizon,
                 )
-                if _arima_fcast is not None and _arima_met.fitted:
-                    # For 5d: blend 30% ARIMA + 70% cascade winner
+                if _ets_fcast is not None and _ets_met.fitted:
+                    # For 5d: blend 30% ETS + 70% cascade winner
                     for label, h in [(l, hh) for l, hh in HORIZONS.items() if 5 <= hh <= 21]:
-                        _arima_val = float(_arima_fcast[min(h - 1, len(_arima_fcast) - 1)])
-                        _arima_weight = 0.3 if h == 5 else 0.2  # Less weight at 21d (tree dominates)
-                        _horizon_forecasts[label] = (1 - _arima_weight) * _horizon_forecasts[label] + _arima_weight * _arima_val
+                        _ets_val = float(_ets_fcast[min(h - 1, len(_ets_fcast) - 1)])
+                        _ets_weight = 0.3 if h == 5 else 0.2  # Less weight at 21d (tree dominates)
+                        _horizon_forecasts[label] = (1 - _ets_weight) * _horizon_forecasts[label] + _ets_weight * _ets_val
 
         # Store results.
         if best_forecast is not None:

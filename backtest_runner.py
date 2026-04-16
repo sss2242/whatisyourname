@@ -1754,27 +1754,9 @@ def run_stage2d(state: BacktestState) -> None:
     except Exception as exc:
         logger.debug("USS integration skipped: %s", exc)
 
-    # Multi-frequency forecasting
+    # Multi-frequency forecasting (per-frequency sub-stages)
     try:
-        from operator1.steps.multi_frequency_runner import run_multi_frequency_pipeline
-        from operator1.models.frequency_fusion import fuse_multi_frequency_results
-        _bt_end = datetime.strptime(state.end_date, "%Y-%m-%d").date()
-        _mf = run_multi_frequency_pipeline(
-            daily_cache=cache, secrets=state._secrets,
-            market_id=state.market_id, ticker=state.company,
-            reference_date=_bt_end,
-            income_df=state._income_df if not state._income_df.empty else None,
-            balance_df=state._balance_df if not state._balance_df.empty else None,
-            cashflow_df=state._cashflow_df if not state._cashflow_df.empty else None,
-            quotes_df=state._quotes_df if not state._quotes_df.empty else None,
-        )
-        if _mf and _mf.results:
-            state.multi_frequency_result = fuse_multi_frequency_results(_mf)
-            logger.info(
-                "Multi-frequency: %d frequencies, survival=%.1f%%",
-                state.multi_frequency_result.n_frequencies_used,
-                state.multi_frequency_result.survival.fused_probability * 100,
-            )
+        _run_bt_mf_all(state)
     except Exception as exc:
         logger.warning("Multi-frequency failed: %s", exc)
 
@@ -1838,6 +1820,434 @@ def run_stage2(state: BacktestState) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Multi-frequency per-frequency sub-stages (used by run_stage2d and dispatch)
+# ---------------------------------------------------------------------------
+
+def _bt_mf_prep(state: BacktestState) -> None:
+    """Build all ResampledCache objects and save to disk."""
+    from operator1.features.frequency_resampler import (
+        build_cache_from_raw_filings, detect_all_filing_frequencies,
+        detect_native_filing_frequency, get_frequencies_slow_to_fast,
+        is_annual_only_market, resample_cache_to_frequency,
+    )
+    cache = state.cache
+    _bt_end = datetime.strptime(state.end_date, "%Y-%m-%d").date()
+    _has_raw = any(not df.empty for df in [state._income_df, state._balance_df, state._cashflow_df])
+    _is_ann = is_annual_only_market(state.market_id)
+    freqs = get_frequencies_slow_to_fast()
+    # Detect semi-annual
+    if _has_raw and "Q" in freqs:
+        _all_f = detect_all_filing_frequencies(state._income_df, state._balance_df, state._cashflow_df)
+        _nat = detect_native_filing_frequency(state._income_df, state._balance_df, state._cashflow_df)
+        if "Q" in _all_f and "S" in _all_f:
+            if "S" not in freqs:
+                freqs.insert(freqs.index("Q"), "S")
+        elif _nat == "S" and "Q" not in _all_f:
+            freqs = [("S" if f == "Q" else f) for f in freqs]
+    # Save freq list
+    import json as _json
+    _mf_dir = Path(state.run_dir) / "mf"
+    _mf_dir.mkdir(parents=True, exist_ok=True)
+    (_mf_dir / "frequencies.json").write_text(_json.dumps(freqs))
+    # Build each cache
+    for freq in freqs:
+        inc = state._income_df if not state._income_df.empty else None
+        bal = state._balance_df if not state._balance_df.empty else None
+        cf = state._cashflow_df if not state._cashflow_df.empty else None
+        qt = state._quotes_df if not state._quotes_df.empty else None
+        if freq in ("Q", "A", "W", "M", "S") and _has_raw:
+            resampled = build_cache_from_raw_filings(
+                income_df=inc, balance_df=bal, cashflow_df=cf, quotes_df=qt,
+                frequency=freq, reference_date=_bt_end,
+            )
+        else:
+            resampled = resample_cache_to_frequency(cache, frequency=freq, reference_date=_bt_end)
+        if resampled.n_periods < 3:
+            logger.info("[%s] Skipping -- %d periods (need 3+)", freq, resampled.n_periods)
+            continue
+        resampled.cache.to_parquet(_mf_dir / f"{freq}_cache.parquet")
+        meta = {"frequency": resampled.frequency, "label": resampled.label,
+                "n_periods": resampled.n_periods, "lookback_years": resampled.lookback_years,
+                "is_partial_last_period": resampled.is_partial_last_period,
+                "original_daily_rows": resampled.original_daily_rows,
+                "resampled_rows": resampled.resampled_rows}
+        (_mf_dir / f"{freq}_meta.json").write_text(_json.dumps(meta, indent=2))
+        logger.info("[%s] Resampled: %d periods", freq, resampled.n_periods)
+
+
+def _bt_mf_run_freq(state: BacktestState, freq: str) -> None:
+    """Run the FULL temporal pipeline (2a1->2a2->2b->2c) for a single frequency.
+
+    Each frequency gets its own BacktestState with the resampled cache.
+    The existing stage functions operate on whatever state.cache contains,
+    so no changes needed to them.  Results are saved to {run_dir}/mf/{freq}/.
+    """
+    import json as _json
+    _mf_dir = Path(state.run_dir) / "mf"
+    cp = _mf_dir / f"{freq}_cache.parquet"
+    if not cp.exists():
+        logger.info("[%s] No cache -- skipping", freq)
+        return
+
+    logger.info("=" * 60)
+    logger.info("FULL TEMPORAL PIPELINE: frequency=%s", freq)
+    logger.info("=" * 60)
+
+    # Create a per-frequency state by copying the shared Stage 1 state
+    freq_state = BacktestState()
+    freq_state.market_id = state.market_id
+    freq_state.company = state.company
+    freq_state.end_date = state.end_date
+    freq_state.years = state.years
+    freq_state.run_dir = str(_mf_dir / freq)  # per-freq output dir
+    freq_state._secrets = state._secrets
+    freq_state._llm_client = state._llm_client
+    freq_state._pit_client = state._pit_client
+
+    # Copy Stage 1 results that don't depend on frequency
+    freq_state.target_profile = state.target_profile
+    freq_state.relationships = state.relationships
+    freq_state.linked_caches = state.linked_caches
+    freq_state.macro_data = state.macro_data
+    freq_state.macro_dataset = state.macro_dataset
+    freq_state.weights = state.weights.copy() if state.weights else {}
+    freq_state.fh_result = state.fh_result
+    freq_state.conflict_result = state.conflict_result
+    freq_state.buying_power_result = state.buying_power_result
+    freq_state.filing_calendar_result = state.filing_calendar_result
+    freq_state.estimation_coverage = state.estimation_coverage
+    freq_state.fuzzy_result = state.fuzzy_result
+    freq_state.macro_quadrant_result = state.macro_quadrant_result
+    freq_state.target_holders = state.target_holders
+    freq_state.target_insiders = state.target_insiders
+    freq_state.signal_ic_result = state.signal_ic_result
+    freq_state._adaptive_thresholds = state._adaptive_thresholds
+    freq_state._adaptive_model_params = state._adaptive_model_params
+    freq_state._adaptive_tier3 = state._adaptive_tier3
+    freq_state._is_private = state._is_private
+    freq_state._ohlcv_source_label = state._ohlcv_source_label
+    freq_state._seg_result = state._seg_result
+    freq_state._income_df = state._income_df
+    freq_state._balance_df = state._balance_df
+    freq_state._cashflow_df = state._cashflow_df
+    freq_state._quotes_df = state._quotes_df
+
+    # Load the resampled cache for this frequency
+    freq_state.cache = pd.read_parquet(cp)
+    logger.info("[%s] Loaded resampled cache: %d rows x %d cols",
+                freq, len(freq_state.cache), len(freq_state.cache.columns))
+
+    # Run the full temporal pipeline (2a1 -> 2a2 -> 2b -> 2c)
+    t0 = time.time()
+    try:
+        run_stage2a1(freq_state)
+    except Exception as exc:
+        logger.warning("[%s] Stage 2a1 failed: %s", freq, exc)
+
+    try:
+        run_stage2a2(freq_state)
+    except Exception as exc:
+        logger.warning("[%s] Stage 2a2 failed: %s", freq, exc)
+
+    try:
+        run_stage2b(freq_state)
+    except Exception as exc:
+        logger.warning("[%s] Stage 2b failed: %s", freq, exc)
+
+    try:
+        run_stage2c(freq_state)
+    except Exception as exc:
+        logger.warning("[%s] Stage 2c failed: %s", freq, exc)
+
+    elapsed = time.time() - t0
+
+    # Save full per-frequency state
+    freq_state.save_sub("2c")
+
+    logger.info("[%s] Full temporal pipeline complete: %.1fs", freq, elapsed)
+
+
+def _bt_mf_fuse(state: BacktestState) -> None:
+    """Fuse all per-frequency full states, then run USS + diagnostics + HF.
+
+    1. Load each frequency's BacktestState from mf/{freq}/
+    2. Extract FrequencyResult summaries for the fusion engine
+    3. Fuse into FusedMultiFreqResult
+    4. Run USS (forecast bounding + scenario engine)
+    5. Run retroactive calibration + model diagnostics
+    6. Run HF analysis on fused result
+    7. Save everything back to the main state
+    """
+    import json as _json
+    from operator1.models.frequency_fusion import fuse_multi_frequency_results
+    from operator1.steps.multi_frequency_runner import (
+        MultiFrequencyResult, FrequencyResult, FrequencyContext,
+    )
+
+    _mf_dir = Path(state.run_dir) / "mf"
+    fp = _mf_dir / "frequencies.json"
+    freqs = _json.loads(fp.read_text()) if fp.exists() else []
+
+    # Load each frequency's state and build FrequencyResult summaries
+    freq_states: dict[str, BacktestState] = {}
+    freq_results: dict[str, FrequencyResult] = {}
+
+    for freq in freqs:
+        freq_dir = _mf_dir / freq
+        state_pkl = freq_dir / "state_2c.pkl"
+        if not state_pkl.exists():
+            logger.info("[%s] No state_2c.pkl -- skipping", freq)
+            continue
+
+        # Load per-frequency state
+        fs = BacktestState()
+        fs.run_dir = str(freq_dir)
+        fs.market_id = state.market_id
+        fs.company = state.company
+        fs.end_date = state.end_date
+        fs.years = state.years
+        fs.load_sub("2c")
+        freq_states[freq] = fs
+
+        # Build FrequencyResult summary from the full state
+        _surv_prob = 1.0
+        _surv_regime = "normal"
+        _trend = "flat"
+        _regime = "unknown"
+        _forecast_summary = {}
+        _wf_mae = None
+
+        if fs.cache is not None:
+            if "survival_probability" in fs.cache.columns:
+                sp = fs.cache["survival_probability"].dropna()
+                if len(sp) > 0:
+                    _surv_prob = float(sp.iloc[-1])
+            if "survival_regime" in fs.cache.columns:
+                sr = fs.cache["survival_regime"].dropna()
+                if len(sr) > 0:
+                    _surv_regime = str(sr.iloc[-1])
+            if "regime_label" in fs.cache.columns:
+                rl = fs.cache["regime_label"].dropna()
+                if len(rl) > 0:
+                    _regime = str(rl.iloc[-1])
+            # Trend from close
+            if "close" in fs.cache.columns:
+                closes = fs.cache["close"].dropna()
+                if len(closes) >= 3:
+                    first = closes.iloc[:len(closes)//3].mean()
+                    last = closes.iloc[-len(closes)//3:].mean()
+                    _trend = "up" if last > first * 1.05 else ("down" if last < first * 0.95 else "flat")
+
+        if fs.forecast_result is not None and hasattr(fs.forecast_result, "forecasts"):
+            for var, horizons in fs.forecast_result.forecasts.items():
+                if isinstance(horizons, dict):
+                    for h, val in horizons.items():
+                        _forecast_summary[f"{var}_{h}"] = float(val) if val is not None else None
+
+        if fs.walk_forward_result is not None and hasattr(fs.walk_forward_result, "overall_mae"):
+            if not pd.isna(fs.walk_forward_result.overall_mae):
+                _wf_mae = fs.walk_forward_result.overall_mae
+
+        fr = FrequencyResult(
+            frequency=freq, label=freq,
+            n_periods=len(fs.cache) if fs.cache is not None else 0,
+            elapsed_seconds=0,
+            regime_label=_regime,
+            survival_probability=_surv_prob,
+            survival_regime=_surv_regime,
+            trend_direction=_trend,
+            forecast_summary=_forecast_summary,
+            walk_forward_mae=_wf_mae,
+            context_for_next=FrequencyContext(
+                frequency=freq, trend_direction=_trend,
+                survival_probability_latest=_surv_prob,
+                survival_regime=_surv_regime,
+            ),
+        )
+        freq_results[freq] = fr
+        logger.info("[%s] Loaded: %d periods, regime=%s, survival=%.3f, forecasts=%d",
+                    freq, fr.n_periods, _regime, _surv_prob, len(_forecast_summary))
+
+    if not freq_results:
+        logger.warning("No per-frequency results to fuse")
+        return
+
+    # Fuse all frequency results
+    mfr = MultiFrequencyResult(
+        results=freq_results,
+        execution_order=list(freq_results.keys()),
+        total_elapsed_seconds=0,
+    )
+    state.multi_frequency_result = fuse_multi_frequency_results(mfr)
+    logger.info("MF fusion: %d freqs, survival=%.1f%%",
+                state.multi_frequency_result.n_frequencies_used,
+                state.multi_frequency_result.survival.fused_probability * 100)
+
+    # Use the Daily frequency's state as the base for downstream (USS, HF, profile)
+    # since it has the most complete data (504 days, all models)
+    daily_state = freq_states.get("D")
+    if daily_state is not None:
+        # Copy Daily's temporal model results into the main state
+        for attr in ("cache", "forecast_result", "forward_pass_result",
+                     "walk_forward_result", "burnout_result", "mc_result",
+                     "pred_result", "conformal_result", "copula_result",
+                     "transformer_result", "particle_filter_result",
+                     "shap_result", "sobol_result", "ga_result",
+                     "ohlc_result", "dual_regime_result", "granger_result",
+                     "transfer_entropy_result", "cycle_result", "pattern_result",
+                     "regime_detector", "enriched_timeline_result",
+                     "_mode_weights", "_synergy_meta", "_pattern_drift",
+                     "_tv_granger_result", "_mv_mc_result", "_extra_vars"):
+            val = getattr(daily_state, attr, None)
+            if val is not None:
+                setattr(state, attr, val)
+        logger.info("Daily state merged into main state")
+
+    # USS: forecast bounding + scenario engine
+    cache = state.cache
+    if cache is not None:
+        try:
+            from operator1.analysis.survival_regime_controller import (
+                SurvivalRegimeController, bound_forecast_dict,
+            )
+            state.survival_controller = SurvivalRegimeController.from_cache(cache)
+            if state.survival_controller.is_survival:
+                if state.forecast_result is not None and hasattr(state.forecast_result, "forecasts"):
+                    state.forecast_result.forecasts = bound_forecast_dict(
+                        state.forecast_result.forecasts, cache,
+                        state.survival_controller.current_regime,
+                    )
+                from operator1.analysis.scenario_engine import run_scenario_engine
+                state.scenario_result = run_scenario_engine(
+                    cache, regime=state.survival_controller.current_regime,
+                    n_paths=state.survival_controller.model_config.mc_n_paths,
+                )
+        except Exception as exc:
+            logger.debug("USS skipped: %s", exc)
+
+    # Retroactive calibration
+    try:
+        from operator1.analysis.retroactive_calibration import run_retroactive_calibration
+        _eg = {}
+        if state.relationships:
+            for grp, ents in state.relationships.items():
+                if isinstance(ents, list):
+                    ids = [
+                        (e.get("isin", "") or e.get("ticker", "")) if isinstance(e, dict)
+                        else (getattr(e, "isin", "") or getattr(e, "ticker", ""))
+                        for e in ents
+                    ]
+                    _eg[grp] = [i for i in ids if i]
+        state._retro_params = run_retroactive_calibration(
+            cache=cache, linked_caches=state.linked_caches or None,
+            entity_groups=_eg or None, walk_forward_result=state.walk_forward_result,
+            forecast_result=state.forecast_result, sobol_result=state.sobol_result,
+            target_profile=state.target_profile,
+        )
+    except Exception as exc:
+        logger.debug("Retro-cal skipped: %s", exc)
+
+    # Model diagnostics
+    try:
+        from operator1.monitoring.model_diagnostics import compute_model_diagnostics
+        compute_model_diagnostics(
+            cache, forecast_result=state.forecast_result, mc_result=state.mc_result,
+            copula_result=state.copula_result, granger_result=state.granger_result,
+            cycle_result=state.cycle_result, dtw_result=state.dtw_result,
+            conformal_result=state.conformal_result,
+        )
+    except Exception as exc:
+        logger.debug("Diagnostics skipped: %s", exc)
+
+    # HF analysis (runs on fused result)
+    try:
+        from operator1.hedge_fund.engine import run_hedge_fund_analysis
+        from operator1.clients.llm_factory import create_llm_client
+        if state._llm_client is None:
+            state._llm_client = create_llm_client(state._secrets)
+        hf_result = run_hedge_fund_analysis(
+            income_df=state._income_df,
+            balance_df=state._balance_df,
+            cashflow_df=state._cashflow_df,
+            cache=cache,
+            target_profile=state.target_profile,
+            forecast_result=state.forecast_result,
+            mc_result=state.mc_result,
+            scenario_result=state.scenario_result,
+            multi_frequency_result=state.multi_frequency_result,
+            signal_ic_result=state.signal_ic_result,
+            filing_calendar_result=state.filing_calendar_result,
+            fh_result=state.fh_result,
+            peer_ranking_result=state.peer_ranking_result if isinstance(state.peer_ranking_result, dict) else None,
+            sentiment_result=state.sentiment_result,
+            survival_controller=state.survival_controller,
+            linked_caches=state.linked_caches,
+            macro_data=state.macro_data,
+        )
+        if hf_result and hf_result.available:
+            # Store HF result -- will be picked up by Stage 3
+            state.profile["hedge_fund"] = hf_result.to_profile_dict()
+            logger.info("HF Analysis: grade=%s, signal=%+.2f",
+                        hf_result.scorecard.investment_grade, hf_result.position.signal)
+    except Exception as exc:
+        logger.warning("HF analysis failed: %s", exc)
+
+    logger.info("Fusion + USS + HF complete")
+
+
+def _run_bt_mf_all(state: BacktestState) -> None:
+    """Run full per-frequency pipeline: prep -> all freqs -> fuse + USS + HF."""
+    import json as _json
+    _bt_mf_prep(state)
+    _mf_dir = Path(state.run_dir) / "mf"
+    fp = _mf_dir / "frequencies.json"
+    freqs = _json.loads(fp.read_text()) if fp.exists() else []
+    for freq in freqs:
+        if (_mf_dir / f"{freq}_cache.parquet").exists():
+            _bt_mf_run_freq(state, freq)
+    _bt_mf_fuse(state)
+
+
+# Per-frequency dispatch wrappers for CLI --stage
+def _run_bt_mf_prep(state: BacktestState) -> None:
+    _bt_mf_prep(state)
+    state.save_sub("2d.mf.prep")
+
+def _run_bt_mf_A(state: BacktestState) -> None:
+    _bt_mf_run_freq(state, "A")
+    state.save_sub("2d.mf.A")
+
+def _run_bt_mf_Q(state: BacktestState) -> None:
+    # Run Q and/or S depending on what prep detected
+    import json as _json
+    _mf_dir = Path(state.run_dir) / "mf"
+    fp = _mf_dir / "frequencies.json"
+    freqs = _json.loads(fp.read_text()) if fp.exists() else []
+    for f in freqs:
+        if f in ("Q", "S") and (_mf_dir / f"{f}_cache.parquet").exists():
+            _bt_mf_run_freq(state, f)
+    state.save_sub("2d.mf.Q")
+
+def _run_bt_mf_M(state: BacktestState) -> None:
+    _bt_mf_run_freq(state, "M")
+    state.save_sub("2d.mf.M")
+
+def _run_bt_mf_W(state: BacktestState) -> None:
+    _bt_mf_run_freq(state, "W")
+    state.save_sub("2d.mf.W")
+
+def _run_bt_mf_D(state: BacktestState) -> None:
+    _bt_mf_run_freq(state, "D")
+    state.save_sub("2d.mf.D")
+
+def _run_bt_mf_fuse(state: BacktestState) -> None:
+    _bt_mf_fuse(state)
+    state.save_sub("2d.mf.fuse")
+    # Also save as "2d" so Stage 3 can load via its dep ("3" -> "2d")
+    state.save_sub("2d")
+
+
+# ---------------------------------------------------------------------------
 # Stage 3: Profile build + prediction extraction + validation
 # ---------------------------------------------------------------------------
 
@@ -1886,34 +2296,39 @@ def run_stage3(state: BacktestState) -> None:
         except Exception:
             pass
 
-    # Hedge Fund Analysis (before profile build)
+    # Hedge Fund Analysis -- check if already run by mf.fuse (new flow).
+    # Only run HF here if mf.fuse did NOT already produce a result (backward compat).
     hf_result = None
-    try:
-        from operator1.hedge_fund.engine import run_hedge_fund_analysis
-        hf_result = run_hedge_fund_analysis(
-            income_df=state._income_df,
-            balance_df=state._balance_df,
-            cashflow_df=state._cashflow_df,
-            cache=cache,
-            target_profile=state.target_profile,
-            forecast_result=state.forecast_result,
-            mc_result=state.mc_result,
-            scenario_result=state.scenario_result,
-            multi_frequency_result=state.multi_frequency_result,
-            signal_ic_result=state.signal_ic_result,
-            filing_calendar_result=state.filing_calendar_result,
-            fh_result=state.fh_result,
-            peer_ranking_result=state.peer_ranking_result if isinstance(state.peer_ranking_result, dict) else None,
-            sentiment_result=state.sentiment_result,
-            survival_controller=state.survival_controller,
-            linked_caches=state.linked_caches,
-            macro_data=state.macro_data,
-        )
-        if hf_result and hf_result.available:
-            logger.info("HF Analysis: grade=%s, signal=%+.2f",
-                        hf_result.scorecard.investment_grade, hf_result.position.signal)
-    except Exception as exc:
-        logger.debug("HF analysis skipped: %s", exc)
+    _hf_from_fuse = state.profile.get("hedge_fund", {})
+    if _hf_from_fuse.get("available"):
+        logger.info("HF Analysis: using result from mf.fuse (already ran after fusion)")
+    else:
+        try:
+            from operator1.hedge_fund.engine import run_hedge_fund_analysis
+            hf_result = run_hedge_fund_analysis(
+                income_df=state._income_df,
+                balance_df=state._balance_df,
+                cashflow_df=state._cashflow_df,
+                cache=cache,
+                target_profile=state.target_profile,
+                forecast_result=state.forecast_result,
+                mc_result=state.mc_result,
+                scenario_result=state.scenario_result,
+                multi_frequency_result=state.multi_frequency_result,
+                signal_ic_result=state.signal_ic_result,
+                filing_calendar_result=state.filing_calendar_result,
+                fh_result=state.fh_result,
+                peer_ranking_result=state.peer_ranking_result if isinstance(state.peer_ranking_result, dict) else None,
+                sentiment_result=state.sentiment_result,
+                survival_controller=state.survival_controller,
+                linked_caches=state.linked_caches,
+                macro_data=state.macro_data,
+            )
+            if hf_result and hf_result.available:
+                logger.info("HF Analysis: grade=%s, signal=%+.2f",
+                            hf_result.scorecard.investment_grade, hf_result.position.signal)
+        except Exception as exc:
+            logger.debug("HF analysis skipped: %s", exc)
 
     try:
         profile = build_company_profile(
@@ -1949,8 +2364,10 @@ def run_stage3(state: BacktestState) -> None:
         else:
             profile["unified_survival_system"] = {"available": False}
 
-        # Hedge Fund Analysis
-        if hf_result is not None and hf_result.available:
+        # Hedge Fund Analysis -- use mf.fuse result if available, else Stage 3 result
+        if _hf_from_fuse.get("available"):
+            profile["hedge_fund"] = _hf_from_fuse
+        elif hf_result is not None and hf_result.available:
             profile["hedge_fund"] = hf_result.to_profile_dict()
         else:
             profile["hedge_fund"] = {"available": False}
@@ -2599,7 +3016,12 @@ Examples:
 """,
     )
     parser.add_argument("--stage", type=str, default="all",
-                        choices=["1", "2", "2a", "2a1", "2a2", "2b", "2c", "2d", "3", "all"],
+                        choices=["1", "2", "2a", "2a1", "2a2", "2b", "2c", "2d",
+                                 "2d.mf.prep", "2d.mf.A", "2d.mf.Q", "2d.mf.M",
+                                 "2d.mf.W", "2d.mf.D", "2d.mf.fuse",
+                                 "mf.prep", "mf.A", "mf.Q", "mf.M",
+                                 "mf.W", "mf.D", "mf.fuse",
+                                 "3", "all"],
                         help="Which stage to run. Stage 2a is split into 2a1 (regime+causality+patterns) "
                              "and 2a2 (forecasting). Use '2a' to run both, '2' for all sub-stages.")
     parser.add_argument("--market", type=str, default="us_sec_edgar",
@@ -2640,13 +3062,18 @@ Examples:
 
     # Build ordered list of stages to run
     if args.stage == "all":
-        stages = ["1", "2a1", "2a2", "2b", "2c", "2d", "3"]
+        # New flow: Stage 1 (shared) -> per-frequency full pipelines -> fusion + HF -> profile
+        stages = ["1", "2d.mf.prep", "2d.mf.A", "2d.mf.Q", "2d.mf.M", "2d.mf.W", "2d.mf.D", "2d.mf.fuse", "3"]
     elif args.stage == "2":
-        stages = ["2a1", "2a2", "2b", "2c", "2d"]
+        stages = ["2d.mf.prep", "2d.mf.A", "2d.mf.Q", "2d.mf.M", "2d.mf.W", "2d.mf.D", "2d.mf.fuse"]
     elif args.stage == "2a":
         stages = ["2a1", "2a2"]
     else:
-        stages = [args.stage]
+        # Map short aliases: mf.prep -> 2d.mf.prep, mf.A -> 2d.mf.A, etc.
+        _alias = args.stage
+        if _alias.startswith("mf."):
+            _alias = f"2d.{_alias}"
+        stages = [_alias]
 
     _STAGE_FUNCS = {
         "1": run_stage1,
@@ -2656,6 +3083,14 @@ Examples:
         "2b": run_stage2b,
         "2c": run_stage2c,
         "2d": run_stage2d,
+        # Per-frequency multi-frequency sub-stages
+        "2d.mf.prep": _run_bt_mf_prep,
+        "2d.mf.A": _run_bt_mf_A,
+        "2d.mf.Q": _run_bt_mf_Q,
+        "2d.mf.M": _run_bt_mf_M,
+        "2d.mf.W": _run_bt_mf_W,
+        "2d.mf.D": _run_bt_mf_D,
+        "2d.mf.fuse": _run_bt_mf_fuse,
         "3": run_stage3,
     }
     # Map sub-stages to the stage they depend on for loading state
@@ -2667,6 +3102,13 @@ Examples:
         "2b": "2a2",
         "2c": "2b",
         "2d": "2c",
+        "2d.mf.prep": "2c",
+        "2d.mf.A": "2d.mf.prep",
+        "2d.mf.Q": "2d.mf.A",
+        "2d.mf.M": "2d.mf.Q",
+        "2d.mf.W": "2d.mf.M",
+        "2d.mf.D": "2d.mf.W",
+        "2d.mf.fuse": "2d.mf.D",
         "3": "2d",
     }
 

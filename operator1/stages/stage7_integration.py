@@ -130,43 +130,199 @@ def run_7_3_diagnostics(state: PipelineState) -> None:
 
 
 def run_7_4_multi_frequency(state: PipelineState) -> None:
-    """7.4: Multi-frequency pipeline (5 frequencies) + fusion."""
-    logger.info("Sub-stage 7.4: Multi-frequency pipeline")
+    """7.4: Multi-frequency pipeline -- runs all sub-stages sequentially (backward compat)."""
+    run_7_4_0_resample_prep(state)
+    freqs = state.load_mf_frequencies()
+    for freq in freqs:
+        _run_7_4_single_freq(state, freq)
+    run_7_4_6_fusion(state)
+
+
+def _get_mf_ref_date(state: PipelineState):
+    """Extract reference date for multi-frequency pipeline."""
+    from datetime import datetime as _dt
+    return _dt.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None
+
+
+def _get_mf_secrets() -> dict:
+    """Load secrets for multi-frequency pipeline."""
     try:
-        from operator1.steps.multi_frequency_runner import run_multi_frequency_pipeline
-        from operator1.models.frequency_fusion import fuse_multi_frequency_results
         from operator1.secrets_loader import load_secrets
+        return load_secrets()
+    except Exception:
+        return {}
 
-        secrets = {}
-        try:
-            secrets = load_secrets()
-        except Exception:
-            pass
 
-        from datetime import datetime as _dt
-        _ref = _dt.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None
+def run_7_4_0_resample_prep(state: PipelineState) -> None:
+    """7.4.0: Build all ResampledCache objects and save to disk."""
+    logger.info("Sub-stage 7.4.0: Multi-frequency resample prep")
 
-        _mf = run_multi_frequency_pipeline(
-            daily_cache=state.cache,
-            secrets=secrets,
-            market_id=state.market_id,
-            ticker=state.company,
-            reference_date=_ref,
-            skip_models=False,
-            income_df=state.income_df if not state.income_df.empty else None,
-            balance_df=state.balance_df if not state.balance_df.empty else None,
-            cashflow_df=state.cashflow_df if not state.cashflow_df.empty else None,
-            quotes_df=state.quotes_df if not state.quotes_df.empty else None,
-        )
-        if _mf and _mf.results:
-            state.multi_frequency_result = fuse_multi_frequency_results(_mf)
-            logger.info(
-                "Multi-frequency: %d frequencies, survival=%.1f%%",
-                state.multi_frequency_result.n_frequencies_used,
-                state.multi_frequency_result.survival.fused_probability * 100,
+    from operator1.features.frequency_resampler import (
+        ResampledCache,
+        build_cache_from_raw_filings,
+        detect_all_filing_frequencies,
+        detect_native_filing_frequency,
+        get_frequencies_slow_to_fast,
+        is_annual_only_market,
+        resample_cache_to_frequency,
+    )
+
+    cache = state.cache
+    ref_date = _get_mf_ref_date(state)
+    market_id = state.market_id
+
+    income_df = state.income_df if not state.income_df.empty else None
+    balance_df = state.balance_df if not state.balance_df.empty else None
+    cashflow_df = state.cashflow_df if not state.cashflow_df.empty else None
+    quotes_df = state.quotes_df if not state.quotes_df.empty else None
+
+    _has_raw = any(df is not None and not df.empty for df in [income_df, balance_df, cashflow_df])
+    _is_annual_only = is_annual_only_market(market_id)
+
+    frequencies = get_frequencies_slow_to_fast()
+
+    # Detect semi-annual filings and adjust frequency list
+    if _has_raw and "Q" in frequencies:
+        _all_freqs = detect_all_filing_frequencies(income_df, balance_df, cashflow_df)
+        _native = detect_native_filing_frequency(income_df, balance_df, cashflow_df)
+        if "Q" in _all_freqs and "S" in _all_freqs:
+            if "S" not in frequencies:
+                q_idx = frequencies.index("Q")
+                frequencies.insert(q_idx, "S")
+            logger.info("Both Q and S filings detected -- running both pipelines")
+        elif _native == "S" and "Q" not in _all_freqs:
+            frequencies = [("S" if f == "Q" else f) for f in frequencies]
+            logger.info("Auto-switch: Q -> S (semi-annual filings only)")
+
+    # Save frequency list for later sub-stages
+    state.save_mf_frequencies(frequencies)
+
+    # Build and save each ResampledCache
+    for freq in frequencies:
+        if freq in ("Q", "A", "W", "M", "S") and _has_raw:
+            resampled = build_cache_from_raw_filings(
+                income_df=income_df, balance_df=balance_df,
+                cashflow_df=cashflow_df, quotes_df=quotes_df,
+                frequency=freq, reference_date=ref_date,
             )
+        else:
+            resampled = resample_cache_to_frequency(
+                cache, frequency=freq, reference_date=ref_date,
+            )
+
+        if resampled.n_periods < 3:
+            logger.info("[%s] Skipping -- only %d periods (need 3+)", freq, resampled.n_periods)
+            continue
+
+        state.save_mf_cache(freq, resampled)
+        logger.info("[%s] Resampled: %d periods, saved to disk", freq, resampled.n_periods)
+
+    logger.info("Resample prep complete: %d frequencies prepared", len(frequencies))
+
+
+def _run_7_4_single_freq(state: PipelineState, freq: str) -> None:
+    """Run the pipeline for a single frequency, loading context from prior."""
+    from operator1.steps.multi_frequency_runner import run_single_frequency_pipeline
+
+    resampled = state.load_mf_cache(freq)
+    if resampled is None:
+        logger.info("[%s] No resampled cache found -- skipping", freq)
+        return
+
+    # Load context from prior frequency (cascading)
+    frequencies = state.load_mf_frequencies()
+    idx = frequencies.index(freq) if freq in frequencies else -1
+    prior_context = None
+    if idx > 0:
+        prior_freq = frequencies[idx - 1]
+        prior_context = state.load_mf_context(prior_freq)
+
+    secrets = _get_mf_secrets()
+
+    result = run_single_frequency_pipeline(
+        resampled=resampled,
+        prior_context=prior_context,
+        secrets=secrets,
+        market_id=state.market_id,
+        ticker=state.company,
+        skip_models=False,
+    )
+
+    state.save_mf_result(freq, result)
+    state.save_mf_context(freq, result.context_for_next)
+    logger.info("[%s] Pipeline complete: %d periods, survival=%.3f (%.1fs)",
+                freq, result.n_periods, result.survival_probability, result.elapsed_seconds)
+
+
+def run_7_4_1_annual(state: PipelineState) -> None:
+    """7.4.1: Annual frequency pipeline."""
+    logger.info("Sub-stage 7.4.1: Annual pipeline")
+    _run_7_4_single_freq(state, "A")
+
+
+def run_7_4_2_quarterly(state: PipelineState) -> None:
+    """7.4.2: Quarterly (or Semi-Annual) frequency pipeline."""
+    logger.info("Sub-stage 7.4.2: Quarterly pipeline")
+    freqs = state.load_mf_frequencies()
+    # Run Q, S, or both depending on what prep detected
+    for f in freqs:
+        if f in ("Q", "S"):
+            _run_7_4_single_freq(state, f)
+
+
+def run_7_4_3_monthly(state: PipelineState) -> None:
+    """7.4.3: Monthly frequency pipeline."""
+    logger.info("Sub-stage 7.4.3: Monthly pipeline")
+    _run_7_4_single_freq(state, "M")
+
+
+def run_7_4_4_weekly(state: PipelineState) -> None:
+    """7.4.4: Weekly frequency pipeline."""
+    logger.info("Sub-stage 7.4.4: Weekly pipeline")
+    _run_7_4_single_freq(state, "W")
+
+
+def run_7_4_5_daily(state: PipelineState) -> None:
+    """7.4.5: Daily frequency pipeline."""
+    logger.info("Sub-stage 7.4.5: Daily pipeline")
+    _run_7_4_single_freq(state, "D")
+
+
+def run_7_4_6_fusion(state: PipelineState) -> None:
+    """7.4.6: Fuse all frequency results into a single FusedMultiFreqResult."""
+    logger.info("Sub-stage 7.4.6: Multi-frequency fusion")
+    try:
+        from operator1.models.frequency_fusion import fuse_multi_frequency_results
+        from operator1.steps.multi_frequency_runner import MultiFrequencyResult
+
+        available_freqs = state.list_mf_results()
+        if not available_freqs:
+            logger.info("No frequency results to fuse")
+            return
+
+        results = {}
+        for freq in available_freqs:
+            r = state.load_mf_result(freq)
+            if r is not None:
+                results[freq] = r
+
+        if not results:
+            return
+
+        mf_result = MultiFrequencyResult(
+            results=results,
+            execution_order=list(results.keys()),
+            total_elapsed_seconds=sum(r.elapsed_seconds for r in results.values()),
+        )
+
+        state.multi_frequency_result = fuse_multi_frequency_results(mf_result)
+        logger.info(
+            "Multi-frequency fusion: %d frequencies, survival=%.1f%%",
+            state.multi_frequency_result.n_frequencies_used,
+            state.multi_frequency_result.survival.fused_probability * 100,
+        )
     except Exception as exc:
-        logger.warning("Multi-frequency pipeline failed: %s", exc)
+        logger.warning("Multi-frequency fusion failed: %s", exc)
 
 
 def run_7_5_hedge_fund(state: PipelineState) -> None:
@@ -203,6 +359,13 @@ STAGE_7_SUBSTAGES = [
     ("7.1", run_7_1_uss),
     ("7.2", run_7_2_retro_calibration),
     ("7.3", run_7_3_diagnostics),
-    ("7.4", run_7_4_multi_frequency),
+    ("7.4", run_7_4_multi_frequency),       # backward compat: runs all 7.4.x sequentially
+    ("7.4.0", run_7_4_0_resample_prep),
+    ("7.4.1", run_7_4_1_annual),
+    ("7.4.2", run_7_4_2_quarterly),
+    ("7.4.3", run_7_4_3_monthly),
+    ("7.4.4", run_7_4_4_weekly),
+    ("7.4.5", run_7_4_5_daily),
+    ("7.4.6", run_7_4_6_fusion),
     ("7.5", run_7_5_hedge_fund),
 ]
