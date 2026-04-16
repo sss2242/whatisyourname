@@ -280,6 +280,101 @@ class PipelineState:
                             pkl_path.name, len(state_dict))
                 break
 
+    # ------------------------------------------------------------------
+    # Multi-frequency per-frequency disk helpers
+    # ------------------------------------------------------------------
+
+    def _mf_dir(self) -> Path:
+        """Return the multi-frequency sub-directory, creating if needed."""
+        d = Path(self.output_dir) / "mf"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def save_mf_cache(self, freq: str, resampled) -> None:
+        """Save a ResampledCache to disk for a single frequency."""
+        d = self._mf_dir()
+        resampled.cache.to_parquet(d / f"{freq}_cache.parquet")
+        import json as _json
+        meta = {
+            "frequency": resampled.frequency,
+            "label": resampled.label,
+            "n_periods": resampled.n_periods,
+            "lookback_years": resampled.lookback_years,
+        }
+        (d / f"{freq}_meta.json").write_text(_json.dumps(meta, indent=2))
+
+    def load_mf_cache(self, freq: str):
+        """Load a ResampledCache from disk for a single frequency."""
+        d = self._mf_dir()
+        cache_path = d / f"{freq}_cache.parquet"
+        meta_path = d / f"{freq}_meta.json"
+        if not cache_path.exists():
+            return None
+        import json as _json
+        from operator1.features.frequency_resampler import ResampledCache
+        cache_df = pd.read_parquet(cache_path)
+        meta = _json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        return ResampledCache(
+            cache=cache_df,
+            frequency=meta.get("frequency", freq),
+            label=meta.get("label", freq),
+            n_periods=meta.get("n_periods", len(cache_df)),
+            lookback_years=meta.get("lookback_years", 2),
+        )
+
+    def save_mf_result(self, freq: str, result) -> None:
+        """Save a FrequencyResult to disk."""
+        d = self._mf_dir()
+        with open(d / f"{freq}_result.pkl", "wb") as f:
+            pickle.dump(result, f)
+
+    def load_mf_result(self, freq: str):
+        """Load a FrequencyResult from disk."""
+        d = self._mf_dir()
+        pkl = d / f"{freq}_result.pkl"
+        if not pkl.exists():
+            return None
+        with open(pkl, "rb") as f:
+            return pickle.load(f)
+
+    def save_mf_context(self, freq: str, context) -> None:
+        """Save a FrequencyContext to disk (for cascading to next freq)."""
+        d = self._mf_dir()
+        with open(d / f"{freq}_context.pkl", "wb") as f:
+            pickle.dump(context, f)
+
+    def load_mf_context(self, freq: str):
+        """Load a FrequencyContext from disk."""
+        d = self._mf_dir()
+        pkl = d / f"{freq}_context.pkl"
+        if not pkl.exists():
+            return None
+        with open(pkl, "rb") as f:
+            return pickle.load(f)
+
+    def list_mf_results(self) -> list[str]:
+        """List all frequencies that have saved FrequencyResults."""
+        d = self._mf_dir()
+        return [
+            p.stem.replace("_result", "")
+            for p in sorted(d.glob("*_result.pkl"))
+        ]
+
+    def save_mf_frequencies(self, frequencies: list[str]) -> None:
+        """Save the ordered list of frequencies to run."""
+        import json as _json
+        d = self._mf_dir()
+        (d / "frequencies.json").write_text(_json.dumps(frequencies))
+
+    def load_mf_frequencies(self) -> list[str]:
+        """Load the ordered frequency list."""
+        import json as _json
+        d = self._mf_dir()
+        p = d / "frequencies.json"
+        if not p.exists():
+            return []
+        return _json.loads(p.read_text())
+
     def find_latest_checkpoint(self) -> str | None:
         """Find the latest completed sub-stage checkpoint in run_dir."""
         run_dir = Path(self.output_dir)

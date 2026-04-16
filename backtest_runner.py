@@ -1754,27 +1754,9 @@ def run_stage2d(state: BacktestState) -> None:
     except Exception as exc:
         logger.debug("USS integration skipped: %s", exc)
 
-    # Multi-frequency forecasting
+    # Multi-frequency forecasting (per-frequency sub-stages)
     try:
-        from operator1.steps.multi_frequency_runner import run_multi_frequency_pipeline
-        from operator1.models.frequency_fusion import fuse_multi_frequency_results
-        _bt_end = datetime.strptime(state.end_date, "%Y-%m-%d").date()
-        _mf = run_multi_frequency_pipeline(
-            daily_cache=cache, secrets=state._secrets,
-            market_id=state.market_id, ticker=state.company,
-            reference_date=_bt_end,
-            income_df=state._income_df if not state._income_df.empty else None,
-            balance_df=state._balance_df if not state._balance_df.empty else None,
-            cashflow_df=state._cashflow_df if not state._cashflow_df.empty else None,
-            quotes_df=state._quotes_df if not state._quotes_df.empty else None,
-        )
-        if _mf and _mf.results:
-            state.multi_frequency_result = fuse_multi_frequency_results(_mf)
-            logger.info(
-                "Multi-frequency: %d frequencies, survival=%.1f%%",
-                state.multi_frequency_result.n_frequencies_used,
-                state.multi_frequency_result.survival.fused_probability * 100,
-            )
+        _run_bt_mf_all(state)
     except Exception as exc:
         logger.warning("Multi-frequency failed: %s", exc)
 
@@ -1835,6 +1817,171 @@ def run_stage2(state: BacktestState) -> None:
     run_stage2b(state)
     run_stage2c(state)
     run_stage2d(state)
+
+
+# ---------------------------------------------------------------------------
+# Multi-frequency per-frequency sub-stages (used by run_stage2d and dispatch)
+# ---------------------------------------------------------------------------
+
+def _bt_mf_prep(state: BacktestState) -> None:
+    """Build all ResampledCache objects and save to disk."""
+    from operator1.features.frequency_resampler import (
+        build_cache_from_raw_filings, detect_all_filing_frequencies,
+        detect_native_filing_frequency, get_frequencies_slow_to_fast,
+        is_annual_only_market, resample_cache_to_frequency,
+    )
+    cache = state.cache
+    _bt_end = datetime.strptime(state.end_date, "%Y-%m-%d").date()
+    _has_raw = any(not df.empty for df in [state._income_df, state._balance_df, state._cashflow_df])
+    _is_ann = is_annual_only_market(state.market_id)
+    freqs = get_frequencies_slow_to_fast()
+    # Detect semi-annual
+    if _has_raw and "Q" in freqs:
+        _all_f = detect_all_filing_frequencies(state._income_df, state._balance_df, state._cashflow_df)
+        _nat = detect_native_filing_frequency(state._income_df, state._balance_df, state._cashflow_df)
+        if "Q" in _all_f and "S" in _all_f:
+            if "S" not in freqs:
+                freqs.insert(freqs.index("Q"), "S")
+        elif _nat == "S" and "Q" not in _all_f:
+            freqs = [("S" if f == "Q" else f) for f in freqs]
+    # Save freq list
+    import json as _json
+    _mf_dir = Path(state.run_dir) / "mf"
+    _mf_dir.mkdir(parents=True, exist_ok=True)
+    (_mf_dir / "frequencies.json").write_text(_json.dumps(freqs))
+    # Build each cache
+    for freq in freqs:
+        inc = state._income_df if not state._income_df.empty else None
+        bal = state._balance_df if not state._balance_df.empty else None
+        cf = state._cashflow_df if not state._cashflow_df.empty else None
+        qt = state._quotes_df if not state._quotes_df.empty else None
+        if freq in ("Q", "A", "W", "M", "S") and _has_raw:
+            resampled = build_cache_from_raw_filings(
+                income_df=inc, balance_df=bal, cashflow_df=cf, quotes_df=qt,
+                frequency=freq, reference_date=_bt_end,
+            )
+        else:
+            resampled = resample_cache_to_frequency(cache, frequency=freq, reference_date=_bt_end)
+        if resampled.n_periods < 3:
+            logger.info("[%s] Skipping -- %d periods (need 3+)", freq, resampled.n_periods)
+            continue
+        resampled.cache.to_parquet(_mf_dir / f"{freq}_cache.parquet")
+        meta = {"frequency": resampled.frequency, "label": resampled.label,
+                "n_periods": resampled.n_periods, "lookback_years": resampled.lookback_years}
+        (_mf_dir / f"{freq}_meta.json").write_text(_json.dumps(meta, indent=2))
+        logger.info("[%s] Resampled: %d periods", freq, resampled.n_periods)
+
+
+def _bt_mf_run_freq(state: BacktestState, freq: str) -> None:
+    """Run the pipeline for a single frequency in the backtest context."""
+    import json as _json
+    from operator1.features.frequency_resampler import ResampledCache
+    from operator1.steps.multi_frequency_runner import run_single_frequency_pipeline
+    _mf_dir = Path(state.run_dir) / "mf"
+    cp = _mf_dir / f"{freq}_cache.parquet"
+    if not cp.exists():
+        logger.info("[%s] No cache -- skipping", freq)
+        return
+    cache_df = pd.read_parquet(cp)
+    mp = _mf_dir / f"{freq}_meta.json"
+    meta = _json.loads(mp.read_text()) if mp.exists() else {}
+    resampled = ResampledCache(
+        cache=cache_df, frequency=meta.get("frequency", freq),
+        label=meta.get("label", freq), n_periods=meta.get("n_periods", len(cache_df)),
+        lookback_years=meta.get("lookback_years", 2),
+    )
+    # Load prior context
+    fp = _mf_dir / "frequencies.json"
+    freqs = _json.loads(fp.read_text()) if fp.exists() else []
+    prior_ctx = None
+    idx = freqs.index(freq) if freq in freqs else -1
+    if idx > 0:
+        ctx_pkl = _mf_dir / f"{freqs[idx-1]}_context.pkl"
+        if ctx_pkl.exists():
+            with open(ctx_pkl, "rb") as f:
+                prior_ctx = pickle.load(f)
+    result = run_single_frequency_pipeline(
+        resampled=resampled, prior_context=prior_ctx,
+        secrets=state._secrets, market_id=state.market_id, ticker=state.company,
+    )
+    with open(_mf_dir / f"{freq}_result.pkl", "wb") as f:
+        pickle.dump(result, f)
+    with open(_mf_dir / f"{freq}_context.pkl", "wb") as f:
+        pickle.dump(result.context_for_next, f)
+    logger.info("[%s] Complete: %d periods, survival=%.3f (%.1fs)",
+                freq, result.n_periods, result.survival_probability, result.elapsed_seconds)
+
+
+def _bt_mf_fuse(state: BacktestState) -> None:
+    """Fuse all per-frequency results."""
+    import json as _json
+    from operator1.models.frequency_fusion import fuse_multi_frequency_results
+    from operator1.steps.multi_frequency_runner import MultiFrequencyResult
+    _mf_dir = Path(state.run_dir) / "mf"
+    results = {}
+    for pkl in sorted(_mf_dir.glob("*_result.pkl")):
+        freq = pkl.stem.replace("_result", "")
+        with open(pkl, "rb") as f:
+            results[freq] = pickle.load(f)
+    if not results:
+        logger.info("No MF results to fuse")
+        return
+    mfr = MultiFrequencyResult(results=results, execution_order=list(results.keys()),
+                                total_elapsed_seconds=sum(r.elapsed_seconds for r in results.values()))
+    state.multi_frequency_result = fuse_multi_frequency_results(mfr)
+    logger.info("MF fusion: %d freqs, survival=%.1f%%",
+                state.multi_frequency_result.n_frequencies_used,
+                state.multi_frequency_result.survival.fused_probability * 100)
+
+
+def _run_bt_mf_all(state: BacktestState) -> None:
+    """Run all multi-frequency sub-stages sequentially (used by run_stage2d)."""
+    import json as _json
+    _bt_mf_prep(state)
+    _mf_dir = Path(state.run_dir) / "mf"
+    fp = _mf_dir / "frequencies.json"
+    freqs = _json.loads(fp.read_text()) if fp.exists() else []
+    for freq in freqs:
+        if (_mf_dir / f"{freq}_cache.parquet").exists():
+            _bt_mf_run_freq(state, freq)
+    _bt_mf_fuse(state)
+
+
+# Per-frequency dispatch wrappers for CLI --stage
+def _run_bt_mf_prep(state: BacktestState) -> None:
+    _bt_mf_prep(state)
+    state.save_sub("2d.mf.prep")
+
+def _run_bt_mf_A(state: BacktestState) -> None:
+    _bt_mf_run_freq(state, "A")
+    state.save_sub("2d.mf.A")
+
+def _run_bt_mf_Q(state: BacktestState) -> None:
+    # Run Q and/or S depending on what prep detected
+    import json as _json
+    _mf_dir = Path(state.run_dir) / "mf"
+    fp = _mf_dir / "frequencies.json"
+    freqs = _json.loads(fp.read_text()) if fp.exists() else []
+    for f in freqs:
+        if f in ("Q", "S") and (_mf_dir / f"{f}_cache.parquet").exists():
+            _bt_mf_run_freq(state, f)
+    state.save_sub("2d.mf.Q")
+
+def _run_bt_mf_M(state: BacktestState) -> None:
+    _bt_mf_run_freq(state, "M")
+    state.save_sub("2d.mf.M")
+
+def _run_bt_mf_W(state: BacktestState) -> None:
+    _bt_mf_run_freq(state, "W")
+    state.save_sub("2d.mf.W")
+
+def _run_bt_mf_D(state: BacktestState) -> None:
+    _bt_mf_run_freq(state, "D")
+    state.save_sub("2d.mf.D")
+
+def _run_bt_mf_fuse(state: BacktestState) -> None:
+    _bt_mf_fuse(state)
+    state.save_sub("2d.mf.fuse")
 
 
 # ---------------------------------------------------------------------------
@@ -2656,6 +2803,14 @@ Examples:
         "2b": run_stage2b,
         "2c": run_stage2c,
         "2d": run_stage2d,
+        # Per-frequency multi-frequency sub-stages
+        "2d.mf.prep": _run_bt_mf_prep,
+        "2d.mf.A": _run_bt_mf_A,
+        "2d.mf.Q": _run_bt_mf_Q,
+        "2d.mf.M": _run_bt_mf_M,
+        "2d.mf.W": _run_bt_mf_W,
+        "2d.mf.D": _run_bt_mf_D,
+        "2d.mf.fuse": _run_bt_mf_fuse,
         "3": run_stage3,
     }
     # Map sub-stages to the stage they depend on for loading state
@@ -2667,6 +2822,13 @@ Examples:
         "2b": "2a2",
         "2c": "2b",
         "2d": "2c",
+        "2d.mf.prep": "2c",
+        "2d.mf.A": "2d.mf.prep",
+        "2d.mf.Q": "2d.mf.A",
+        "2d.mf.M": "2d.mf.Q",
+        "2d.mf.W": "2d.mf.M",
+        "2d.mf.D": "2d.mf.W",
+        "2d.mf.fuse": "2d.mf.D",
         "3": "2d",
     }
 
