@@ -1286,6 +1286,18 @@ def run_monte_carlo(
             "Simulating horizon '%s' (%d steps)...", h_label, h_steps,
         )
 
+        # P3: Scale IS tilt by horizon to prevent ESS collapse at short
+        # horizons. With full tilt at 1-5 steps, all importance weight
+        # concentrates on a single particle (ESS=1), producing degenerate
+        # survival estimates (0% or 100%). Scale: no tilt below 10 steps,
+        # linear ramp from 10 to 63 steps, full tilt above 63 steps.
+        _horizon_tilt = importance_tilt
+        if h_steps < 10:
+            _horizon_tilt = 0.0  # no IS for very short horizons
+        elif h_steps < 63:
+            _horizon_tilt = importance_tilt * (h_steps - 10) / 53.0
+        # else: full tilt for 63+ steps
+
         survival_flags, weights, ess = run_simulation(
             n_paths=n_paths,
             horizon_steps=h_steps,
@@ -1295,7 +1307,7 @@ def run_monte_carlo(
             initial_values=initial_values,
             rng=rng,
             importance_fraction=importance_fraction,
-            importance_tilt=importance_tilt,
+            importance_tilt=_horizon_tilt,
             survival_thresholds=survival_thresholds,
             variable_sensitivities=variable_sensitivities,
         )

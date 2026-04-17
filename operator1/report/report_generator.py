@@ -3548,6 +3548,44 @@ def _build_multi_frequency_section(profile: dict[str, Any]) -> str:
             )
         lines.append("")
 
+    # v2 fields (from advanced frequency fusion, PR#2+)
+    disagreement = mf.get("disagreement", {})
+    if disagreement and disagreement.get("shape", "unknown") != "unknown":
+        lines.append("### Cross-Frequency Disagreement\n")
+        lines.append(f"**Shape:** {disagreement.get('shape', 'N/A')} "
+                     f"(score: {disagreement.get('score', 0):.2f}, "
+                     f"diversity: {disagreement.get('cosine_diversity', 0):.2f})\n")
+
+    confirmed_breaks = mf.get("confirmed_breaks", [])
+    if confirmed_breaks:
+        lines.append("### Confirmed Structural Breaks\n")
+        lines.append("| Date | Source | Confirming | Confidence |")
+        lines.append("|------|--------|------------|------------|")
+        for brk in confirmed_breaks[:10]:
+            lines.append(
+                f"| {brk.get('date', 'N/A')} "
+                f"| {brk.get('source_freq', '?')} "
+                f"| {brk.get('n_confirming', 0)} frequencies "
+                f"| {brk.get('confidence', 'low')} |"
+            )
+        lines.append("")
+
+    meta_weights = mf.get("meta_learner_weights", {})
+    if meta_weights:
+        lines.append("### Meta-Learner Frequency Weights\n")
+        _freq_labels = {"A": "Annual", "Q": "Quarterly", "M": "Monthly", "W": "Weekly", "D": "Daily"}
+        for f, w in sorted(meta_weights.items(), key=lambda x: -x[1]):
+            label = _freq_labels.get(f, f)
+            lines.append(f"- **{label}:** {w:.1%}")
+        lines.append("")
+
+    if mf.get("cointegrated"):
+        lines.append(f"**Cointegration:** Frequencies are cointegrated "
+                     f"(ECT = {mf.get('cointegration_ect', 0):.4f})\n")
+
+    return "\n".join(lines)
+
+
 def _build_investment_thesis_scorecard(profile: dict[str, Any]) -> str:
     """Render 5-tier investment thesis scorecard."""
     lines = []

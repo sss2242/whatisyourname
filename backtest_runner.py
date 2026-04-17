@@ -3115,9 +3115,33 @@ Examples:
     for stage_key in stages:
         dep = _STAGE_DEPS[stage_key]
         if dep is not None:
-            # Load state from the dependency stage
+            # Load state from the dependency stage, with fallback chain
             dep_key = str(dep)
-            state.load_sub(dep_key)
+            _loaded = False
+            _dep_pkl = Path(state.run_dir) / f"state_{dep_key}.pkl"
+            if _dep_pkl.exists():
+                state.load_sub(dep_key)
+                _loaded = True
+            else:
+                # Fallback: walk backwards through the dependency chain
+                # to find the latest available checkpoint
+                _fallback = dep_key
+                while _fallback in _STAGE_DEPS and _STAGE_DEPS.get(_fallback) is not None:
+                    _fallback = str(_STAGE_DEPS[_fallback])
+                    _fb_pkl = Path(state.run_dir) / f"state_{_fallback}.pkl"
+                    if _fb_pkl.exists():
+                        logger.warning(
+                            "Stage %s dep '%s' not found, falling back to '%s'",
+                            stage_key, dep_key, _fallback,
+                        )
+                        state.load_sub(_fallback)
+                        _loaded = True
+                        break
+                if not _loaded:
+                    logger.warning(
+                        "No checkpoint found for stage %s (dep=%s), running with current state",
+                        stage_key, dep_key,
+                    )
 
         t0 = time.time()
         try:
