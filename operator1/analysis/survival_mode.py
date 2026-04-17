@@ -42,13 +42,30 @@ logger = logging.getLogger(__name__)
 # Company survival
 # ---------------------------------------------------------------------------
 
-# Default thresholds (overridable via config if needed in the future)
-_COMPANY_THRESHOLDS = {
-    "current_ratio_lt": 1.0,
-    "debt_to_equity_abs_gt": 3.0,
-    "fcf_yield_lt": 0.0,
-    "drawdown_252d_lt": -0.40,
-}
+# Default thresholds -- read from config/scoring_weights.yml if available,
+# falling back to hardcoded values when config is missing.
+def _load_company_thresholds() -> dict[str, float]:
+    """Load survival thresholds from scoring_weights.yml with hardcoded fallbacks."""
+    try:
+        from operator1.scoring_weights import get_weight
+        return {
+            "current_ratio_lt": float(get_weight("survival_thresholds.current_ratio", 1.0)),
+            "debt_to_equity_abs_gt": float(get_weight("survival_thresholds.debt_to_equity", 3.0)),
+            "fcf_yield_lt": float(get_weight("survival_thresholds.fcf_yield", 0.0)),
+            "drawdown_252d_lt": float(get_weight("survival_thresholds.drawdown_252d", -0.40)),
+            "conflict_intensity_gt": float(get_weight("survival_thresholds.conflict_intensity", 0.70)),
+            "inst_flow_momentum_lt": float(get_weight("survival_thresholds.inst_flow_momentum", -0.15)),
+        }
+    except Exception:
+        return {
+            "current_ratio_lt": 1.0,
+            "debt_to_equity_abs_gt": 3.0,
+            "fcf_yield_lt": 0.0,
+            "drawdown_252d_lt": -0.40,
+        }
+
+
+_COMPANY_THRESHOLDS = _load_company_thresholds()
 
 
 def compute_company_survival_flag(

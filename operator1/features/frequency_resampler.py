@@ -240,6 +240,15 @@ def resample_cache_to_frequency(
         is_partial,
     )
 
+    # Ensure resampled cache has return_1d and volatility_21d columns
+    # so regime detection and derived variables work at all frequencies.
+    # For non-daily frequencies, return_1d represents the period return.
+    if "close" in resampled.columns and "return_1d" not in resampled.columns:
+        resampled["return_1d"] = resampled["close"].pct_change()
+    if "return_1d" in resampled.columns and "volatility_21d" not in resampled.columns:
+        _vol_window = min(21, max(3, len(resampled) // 3))
+        resampled["volatility_21d"] = resampled["return_1d"].rolling(_vol_window, min_periods=2).std()
+
     return ResampledCache(
         frequency=frequency,
         label=config["label"],
@@ -578,6 +587,13 @@ def build_cache_from_raw_filings(
         sum(1 for d in [income_df, balance_df, cashflow_df] if d is not None and not d.empty),
         is_partial,
     )
+
+    # Ensure return_1d and volatility_21d exist for regime detection at all frequencies
+    if "close" in combined.columns and "return_1d" not in combined.columns:
+        combined["return_1d"] = combined["close"].pct_change()
+    if "return_1d" in combined.columns and "volatility_21d" not in combined.columns:
+        _vol_window = min(21, max(3, len(combined) // 3))
+        combined["volatility_21d"] = combined["return_1d"].rolling(_vol_window, min_periods=2).std()
 
     return ResampledCache(
         frequency=frequency,

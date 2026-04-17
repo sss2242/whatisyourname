@@ -2708,7 +2708,11 @@ class VARWrapper(BaseModelWrapper):
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 model = VARModel(self._buffer.values)
-                self._result = model.fit(maxlags=self._max_lag, ic="aic")
+                # Cap maxlags relative to observations and number of variables
+                # to avoid "maxlags is too large" errors (matching fit_var logic)
+                n_cols = max(1, self._buffer.shape[1])
+                _capped_lag = min(self._max_lag, max(1, len(self._buffer) // (3 * n_cols)))
+                self._result = model.fit(maxlags=max(1, _capped_lag), ic="aic")
             self._fitted = True
             self._steps_since_refit = 0
         except Exception:
