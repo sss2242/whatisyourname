@@ -2560,7 +2560,7 @@ def run_prediction_aggregation(
             if var_name in ("close", "open", "high", "low") and not math.isnan(point):
                 _last_val = last_value  # from cache[var_name].iloc[-1]
                 if _last_val is not None and not math.isnan(_last_val) and _last_val > 0:
-                    _max_pct = {1: 0.10, 5: 0.20, 21: 0.40, 252: 1.50}.get(h_days, 0.50)
+                    _max_pct = {1: 0.10, 5: 0.20, 21: 0.40, 252: 1.50}.get(horizon_days, 0.50)
                     _upper_bound = _last_val * (1.0 + _max_pct)
                     _lower_bound = _last_val * (1.0 - _max_pct)
                     if point > _upper_bound or point < _lower_bound:

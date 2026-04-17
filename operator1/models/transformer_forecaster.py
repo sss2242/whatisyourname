@@ -194,6 +194,9 @@ def train_transformer(
     """
     import pandas as pd
 
+    # Cap lookback to available data for lower-frequency caches (A/Q/M)
+    lookback = min(lookback, max(3, len(cache) // 3))
+
     result = TransformerResult()
 
     # Filter to available variables

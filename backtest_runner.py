@@ -1333,7 +1333,8 @@ def run_stage2b(state: BacktestState) -> None:
         )
         logger.info("Forward pass: %d days", state.forward_pass_result.total_days)
     except Exception as exc:
-        logger.warning("Forward pass failed: %s", exc)
+        import traceback as _tb
+        logger.warning("Forward pass failed: %s\n%s", exc, _tb.format_exc())
 
     # Burnout
     try:

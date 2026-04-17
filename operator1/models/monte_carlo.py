@@ -62,6 +62,27 @@ DEFAULT_HORIZONS: dict[str, int] = {
     "252d": 252,
 }
 
+
+def _build_frequency_aware_horizons(cache_len: int) -> dict[str, int]:
+    """Build horizons scaled to the cache length (frequency-adaptive).
+
+    At daily (502 rows): {1d:1, 5d:5, 21d:21, 252d:252} -- standard
+    At weekly (158 rows): {1p:1, 4p:4, 13p:13, 52p:52} -- ~week/month/quarter/year
+    At monthly (61 rows): {1p:1, 3p:3, 6p:6, 12p:12}
+    At quarterly (15 rows): {1p:1, 2p:2, 4p:4, 8p:8}
+    At annual (6 rows): {1p:1, 2p:2, 3p:3, 5p:5}
+    """
+    if cache_len >= 400:
+        return DEFAULT_HORIZONS  # daily, use standard
+    # Scale horizons proportionally to available data
+    spy = max(4, cache_len)  # steps per ~year equivalent
+    return {
+        "1p": 1,
+        "short": max(1, spy // 12),
+        "mid": max(1, spy // 4),
+        "long": max(2, spy),
+    }
+
 # Default survival thresholds (aligned with T4.1).
 DEFAULT_SURVIVAL_THRESHOLDS: dict[str, tuple[str, float]] = {
     "current_ratio": ("lt", 1.0),
@@ -1085,7 +1106,7 @@ def run_monte_carlo(
     rng = np.random.default_rng(random_state)
 
     if horizons is None:
-        horizons = DEFAULT_HORIZONS
+        horizons = _build_frequency_aware_horizons(len(cache))
 
     if survival_thresholds is None:
         survival_thresholds = DEFAULT_SURVIVAL_THRESHOLDS
@@ -1459,6 +1480,9 @@ def run_multivariate_monte_carlo(
     Dict with multivariate survival probability and per-variable terminal
     distributions.
     """
+    # Cap horizon to cache length for lower-frequency caches
+    horizon_steps = min(horizon_steps, max(4, len(cache)))
+
     if survival_thresholds is None:
         survival_thresholds = DEFAULT_SURVIVAL_THRESHOLDS
 

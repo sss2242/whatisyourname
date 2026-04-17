@@ -177,10 +177,13 @@ def find_historical_analogs(
 ) -> DTWAnalogResult:
     """Find the K closest historical analogs to the current state.
 
+    Window sizes are capped to available data so the function works at
+    all frequencies (A/Q/M/W/D) in the multi-frequency pipeline.
+
     Parameters
     ----------
     cache:
-        Full 2-year daily cache (DatetimeIndex).
+        Cache DataFrame (daily or resampled to any frequency).
     variables:
         Feature columns to use for DTW matching.  If None, uses a
         default set of key financial variables.
@@ -206,6 +209,10 @@ def find_historical_analogs(
     -------
     DTWAnalogResult with ranked analogs and empirical forecast.
     """
+    # Cap windows to available data for lower-frequency caches (A/Q/M)
+    query_window = min(query_window, max(3, len(cache) // 4))
+    forecast_horizon = min(forecast_horizon, max(1, len(cache) // 4))
+
     result = DTWAnalogResult(
         query_window_days=query_window,
         forecast_horizon_days=forecast_horizon,

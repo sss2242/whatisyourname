@@ -2060,11 +2060,11 @@ Non-interactive examples:
     _seg_result: dict = {}
     try:
         if hasattr(pit_client, "extract_segment_data"):
-            _seg_result = pit_client.extract_segment_data(company) or {}
+            _seg_result = pit_client.extract_segment_data(identifier) or {}
             if _seg_result.get("n_segments", 0) >= 2:
                 logger.info(
                     "Segments extracted: %d segments for %s",
-                    _seg_result["n_segments"], company,
+                    _seg_result["n_segments"], company_name,
                 )
                 # Inject product metrics into cache for temporal models
                 try:
