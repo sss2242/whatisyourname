@@ -115,10 +115,11 @@ class USEdgarClient:
         user_agent: str = "",
         cache_dir: Path | str = _CACHE_DIR,
     ) -> None:
-        # Prefer EDGAR_IDENTITY env var (email), fall back to provided arg or default
+        # Prefer EDGAR_IDENTITY env var, then SEC_EDGAR_EMAIL, fall back to provided arg or default
         self._user_agent = (
             user_agent
             or os.environ.get("EDGAR_IDENTITY", "")
+            or os.environ.get("SEC_EDGAR_EMAIL", "")
             or _DEFAULT_USER_AGENT
         )
         # SEC requires email in User-Agent; if EDGAR_IDENTITY is just an email, wrap it

@@ -168,9 +168,21 @@ def create_pit_client(
     # Import and instantiate the appropriate client
     if market_id == "us_sec_edgar":
         from operator1.clients.us_edgar import USEdgarClient
-        edgar_identity = secrets.get("EDGAR_IDENTITY", "")
+        import os as _os
+        edgar_identity = (
+            secrets.get("EDGAR_IDENTITY", "")
+            or secrets.get("SEC_EDGAR_EMAIL", "")
+            or _os.environ.get("EDGAR_IDENTITY", "")
+            or _os.environ.get("SEC_EDGAR_EMAIL", "")
+        )
         if edgar_identity:
-            user_agent = f"Operator1/1.0 ({edgar_identity})"
+            # SEC requires email in User-Agent; wrap if needed
+            if "@" in edgar_identity and "/" not in edgar_identity:
+                user_agent = f"Operator1/1.0 ({edgar_identity})"
+            else:
+                user_agent = edgar_identity
+            # Also set EDGAR_IDENTITY env var so edgartools picks it up
+            _os.environ.setdefault("EDGAR_IDENTITY", edgar_identity)
         else:
             user_agent = "Operator1/1.0 (https://github.com/Abdu2024/OP-1)"
         return USEdgarClient(user_agent=user_agent)

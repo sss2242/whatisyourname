@@ -2553,6 +2553,27 @@ def run_prediction_aggregation(
                 var_rmse, rmse_reference, surv_prob,
             )
 
+            # P2: Sanity clamp for price-level predictions (close, open, high).
+            # Level-based models (XGBoost, tree) can extrapolate wildly beyond
+            # reasonable bounds. Cap at +/- max_pct_change per horizon from
+            # the last observed value.
+            if var_name in ("close", "open", "high", "low") and not math.isnan(point):
+                _last_val = last_value  # from cache[var_name].iloc[-1]
+                if _last_val is not None and not math.isnan(_last_val) and _last_val > 0:
+                    _max_pct = {1: 0.10, 5: 0.20, 21: 0.40, 252: 1.50}.get(h_days, 0.50)
+                    _upper_bound = _last_val * (1.0 + _max_pct)
+                    _lower_bound = _last_val * (1.0 - _max_pct)
+                    if point > _upper_bound or point < _lower_bound:
+                        _clamped = max(_lower_bound, min(_upper_bound, point))
+                        logger.debug(
+                            "P2 clamp: %s/%s %.2f -> %.2f (last=%.2f, max_pct=%.0f%%)",
+                            var_name, h_label, point, _clamped, _last_val, _max_pct * 100,
+                        )
+                        point = _clamped
+                        # Also tighten CIs to clamped range
+                        lower = max(_lower_bound, lower) if not math.isnan(lower) else lower
+                        upper = min(_upper_bound, upper) if not math.isnan(upper) else upper
+
             pred = HorizonPrediction(
                 variable=var_name,
                 horizon=h_label,
