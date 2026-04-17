@@ -1,8 +1,8 @@
-# Analysis Models Map (2026-04-01)
+# Analysis Models Map (2026-04-17)
 
-Comprehensive reference for all 50 analytical modules in Operator 1. Each module documented with purpose, mathematical basis, inputs, outputs, pipeline wiring, profile/report integration, dependencies, and current status.
+Comprehensive reference for all 62 analytical modules in Operator 1. Each module documented with purpose, mathematical basis, inputs, outputs, pipeline wiring, profile/report integration, dependencies, and current status.
 
-Total: ~37,700 lines of analytical code across 3 layers.
+Total: ~49,900 lines of analytical code across 6 layers.
 
 ---
 
@@ -297,6 +297,52 @@ conflict_intensity = 0.40 * event_score + 0.20 * fatality_score + 0.25 * flag_sc
 
 **Input:** Cache, profile dict, optional news articles from sentiment module
 **Output:** Cache + catalyst columns, `CatalystResult`
+
+---
+
+### 1.13 Product Metrics (NEW -- 2026-04-11)
+
+**File:** `operator1/features/product_metrics.py` (289 lines)
+**Pipeline step:** Step 5i.6
+**Profile key:** `product_segments`
+
+**Purpose:** Computes quantitative product-level metrics from segment revenue data extracted by per-market `extract_segment_data()` methods. These metrics feed into temporal models as extra variables and into Monte Carlo for concentration risk assessment.
+
+**Metrics computed:**
+- **segment_hhi**: Herfindahl-Hirschman Index of revenue concentration across segments (0-1, higher = more concentrated)
+- **cannibalization_rate**: Revenue shift between segments (negative = segments cannibalizing each other)
+- **network_effect_score**: Revenue acceleration from user/customer network effects
+- **input_cost_pressure**: Cost growth rate relative to revenue growth
+- **growth_runway_quarters**: Estimated quarters before dominant segment matures
+- **maturity_concentration**: Fraction of revenue from mature (low-growth) segments
+- **estimated_market_share**: Inferred from segment revenue vs industry benchmarks
+- **dominant_segment_growth**: YoY growth rate of the largest revenue segment
+- **net_new_revenue_pct**: Revenue from segments that didn't exist N quarters ago
+
+**Segment extraction coverage:** 15 markets have `extract_segment_data()` implementations: US (XBRL + 10-K text), EU/NL/ES/IT/SE (ESEF XBRL IFRS 8), UK (ESEF crossover + PDF + docTR OCR), KR (DART XBRL), JP (IRBank + SEC EDGAR ADR), CN (akshare/EastMoney), TW (doc.twse.com.tw + SEC EDGAR ADR), CL (SEC EDGAR ADR), BR (DFP PDF + fuzzy parser), SA (Tadawul XBRL + PDF), CH (3 paths), ZA (SENS PDF), MX (BMV XBRL IFRS 8).
+
+**Input:** Cache DataFrame, segment data dict from `extract_segment_data()`
+**Output:** Cache + 9 product metric columns
+**Downstream consumers:** Temporal models (via `_extra_vars`), Monte Carlo (`segment_hhi` for concentration risk flag), OHLC predictor, profile builder
+
+---
+
+### 1.14 OCR Pipeline for Image-Based PDFs (NEW -- 2026-04-13)
+
+**File:** `operator1/clients/fuzzy_pdf_parser.py` (OCR integration within existing module)
+**Pipeline step:** Called during filing extraction for image-based PDFs
+**Profile key:** N/A (transparent fallback)
+
+**Purpose:** When camelot-py and pdfplumber find no extractable text in a PDF (scanned/image-based documents, common in UK Companies House filings), falls back to deep learning OCR via `python-doctr` (Mindee).
+
+**Batched processing architecture:**
+- Pages processed in batches of 50 (configurable via `max_batches_per_run`)
+- Each batch's OCR output cached to disk (`cache/ocr/{hash}/page_{n}.txt`)
+- On timeout or interruption, next run resumes from last cached page
+- `scripts/run_ocr_batch.py` for staged processing of large PDFs
+- `scripts/check_ocr_cache.py` for cache inspection
+
+**Dependencies:** `python-doctr>=1.0` (optional, graceful fallback to empty extraction)
 
 ---
 
@@ -778,7 +824,7 @@ Where H is conditional entropy estimated via k-nearest-neighbor density estimati
 
 6. **Baseline** (last-value or EMA): Simple carry-forward or exponential moving average. Always available as fallback.
 
-**Standalone functions:** `fit_autoarima()` (via `statsforecast`, 100x faster than pmdarima) and `fit_dynamic_factor()` (multi-variable DFM via `statsmodels.tsa.DynamicFactor`).
+**Standalone functions:** `fit_ets()` (via `statsforecast` ETS, replaced AutoARIMA on 2026-04-16, 10-50x faster) and `fit_dynamic_factor()` (multi-variable DFM via `statsmodels.tsa.DynamicFactor`). `fit_autoarima()` was removed -- ETS provides equivalent accuracy with dramatically lower latency and no hanging risk.
 
 **Output:** `ForecastResult` with `.forecasts` (per-var, per-horizon point forecasts), `.metrics` (per-model RMSE/MAE), `.model_used` (which model won per variable), `.residuals` (for conformal calibration).
 
@@ -1759,6 +1805,94 @@ Where alpha comes from `forecast_result.return_5d` (primary) or scorecard grade 
 
 ---
 
+## Layer 6: Staged Pipeline Architecture (NEW -- 2026-04-16)
+
+5 modules in `operator1/stages/` that decompose the monolithic pipeline into per-model sub-stages with checkpoint save/resume via `PipelineState`.
+
+---
+
+### 6.1 Pipeline State
+
+**File:** `operator1/pipeline_state.py` (401 lines)
+**Purpose:** Mutable state bag replacing hundreds of local variables in `main.py`. Serializes to disk between sub-stages: DataFrames as Parquet, model results as pickle.
+
+### 6.2 Stage Runner
+
+**File:** `operator1/stages/runner.py` (279 lines)
+**Purpose:** Dispatches sub-stages in dependency order with checkpoint save/resume. Supports stage specs: `"3"` (all stage 3), `"4.1"` (just forecasting), `"3-6"` (range), `"all"`.
+
+### 6.3 Stage 3 -- Temporal Analysis
+
+**File:** `operator1/stages/stage3_temporal.py` (247 lines)
+**Sub-stages:** 3.1 (regime detection), 3.2 (dual regimes), 3.3 (Granger), 3.4 (transfer entropy), 3.5 (cycle decomposition), 3.6 (pattern detection), 3.7 (pre-forecast synergies)
+
+### 6.4 Stage 4 -- Forecasting
+
+**File:** `operator1/stages/stage4_forecasting.py` (54 lines)
+**Sub-stages:** 4.1 (forecasting -- Kalman, GARCH, VAR, LSTM, Tree, ETS, baseline)
+
+### 6.5 Stage 5 -- Forward Modeling
+
+**File:** `operator1/stages/stage5_forward.py` (274 lines)
+**Sub-stages:** 5.1 (forward pass), 5.2 (burn-out), 5.3 (walk-forward + MCS + FixedShare), 5.4 (Monte Carlo), 5.5 (copula), 5.6 (regime shift prediction)
+
+### 6.6 Stage 6 -- Ensemble & Aggregation
+
+**File:** `operator1/stages/stage6_ensemble.py` (414 lines)
+**Sub-stages:** 6.1 (transformer), 6.2 (particle filter), 6.3 (conformal), 6.4 (DTW), 6.5 (prediction aggregation), 6.6 (SHAP), 6.7 (Sobol), 6.8 (TV Granger), 6.9 (MV Monte Carlo), 6.10 (genetic optimizer), 6.11 (OHLC predictor + predicted patterns)
+
+### 6.7 Stage 7 -- Integration
+
+**File:** `operator1/stages/stage7_integration.py` (371 lines)
+**Sub-stages:** 7.1 (USS + scenario engine), 7.2 (retroactive calibration), 7.3 (model diagnostics), 7.4 (multi-frequency pipeline + fusion), 7.5 (hedge fund analysis)
+
+---
+
+### Layer 4 Addendum: Advanced HF Methods + Fusion (NEW -- 2026-04-03)
+
+### 4.19 Advanced HF Methods
+
+**File:** `operator1/hedge_fund/advanced_methods.py` (911 lines)
+**Pipeline step:** Step 6-HF (called from engine.py)
+**Profile key:** `hedge_fund.advanced_methods`
+
+**Purpose:** 15 additional investment-grade forensic and valuation metrics that extend the base HF pipeline:
+
+- Piotroski F-Score (9-factor binary, Piotroski 2000)
+- Ohlson-Udell Bankruptcy (O-Score, Ohlson 1980)
+- Altman Z''' (emerging market variant, Altman 2014)
+- Forensic Cash Flow (OCF decomposition + quality scoring)
+- Merton Default Probability (structural model, Black-Scholes framework)
+- Springate S-Score (4-factor distress, Springate 1978)
+- Zmijewski Score (probit model, Zmijewski 1984)
+- Laitinen Failure Process (3-phase deterioration)
+- Beneish Extended (8-factor + sector calibration)
+- Revenue Quality Decomposition (organic vs inorganic)
+- Working Capital Efficiency Score
+- Capital Allocation Efficiency (ROIC vs WACC spread)
+- Earnings Persistence (AR coefficient of NI)
+- Free Cash Flow Sustainability Index
+- Margin of Safety (Graham-Dodd, intrinsic vs market)
+
+### 4.20 Cross-Pipeline Insight Fusion
+
+**File:** `operator1/hedge_fund/fusion.py` (652 lines)
+**Pipeline step:** Step 6-HF (post-scorecard)
+**Profile key:** `hedge_fund.fusion`
+
+**Purpose:** 8-method fusion layer combining HF metrics with pipeline temporal/multi-frequency results:
+
+1. **Signal quality fusion:** IC-weighted HF metric reliability
+2. **Filing frequency alignment:** HF metrics anchored to filing calendar
+3. **Survival regime context:** Regime-conditional HF weighting
+4. **Multi-frequency trend consistency:** Cross-frequency directional agreement
+5. **Cross-method convergence scoring:** Agreement across independent methods
+6. **Regime-conditional HF weighting:** Distress metrics amplified in survival
+7. **Temporal decay adjustment:** Recent HF data weighted more
+8. **Confidence calibration:** Inter-method agreement drives confidence
+
+---
+
 ## Execution Order
 
 ```
@@ -1846,13 +1980,14 @@ Step 8:    report_generator + triage_card (USS)
 
 | Layer | Modules | Lines | Description |
 |-------|---------|-------|-------------|
-| Features | 12 | ~10,200 | Raw cache -> enriched features |
+| Features | 14 | ~11,500 | Raw cache -> enriched features (includes product_metrics + OCR) |
 | Analysis | 10 | ~6,300 | Survival flags, hierarchy, protection, adaptive calibration, USS |
-| Temporal | 25 | ~18,200 | Regime, forecasting, MC, uncertainty, aggregation, regime shift prediction |
+| Temporal | 25 | ~18,500 | Regime, forecasting (ETS replaced AutoARIMA), MC, uncertainty, aggregation |
 | USS | 2 | ~1,040 | Unified Survival System (controller + scenario engine) |
 | Monitoring/Diagnostics | 1 | ~875 | Model expected path vs actual path diagnostics |
-| **Hedge Fund** | **7** | **~3,500** | **Investment thesis: earnings forensics, cash flow stress, balance sheet risk, inflection, valuation, scorecard, position signal** |
-| **Multi-Frequency** | **3** | **~1,720** | **5-frequency pipeline (A/Q/M/W/D) with cascading context + cross-frequency fusion** |
-| **Total** | **60** | **~41,835** | |
+| **Hedge Fund** | **9** | **~5,100** | **15 base metrics + 15 advanced methods (Piotroski, Altman Z''', etc.) + 8-method fusion + scorecard + position signal** |
+| **Multi-Frequency** | **3** | **~1,800** | **5-frequency pipeline (A/Q/M/W/D) with per-frequency sub-stages + cross-frequency fusion** |
+| **Staged Pipeline** | **6** | **~1,865** | **PipelineState + runner + 5 stage modules (30 sub-stages with checkpoint save/resume)** |
+| **Total** | **70** | **~46,980** | |
 
-All 60 modules wired in main.py. All results stored in profile_builder. HF results in `profile["hedge_fund"]`. Multi-frequency results in `profile["multi_frequency"]`.
+All 70 modules wired in main.py (or via staged runner). All results stored in profile_builder. HF results in `profile["hedge_fund"]`. Multi-frequency results in `profile["multi_frequency"]`. Staged pipeline accessible via `--stage 3-6 --run-dir cache/AAPL`.

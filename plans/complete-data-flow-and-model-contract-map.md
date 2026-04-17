@@ -1,6 +1,6 @@
 # Complete Data Flow and Model Contract Map
 
-*Last updated: 2026-04-01*
+*Last updated: 2026-04-17*
 
 Every model in the Operator 1 pipeline, from raw cache construction through
 report generation, with expected vs actual inputs, outputs, and operations.
@@ -326,7 +326,7 @@ Three modules that replace fixed constants across the pipeline with data-derived
 |---|----------|--------|--------|
 | **Input** | cache, `extra_variables` list | Same | OK |
 | **Output** | cache + forecast columns, `ForecastResult` with `.forecasts` (per-var, per-horizon point forecasts), `.metrics` (per-model RMSE/MAE), `.model_used`, `.residuals` | `.residuals` was None (never populated) | FIXED |
-| **Operation** | For each variable, try models in order: 1. Kalman (local-level state-space). 2. GARCH (conditional volatility). 3. VAR (multivariate, AR(1) fallback). 4. LSTM (PyTorch, GBM/LR fallback). 5. Tree ensemble (RF/GBM/XGB). 6. Baseline (last-value or EMA). First model that fits successfully wins. **NEW standalone functions**: `fit_autoarima()` via statsforecast (100x faster) and `fit_dynamic_factor()` (multi-variable DFM). | Same | **ENHANCED** |
+| **Operation** | For each variable, try models in order: 1. Kalman (local-level state-space). 2. GARCH (conditional volatility). 3. VAR (multivariate, AR(1) fallback). 4. LSTM (PyTorch, GBM/LR fallback). 5. Tree ensemble (RF/GBM/XGB). 6. Baseline (last-value or EMA). First model that fits successfully wins. **NEW standalone functions**: `fit_ets()` via statsforecast ETS (replaced AutoARIMA, 10-50x faster) and `fit_dynamic_factor()` (multi-variable DFM). `fit_autoarima()` removed (2026-04-16). | Same | **ENHANCED** |
 
 ### F9. Forward Pass -- `run_forward_pass()`
 
@@ -659,6 +659,153 @@ Three modules that replace fixed constants across the pipeline with data-derived
 
 ---
 
+## Phase I: Staged Pipeline Architecture (NEW -- 2026-04-16)
+
+### I1. Pipeline State -- `PipelineState`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | All local variables from main.py's `main()` function | Same | OK |
+| **Output** | Serializable state bag: `cache.parquet` + `state_{sub_stage}.pkl` per checkpoint | Same | OK |
+| **Location** | `operator1/pipeline_state.py` (401 lines) | | |
+| **Operation** | Replaces hundreds of local variables in main.py. Each sub-stage reads/writes to PipelineState. Between sub-stages, state serializes to disk (Parquet for DataFrames, pickle for model results) so execution can resume in a fresh process. Supports linked_caches, linked_agg_df, raw statement DFs, and multi-frequency sub-directory helpers. | Same | OK |
+
+### I2. Stage Runner -- `run_stages()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | `PipelineState`, `stage_spec` string (e.g. "3", "4.1", "3-6", "all") | Same | OK |
+| **Output** | Mutated PipelineState with all sub-stage results populated + disk checkpoints | Same | OK |
+| **Location** | `operator1/stages/runner.py` (279 lines) | | |
+| **Operation** | Dispatches sub-stages with checkpoint save/resume. Parses stage specs, filters registry, loads from previous checkpoint if resuming. Each sub-stage wrapped in try/except with failed checkpoint save. | Same | OK |
+
+### I3. Sub-Stage Modules (5 files, ~1,360 lines total)
+
+| Sub-Stage | ID | Module | Models |
+|-----------|----|----|--------|
+| Regime Detection | 3.1 | `stage3_temporal.py` | HMM, GMM, PELT, BCP, ChangeFinder |
+| Dual Regimes | 3.2 | `stage3_temporal.py` | Regime mixer |
+| Granger Causality | 3.3 | `stage3_temporal.py` | PCMCI / Granger F-tests |
+| Transfer Entropy | 3.4 | `stage3_temporal.py` | Shannon entropy |
+| Cycle Decomposition | 3.5 | `stage3_temporal.py` | CEEMDAN / FFT |
+| Pattern Detection | 3.6 | `stage3_temporal.py` | Candlestick + Matrix Profile |
+| Pre-Forecast Synergies | 3.7 | `stage3_temporal.py` | Economic planes + causal pruning |
+| Forecasting | 4.1 | `stage4_forecasting.py` | Kalman, GARCH, VAR, LSTM, Tree, ETS |
+| Forward Pass | 5.1 | `stage5_forward.py` | PID-controlled walk |
+| Burn-Out | 5.2 | `stage5_forward.py` | Exponential gradient calibration |
+| Walk-Forward | 5.3 | `stage5_forward.py` | MCS + FixedShare |
+| Monte Carlo | 5.4 | `stage5_forward.py` | Regime-switching MC |
+| Copula | 5.5 | `stage5_forward.py` | Gaussian/Student-t/Clayton |
+| Regime Shift Prediction | 5.6 | `stage5_forward.py` | HMM transition CDF |
+| Transformer | 6.1 | `stage6_ensemble.py` | Multi-head attention |
+| Particle Filter | 6.2 | `stage6_ensemble.py` | Sequential MC |
+| Conformal Prediction | 6.3 | `stage6_ensemble.py` | PID calibrator + Mondrian |
+| DTW Analogs | 6.4 | `stage6_ensemble.py` | Dynamic Time Warping |
+| Prediction Aggregation | 6.5 | `stage6_ensemble.py` | Inverse-RMSE + FixedShare |
+| SHAP | 6.6 | `stage6_ensemble.py` | TreeExplainer / KernelExplainer |
+| Sobol | 6.7 | `stage6_ensemble.py` | Saltelli sensitivity |
+| TV Granger | 6.8 | `stage6_ensemble.py` | Rolling-window causal |
+| MV Monte Carlo | 6.9 | `stage6_ensemble.py` | Copula joint simulation |
+| Genetic Optimizer | 6.10 | `stage6_ensemble.py` | Optuna TPE / GA |
+| OHLC Predictor | 6.11 | `stage6_ensemble.py` | Forecast + MC + pattern drift |
+| USS + Scenario | 7.1 | `stage7_integration.py` | Forecast bounding + 3-scenario MC |
+| Retro Calibration | 7.2 | `stage7_integration.py` | Empirical Bayes |
+| Model Diagnostics | 7.3 | `stage7_integration.py` | Expected vs actual path |
+| Multi-Frequency | 7.4 | `stage7_integration.py` | 5-frequency pipeline + fusion |
+| Hedge Fund | 7.5 | `stage7_integration.py` | 15 metrics + scorecard |
+
+---
+
+## Phase J: Product Segment Extraction (NEW -- 2026-04-11 to 2026-04-14)
+
+### J1. Product Segment Extraction -- `extract_segment_data()` (per-market)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | Company identifier (ticker/CIK) | Same | OK |
+| **Output** | Dict with `segments` (name -> revenue), `descriptions` (name -> text), `n_segments`, `has_revenue`, `has_descriptions`, `source` | Same | OK |
+| **Operation** | Per-market segment extraction using native XBRL, 10-K text, akshare, IRBank, or PDF parsing. Results injected into cache via `product_metrics.py`. | Same | OK |
+| **Wired in** | `main.py` Step 5i.6 (before temporal models) | | |
+
+**Market coverage (15 markets with segment extraction):**
+
+| Market | Method | Source |
+|--------|--------|--------|
+| US SEC EDGAR | XBRL OperatingSegmentsMember + 10-K text fallback | edgartools |
+| EU ESEF | XBRL dimensional facts (IFRS 8) | filings.xbrl.org |
+| UK Companies House | ESEF crossover + PDF fallback + docTR OCR | iXBRL + camelot |
+| KR DART | XBRL segment extraction | dart-fss |
+| JP J-Quants | IRBank (primary) + SEC EDGAR 20-F ADR (fallback) | IRBank scraper |
+| CN SSE | akshare/EastMoney stock_zygc_em | akshare |
+| TW MOPS | doc.twse.com.tw PDF (primary) + SEC EDGAR ADR (fallback) | pdfplumber |
+| CL CMF | SEC EDGAR ADR | edgartools |
+| BR CVM | DFP PDF + fuzzy parser | pdfplumber + camelot |
+| SA Tadawul | XBRL + enhanced PDF keywords | curl_cffi |
+| CH SIX | 3 paths (ESEF crossover, dividend, LLM) | SIX APIs |
+| ZA JSE | SENS PDF + SA number format | pdfplumber |
+| MX BMV | XBRL IFRS 8 Operating Segments | BMV XBRL JSON |
+| NL/ES/IT/SE | ESEF XBRL dimensional facts (IFRS 8) | filings.xbrl.org |
+
+### J2. Product Metrics -- `compute_product_metrics()`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache DataFrame, segment data dict | Same | OK |
+| **Output** | cache + `segment_hhi`, `cannibalization_rate`, `network_effect_score`, `input_cost_pressure`, `growth_runway_quarters`, `maturity_concentration`, `estimated_market_share`, `dominant_segment_growth`, `net_new_revenue_pct` | Same | OK |
+| **Location** | `operator1/features/product_metrics.py` (289 lines, NEW) | | |
+| **Operation** | Computes quantitative product metrics from segment revenue data. HHI measures concentration risk. Cannibalization rate detects revenue shifts between segments. Network effects scored from revenue acceleration patterns. | Same | OK |
+| **Downstream** | Consumed by temporal models (via `_extra_vars`), Monte Carlo (`segment_hhi` for concentration risk flag), profile builder (`profile["product_segments"]`) | Same | OK |
+
+---
+
+## Phase K: OCR Pipeline for Image-Based PDFs (NEW -- 2026-04-13 to 2026-04-14)
+
+### K1. docTR OCR Fallback
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | Image-based PDF bytes (scanned documents, UK Companies House) | Same | OK |
+| **Output** | Extracted text per page | Same | OK |
+| **Operation** | Uses `python-doctr` deep learning OCR (Mindee) for image-based PDF extraction when camelot/pdfplumber find no text. Batched processing (50 pages/batch) with disk caching for resume on timeout. `max_batches_per_run` limit for staged processing. | Same | OK |
+| **Location** | `operator1/clients/fuzzy_pdf_parser.py` (OCR integration), `scripts/run_ocr_batch.py`, `scripts/check_ocr_cache.py` | | |
+| **Dependencies** | `python-doctr>=1.0` (optional, graceful fallback) | | |
+
+---
+
+## Phase L: Advanced Hedge Fund Methods + Fusion (NEW -- 2026-04-03)
+
+### L1. Advanced HF Methods -- `hedge_fund/advanced_methods.py`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | Raw statement DFs, cache, all upstream model results | Same | OK |
+| **Output** | 15 additional investment-grade metrics (Piotroski F-Score, Ohlson-Udell, Altman Z''', forensic CF, Merton default, etc.) | Same | OK |
+| **Location** | `operator1/hedge_fund/advanced_methods.py` (911 lines, NEW) | | |
+| **Profile** | Stored in `profile["hedge_fund"]["advanced_methods"]` | Same | OK |
+
+### L2. Cross-Pipeline Insight Fusion -- `hedge_fund/fusion.py`
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | HF results, multi-frequency results, signal IC, filing calendar, survival controller | Same | OK |
+| **Output** | 8-method fused insights combining HF metrics with pipeline temporal/multi-freq results | Same | OK |
+| **Location** | `operator1/hedge_fund/fusion.py` (652 lines, NEW) | | |
+| **Operation** | Fuses: (1) signal quality from IC, (2) filing frequency alignment, (3) survival regime context, (4) multi-frequency trend consistency, (5) cross-method convergence scoring, (6) regime-conditional HF weighting, (7) temporal decay adjustment, (8) confidence calibration | Same | OK |
+
+---
+
+## Phase M: Full-Pipeline Per-Frequency Architecture (NEW -- 2026-04-16)
+
+### M1. Per-Frequency Sub-Stages
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | Daily cache, raw statement DFs | Same | OK |
+| **Output** | Per-frequency pipeline results with post-fusion HF analysis | Same | OK |
+| **Operation** | Multi-frequency pipeline refactored: each frequency runs as a sub-stage with checkpoint save/resume. Post-fusion HF runs once on fused results (not per-frequency). ResampledCache constructor now includes 3 previously missing fields for MF disk serialization. HF runs once in `mf.fuse`, Stage 3 skips if already available. | Same | OK |
+
+---
+
 ## Summary of All Fixes Applied
 
 | Issue | Location | What was wrong | What was fixed |
@@ -687,3 +834,11 @@ Three modules that replace fixed constants across the pipeline with data-derived
 | R5 | report_generator.py:2577 | Stale `geopolitical_risk` fallback key never produced by any module | **FIXED** -- removed dead fallback |
 | R6 | profile_builder.py:675 | `_build_historical_section()` crashes on `cache=None` (None guard placed after `.columns` access) | **FIXED** -- moved None guard before `.columns` access |
 | R7 | test_phase7_report.py:222,679,708 | 17 tests failing due to obsolete `output_path` parameter and stale file existence assertions | **FIXED** -- removed `output_path`, updated assertions to test returned dict directly (34/34 pass) |
+| S17 | forecasting.py | AutoARIMA via statsforecast is slow (30s+ per variable) and occasionally hangs | **FIXED (2026-04-16)** -- Replaced with statsforecast ETS (10-50x faster). `fit_autoarima()` removed. `fit_ets()` added as standalone function. 30s timeout added as safety net. |
+| S18 | main.py / stages/ | No checkpoint save/resume; entire pipeline must re-run on failure | **FIXED (2026-04-16)** -- Added staged pipeline architecture. PipelineState serializes to disk (Parquet + pickle). 30 sub-stages across Stages 3-7 with per-model granularity. Resume via `--stage 4.1 --run-dir cache/AAPL`. |
+| S19 | 15 wrappers | No product segment extraction capability | **FIXED (2026-04-11 to 2026-04-14)** -- Added `extract_segment_data()` to 15 market wrappers using native XBRL (IFRS 8), 10-K text parsing, akshare, IRBank, and PDF fallback. `product_metrics.py` (289 lines) computes segment_hhi, cannibalization_rate, network_effect_score. |
+| S20 | fuzzy_pdf_parser.py | Image-based PDFs (scans) produce empty extraction | **FIXED (2026-04-13)** -- Added docTR OCR fallback for image-based PDFs. Batched processing (50 pages/batch) with disk caching for resume on timeout. |
+| S21 | hedge_fund/engine.py | HF pipeline lacked advanced forensic methods | **FIXED (2026-04-03)** -- Added `advanced_methods.py` (911 lines, 15 methods including Piotroski F-Score, Altman Z''', forensic CF) and `fusion.py` (652 lines, 8-method cross-pipeline insight fusion). |
+| S22 | multi_frequency_runner.py | MF pipeline ran sequentially in main.py, no sub-stage checkpoints | **FIXED (2026-04-16)** -- Split into per-frequency sub-stages with disk serialization. Post-fusion HF runs once (not per-frequency). ResampledCache constructor fixed with 3 missing fields. |
+| S23 | backtest_runner.py | 13 parity bugs vs main.py (HMM look-ahead, missing kwargs, profile gaps) | **FIXED (2026-04-15)** -- HMM look-ahead bias fixed, missing kwargs added, profile gap fields populated. |
+| S24 | scoring_weights.py | 7 analytical modules using hardcoded constants instead of config | **FIXED (2026-04-04)** -- Wired conflict_weights, vanity_weights, frequency_fusion, uss_model_switching, and others to `config/scoring_weights.yml`. |

@@ -1,4 +1,4 @@
-# Reporting, Monitoring & Dashboard Map (2026-04-01)
+# Reporting, Monitoring & Dashboard Map (2026-04-17)
 
 Complete map of all modules in the output/presentation layer: report generation (4 modules, ~6,850 lines), monitoring (3 modules, ~3,100 lines), and dashboard (1 module, ~1,850 lines). Covers inputs, outputs, wiring status, and current state.
 
@@ -69,6 +69,14 @@ The report layer consumes `company_profile.json` from the profile builder and pr
 | `supply_chain_stress` | `supply_chain_stress_result` | When supply chain stress computed |
 | `product_catalysts` | `CatalystResult` | When catalyst detection ran |
 | `scenario_analysis` | `scenario_result.to_dict()` | When USS scenario engine ran |
+| `product_segments` | Segment data dict from `extract_segment_data()` | When segment extraction succeeded (15 markets, NEW 2026-04-11) |
+| `hedge_fund.advanced_methods` | Advanced HF forensic results | When advanced_methods.py ran (NEW 2026-04-03) |
+| `hedge_fund.fusion` | Cross-pipeline insight fusion | When fusion.py ran (NEW 2026-04-03) |
+| `signal_ic` | `signal_ic_result.to_profile_dict()` | When Signal IC measurement ran |
+| `prediction_log` | Prediction log summary | When prediction log fill ran |
+| `position_signal` | Position signal (-1 to +1) | When position signal computed |
+| `multi_frequency` | `multi_frequency_result.to_profile_dict()` | When multi-frequency pipeline ran |
+| `unified_survival_system` | `survival_controller.to_profile_dict()` | When USS controller active |
 
 ### 1.2 Profile Schema -- `profile_schema.py`
 
@@ -385,11 +393,11 @@ The NiceGUI desktop dashboard provides a visual interface for running analyses, 
 
 | Page | Route | Content |
 |------|-------|---------|
-| Home | default | Last analysis summary or welcome screen + history table |
-| New Analysis | "analyze" | LLM provider, region/market/company selection, pipeline options, run button with live log |
-| Report | "report" | Tabbed view: Summary, Interactive (plotly), Charts (ECharts), Full Report (markdown), Tearsheet |
+| Home | default | Last analysis summary or welcome screen + history table + **all 20 profile outputs displayed** (NEW 2026-04-03) |
+| New Analysis | "analyze" | LLM provider, region/market/company selection, pipeline options, run button with live log + **all 7 advanced pipeline options** (NEW 2026-04-03) |
+| Report | "report" | Tabbed view: Summary (**key results + advanced analytics**, NEW 2026-04-03), Interactive (plotly), Charts (ECharts), Full Report (markdown), Tearsheet |
 | Health | "health" | System health: Tier 1/2 market cards, dependency status, run full check button |
-| Config | "config" | API keys status, cache management, about |
+| Config | "config" | API keys status, cache management, about + **Scoring Weights panel** (Panel A: tweakable inputs, Panel B: computed outputs, NEW 2026-04-03) |
 
 **Dashboard components:**
 

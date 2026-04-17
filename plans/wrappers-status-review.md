@@ -1,4 +1,4 @@
-# Wrappers Status Review (2026-03-21)
+# Wrappers Status Review (2026-04-17)
 
 Current state of all Tier 1 and Tier 2 market wrappers based on code review.
 
@@ -255,6 +255,41 @@ Live probe results for 8 markets with known holder data issues. All tests run fr
 
 ---
 
+## Product Segment Extraction (NEW -- 2026-04-11 to 2026-04-14)
+
+All 25 Tier 1 + Tier 2 wrappers now support `extract_segment_data()` for product/operating segment revenue decomposition. 15 markets have native or PDF-based extraction; remaining markets return empty (no segment data available from their APIs).
+
+### Segment Extraction Coverage
+
+| # | Market | ID | Method | Source | Status |
+|---|--------|----|--------|--------|--------|
+| 1 | **United States** | `us_sec_edgar` | XBRL OperatingSegmentsMember + 10-K text fallback | edgartools | Working |
+| 2 | **United Kingdom** | `uk_companies_house` | ESEF crossover + PDF fallback + docTR OCR for image PDFs | iXBRL + camelot + python-doctr | Working |
+| 3 | **EU (pan-EU)** | `eu_esef` | XBRL dimensional facts (IFRS 8 Operating Segments) | filings.xbrl.org | Working |
+| 4 | **South Korea** | `kr_dart` | DART XBRL segment extraction | dart-fss | Working (Samsung: 3 segments) |
+| 5 | **Japan** | `jp_jquants` | IRBank (primary) + SEC EDGAR 20-F ADR (fallback) | IRBank scraper + edgartools | Working |
+| 6 | **China** | `cn_sse` | akshare/EastMoney stock_zygc_em (revenue breakdown) | akshare | Working |
+| 7 | **Taiwan** | `tw_mops` | doc.twse.com.tw annual report PDF (primary) + SEC EDGAR ADR (fallback) | pdfplumber + edgartools | Working |
+| 8 | **Chile** | `cl_cmf` | SEC EDGAR ADR (20-F segment data) | edgartools | Working |
+| 9 | **Brazil** | `br_cvm` | DFP PDF + fuzzy parser | pdfplumber + camelot | Working |
+| 10 | **Saudi Arabia** | `sa_tadawul` | Tadawul XBRL + enhanced PDF keywords (Saudi IFRS + industry terms) | curl_cffi | Working |
+| 11 | **Switzerland** | `ch_six` | 3 paths (ESEF crossover, dividend inference, LLM extraction) | SIX APIs | Working |
+| 12 | **South Africa** | `za_jse` | SENS PDF + SA number format handler + left-turnover layout | pdfplumber | Working |
+| 13 | **Mexico** | `mx_bmv` | BMV XBRL IFRS 8 Operating Segments | BMV XBRL JSON | Working |
+| 14 | **Netherlands/Spain/Italy/Sweden** | `nl/es/it/se_esef` | ESEF XBRL dimensional facts (IFRS 8) | filings.xbrl.org | Working |
+
+### OCR Capability (for image-based PDFs)
+
+Added 2026-04-13. UK Companies House and some other markets produce image-based (scanned) PDFs where camelot/pdfplumber find no text. The docTR deep learning OCR (Mindee) provides fallback extraction:
+
+- **Batched processing:** 50 pages per batch (configurable)
+- **Disk caching:** OCR output cached per page to `cache/ocr/{hash}/page_{n}.txt`
+- **Resume on timeout:** Next run picks up from last cached page
+- **Staged processing:** `max_batches_per_run` limit prevents single-run timeouts
+- **Dependencies:** `python-doctr>=1.0` (optional, graceful fallback)
+
+---
+
 ## Summary by Capability
 
 | Capability | Working | Partial | Broken |
@@ -264,3 +299,4 @@ Live probe results for 8 markets with known holder data issues. All tests run fr
 | Financial Statements | IN (native), CN (akshare), **HK (akshare/EastMoney)**, **MX (XBRL JSON)**, **CH (synthetic)**, **SA (XBRL HTML)**, **NL/ES/IT/SE (ESEF XBRL JSON)** | AU, CA, SG, **ZA**, **AE** (LLM primary + fuzzy PDF fallback) | -- |
 | OHLCV | All 15 (**CH**: SIX CSV, **AE**: api2 snapshot + yfinance) | -- | -- |
 | Filing Discovery | IN, AU, CA, HK, SG, **MX**, **SA**, **ZA**, **AE**, **NL/ES/IT/SE** (ESEF XBRL) | **CH** (ESEF + LLM) | -- |
+| **Segment Extraction** (NEW) | US, EU, UK (+ OCR), KR, JP, CN, TW, CL, BR, SA, CH, ZA, MX, **NL/ES/IT/SE** (14 markets native/PDF) | -- | -- |

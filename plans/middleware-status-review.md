@@ -1,4 +1,4 @@
-# Middleware Status Review (2026-03-22)
+# Middleware Status Review (2026-04-17)
 
 Status of the data processing pipeline between wrapper outputs and analytical models.
 Covers: Canonical Translator, Data Reconciliation, Cache Builder, Frequency Interpolator, Estimator, and Survival Timeline.
@@ -473,7 +473,102 @@ Post-cache validation layer:
 | Macro Mapping | 261 | WORKING | None. Raw macro -> MacroDataset container with canonical names |
 | Hierarchy Weights | 323 | WORKING | None. 4 regimes, vanity-adjusted weight allocation |
 | Data Quality Enforcement | 433 | WORKING | None. Look-ahead audit, ratio safety, coverage report |
-| **Total** | **12,820** | **All 20 operational** | **0 blocking issues** |
+| Pipeline State | 401 | WORKING | None. Mutable state bag with Parquet/pickle serialization for checkpoint save/resume |
+| Stage Runner | 279 | WORKING | None. 30 sub-stages across Stages 3-7, dependency map, error checkpoint |
+| Stage 3 (Temporal) | 247 | WORKING | None. 7 sub-stages: regime, dual regime, Granger, TE, cycle, pattern, synergies |
+| Stage 4 (Forecasting) | 54 | WORKING | None. 1 sub-stage: full forecasting cascade |
+| Stage 5 (Forward) | 274 | WORKING | None. 6 sub-stages: forward pass, burn-out, walk-forward, MC, copula, regime shift |
+| Stage 6 (Ensemble) | 414 | WORKING | None. 11 sub-stages: transformer, PF, conformal, DTW, aggregation, SHAP, Sobol, etc. |
+| Stage 7 (Integration) | 371 | WORKING | None. 5 sub-stages: USS, retro-cal, diagnostics, multi-freq, HF |
+| Product Metrics | 289 | WORKING | None. 9 quantitative metrics from segment revenue data |
+| **Total** | **15,149** | **All 28 operational** | **0 blocking issues** |
+
+---
+
+## 9. Staged Pipeline Architecture (NEW -- 2026-04-16)
+
+### 9a. Pipeline State (`operator1/pipeline_state.py`)
+
+**Lines:** 401 | **Status:** WORKING
+
+Mutable state bag that replaces local variables in `main.py`. Serializes to disk between sub-stages:
+- DataFrames: Parquet (cache, linked_caches, linked_agg, raw statement DFs)
+- Model results: pickle (all non-DataFrame state)
+- Config: JSON (market_id, company, end_date, years, sub_stage_completed)
+
+Multi-frequency sub-directory helpers for per-frequency cache/state serialization.
+
+### 9b. Stage Runner (`operator1/stages/runner.py`)
+
+**Lines:** 279 | **Status:** WORKING
+
+Dispatches 30 sub-stages across Stages 3-7:
+- Stage spec parser: `"3"` (all stage 3), `"4.1"` (just forecasting), `"3-6"` (range), `"all"`
+- Dependency map: each sub-stage knows its predecessor for checkpoint loading
+- Error handling: failed sub-stage saved as `{sub_id}_failed` checkpoint
+- CLI: `python -m operator1.stages.runner --stage 3.1 --run-dir cache/AAPL`
+
+### 9c. Stage Modules (5 files, ~1,360 lines total)
+
+| Module | Sub-stages | Lines | Key Models |
+|--------|-----------|-------|------------|
+| `stage3_temporal.py` | 3.1-3.7 | 247 | Regime, Granger, TE, Cycle, Pattern, Synergies |
+| `stage4_forecasting.py` | 4.1 | 54 | Kalman, GARCH, VAR, LSTM, Tree, ETS |
+| `stage5_forward.py` | 5.1-5.6 | 274 | Forward pass, Burn-out, Walk-forward, MC, Copula, Regime shift |
+| `stage6_ensemble.py` | 6.1-6.11 | 414 | Transformer, PF, Conformal, DTW, Aggregation, SHAP, Sobol, GA, OHLC |
+| `stage7_integration.py` | 7.1-7.5 | 371 | USS, Retro-cal, Diagnostics, Multi-freq, HF |
+
+---
+
+## 10. Product Segment Extraction Pipeline (NEW -- 2026-04-11 to 2026-04-14)
+
+### 10a. Per-Market `extract_segment_data()` Methods
+
+**Status:** WORKING across 15 markets
+
+Each market wrapper implements `extract_segment_data(identifier)` returning:
+```python
+{
+    "segments": {"Segment A": 1000000, "Segment B": 500000},
+    "descriptions": {"Segment A": "Consumer electronics", ...},
+    "n_segments": 2,
+    "has_revenue": True,
+    "has_descriptions": True,
+    "source": "xbrl"  # or "pdf", "akshare", "irbank", etc.
+}
+```
+
+Wired in `main.py` Step 5i.6 (before temporal models, so segment metrics are available as `_extra_vars`).
+
+### 10b. Product Metrics (`operator1/features/product_metrics.py`)
+
+**Lines:** 289 | **Status:** WORKING
+
+Computes 9 quantitative metrics from segment revenue data:
+- `segment_hhi`: Revenue concentration (0-1, Herfindahl-Hirschman Index)
+- `cannibalization_rate`: Inter-segment revenue cannibalization
+- `network_effect_score`: Revenue acceleration from network effects
+- `input_cost_pressure`: Cost growth vs revenue growth
+- `growth_runway_quarters`: Maturity estimation
+- `maturity_concentration`: Revenue from low-growth segments
+- `estimated_market_share`: Inferred from revenue vs benchmarks
+- `dominant_segment_growth`: Largest segment YoY growth
+- `net_new_revenue_pct`: Revenue from new segments
+
+Consumed by temporal models (via `_extra_vars`), Monte Carlo (`segment_hhi` for concentration risk), profile builder.
+
+---
+
+## 11. AutoARIMA to ETS Migration (2026-04-16)
+
+| | Before | After |
+|---|--------|-------|
+| **Function** | `fit_autoarima()` | `fit_ets()` |
+| **Library** | `statsforecast.models.AutoARIMA` | `statsforecast.models.AutoETS` |
+| **Speed** | 5-30s per variable | 0.1-0.5s per variable (10-50x faster) |
+| **Timeout** | Added 30s timeout (2026-04-15) | Not needed (always fast) |
+| **Accuracy** | Equivalent (ETS handles same patterns: trend, seasonality, damping) |
+| **Location** | `operator1/models/forecasting.py` | Same file, function renamed |
 
 ---
 
