@@ -3537,7 +3537,10 @@ def run_forward_pass(
     ForwardPassResult containing per-tier daily errors, model states,
     and a day-by-day predictions log.
     """
-    logger.info("Starting forward pass (warmup=%d days)...", warmup_days)
+    # Cap warmup to available data so lower-frequency caches (A/Q/M) can still
+    # produce prediction steps instead of yielding 0 steps.
+    warmup_days = min(warmup_days, max(3, len(cache) // 3))
+    logger.info("Starting forward pass (warmup=%d days, cache=%d rows)...", warmup_days, len(cache))
 
     # Initialise PID bank for adaptive learning rate adjustment
     try:

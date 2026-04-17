@@ -399,6 +399,9 @@ def run_walk_forward(
     """
     result = WalkForwardResult()
 
+    # Cap min_history to available data so lower-frequency caches can produce predictions
+    min_history = min(min_history, max(3, len(daily_cache) // 3))
+
     if daily_cache.empty:
         result.error = "Empty daily cache"
         logger.warning(result.error)
