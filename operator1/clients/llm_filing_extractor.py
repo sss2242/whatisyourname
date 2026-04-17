@@ -469,7 +469,7 @@ Filing text excerpt:
 
 
 @dataclass
-class FilingFilingExtractionResult:
+class FilingExtractionResult:
     """Result of financial data extraction from a single filing."""
 
     success: bool = False

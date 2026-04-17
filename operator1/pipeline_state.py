@@ -86,6 +86,7 @@ class PipelineState:
         self.six_proxy_result: Any = None
         self.linked_conflict: Any = None
         self.seg_result: dict = {}
+        self.supply_chain_stress_result: Any = None
         self.is_private: bool = False
         self.ohlcv_source_label: str = ""
         self.adaptive_thresholds: Any = None

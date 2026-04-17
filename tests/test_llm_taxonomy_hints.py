@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from operator1.clients.llm_filing_extractor import (
-    ExtractionResult,
+    FilingExtractionResult,
     LLMFilingExtractor,
     _EXTRACTION_PROMPT,
     _MARKET_TAXONOMY_HINTS,
