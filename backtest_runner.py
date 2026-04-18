@@ -722,6 +722,18 @@ def run_stage1(state: BacktestState) -> None:
     except Exception:
         pass
 
+    # Event calendar features (Gap 4)
+    try:
+        from operator1.features.event_calendar import compute_event_calendar_features
+        from datetime import datetime as _dt
+        _ref = _dt.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None
+        cache, _evt_result = compute_event_calendar_features(
+            cache, ticker=ticker, filing_calendar_result=state.filing_calendar_result,
+            reference_date=_ref,
+        )
+    except Exception:
+        pass
+
     # Derived variables
     try:
         from operator1.features.derived_variables import compute_derived_variables
@@ -1178,6 +1190,9 @@ def _init_extra_vars(state: BacktestState) -> None:
                      "buying_power_index", "sector_demand_momentum",
                      "catalyst_score", "online_change_score",
                      "iv30", "iv_rv_spread",
+                     "days_to_next_event", "event_uncertainty_premium",
+                     "fomc_proximity", "earnings_proximity",
+                     "event_density_30d",
                      "cannibalization_rate", "net_new_revenue_pct",
                      "network_effect_score", "input_cost_pressure",
                      "growth_runway_quarters", "maturity_concentration",

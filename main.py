@@ -1084,6 +1084,24 @@ Non-interactive examples:
             logger.warning("Macro quadrant classification failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 4a.9: Event calendar features (Gap 4)
+    # Tracks known upcoming events (FOMC, earnings, political) and
+    # computes proximity features that adjust prediction confidence
+    # and conformal interval width.
+    # ------------------------------------------------------------------
+    event_calendar_result = None
+    try:
+        from operator1.features.event_calendar import compute_event_calendar_features
+        cache, event_calendar_result = compute_event_calendar_features(
+            cache,
+            ticker=ticker,
+            filing_calendar_result=filing_calendar_result if 'filing_calendar_result' in dir() else None,
+            reference_date=_backtest_end_date,
+        )
+    except Exception as exc:
+        logger.debug("Event calendar signals skipped: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 4a-validate: Log what both APIs returned for diagnostics
     # ------------------------------------------------------------------
     _validate_api_data(
@@ -2572,6 +2590,9 @@ Non-interactive examples:
                          "buying_power_index", "sector_demand_momentum",
                          "catalyst_score", "online_change_score",
                          "iv30", "iv_rv_spread",
+                         "days_to_next_event", "event_uncertainty_premium",
+                         "fomc_proximity", "earnings_proximity",
+                         "event_density_30d",
                          "cannibalization_rate", "net_new_revenue_pct",
                          "network_effect_score", "input_cost_pressure",
                          "growth_runway_quarters", "maturity_concentration",
@@ -3783,6 +3804,12 @@ Non-interactive examples:
             }
         else:
             profile["product_catalysts"] = {"available": False}
+
+        # Inject event calendar signals (Gap 4)
+        if event_calendar_result is not None and event_calendar_result.available:
+            profile["event_calendar_signals"] = event_calendar_result.to_profile_dict()
+        else:
+            profile["event_calendar_signals"] = {"available": False}
 
         # Product segment data -- reuse _seg_result from Step 5i.6
         # (extraction + cache injection already happened before temporal models).
