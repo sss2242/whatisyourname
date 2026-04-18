@@ -284,6 +284,9 @@ class DCFResult:
     upside_pct: float | None = None     # (p50 - current) / current
     risk_reward_ratio: float | None = None  # upside / downside
     n_simulations: int = 0
+    implied_growth_rate: float | None = None  # Gap 5: reverse DCF implied growth
+    reliable: bool | None = None              # Gap 5: sanity gate (DCF/price ratio check)
+    warning: str = ""                         # Gap 5: sanity gate warning message
     narrative: str = ""
     error: str = ""
 

@@ -586,6 +586,21 @@ def run_stage1(state: BacktestState) -> None:
     except Exception:
         pass
 
+    # Options-derived forward-looking signals (Gap 1)
+    try:
+        from operator1.features.options_signals import compute_options_signals
+        cache, _opt_result = compute_options_signals(
+            cache, ticker=ticker, market_id=state.market_id,
+        )
+        if _opt_result and _opt_result.available:
+            logger.info(
+                "Options signals: PCR=%.2f, RR25d=%s",
+                _opt_result.put_call_ratio or 0,
+                f"{_opt_result.risk_reversal_25d:.4f}" if _opt_result.risk_reversal_25d is not None else "N/A",
+            )
+    except Exception:
+        pass
+
     # Merge statements
     try:
         from operator1.estimation.frequency_interpolator import interpolate_statement_to_daily
@@ -1197,6 +1212,9 @@ def _init_extra_vars(state: BacktestState) -> None:
                      "geo_hhi", "china_revenue_pct",
                      "supply_chain_geo_hhi", "trade_policy_uncertainty",
                      "tariff_exposure_score",
+                     "put_call_ratio", "risk_reversal_25d",
+                     "iv_skew", "vix_term_structure",
+                     "skew_index", "variance_risk_premium",
                      "cannibalization_rate", "net_new_revenue_pct",
                      "network_effect_score", "input_cost_pressure",
                      "growth_runway_quarters", "maturity_concentration",
