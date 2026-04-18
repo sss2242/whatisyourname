@@ -1935,6 +1935,102 @@ def _extract_segments_from_table(table: list[list]) -> dict[str, float]:
     return segments
 
 
+def _extract_geo_segments_from_text(text: str) -> dict[str, float]:
+    """Extract geographic revenue breakdown from 10-K / annual report text.
+
+    Looks for ASC 280 / ASC 606 / IFRS 8 geographic revenue disclosures.
+    Common section headings: "Revenue by Geography", "Geographic Information",
+    "Disaggregation of Revenue", "Revenue by Region".
+
+    Returns dict of region_name -> revenue (e.g. {"Americas": 170000, "Europe": 95000}).
+    Returns empty dict if no geographic data found.
+    """
+    # Normalize Unicode
+    text = (
+        text.replace("\u2212", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u00a0", " ")
+    )
+
+    # Geographic section markers (order: most specific first)
+    _GEO_MARKERS = [
+        r"(?:revenue|net\s+sales|net\s+revenue)\s+by\s+(?:geographic|geography|region|reportable\s+segment)",
+        r"geographic\s+(?:information|data|revenue|breakdown|segments?)",
+        r"disaggregation\s+of\s+revenue.*?(?:geographic|region|country)",
+        r"revenue\s+(?:from|by)\s+(?:geographic|region)",
+        r"(?:net\s+)?(?:revenue|sales)\s+by\s+(?:country|region|area)",
+        r"information\s+by\s+geographic\s+area",
+    ]
+
+    # Known geographic region names (case-insensitive match)
+    _GEO_NAMES = {
+        "americas", "united states", "u.s.", "us", "north america",
+        "europe", "emea", "european union", "eu", "middle east",
+        "asia", "asia pacific", "asia-pacific", "apac", "greater china",
+        "china", "japan", "rest of asia", "rest of asia pacific",
+        "latin america", "south america", "brazil",
+        "africa", "rest of world", "other regions", "other countries",
+        "canada", "india", "australia", "uk", "united kingdom",
+        "germany", "france", "international", "domestic",
+    }
+
+    geo_segments: dict[str, float] = {}
+
+    # Find the geographic section in the text
+    geo_section = ""
+    for marker in _GEO_MARKERS:
+        match = re.search(marker, text, re.IGNORECASE)
+        if match:
+            start = match.start()
+            # Extract ~2000 chars after the marker (enough for the table)
+            geo_section = text[start:start + 2000]
+            break
+
+    if not geo_section:
+        return geo_segments
+
+    lines = geo_section.split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line or len(line) < 3:
+            continue
+        if not re.search(r"\d", line):
+            continue
+
+        # Pattern: "Region Name    $123,456" or "Region Name    123,456"
+        # Allow optional $ and currency symbols
+        match = re.match(
+            r"^([A-Za-z][\w\s&/\(\)\-\.,]+?)\s{2,}"
+            r"[\$]?\s*([\(\-]?[\d,]+\.?\d*\)?)"
+            r"(?:\s|$)",
+            line,
+        )
+        if match:
+            name = match.group(1).strip().rstrip(".:,;")
+            name_lower = name.lower()
+            # Check if this looks like a geographic region
+            is_geo = any(gn in name_lower for gn in _GEO_NAMES)
+            # Also accept capitalized multi-word names that aren't skip labels
+            if not is_geo and len(name) >= 3:
+                # Heuristic: if the name is in the geographic section and isn't
+                # a financial term, treat it as a region
+                skip_terms = {"total", "revenue", "net sales", "operating", "income",
+                              "cost", "expense", "profit", "loss", "depreciation",
+                              "segment", "eliminations", "corporate", "unallocated"}
+                is_geo = not any(st in name_lower for st in skip_terms)
+
+            if is_geo:
+                val_str = match.group(2).strip()
+                value = _parse_indian_number(val_str)
+                if value is not None and abs(value) >= 1.0:
+                    # Skip "Total" aggregates
+                    if not name_lower.startswith("total"):
+                        geo_segments[name] = abs(value)
+
+    return geo_segments
+
+
 def _extract_segments_from_text(text: str) -> dict[str, float]:
     """Extract segment revenue from text using multiple layout patterns.
 
