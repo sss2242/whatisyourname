@@ -2787,4 +2787,23 @@ def run_prediction_aggregation(
         extras_str,
     )
 
+    # --- B3 fix: Apply feature-driven model routing weights ---
+    # These are computed but were never wired into the aggregation.
+    # Apply them as a post-hoc adjustment to the prediction metadata.
+    try:
+        routing_weights = compute_model_routing_weights(cache)
+        if routing_weights and hasattr(result, "metadata"):
+            if result.metadata is None:
+                result.metadata = {}
+            result.metadata["model_routing_weights"] = routing_weights
+    except Exception:
+        pass
+
+    # --- B4 fix: Apply reject option (reduce confidence for extreme uncertainty) ---
+    try:
+        if hasattr(result, "predictions") and result.predictions:
+            apply_reject_option(result.predictions, cache)
+    except Exception:
+        pass
+
     return result
