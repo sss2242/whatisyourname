@@ -50,6 +50,7 @@ class GAResult:
     converged: bool = False
 
     fitted: bool = False
+    diversity_forced: bool = False  # Gap 6: True when equal-weight fallback applied
     error: str | None = None
 
 
@@ -403,6 +404,28 @@ def run_genetic_optimization(
     for name in MODEL_NAMES:
         if name not in result.best_weights:
             result.best_weights[name] = 0.0
+
+    # --- Gap 6: Equal-weight diversity fallback ---
+    # When GA converges to single-model dominance (one weight > 0.85),
+    # force diversity by blending 70% GA weights + 30% equal weights.
+    # This prevents the ensemble from degenerating to a single-model predictor
+    # (e.g., Kalman=1.0, everything else=0.0 in the AAPL backtest).
+    if result.best_weights:
+        max_weight = max(result.best_weights.values())
+        if max_weight > 0.85:
+            n_models = len(result.best_weights)
+            if n_models > 1:
+                equal = {k: 1.0 / n_models for k in result.best_weights}
+                result.best_weights = {
+                    k: round(0.7 * result.best_weights[k] + 0.3 * equal[k], 6)
+                    for k in result.best_weights
+                }
+                result.diversity_forced = True
+                logger.info(
+                    "GA diversity fallback: single-model dominance (%.1f%%) "
+                    "corrected with 30%% equal-weight blend",
+                    max_weight * 100,
+                )
 
     # Per-tier optimization (simplified: use same weights but adjust
     # based on tier-model affinity heuristic from spec)

@@ -586,6 +586,31 @@ def run_stage1(state: BacktestState) -> None:
     except Exception:
         pass
 
+    # Cross-asset sector rotation signals (Gap 3)
+    try:
+        from operator1.features.cross_asset_signals import compute_cross_asset_signals
+        cache, _ca_result = compute_cross_asset_signals(
+            cache, sector=state.target_profile.get("sector", ""),
+        )
+        if _ca_result and _ca_result.available:
+            logger.info("Cross-asset signals: rank=%s, disp=%s",
+                        _ca_result.sector_rank_12m or "N/A",
+                        f"{_ca_result.sector_dispersion:.5f}" if _ca_result.sector_dispersion else "N/A")
+    # Options-derived forward-looking signals (Gap 1)
+    try:
+        from operator1.features.options_signals import compute_options_signals
+        cache, _opt_result = compute_options_signals(
+            cache, ticker=ticker, market_id=state.market_id,
+        )
+        if _opt_result and _opt_result.available:
+            logger.info(
+                "Options signals: PCR=%.2f, RR25d=%s",
+                _opt_result.put_call_ratio or 0,
+                f"{_opt_result.risk_reversal_25d:.4f}" if _opt_result.risk_reversal_25d is not None else "N/A",
+            )
+    except Exception:
+        pass
+
     # Merge statements
     try:
         from operator1.estimation.frequency_interpolator import interpolate_statement_to_daily
@@ -1147,6 +1172,22 @@ def run_stage1(state: BacktestState) -> None:
         except Exception as exc:
             logger.debug("Product metrics computation failed: %s", exc)
 
+    # Geographic supply chain risk metrics (Gap 2)
+    if _seg_result:
+        try:
+            from operator1.features.product_metrics import compute_geographic_metrics
+            _geo_segs = _seg_result.get("geo_segments", {})
+            _gleif_subs = state.relationships.get("subsidiaries", [])
+            _sub_dicts = [
+                s if isinstance(s, dict) else {"country": getattr(s, "country", "")}
+                for s in _gleif_subs
+            ]
+            cache = compute_geographic_metrics(
+                cache, geo_segments=_geo_segs, subsidiaries=_sub_dicts,
+            )
+        except Exception as exc:
+            logger.debug("Geographic metrics computation failed: %s", exc)
+
     state.cache = cache
     state.save_sub("1")
     logger.info("STAGE 1 COMPLETE: %d rows x %d cols", len(cache), len(cache.columns))
@@ -1193,6 +1234,15 @@ def _init_extra_vars(state: BacktestState) -> None:
                      "days_to_next_event", "event_uncertainty_premium",
                      "fomc_proximity", "earnings_proximity",
                      "event_density_30d",
+                     "sector_relative_strength", "sector_rank_12m",
+                     "sector_dispersion", "yield_curve_10y2y",
+                     "usd_momentum_21d", "cross_asset_stress",
+                     "geo_hhi", "china_revenue_pct",
+                     "supply_chain_geo_hhi", "trade_policy_uncertainty",
+                     "tariff_exposure_score",
+                     "put_call_ratio", "risk_reversal_25d",
+                     "iv_skew", "vix_term_structure",
+                     "skew_index", "variance_risk_premium",
                      "cannibalization_rate", "net_new_revenue_pct",
                      "network_effect_score", "input_cost_pressure",
                      "growth_runway_quarters", "maturity_concentration",
