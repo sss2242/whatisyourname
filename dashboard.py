@@ -553,6 +553,42 @@ def render_home():
                     _card("Hit Rate", f"{plog.get('hit_rate', 0):.0%}", f"{plog.get('n_filled', 0)} predictions evaluated", "fact_check")
                     _card("Realized IC", f"{plog.get('realized_ic', 0):.4f}", "", "analytics")
 
+            # Forward Signals (Options, Cross-Asset, Event Calendar, Regime Shifts)
+            _opt = profile.get("options_signals", {})
+            _ca = profile.get("cross_asset_signals", {})
+            _ev = profile.get("event_calendar_signals", {})
+            _rs = profile.get("predicted_regime_shifts", {})
+            if any(d.get("available") for d in [_opt, _ca, _ev, _rs]):
+                ui.separator()
+                ui.label("Forward-Looking Signals").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    if _opt.get("available"):
+                        _pcr = _opt.get("put_call_ratio")
+                        _pcr_str = f"{_pcr:.2f}" if _pcr is not None else "N/A"
+                        _stress = sum([
+                            1 if _pcr is not None and _pcr > 1.0 else 0,
+                            1 if (_opt.get("risk_reversal_25d") or 0) < -0.02 else 0,
+                            1 if (_opt.get("variance_risk_premium") or 0) > 0.05 else 0,
+                        ])
+                        _badge = "RISK OFF" if _stress >= 2 else "RISK ON" if _stress == 0 else "NEUTRAL"
+                        _card("Options", _badge, f"PCR={_pcr_str}", "show_chart")
+                    if _ca.get("available"):
+                        _rank = _ca.get("sector_rank_12m")
+                        _stress_idx = _ca.get("cross_asset_stress")
+                        _rank_str = f"#{_rank}/11" if _rank is not None else "N/A"
+                        _card("Sector Rank", _rank_str, f"Stress: {_stress_idx:.2f}" if _stress_idx else "", "leaderboard")
+                    if _ev.get("available"):
+                        _days = _ev.get("days_to_next_event")
+                        _density = _ev.get("event_density_30d")
+                        _days_str = f"{int(_days)}d" if _days is not None else "N/A"
+                        _dens_lbl = "busy" if _density and _density > 5 else "quiet" if _density and _density <= 2 else "moderate"
+                        _card("Next Event", _days_str, f"Calendar: {_dens_lbl}", "event")
+                    if _rs.get("available"):
+                        _p21 = _rs.get("prob_exit_21d")
+                        _next = _rs.get("most_probable_next_regime", "unknown")
+                        _p_str = f"{_p21:.0%}" if _p21 is not None else "N/A"
+                        _card("Regime Shift", _p_str, f"Next: {_next}", "swap_horiz")
+
             # Hedge Fund Thesis (if available)
             hf = profile.get("hedge_fund", {})
             if hf.get("available"):
@@ -992,6 +1028,26 @@ def render_report():
                         _extra_cards.append(("Freq Consensus", _rc.get("consensus_regime", "?"), f"{_rc.get('agreement_ratio', 0):.0%}", "merge_type"))
                     if sig.get("available"):
                         _extra_cards.append(("Best Signal", sig.get("best_signal", "?"), f"IC={sig.get('best_ic', 0):.4f}", "trending_up"))
+
+                    # Forward signals from Gap 1/3/4
+                    _opt_s = profile.get("options_signals", {})
+                    _ca_s = profile.get("cross_asset_signals", {})
+                    _ev_s = profile.get("event_calendar_signals", {})
+                    if _opt_s.get("available"):
+                        _pcr_v = _opt_s.get("put_call_ratio")
+                        _sc = sum([
+                            1 if _pcr_v is not None and _pcr_v > 1.0 else 0,
+                            1 if (_opt_s.get("risk_reversal_25d") or 0) < -0.02 else 0,
+                            1 if (_opt_s.get("variance_risk_premium") or 0) > 0.05 else 0,
+                        ])
+                        _b = "RISK OFF" if _sc >= 2 else "RISK ON" if _sc == 0 else "NEUTRAL"
+                        _extra_cards.append(("Options", _b, f"PCR={_pcr_v:.2f}" if _pcr_v else "", "show_chart"))
+                    if _ca_s.get("available"):
+                        _rk = _ca_s.get("sector_rank_12m")
+                        _extra_cards.append(("Sector Rank", f"#{_rk}/11" if _rk else "N/A", "", "leaderboard"))
+                    if _ev_s.get("available"):
+                        _dn = _ev_s.get("days_to_next_event")
+                        _extra_cards.append(("Next Event", f"{int(_dn)}d" if _dn else "N/A", "", "event"))
 
                     if _extra_cards:
                         ui.label("Advanced Analytics").classes("text-lg mt-4")
