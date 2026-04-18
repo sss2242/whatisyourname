@@ -1150,6 +1150,22 @@ def run_stage1(state: BacktestState) -> None:
         except Exception as exc:
             logger.debug("Product metrics computation failed: %s", exc)
 
+    # Geographic supply chain risk metrics (Gap 2)
+    if _seg_result:
+        try:
+            from operator1.features.product_metrics import compute_geographic_metrics
+            _geo_segs = _seg_result.get("geo_segments", {})
+            _gleif_subs = state.relationships.get("subsidiaries", [])
+            _sub_dicts = [
+                s if isinstance(s, dict) else {"country": getattr(s, "country", "")}
+                for s in _gleif_subs
+            ]
+            cache = compute_geographic_metrics(
+                cache, geo_segments=_geo_segs, subsidiaries=_sub_dicts,
+            )
+        except Exception as exc:
+            logger.debug("Geographic metrics computation failed: %s", exc)
+
     state.cache = cache
     state.save_sub("1")
     logger.info("STAGE 1 COMPLETE: %d rows x %d cols", len(cache), len(cache.columns))
@@ -1193,6 +1209,9 @@ def _init_extra_vars(state: BacktestState) -> None:
                      "buying_power_index", "sector_demand_momentum",
                      "catalyst_score", "online_change_score",
                      "iv30", "iv_rv_spread",
+                     "geo_hhi", "china_revenue_pct",
+                     "supply_chain_geo_hhi", "trade_policy_uncertainty",
+                     "tariff_exposure_score",
                      "put_call_ratio", "risk_reversal_25d",
                      "iv_skew", "vix_term_structure",
                      "skew_index", "variance_risk_premium",

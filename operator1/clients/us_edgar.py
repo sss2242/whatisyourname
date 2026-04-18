@@ -638,7 +638,14 @@ class USEdgarClient:
             "us-gaap:ProductOrServiceAxis",
         ]
 
+        # Geographic axis dimension keys (Gap 2)
+        geographic_axes = [
+            "srt:StatementGeographicalAxis",
+            "us-gaap:StatementGeographicalAxis",
+        ]
+
         segments: dict[str, float] = {}
+        geo_segments: dict[str, float] = {}
         products: dict[str, list[str]] = {}
         segment_details: dict[str, dict[str, float]] = {}
 
@@ -727,6 +734,7 @@ class USEdgarClient:
         n_segments = len(segments)
         return {
             "segments": segments,
+            "geo_segments": geo_segments,
             "products": products,
             "descriptions": {},
             "segment_details": segment_details,
