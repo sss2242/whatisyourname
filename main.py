@@ -1084,24 +1084,6 @@ Non-interactive examples:
             logger.warning("Macro quadrant classification failed: %s", exc)
 
     # ------------------------------------------------------------------
-    # Step 4a.9: Event calendar features (Gap 4)
-    # Tracks known upcoming events (FOMC, earnings, political) and
-    # computes proximity features that adjust prediction confidence
-    # and conformal interval width.
-    # ------------------------------------------------------------------
-    event_calendar_result = None
-    try:
-        from operator1.features.event_calendar import compute_event_calendar_features
-        cache, event_calendar_result = compute_event_calendar_features(
-            cache,
-            ticker=ticker,
-            filing_calendar_result=filing_calendar_result if 'filing_calendar_result' in dir() else None,
-            reference_date=_backtest_end_date,
-        )
-    except Exception as exc:
-        logger.debug("Event calendar signals skipped: %s", exc)
-
-    # ------------------------------------------------------------------
     # Step 4a-validate: Log what both APIs returned for diagnostics
     # ------------------------------------------------------------------
     _validate_api_data(
@@ -1361,6 +1343,24 @@ Non-interactive examples:
             cache = inject_filing_freshness(cache, filing_calendar_result, market_id=market_id)
         except Exception as exc:
             logger.warning("Filing freshness injection failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 4c.1: Event calendar features (Gap 4)
+    # Moved here from Step 4a.9 so filing_calendar_result is available.
+    # Tracks known upcoming events (FOMC, earnings, political) and
+    # computes proximity features that adjust prediction confidence.
+    # ------------------------------------------------------------------
+    event_calendar_result = None
+    try:
+        from operator1.features.event_calendar import compute_event_calendar_features
+        cache, event_calendar_result = compute_event_calendar_features(
+            cache,
+            ticker=ticker,
+            filing_calendar_result=filing_calendar_result,
+            reference_date=_backtest_end_date,
+        )
+    except Exception as exc:
+        logger.debug("Event calendar signals skipped: %s", exc)
 
     # ------------------------------------------------------------------
     # Step 5: Feature engineering
