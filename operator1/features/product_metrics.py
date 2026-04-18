@@ -4,7 +4,9 @@ Converts segment revenue data from ``extract_segment_data()`` into daily
 cache columns consumed by temporal models, Monte Carlo concentration risk,
 and the prediction aggregator.
 
-Columns produced (10):
+Columns produced (10 product + 5 geographic = 15):
+
+Product metrics:
     segment_hhi           -- Herfindahl-Hirschman Index (0-1)
     segment_count         -- number of reporting segments
     dominant_segment_growth -- YoY growth of largest segment (NaN if single snapshot)
@@ -15,6 +17,13 @@ Columns produced (10):
     input_cost_pressure   -- COGS/revenue trend from cache
     growth_runway_quarters -- estimated quarters of above-avg growth remaining
     maturity_concentration -- fraction of revenue from decelerating segments
+
+Geographic metrics (Gap 2):
+    geo_hhi               -- Geographic revenue HHI across countries (0-1)
+    china_revenue_pct     -- Revenue from China/Greater China as fraction (0-1)
+    supply_chain_geo_hhi  -- Manufacturing concentration from GLEIF subsidiary countries (0-1)
+    trade_policy_uncertainty -- Baker-Bloom-Davis TPU index value
+    tariff_exposure_score -- Composite: geo_hhi * tpu_normalized * china_pct
 
 All columns are constant across the daily index (segment data is periodic,
 not daily).  If computation fails, columns are set to NaN and the pipeline
@@ -287,3 +296,199 @@ def _compute_input_cost_pressure(cache: pd.DataFrame) -> float:
         return float(slope * 252)
     except Exception:
         return np.nan
+
+
+# ---------------------------------------------------------------------------
+# Geographic supply chain metrics (Gap 2)
+# ---------------------------------------------------------------------------
+
+# Country name patterns that map to "China" for tariff exposure scoring.
+_CHINA_PATTERNS = [
+    "china", "prc", "greater china", "mainland china",
+    "people's republic", "hong kong", "macau", "macao",
+]
+
+# Broader Asia-Pacific pattern (weighted 0.5 for china_revenue_pct since
+# not all Asia-Pacific revenue is China-exposed).
+_ASIA_PACIFIC_PATTERNS = ["asia pacific", "asia-pacific", "apac", "asia"]
+
+
+def _compute_hhi(shares: dict[str, float]) -> float:
+    """Compute Herfindahl-Hirschman Index from a name->value dict.
+
+    HHI ranges from 0 (perfectly diversified) to 1.0 (single country).
+    """
+    if not shares:
+        return 0.0
+    total = sum(abs(v) for v in shares.values())
+    if total < EPSILON:
+        return 0.0
+    return float(sum((v / total) ** 2 for v in shares.values()))
+
+
+def _estimate_china_pct(geo_segments: dict[str, float]) -> float:
+    """Estimate fraction of revenue attributable to China/Greater China.
+
+    Exact match for China-specific segment names, 0.5 weight for
+    broad Asia-Pacific segments (not all APAC revenue is China).
+    """
+    if not geo_segments:
+        return 0.0
+    total = sum(abs(v) for v in geo_segments.values())
+    if total < EPSILON:
+        return 0.0
+
+    china_rev = 0.0
+    for name, value in geo_segments.items():
+        name_lower = name.lower().strip()
+        if any(p in name_lower for p in _CHINA_PATTERNS):
+            china_rev += abs(value)
+        elif any(p in name_lower for p in _ASIA_PACIFIC_PATTERNS):
+            # Approximate: 50% of APAC revenue attributed to China
+            china_rev += abs(value) * 0.5
+
+    return min(china_rev / total, 1.0)
+
+
+def _compute_supply_chain_geo_hhi(
+    subsidiaries: list[dict[str, str]],
+) -> float:
+    """Compute geographic HHI from GLEIF subsidiary country distribution.
+
+    Each subsidiary contributes equally (we don't have revenue per sub).
+    HHI measures manufacturing/operational concentration across countries.
+    """
+    if not subsidiaries:
+        return 0.0
+
+    country_counts: dict[str, int] = {}
+    for sub in subsidiaries:
+        country = sub.get("country", "").upper().strip()
+        if country and len(country) == 2:
+            country_counts[country] = country_counts.get(country, 0) + 1
+
+    if not country_counts:
+        return 0.0
+
+    total = sum(country_counts.values())
+    return float(sum((c / total) ** 2 for c in country_counts.values()))
+
+
+def fetch_trade_policy_uncertainty() -> float | None:
+    """Fetch the latest Trade Policy Uncertainty index value.
+
+    Source: policyuncertainty.com (Baker, Bloom & Davis 2016).
+    The TPU index measures news-based trade policy uncertainty.
+    Higher values = more tariff/trade policy uncertainty.
+
+    Returns the latest monthly value, or None if unavailable.
+    """
+    try:
+        url = (
+            "https://www.policyuncertainty.com/media/"
+            "Trade_Policy_Uncertainty_Index.csv"
+        )
+        df = pd.read_csv(url, timeout=15)
+
+        # The CSV has columns: Year, Month, TPU_Index (or similar)
+        # Try common column name patterns
+        tpu_col = None
+        for col in df.columns:
+            if "tpu" in col.lower() or "trade" in col.lower() or "index" in col.lower():
+                tpu_col = col
+                break
+
+        if tpu_col is None and len(df.columns) >= 3:
+            # Assume third column is the index value
+            tpu_col = df.columns[2]
+
+        if tpu_col is None:
+            return None
+
+        # Get latest non-NaN value
+        values = pd.to_numeric(df[tpu_col], errors="coerce").dropna()
+        if values.empty:
+            return None
+
+        return float(values.iloc[-1])
+
+    except Exception as exc:
+        logger.debug("TPU index fetch failed: %s", exc)
+        return None
+
+
+def compute_geographic_metrics(
+    cache: pd.DataFrame,
+    geo_segments: dict[str, float] | None = None,
+    subsidiaries: list[dict[str, str]] | None = None,
+) -> pd.DataFrame:
+    """Compute geographic supply chain risk metrics and inject into cache.
+
+    Adds 5 columns to the daily cache:
+    - geo_hhi: Geographic revenue concentration (0-1)
+    - china_revenue_pct: Revenue from China/Greater China (0-1)
+    - supply_chain_geo_hhi: Manufacturing concentration from GLEIF subs (0-1)
+    - trade_policy_uncertainty: Baker-Bloom-Davis TPU index
+    - tariff_exposure_score: Composite risk score
+
+    Parameters
+    ----------
+    cache : daily cache DataFrame
+    geo_segments : dict of country/region name -> revenue value
+        From extract_segment_data() with geographic dimension parsing.
+    subsidiaries : list of subsidiary dicts with 'country' key
+        From GLEIF corporate structure (relationships["subsidiaries"]).
+
+    Returns
+    -------
+    Cache DataFrame with 5 new constant columns.
+    """
+    geo_segments = geo_segments or {}
+    subsidiaries = subsidiaries or []
+
+    # 1. Geographic revenue HHI
+    geo_hhi = _compute_hhi(geo_segments) if geo_segments else np.nan
+    cache["geo_hhi"] = geo_hhi
+
+    # 2. China revenue percentage
+    china_pct = _estimate_china_pct(geo_segments) if geo_segments else np.nan
+    cache["china_revenue_pct"] = china_pct
+
+    # 3. Supply chain geographic HHI from GLEIF subsidiaries
+    sc_hhi = _compute_supply_chain_geo_hhi(subsidiaries)
+    cache["supply_chain_geo_hhi"] = sc_hhi if sc_hhi > 0 else np.nan
+
+    # 4. Trade Policy Uncertainty index
+    tpu = fetch_trade_policy_uncertainty()
+    cache["trade_policy_uncertainty"] = tpu if tpu is not None else np.nan
+
+    # 5. Tariff exposure composite
+    # Combines geographic concentration, China exposure, and policy uncertainty
+    tariff_score = np.nan
+    if not np.isnan(geo_hhi) and not np.isnan(china_pct) and tpu is not None:
+        # Normalize TPU to 0-1 range (historical range ~50-400)
+        tpu_norm = min(tpu / 400.0, 1.0)
+        tariff_score = geo_hhi * tpu_norm * china_pct
+    elif not np.isnan(geo_hhi) and not np.isnan(china_pct):
+        # Without TPU, use geo_hhi * china_pct as a simpler proxy
+        tariff_score = geo_hhi * china_pct
+    cache["tariff_exposure_score"] = tariff_score
+
+    n_computed = sum(
+        1 for col in ["geo_hhi", "china_revenue_pct", "supply_chain_geo_hhi",
+                       "trade_policy_uncertainty", "tariff_exposure_score"]
+        if col in cache.columns and cache[col].notna().any()
+    )
+    if n_computed > 0:
+        logger.info(
+            "Geographic metrics: geo_hhi=%.3f, china_pct=%.3f, sc_hhi=%.3f, "
+            "tpu=%s, tariff=%.4f (%d/5 columns populated)",
+            geo_hhi if not np.isnan(geo_hhi) else 0,
+            china_pct if not np.isnan(china_pct) else 0,
+            sc_hhi if sc_hhi > 0 else 0,
+            f"{tpu:.1f}" if tpu is not None else "N/A",
+            tariff_score if not np.isnan(tariff_score) else 0,
+            n_computed,
+        )
+
+    return cache

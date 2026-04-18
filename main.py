@@ -2072,6 +2072,24 @@ Non-interactive examples:
                     cache = compute_product_metrics(cache, _seg_result)
                 except Exception as _pm_exc:
                     logger.debug("Product metrics computation failed: %s", _pm_exc)
+
+                # Geographic supply chain risk metrics (Gap 2)
+                try:
+                    from operator1.features.product_metrics import compute_geographic_metrics
+                    _geo_segs = _seg_result.get("geo_segments", {})
+                    _gleif_subs = relationships.get("subsidiaries", [])
+                    # Convert dataclass subsidiaries to dicts if needed
+                    _sub_dicts = [
+                        s if isinstance(s, dict) else {"country": getattr(s, "country", "")}
+                        for s in _gleif_subs
+                    ]
+                    cache = compute_geographic_metrics(
+                        cache,
+                        geo_segments=_geo_segs,
+                        subsidiaries=_sub_dicts,
+                    )
+                except Exception as _geo_exc:
+                    logger.debug("Geographic metrics computation failed: %s", _geo_exc)
     except Exception as _seg_exc:
         logger.debug("Segment extraction failed: %s", _seg_exc)
 
@@ -2572,6 +2590,9 @@ Non-interactive examples:
                          "buying_power_index", "sector_demand_momentum",
                          "catalyst_score", "online_change_score",
                          "iv30", "iv_rv_spread",
+                         "geo_hhi", "china_revenue_pct",
+                         "supply_chain_geo_hhi", "trade_policy_uncertainty",
+                         "tariff_exposure_score",
                          "cannibalization_rate", "net_new_revenue_pct",
                          "network_effect_score", "input_cost_pressure",
                          "growth_runway_quarters", "maturity_concentration",
