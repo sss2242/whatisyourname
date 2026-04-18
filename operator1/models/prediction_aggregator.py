@@ -189,24 +189,42 @@ class FixedShareForecaster:
         model_names: list[str],
         alpha: float = 0.05,
         eta: float = 0.5,
+        adaptive: bool = True,
     ) -> None:
         self._models = list(model_names)
         self._n = len(model_names)
+        self._base_alpha = alpha
         self._alpha = alpha
         self._eta = eta
+        self._adaptive = adaptive
         # Initialize uniform weights
         self._weights = {name: 1.0 / self._n for name in self._models}
 
-    def update(self, losses: dict[str, float]) -> None:
+    def update(
+        self,
+        losses: dict[str, float],
+        online_change_score: float = 0.0,
+    ) -> None:
         """Update weights based on model losses for the current step.
 
         Parameters
         ----------
         losses:
             Dict of {model_name: squared_error} for the current day.
+        online_change_score:
+            ChangeFinder score (0-1) from the regime detector. When high,
+            indicates a regime change is in progress and the share parameter
+            should increase to adapt faster (Gap 6 Adaptive FixedShare).
         """
         if not losses or self._n == 0:
             return
+
+        # Gap 6: Adaptive share parameter -- increase alpha during regime changes
+        if self._adaptive and online_change_score > 0.3:
+            # Scale alpha up to 3x during regime transitions (cap at 0.3)
+            self._alpha = min(self._base_alpha * (1.0 + online_change_score * 2.0), 0.30)
+        else:
+            self._alpha = self._base_alpha
 
         # Multiplicative weight update
         for name in self._models:
@@ -2039,6 +2057,125 @@ def get_survival_context_from_cache(
 # ===========================================================================
 # Pipeline entry point
 # ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Gap 6: Feature-driven model routing + reject option
+# ---------------------------------------------------------------------------
+
+
+def compute_model_routing_weights(cache: pd.DataFrame) -> dict[str, float]:
+    """Route to dominant model based on current market characteristics.
+
+    Uses technical indicators already in the cache to determine which
+    model type is best suited for the current regime. Multiplied with
+    inverse-RMSE/FixedShare weights for the final ensemble.
+
+    Returns normalized weights (model_name -> multiplier, sums to ~1).
+    """
+    if cache is None or cache.empty:
+        return {}
+
+    latest = cache.iloc[-1]
+    weights: dict[str, float] = {
+        "kalman": 1.0, "garch": 1.0, "var": 1.0,
+        "lstm": 1.0, "tree": 1.0, "baseline": 1.0,
+    }
+
+    # ADX > 25 = strong trend -> Kalman (optimal for trending linear state)
+    adx = latest.get("adx_14", 20) if "adx_14" in cache.columns else 20
+    if isinstance(adx, (int, float)) and np.isfinite(adx) and adx > 25:
+        weights["kalman"] *= 2.0
+        weights["baseline"] *= 0.5  # mean-reversion baseline is worse in trends
+
+    # IV-RV spread > 0.05 = vol expansion -> GARCH (volatility specialist)
+    iv_rv = latest.get("iv_rv_spread", 0) if "iv_rv_spread" in cache.columns else 0
+    if isinstance(iv_rv, (int, float)) and np.isfinite(iv_rv) and iv_rv > 0.05:
+        weights["garch"] *= 2.0
+
+    # VIX term structure > 1.0 = backwardation = stress -> tree (non-linear)
+    vts = latest.get("vix_term_structure", 1.0) if "vix_term_structure" in cache.columns else 1.0
+    if isinstance(vts, (int, float)) and np.isfinite(vts) and vts > 1.0:
+        weights["tree"] *= 1.5
+        weights["lstm"] *= 1.3  # LSTM also handles non-linearity
+
+    # Low return autocorrelation = mean-reverting -> baseline
+    if "return_1d" in cache.columns:
+        ret = cache["return_1d"].dropna()
+        if len(ret) >= 30:
+            try:
+                autocorr = float(ret.autocorr(lag=1))
+                if np.isfinite(autocorr) and abs(autocorr) < 0.1:
+                    weights["baseline"] *= 1.5  # mean-reversion favored
+                    weights["kalman"] *= 0.8  # trend-following less useful
+            except Exception:
+                pass
+
+    # Normalize to sum to 1
+    total = sum(weights.values())
+    if total > 0:
+        return {k: v / total for k, v in weights.items()}
+    return weights
+
+
+def apply_reject_option(
+    predictions: dict,
+    cache: pd.DataFrame,
+) -> dict:
+    """Apply reject option: when no model is confident, reduce directional bet.
+
+    If conformal interval width > 2x the absolute point forecast for 'close',
+    replace the point forecast with last close (no directional bet) and
+    reduce confidence to 0.3.
+
+    This prevents the ensemble from making high-confidence predictions when
+    all underlying models disagree significantly.
+
+    Parameters
+    ----------
+    predictions:
+        Dict of {variable: {horizon: HorizonPrediction}} from the aggregator.
+    cache:
+        Daily cache (for last close value).
+
+    Returns
+    -------
+    Modified predictions dict (in-place modification + returned).
+    """
+    if not predictions or cache is None or cache.empty:
+        return predictions
+
+    last_close = None
+    if "close" in cache.columns and cache["close"].notna().any():
+        last_close = float(cache["close"].dropna().iloc[-1])
+
+    for var, horizons in predictions.items():
+        if not isinstance(horizons, dict):
+            continue
+        for h, hp in horizons.items():
+            upper = getattr(hp, "upper_ci", None)
+            lower = getattr(hp, "lower_ci", None)
+            pf = getattr(hp, "point_forecast", None)
+
+            if upper is not None and lower is not None and pf is not None:
+                interval_width = abs(float(upper) - float(lower))
+                abs_pf = abs(float(pf))
+
+                # Reject when interval > 2x the forecast value (extreme uncertainty)
+                if abs_pf > 0 and interval_width > 2.0 * abs_pf:
+                    # For close price: use last close (no directional bet)
+                    if var == "close" and last_close is not None:
+                        hp.point_forecast = last_close
+                    # Reduce confidence
+                    if hasattr(hp, "confidence") and hp.confidence is not None:
+                        hp.confidence *= 0.3
+                    # Flag as rejected
+                    if hasattr(hp, "metadata"):
+                        if hp.metadata is None:
+                            hp.metadata = {}
+                        hp.metadata["reject_flag"] = True
+
+    return predictions
 
 
 def run_prediction_aggregation(
