@@ -596,6 +596,8 @@ def run_stage1(state: BacktestState) -> None:
             logger.info("Cross-asset signals: rank=%s, disp=%s",
                         _ca_result.sector_rank_12m or "N/A",
                         f"{_ca_result.sector_dispersion:.5f}" if _ca_result.sector_dispersion else "N/A")
+    except Exception:
+        pass
     # Options-derived forward-looking signals (Gap 1)
     try:
         from operator1.features.options_signals import compute_options_signals

@@ -313,8 +313,8 @@ _CHINA_PATTERNS = [
 _ASIA_PACIFIC_PATTERNS = ["asia pacific", "asia-pacific", "apac", "asia"]
 
 
-def _compute_hhi(shares: dict[str, float]) -> float:
-    """Compute Herfindahl-Hirschman Index from a name->value dict.
+def _compute_geo_hhi(shares: dict[str, float]) -> float:
+    """Compute Herfindahl-Hirschman Index from a geographic name->value dict.
 
     HHI ranges from 0 (perfectly diversified) to 1.0 (single country).
     """
@@ -447,7 +447,7 @@ def compute_geographic_metrics(
     subsidiaries = subsidiaries or []
 
     # 1. Geographic revenue HHI
-    geo_hhi = _compute_hhi(geo_segments) if geo_segments else np.nan
+    geo_hhi = _compute_geo_hhi(geo_segments) if geo_segments else np.nan
     cache["geo_hhi"] = geo_hhi
 
     # 2. China revenue percentage
