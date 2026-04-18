@@ -1026,6 +1026,29 @@ Non-interactive examples:
         logger.debug("Sector leading indicators skipped: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 4a.8: Cross-asset sector rotation signals (Gap 3)
+    # Tracks 11 sector ETFs + Treasury yields + USD + gold to detect
+    # institutional capital rotation before it hits individual stocks.
+    # ------------------------------------------------------------------
+    cross_asset_result = None
+    try:
+        from operator1.features.cross_asset_signals import compute_cross_asset_signals
+        cache, cross_asset_result = compute_cross_asset_signals(
+            cache, sector=target_profile.get("sector", ""),
+        )
+        if cross_asset_result and cross_asset_result.available:
+            logger.info(
+                "Cross-asset signals: RS=%s, rank=%s, disp=%s, YC=%s",
+                f"{cross_asset_result.sector_relative_strength:.3f}"
+                if cross_asset_result.sector_relative_strength is not None else "N/A",
+                cross_asset_result.sector_rank_12m or "N/A",
+                f"{cross_asset_result.sector_dispersion:.5f}"
+                if cross_asset_result.sector_dispersion is not None else "N/A",
+                f"{cross_asset_result.yield_curve_10y2y:.3f}"
+                if cross_asset_result.yield_curve_10y2y is not None else "N/A",
+            )
+    except Exception as exc:
+        logger.debug("Cross-asset signals skipped: %s", exc)
     # Step 4a.7: Options-derived forward-looking signals (Gap 1)
     # Fetches full options surface and computes 6 features: put/call ratio,
     # 25-delta risk reversal, IV skew, VIX term structure, SKEW index,
@@ -2615,6 +2638,9 @@ Non-interactive examples:
                          "buying_power_index", "sector_demand_momentum",
                          "catalyst_score", "online_change_score",
                          "iv30", "iv_rv_spread",
+                         "sector_relative_strength", "sector_rank_12m",
+                         "sector_dispersion", "yield_curve_10y2y",
+                         "usd_momentum_21d", "cross_asset_stress",
                          "geo_hhi", "china_revenue_pct",
                          "supply_chain_geo_hhi", "trade_policy_uncertainty",
                          "tariff_exposure_score",
@@ -3833,6 +3859,11 @@ Non-interactive examples:
         else:
             profile["product_catalysts"] = {"available": False}
 
+        # Inject cross-asset rotation signals (Gap 3)
+        if cross_asset_result is not None and cross_asset_result.available:
+            profile["cross_asset_signals"] = cross_asset_result.to_profile_dict()
+        else:
+            profile["cross_asset_signals"] = {"available": False}
         # Inject options-derived signals (Gap 1)
         if options_signal_result is not None and options_signal_result.available:
             profile["options_signals"] = options_signal_result.to_profile_dict()

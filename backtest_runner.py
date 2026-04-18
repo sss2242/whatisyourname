@@ -586,6 +586,16 @@ def run_stage1(state: BacktestState) -> None:
     except Exception:
         pass
 
+    # Cross-asset sector rotation signals (Gap 3)
+    try:
+        from operator1.features.cross_asset_signals import compute_cross_asset_signals
+        cache, _ca_result = compute_cross_asset_signals(
+            cache, sector=state.target_profile.get("sector", ""),
+        )
+        if _ca_result and _ca_result.available:
+            logger.info("Cross-asset signals: rank=%s, disp=%s",
+                        _ca_result.sector_rank_12m or "N/A",
+                        f"{_ca_result.sector_dispersion:.5f}" if _ca_result.sector_dispersion else "N/A")
     # Options-derived forward-looking signals (Gap 1)
     try:
         from operator1.features.options_signals import compute_options_signals
@@ -1209,6 +1219,9 @@ def _init_extra_vars(state: BacktestState) -> None:
                      "buying_power_index", "sector_demand_momentum",
                      "catalyst_score", "online_change_score",
                      "iv30", "iv_rv_spread",
+                     "sector_relative_strength", "sector_rank_12m",
+                     "sector_dispersion", "yield_curve_10y2y",
+                     "usd_momentum_21d", "cross_asset_stress",
                      "geo_hhi", "china_revenue_pct",
                      "supply_chain_geo_hhi", "trade_policy_uncertainty",
                      "tariff_exposure_score",
