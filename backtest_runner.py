@@ -2002,6 +2002,9 @@ def _bt_mf_run_freq(state: BacktestState, freq: str) -> None:
     freq_state._is_private = state._is_private
     freq_state._ohlcv_source_label = state._ohlcv_source_label
     freq_state._seg_result = state._seg_result
+    freq_state.options_signal_result = state.options_signal_result
+    freq_state.cross_asset_result = state.cross_asset_result
+    freq_state.event_calendar_result = state.event_calendar_result
     freq_state._income_df = state._income_df
     freq_state._balance_df = state._balance_df
     freq_state._cashflow_df = state._cashflow_df
