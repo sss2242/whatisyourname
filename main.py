@@ -1393,6 +1393,24 @@ Non-interactive examples:
             logger.warning("Filing freshness injection failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Step 4c.1: Event calendar features (Gap 4)
+    # Moved here from Step 4a.9 so filing_calendar_result is available.
+    # Tracks known upcoming events (FOMC, earnings, political) and
+    # computes proximity features that adjust prediction confidence.
+    # ------------------------------------------------------------------
+    event_calendar_result = None
+    try:
+        from operator1.features.event_calendar import compute_event_calendar_features
+        cache, event_calendar_result = compute_event_calendar_features(
+            cache,
+            ticker=ticker,
+            filing_calendar_result=filing_calendar_result,
+            reference_date=_backtest_end_date,
+        )
+    except Exception as exc:
+        logger.debug("Event calendar signals skipped: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 5: Feature engineering
     # ------------------------------------------------------------------
     logger.info("")
@@ -2638,6 +2656,9 @@ Non-interactive examples:
                          "buying_power_index", "sector_demand_momentum",
                          "catalyst_score", "online_change_score",
                          "iv30", "iv_rv_spread",
+                         "days_to_next_event", "event_uncertainty_premium",
+                         "fomc_proximity", "earnings_proximity",
+                         "event_density_30d",
                          "sector_relative_strength", "sector_rank_12m",
                          "sector_dispersion", "yield_curve_10y2y",
                          "usd_momentum_21d", "cross_asset_stress",
@@ -3859,6 +3880,11 @@ Non-interactive examples:
         else:
             profile["product_catalysts"] = {"available": False}
 
+        # Inject event calendar signals (Gap 4)
+        if event_calendar_result is not None and event_calendar_result.available:
+            profile["event_calendar_signals"] = event_calendar_result.to_profile_dict()
+        else:
+            profile["event_calendar_signals"] = {"available": False}
         # Inject cross-asset rotation signals (Gap 3)
         if cross_asset_result is not None and cross_asset_result.available:
             profile["cross_asset_signals"] = cross_asset_result.to_profile_dict()
