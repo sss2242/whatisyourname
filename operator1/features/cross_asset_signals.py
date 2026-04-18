@@ -368,6 +368,10 @@ def compute_cross_asset_signals(
 
     result.n_sectors_fetched = sum(1 for e in _ALL_SECTOR_ETFS if e in close_df.columns)
 
+    # Initialize variables before conditional blocks (B1 fix: NameError when sector_etf empty)
+    rs = None
+    rank = None
+
     # 1. Sector relative strength (21d rolling)
     if sector_etf:
         rs = _compute_sector_relative_strength(close_df, sector_etf)
