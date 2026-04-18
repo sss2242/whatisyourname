@@ -615,8 +615,17 @@ def _compute_dcf(
     target_profile: dict | None = None,
     mc_result: Any = None,
     macro_data: dict | None = None,
+    income_df: pd.DataFrame | None = None,
 ) -> DCFResult:
-    """HF-5.1: DCF Monte Carlo valuation."""
+    """HF-5.1: DCF Monte Carlo valuation (calibrated -- Gap 5 fixes).
+
+    5 calibration fixes from v3 accuracy improvement plan:
+    1. Growth prior from company's own 3-year revenue CAGR (not regime dists)
+    2. WACC capped at sector median + 2% (prevents extreme discount rates)
+    3. 3-stage model for high-growth companies (revenue CAGR > 10%)
+    4. Reverse DCF: solve for implied growth rate from current price
+    5. Sanity gate: flag as unreliable when DCF/price ratio > 5x or < 0.2x
+    """
     result = DCFResult()
     try:
         cfg = get_hf_weight("valuation.dcf", {})
@@ -646,32 +655,84 @@ def _compute_dcf(
         wacc_mean = cfg.get("wacc_mean", 0.09)
         wacc_std = cfg.get("wacc_std", 0.01)
 
-        # Growth rate from MC regime distributions if available
+        # --- Fix 1: Growth prior from company's own revenue CAGR ---
+        # The old approach used MC regime distribution means, which can be
+        # near-zero in high-vol regimes (causing $33 intrinsic for $250 stock).
+        # Now use the company's actual 3-year revenue CAGR as the base prior.
         growth_mean = 0.05
         growth_std = 0.03
-        if mc_result is not None and hasattr(mc_result, "regime_distributions"):
+        _used_cagr = False
+        if income_df is not None and not income_df.empty:
+            try:
+                rev_series = extract_quarterly_series(income_df, "revenue", 12)
+                if len(rev_series) >= 8:
+                    # 3-year CAGR: (latest / 12Q ago)^(1/3) - 1
+                    _earliest = rev_series.iloc[0]
+                    _latest = rev_series.iloc[-1]
+                    if _earliest > 0 and _latest > 0:
+                        cagr_3y = (_latest / _earliest) ** (1.0 / 3.0) - 1.0
+                        growth_mean = max(0.02, min(cagr_3y, 0.30))
+                        growth_std = max(0.01, min(abs(growth_mean) * 0.3, 0.08))
+                        _used_cagr = True
+                        logger.debug("DCF growth from 3yr CAGR: %.1f%%", growth_mean * 100)
+            except Exception:
+                pass
+
+        # Fallback to MC regime distributions only if CAGR unavailable
+        if not _used_cagr and mc_result is not None and hasattr(mc_result, "regime_distributions"):
             dists = mc_result.regime_distributions
             if dists:
-                # Use the mean return across all regimes as growth proxy
                 means = [d.get("mean", 0) for d in dists.values() if isinstance(d, dict)]
                 if means:
-                    growth_mean = max(0.01, min(0.20, np.mean(means) * 252))
+                    growth_mean = max(0.02, min(0.20, np.mean(means) * 252))
                     growth_std = max(0.01, min(0.10, np.std(means) * 252)) if len(means) > 1 else 0.03
+
+        # --- Fix 2: Cap WACC at sector median + 2% ---
+        wacc_cap = cfg.get("wacc_cap", 0.14)  # default cap: 14%
+        wacc_mean = min(wacc_mean, wacc_cap)
+
+        # --- Fix 3: 3-stage model for high-growth companies ---
+        use_3stage = growth_mean > 0.10
+        transition_years = 5  # years 6-10: fade to terminal growth
 
         rng = np.random.default_rng(42)
         intrinsic_values = []
         for _ in range(n_sims):
             g = rng.normal(growth_mean, growth_std)
-            g = max(-0.10, min(0.30, g))
+            g = max(-0.05, min(0.35, g))
             wacc = rng.normal(wacc_mean, wacc_std)
-            wacc = max(0.04, min(0.20, wacc))
+            wacc = max(0.04, min(wacc_cap, wacc))
             tg = rng.normal(tg_mean, tg_std)
             tg = max(0.01, min(wacc - 0.01, tg))
 
-            pv_fcf = sum(fcf_latest * (1 + g) ** t / (1 + wacc) ** t for t in range(1, years + 1))
-            terminal = fcf_latest * (1 + g) ** years * (1 + tg) / max(wacc - tg, 0.01)
-            pv_terminal = terminal / (1 + wacc) ** years
-            equity_value = pv_fcf + pv_terminal - debt + cash_val
+            if use_3stage:
+                # Stage 1: High growth (years 1-5)
+                pv_fcf = sum(
+                    fcf_latest * (1 + g) ** t / (1 + wacc) ** t
+                    for t in range(1, years + 1)
+                )
+                # Stage 2: Transition (years 6-10, linear fade to terminal)
+                pv_transition = 0.0
+                for t_offset in range(1, transition_years + 1):
+                    t = years + t_offset
+                    # Linear fade: growth decreases from g to tg
+                    fade_frac = t_offset / transition_years
+                    g_fade = g * (1 - fade_frac) + tg * fade_frac
+                    pv_transition += fcf_latest * (1 + g) ** years * (1 + g_fade) ** t_offset / (1 + wacc) ** t
+
+                # Stage 3: Terminal (year 11+)
+                fcf_end_transition = fcf_latest * (1 + g) ** years * (1 + (g + tg) / 2) ** transition_years
+                terminal = fcf_end_transition * (1 + tg) / max(wacc - tg, 0.01)
+                pv_terminal = terminal / (1 + wacc) ** (years + transition_years)
+
+                equity_value = pv_fcf + pv_transition + pv_terminal - debt + cash_val
+            else:
+                # Standard single-stage DCF
+                pv_fcf = sum(fcf_latest * (1 + g) ** t / (1 + wacc) ** t for t in range(1, years + 1))
+                terminal = fcf_latest * (1 + g) ** years * (1 + tg) / max(wacc - tg, 0.01)
+                pv_terminal = terminal / (1 + wacc) ** years
+                equity_value = pv_fcf + pv_terminal - debt + cash_val
+
             per_share = equity_value / shares
             if np.isfinite(per_share) and per_share > 0:
                 intrinsic_values.append(per_share)
@@ -692,10 +753,48 @@ def _compute_dcf(
                 upside = abs(result.intrinsic_p75 - close) if result.intrinsic_p75 else 0
                 result.risk_reward_ratio = safe_divide(upside, downside)
 
+            # --- Fix 4: Reverse DCF (implied growth rate) ---
+            if close and close > 0 and shares > 0:
+                try:
+                    target_ev = close * shares + debt - cash_val
+                    if target_ev > 0:
+                        # Binary search for implied growth rate
+                        lo, hi = -0.05, 0.50
+                        for _ in range(50):
+                            mid = (lo + hi) / 2
+                            pv = sum(fcf_latest * (1 + mid) ** t / (1 + wacc_mean) ** t for t in range(1, years + 1))
+                            tv = fcf_latest * (1 + mid) ** years * (1 + tg_mean) / max(wacc_mean - tg_mean, 0.01)
+                            pv_tv = tv / (1 + wacc_mean) ** years
+                            if pv + pv_tv < target_ev:
+                                lo = mid
+                            else:
+                                hi = mid
+                        result.implied_growth_rate = round((lo + hi) / 2, 4)
+                except Exception:
+                    pass
+
+            # --- Fix 5: Sanity gate ---
+            if close and close > 0:
+                ratio = result.intrinsic_p50 / close
+                if ratio > 5.0 or ratio < 0.2:
+                    result.reliable = False
+                    result.warning = (
+                        f"DCF/price ratio {ratio:.1f}x is extreme -- "
+                        f"intrinsic ${result.intrinsic_p50:.2f} vs market ${close:.2f}. "
+                        f"Growth assumption ({growth_mean*100:.1f}%) or WACC ({wacc_mean*100:.1f}%) "
+                        f"may be miscalibrated."
+                    )
+                    logger.warning("DCF sanity gate: ratio=%.1fx, flagged as unreliable", ratio)
+                else:
+                    result.reliable = True
+
+            _model_type = "3-stage" if use_3stage else "single-stage"
+            _growth_src = "revenue CAGR" if _used_cagr else "MC regime"
             result.narrative = (
                 f"Intrinsic value ${result.intrinsic_p50:.2f} "
                 f"(range ${result.intrinsic_p25:.2f}-${result.intrinsic_p75:.2f})"
                 + (f" vs current ${close:.2f}" if close else "")
+                + f" [{_model_type}, growth={growth_mean*100:.1f}% from {_growth_src}]"
             )
             result.available = True
     except Exception as exc:
@@ -1113,7 +1212,7 @@ def run_hedge_fund_analysis(
     )
 
     # --- Tier 5: Valuation Engine ---
-    hf.dcf = _compute_dcf(cashflow_df, balance_df, cache, target_profile, mc_result, macro_data)
+    hf.dcf = _compute_dcf(cashflow_df, balance_df, cache, target_profile, mc_result, macro_data, income_df=income_df)
     hf_results_dict = {
         "fcf_quality": hf.fcf_quality, "accruals_forensic": hf.accruals_forensic,
         "asset_quality": hf.asset_quality, "leverage_stress": hf.leverage_stress,

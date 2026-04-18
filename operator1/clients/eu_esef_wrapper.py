@@ -1043,6 +1043,13 @@ class EUEsefClient:
             "srt:ProductOrServiceAxis",
         }
 
+        # Geographic axes (Gap 2 -- geographic supply chain risk)
+        geographic_axes = {
+            "ifrs-full:GeographicAreasAxis",
+            "ifrs-full:CountryOfDomicileAxis",
+            "srt:StatementGeographicalAxis",
+        }
+
         # Revenue concepts to extract per segment
         revenue_concepts = {
             "ifrs-full:Revenue",
@@ -1058,6 +1065,7 @@ class EUEsefClient:
         }
 
         segments: dict[str, float] = {}
+        geo_segments: dict[str, float] = {}
         segment_details: dict[str, dict[str, float]] = {}
 
         for fact_id, fact in facts.items():
@@ -1068,8 +1076,9 @@ class EUEsefClient:
             if len(dims) <= 4:
                 continue
 
-            # Find which segment axis is present
+            # Find which segment axis is present (operating or geographic)
             seg_member = ""
+            is_geographic = False
             for axis in segment_axes:
                 if axis in dims:
                     raw_member = dims[axis]
@@ -1079,6 +1088,18 @@ class EUEsefClient:
                     seg_member = re.sub(r"([a-z])([A-Z])", r"\1 \2", seg_member)
                     seg_member = seg_member.strip()
                     break
+
+            # Check geographic axes if no operating segment found
+            if not seg_member:
+                for axis in geographic_axes:
+                    if axis in dims:
+                        raw_member = dims[axis]
+                        seg_member = re.sub(r"^[^:]+:", "", str(raw_member))
+                        seg_member = re.sub(r"Member$", "", seg_member)
+                        seg_member = re.sub(r"([a-z])([A-Z])", r"\1 \2", seg_member)
+                        seg_member = seg_member.strip()
+                        is_geographic = True
+                        break
 
             if not seg_member or len(seg_member) < 2:
                 continue
@@ -1099,11 +1120,16 @@ class EUEsefClient:
             except (ValueError, TypeError):
                 continue
 
-            # Extract revenue per segment
+            # Extract revenue per segment (operating or geographic)
             if concept in revenue_concepts:
-                # Keep the largest revenue value per segment (most recent period)
-                if seg_member not in segments or abs(value) > abs(segments[seg_member]):
-                    segments[seg_member] = value
+                if is_geographic:
+                    # Geographic segment revenue (Gap 2)
+                    if seg_member not in geo_segments or abs(value) > abs(geo_segments[seg_member]):
+                        geo_segments[seg_member] = value
+                else:
+                    # Operating segment revenue
+                    if seg_member not in segments or abs(value) > abs(segments[seg_member]):
+                        segments[seg_member] = value
 
             # Extract additional metrics
             canonical = detail_concepts.get(concept)
@@ -1134,6 +1160,7 @@ class EUEsefClient:
 
         return {
             "segments": segments,
+            "geo_segments": geo_segments,
             "descriptions": descriptions,
             "segment_details": segment_details,
             "has_revenue": len(segments) >= 2,
