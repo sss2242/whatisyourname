@@ -3189,12 +3189,27 @@ Non-interactive examples:
                                 _conf_vol_ratio = float(_regime_vols.max() / max(_regime_vols.min(), 1e-8))
                     except Exception:
                         pass
+                # Extract event uncertainty premium from cache for interval widening
+                _conf_event_premium = None
+                if "event_uncertainty_premium" in cache.columns:
+                    _eup = cache["event_uncertainty_premium"].dropna()
+                    if len(_eup) > 0:
+                        _conf_event_premium = float(_eup.iloc[-1])
+                # Extract geographic concentration for interval widening
+                _conf_geo_hhi = None
+                if "geo_hhi" in cache.columns:
+                    _gh = cache["geo_hhi"].dropna()
+                    if len(_gh) > 0:
+                        _conf_geo_hhi = float(_gh.iloc[-1])
+
                 conformal_result = build_conformal_result(
                     calibrator,
                     forecasts=_nested_forecasts,
                     horizons={"1d": 1, "5d": 5, "21d": 21, "252d": 252},
                     regime_transition_prob=_conf_trans_prob,
                     regime_vol_ratio=_conf_vol_ratio,
+                    event_uncertainty_premium=_conf_event_premium,
+                    geo_concentration_hhi=_conf_geo_hhi,
                 )
                 logger.info("Conformal prediction intervals computed")
 

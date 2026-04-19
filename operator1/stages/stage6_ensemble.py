@@ -144,12 +144,26 @@ def run_6_3_conformal(state: PipelineState) -> None:
                 except Exception:
                     pass
 
+            # Extract event + geo data for interval widening
+            _event_prem = None
+            if "event_uncertainty_premium" in cache.columns:
+                _ep = cache["event_uncertainty_premium"].dropna()
+                if len(_ep) > 0:
+                    _event_prem = float(_ep.iloc[-1])
+            _geo_hhi = None
+            if "geo_hhi" in cache.columns:
+                _gh = cache["geo_hhi"].dropna()
+                if len(_gh) > 0:
+                    _geo_hhi = float(_gh.iloc[-1])
+
             state.conformal_result = build_conformal_result(
                 calibrator,
                 forecasts=_nested,
                 horizons={"1d": 1, "5d": 5, "21d": 21, "252d": 252},
                 regime_transition_prob=_trans_prob,
                 regime_vol_ratio=_vol_ratio,
+                event_uncertainty_premium=_event_prem,
+                geo_concentration_hhi=_geo_hhi,
             )
             logger.info("Conformal prediction intervals computed")
 
