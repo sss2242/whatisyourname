@@ -2671,8 +2671,14 @@ Non-interactive examples:
                          "cannibalization_rate", "net_new_revenue_pct",
                          "network_effect_score", "input_cost_pressure",
                          "growth_runway_quarters", "maturity_concentration",
-                         "estimated_market_share", "dominant_segment_growth")
-                or any(c.startswith(p) for p in _linked_prefixes))
+                         "estimated_market_share", "dominant_segment_growth",
+                     # Raw macro indicators (Gap C)
+                     "gdp_growth", "inflation_rate_yoy", "real_interest_rate",
+                     "unemployment_rate", "official_exchange_rate_lcu_per_usd")
+                or any(c.startswith(p) for p in _linked_prefixes)
+                # Estimation confidence columns (Gap B)
+                or c.endswith("_confidence")
+                or c.startswith("interp_confidence_"))
             and cache[c].dtype in ("float64", "float32", "int64")
             and not c.startswith("is_missing_")
             and c not in _hmm_lookahead_cols
@@ -2721,12 +2727,11 @@ Non-interactive examples:
         except Exception as exc:
             logger.warning("Dual regime classification failed: %s", exc)
 
-        # Granger causality
+        # Granger causality (informational -- pruning replaced by feature selection below)
         _gc_vars = []
         try:
             from operator1.models.granger_causality import (
                 compute_granger_causality,
-                prune_features_by_causality,
             )
             _gc_vars = [
                 c for c in cache.columns
@@ -2738,20 +2743,9 @@ Non-interactive examples:
                     cache, variables=_gc_vars,
                 )
                 if granger_result and granger_result.fitted:
-                    _granger_keep = (
-                        ["equity_value", "equity_change_rate", "financial_volatility"]
-                        if _is_private
-                        else ["close", "return_1d", "volatility_21d"]
-                    )
-                    _extra_vars = prune_features_by_causality(
-                        _extra_vars,
-                        granger_result,
-                        always_keep=_granger_keep,
-                    )
                     logger.info(
-                        "Granger causality: %d significant pairs, %d variables retained",
+                        "Granger causality: %d significant pairs (informational, no pruning)",
                         len(granger_result.significant_pairs),
-                        len(_extra_vars),
                     )
         except Exception as exc:
             logger.warning("Granger causality analysis failed: %s", exc)
@@ -2813,6 +2807,30 @@ Non-interactive examples:
             logger.info("Pre-forecasting synergies applied")
         except Exception as exc:
             logger.warning("Pre-forecasting synergies failed: %s", exc)
+
+        # Feature selection (Boruta + Regime-Conditional PIMP + mRMR)
+        # Replaces the old Granger-based pruning with a 3-layer system that
+        # handles non-linear effects and regime-conditional importance.
+        feature_selection_result = None
+        try:
+            from operator1.models.feature_selector import run_feature_selection
+            _fs_target = "equity_change_rate" if _is_private else "return_1d"
+            _fs_regime = cache.get("regime_label") if "regime_label" in cache.columns else None
+            _extra_vars, feature_selection_result = run_feature_selection(
+                cache, _extra_vars, regime_labels=_fs_regime,
+                target_col=_fs_target, granger_result=granger_result,
+            )
+            if feature_selection_result and feature_selection_result.fitted:
+                logger.info(
+                    "Feature selection: %d -> %d features (Boruta: %d, PIMP: %d, mRMR: %d)",
+                    feature_selection_result.n_input,
+                    feature_selection_result.n_output,
+                    len(feature_selection_result.boruta_confirmed),
+                    sum(len(v) for v in feature_selection_result.regime_selected.values()),
+                    len(feature_selection_result.mrmr_selected),
+                )
+        except Exception as exc:
+            logger.warning("Feature selection failed (keeping all features): %s", exc)
 
         # Standard forecasting
         try:
@@ -3171,12 +3189,27 @@ Non-interactive examples:
                                 _conf_vol_ratio = float(_regime_vols.max() / max(_regime_vols.min(), 1e-8))
                     except Exception:
                         pass
+                # Extract event uncertainty premium from cache for interval widening
+                _conf_event_premium = None
+                if "event_uncertainty_premium" in cache.columns:
+                    _eup = cache["event_uncertainty_premium"].dropna()
+                    if len(_eup) > 0:
+                        _conf_event_premium = float(_eup.iloc[-1])
+                # Extract geographic concentration for interval widening
+                _conf_geo_hhi = None
+                if "geo_hhi" in cache.columns:
+                    _gh = cache["geo_hhi"].dropna()
+                    if len(_gh) > 0:
+                        _conf_geo_hhi = float(_gh.iloc[-1])
+
                 conformal_result = build_conformal_result(
                     calibrator,
                     forecasts=_nested_forecasts,
                     horizons={"1d": 1, "5d": 5, "21d": 21, "252d": 252},
                     regime_transition_prob=_conf_trans_prob,
                     regime_vol_ratio=_conf_vol_ratio,
+                    event_uncertainty_premium=_conf_event_premium,
+                    geo_concentration_hhi=_conf_geo_hhi,
                 )
                 logger.info("Conformal prediction intervals computed")
 
@@ -3268,6 +3301,7 @@ Non-interactive examples:
                     granger_result=granger_result,
                     shap_result=shap_result,
                     walk_forward_result=walk_forward_result,
+                    feature_selection_result=profile.get("feature_selection") if profile else None,
                 )
                 logger.info("Predictions aggregated (with %d sibling module results)",
                     sum(1 for r in [conformal_result, dual_regime_result,
@@ -4167,6 +4201,23 @@ Non-interactive examples:
         # Module contribution scores (Section F.1 Category 7 from core idea)
         if pred_result is not None and hasattr(pred_result, "module_contributions") and pred_result.module_contributions:
             profile.setdefault("model_metrics", {})["module_contributions"] = pred_result.module_contributions
+
+        # Inject feature selection results
+        if feature_selection_result is not None and feature_selection_result.fitted:
+            profile["feature_selection"] = {
+                "available": True,
+                "n_input": feature_selection_result.n_input,
+                "n_output": feature_selection_result.n_output,
+                "boruta_confirmed": feature_selection_result.boruta_confirmed[:20],
+                "boruta_tentative": feature_selection_result.boruta_tentative[:10],
+                "regime_selected": {
+                    k: v[:10] for k, v in feature_selection_result.regime_selected.items()
+                },
+                "mrmr_selected": feature_selection_result.mrmr_selected[:15],
+                "method_contributions": feature_selection_result.method_contributions,
+            }
+        else:
+            profile["feature_selection"] = {"available": False}
 
         if _synergy_meta:
             profile["synergies_applied"] = {

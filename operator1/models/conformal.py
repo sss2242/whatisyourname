@@ -381,6 +381,8 @@ def build_conformal_result(
     horizons: dict[str, int],
     regime_transition_prob: float | None = None,
     regime_vol_ratio: float | None = None,
+    event_uncertainty_premium: float | None = None,
+    geo_concentration_hhi: float | None = None,
 ) -> ConformalResult:
     """Build a full ConformalResult across all variables and horizons.
 
@@ -424,6 +426,29 @@ def build_conformal_result(
             regime_transition_prob, regime_vol_ratio, regime_widen_factor,
         )
 
+    # Event calendar widening: predictions near FOMC meetings or earnings
+    # are inherently less certain. Widen intervals by the event premium.
+    event_widen_factor = 1.0
+    if event_uncertainty_premium is not None and event_uncertainty_premium > 0:
+        event_widen_factor = 1.0 + min(float(event_uncertainty_premium), 0.5)
+        logger.debug(
+            "Conformal event widening: premium=%.3f, factor=%.3f",
+            event_uncertainty_premium, event_widen_factor,
+        )
+
+    # Geographic concentration widening: companies with high geo_hhi
+    # (revenue concentrated in few countries) have more geopolitical uncertainty.
+    geo_widen_factor = 1.0
+    if geo_concentration_hhi is not None and geo_concentration_hhi > 0.5:
+        geo_widen_factor = 1.0 + (float(geo_concentration_hhi) - 0.5) * 0.3
+        logger.debug(
+            "Conformal geo widening: HHI=%.3f, factor=%.3f",
+            geo_concentration_hhi, geo_widen_factor,
+        )
+
+    # Combined widening factor
+    total_widen_factor = regime_widen_factor * event_widen_factor * geo_widen_factor
+
     for var, horizon_forecasts in forecasts.items():
         result.intervals[var] = {}
         for h_label, point in horizon_forecasts.items():
@@ -433,17 +458,19 @@ def build_conformal_result(
                 point_forecast=point,
                 horizon_days=days,
             )
-            # Apply regime widening to the interval
-            if regime_widen_factor > 1.0 and isinstance(interval, dict):
+            # Apply combined widening to the interval (regime + event + geo)
+            if total_widen_factor > 1.0 and isinstance(interval, dict):
                 center = point
                 lower = interval.get("lower", center)
                 upper = interval.get("upper", center)
                 half_width = (upper - lower) / 2.0
-                widened_half = half_width * regime_widen_factor
+                widened_half = half_width * total_widen_factor
                 interval["lower"] = center - widened_half
                 interval["upper"] = center + widened_half
-                interval["regime_widened"] = True
-                interval["regime_widen_factor"] = round(regime_widen_factor, 3)
+                interval["regime_widened"] = regime_widen_factor > 1.0
+                interval["event_widened"] = event_widen_factor > 1.0
+                interval["geo_widened"] = geo_widen_factor > 1.0
+                interval["total_widen_factor"] = round(total_widen_factor, 3)
             result.intervals[var][h_label] = interval
 
     result.calibration_scores_count = sum(

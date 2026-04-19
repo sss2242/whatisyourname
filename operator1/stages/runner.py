@@ -79,10 +79,12 @@ def _matches_stage(sub_id: str, stage_spec: str) -> bool:
     '3' matches '3.1', '3.2', etc.
     '3.1' matches only '3.1'.
     '4' matches '4.1'.
+    '7.4' matches '7.4.0', '7.4.1', etc.
     """
     if sub_id == stage_spec:
         return True
-    if "." not in stage_spec and sub_id.startswith(stage_spec + "."):
+    # Prefix match: spec "3" matches "3.1", spec "7.4" matches "7.4.0"
+    if sub_id.startswith(stage_spec + "."):
         return True
     return False
 

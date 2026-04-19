@@ -2068,13 +2068,32 @@ def compute_model_routing_weights(cache: pd.DataFrame) -> dict[str, float]:
     """Route to dominant model based on current market characteristics.
 
     Uses technical indicators already in the cache to determine which
-    model type is best suited for the current regime. Multiplied with
-    inverse-RMSE/FixedShare weights for the final ensemble.
+    model type is best suited for the current regime. Applied as a
+    confidence multiplier on per-prediction outputs.
+
+    Affinity weights are loaded from ``config/scoring_weights.yml``
+    section ``model_routing`` with hardcoded fallbacks.
 
     Returns normalized weights (model_name -> multiplier, sums to ~1).
     """
     if cache is None or cache.empty:
         return {}
+
+    # Load affinity weights from config (with fallbacks)
+    try:
+        from operator1.scoring_weights import get_weight
+        _trend = get_weight("model_routing.trend_affinity", {})
+        _volatile = get_weight("model_routing.volatile_affinity", {})
+        _mean_rev = get_weight("model_routing.mean_revert_affinity", {})
+    except Exception:
+        _trend = {}
+        _volatile = {}
+        _mean_rev = {}
+
+    # Defaults if config is empty
+    _trend = _trend or {"kalman": 1.3, "tree": 1.1, "garch": 0.7, "baseline": 0.9}
+    _volatile = _volatile or {"garch": 1.4, "tree": 1.0, "kalman": 0.7, "baseline": 1.1}
+    _mean_rev = _mean_rev or {"baseline": 1.3, "kalman": 0.9, "tree": 0.8, "garch": 1.0}
 
     latest = cache.iloc[-1]
     weights: dict[str, float] = {
@@ -2082,34 +2101,50 @@ def compute_model_routing_weights(cache: pd.DataFrame) -> dict[str, float]:
         "lstm": 1.0, "tree": 1.0, "baseline": 1.0,
     }
 
-    # ADX > 25 = strong trend -> Kalman (optimal for trending linear state)
+    # Detect market regime from technical indicators
+    _is_trending = False
+    _is_volatile = False
+    _is_mean_reverting = False
+
+    # ADX > 25 = strong trend
     adx = latest.get("adx_14", 20) if "adx_14" in cache.columns else 20
     if isinstance(adx, (int, float)) and np.isfinite(adx) and adx > 25:
-        weights["kalman"] *= 2.0
-        weights["baseline"] *= 0.5  # mean-reversion baseline is worse in trends
+        _is_trending = True
 
-    # IV-RV spread > 0.05 = vol expansion -> GARCH (volatility specialist)
+    # IV-RV spread > 0.05 = vol expansion
     iv_rv = latest.get("iv_rv_spread", 0) if "iv_rv_spread" in cache.columns else 0
     if isinstance(iv_rv, (int, float)) and np.isfinite(iv_rv) and iv_rv > 0.05:
-        weights["garch"] *= 2.0
+        _is_volatile = True
 
-    # VIX term structure > 1.0 = backwardation = stress -> tree (non-linear)
+    # VIX term structure > 1.0 = backwardation = stress
     vts = latest.get("vix_term_structure", 1.0) if "vix_term_structure" in cache.columns else 1.0
     if isinstance(vts, (int, float)) and np.isfinite(vts) and vts > 1.0:
-        weights["tree"] *= 1.5
-        weights["lstm"] *= 1.3  # LSTM also handles non-linearity
+        _is_volatile = True
 
-    # Low return autocorrelation = mean-reverting -> baseline
+    # Low return autocorrelation = mean-reverting
     if "return_1d" in cache.columns:
         ret = cache["return_1d"].dropna()
         if len(ret) >= 30:
             try:
                 autocorr = float(ret.autocorr(lag=1))
                 if np.isfinite(autocorr) and abs(autocorr) < 0.1:
-                    weights["baseline"] *= 1.5  # mean-reversion favored
-                    weights["kalman"] *= 0.8  # trend-following less useful
+                    _is_mean_reverting = True
             except Exception:
                 pass
+
+    # Apply config-driven affinity weights
+    if _is_trending:
+        for model, mult in _trend.items():
+            if model in weights:
+                weights[model] *= float(mult)
+    if _is_volatile:
+        for model, mult in _volatile.items():
+            if model in weights:
+                weights[model] *= float(mult)
+    if _is_mean_reverting:
+        for model, mult in _mean_rev.items():
+            if model in weights:
+                weights[model] *= float(mult)
 
     # Normalize to sum to 1
     total = sum(weights.values())
@@ -2202,6 +2237,7 @@ def run_prediction_aggregation(
     granger_result: Any | None = None,
     shap_result: Any | None = None,
     walk_forward_result: Any | None = None,
+    feature_selection_result: Any | None = None,
 ) -> PredictionAggregatorResult:
     """Run the full prediction aggregation pipeline.
 
@@ -2788,14 +2824,54 @@ def run_prediction_aggregation(
     )
 
     # --- B3 fix: Apply feature-driven model routing weights ---
-    # These are computed but were never wired into the aggregation.
-    # Apply them as a post-hoc adjustment to the prediction metadata.
+    # Routing weights adjust confidence based on market characteristics:
+    # trending markets boost Kalman/tree, volatile markets boost GARCH/MC.
     try:
         routing_weights = compute_model_routing_weights(cache)
         if routing_weights and hasattr(result, "metadata"):
             if result.metadata is None:
                 result.metadata = {}
             result.metadata["model_routing_weights"] = routing_weights
+
+            # Apply routing as confidence multiplier on each prediction.
+            # If the model_used for a prediction is favored by routing,
+            # boost its confidence; if disfavored, dampen it.
+            if hasattr(result, "predictions") and result.predictions:
+                for _var, _horizons in result.predictions.items():
+                    if isinstance(_horizons, dict):
+                        for _h, _hp in _horizons.items():
+                            _mu = getattr(_hp, "model_used", "")
+                            if _mu and _mu in routing_weights:
+                                _rw = routing_weights[_mu]
+                                # Scale confidence by routing affinity (0.5-1.5x range)
+                                _conf = getattr(_hp, "confidence", float("nan"))
+                                if not math.isnan(_conf):
+                                    _hp.confidence = max(0.0, min(1.0, _conf * _rw))
+    except Exception:
+        pass
+
+    # --- Feature-weighted ensemble confidence ---
+    # When Boruta/PIMP/mRMR confirmed features, boost confidence proportionally.
+    # More confirmed features = more information supporting the prediction.
+    try:
+        if feature_selection_result is not None and getattr(feature_selection_result, "fitted", False):
+            _boruta = getattr(feature_selection_result, "boruta_confirmed", [])
+            _n_confirmed = len(_boruta) if _boruta else 0
+            # support ranges from 0.3 (0 features) to 1.0 (10+ features)
+            _support = min(1.0, max(0.3, _n_confirmed / 10.0))
+            # Confidence multiplier: 0.7 + 0.3*support => range [0.79, 1.0]
+            _feat_mult = 0.7 + 0.3 * _support
+            if hasattr(result, "predictions") and result.predictions:
+                for _var, _horizons in result.predictions.items():
+                    if isinstance(_horizons, dict):
+                        for _h, _hp in _horizons.items():
+                            _conf = getattr(_hp, "confidence", float("nan"))
+                            if not math.isnan(_conf):
+                                _hp.confidence = max(0.0, min(1.0, _conf * _feat_mult))
+            if result.metadata is None:
+                result.metadata = {}
+            result.metadata["feature_support_score"] = round(_support, 3)
+            result.metadata["feature_confidence_multiplier"] = round(_feat_mult, 3)
     except Exception:
         pass
 

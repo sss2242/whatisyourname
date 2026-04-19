@@ -95,6 +95,7 @@ class PipelineState:
         self.mode_weights: Any = None
 
         # ---- Stage 3: Temporal Analysis ----
+        self.feature_selection_result: Any = None
         self.dual_regime_result: Any = None
         self.granger_result: Any = None
         self.transfer_entropy_result: Any = None

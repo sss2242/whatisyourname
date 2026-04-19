@@ -1298,6 +1298,37 @@ def run_monte_carlo(
         }
 
     # ------------------------------------------------------------------
+    # Options + cross-asset stress boost for importance sampling tilt.
+    # When options market signals stress (high put/call ratio, VIX
+    # backwardation) or cross-asset stress is elevated, increase the
+    # IS tilt toward crisis paths to better sample tail scenarios.
+    # ------------------------------------------------------------------
+    _stress_tilt_boost = 0.0
+    try:
+        if "put_call_ratio" in cache.columns and "vix_term_structure" in cache.columns:
+            _pcr = cache["put_call_ratio"].iloc[-1] if cache["put_call_ratio"].notna().any() else 0
+            _vts = cache["vix_term_structure"].iloc[-1] if cache["vix_term_structure"].notna().any() else 1.0
+            if isinstance(_pcr, (int, float)) and isinstance(_vts, (int, float)):
+                # PCR > 1.5 = heavy put buying (hedging/fear)
+                # VTS > 1.0 = backwardation (near-term fear > long-term)
+                if float(_pcr) > 1.5 and float(_vts) > 1.0:
+                    _stress_tilt_boost += 0.5  # strong options stress
+                    logger.info("MC options stress boost: PCR=%.2f, VTS=%.2f -> +0.5 tilt", _pcr, _vts)
+                elif float(_pcr) > 1.2 or float(_vts) > 1.0:
+                    _stress_tilt_boost += 0.25  # moderate options stress
+        if "cross_asset_stress" in cache.columns:
+            _cas = cache["cross_asset_stress"].iloc[-1] if cache["cross_asset_stress"].notna().any() else 0
+            if isinstance(_cas, (int, float)) and float(_cas) > 0.7:
+                _stress_tilt_boost += 0.25  # cross-asset contagion signal
+                logger.info("MC cross-asset stress boost: stress=%.2f -> +0.25 tilt", _cas)
+    except Exception:
+        pass
+
+    if _stress_tilt_boost > 0:
+        importance_tilt = importance_tilt + _stress_tilt_boost
+        logger.info("MC importance_tilt boosted to %.2f (base + %.2f stress)", importance_tilt, _stress_tilt_boost)
+
+    # ------------------------------------------------------------------
     # Run simulations per horizon
     # ------------------------------------------------------------------
     all_survival_probs: list[float] = []

@@ -359,7 +359,6 @@ STAGE_7_SUBSTAGES = [
     ("7.1", run_7_1_uss),
     ("7.2", run_7_2_retro_calibration),
     ("7.3", run_7_3_diagnostics),
-    ("7.4", run_7_4_multi_frequency),       # backward compat: runs all 7.4.x sequentially
     ("7.4.0", run_7_4_0_resample_prep),
     ("7.4.1", run_7_4_1_annual),
     ("7.4.2", run_7_4_2_quarterly),

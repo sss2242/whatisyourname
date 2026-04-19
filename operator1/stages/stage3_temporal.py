@@ -72,8 +72,14 @@ def _init_extra_vars(state: PipelineState) -> None:
                      "cannibalization_rate", "net_new_revenue_pct",
                      "network_effect_score", "input_cost_pressure",
                      "growth_runway_quarters", "maturity_concentration",
-                     "estimated_market_share", "dominant_segment_growth")
-            or any(c.startswith(p) for p in _linked_prefixes))
+                     "estimated_market_share", "dominant_segment_growth",
+                     # Raw macro indicators (Gap C)
+                     "gdp_growth", "inflation_rate_yoy", "real_interest_rate",
+                     "unemployment_rate", "official_exchange_rate_lcu_per_usd")
+            or any(c.startswith(p) for p in _linked_prefixes)
+            # Estimation confidence columns (Gap B)
+            or c.endswith("_confidence")
+            or c.startswith("interp_confidence_"))
         and cache[c].dtype in ("float64", "float32", "int64")
         and not c.startswith("is_missing_")
         and c not in _hmm_lookahead_cols
@@ -141,7 +147,6 @@ def run_3_3_granger(state: PipelineState) -> None:
     try:
         from operator1.models.granger_causality import (
             compute_granger_causality,
-            prune_features_by_causality,
         )
         gc_vars = [
             c for c in cache.columns
@@ -151,18 +156,12 @@ def run_3_3_granger(state: PipelineState) -> None:
         if len(gc_vars) >= 3:
             state.granger_result = compute_granger_causality(cache, variables=gc_vars)
             if state.granger_result and state.granger_result.fitted:
-                keep = (
-                    ["equity_value", "equity_change_rate", "financial_volatility"]
-                    if state.is_private
-                    else ["close", "return_1d", "volatility_21d"]
-                )
-                state.extra_vars = prune_features_by_causality(
-                    state.extra_vars, state.granger_result, always_keep=keep,
-                )
+                # Note: Granger pruning removed -- feature selection now handled
+                # by sub-stage 3.8 (Boruta + PIMP + mRMR). Granger result kept
+                # for informational purposes (profile, report, synergies).
                 logger.info(
-                    "Granger causality: %d significant pairs, %d variables retained",
+                    "Granger causality: %d significant pairs (informational, no pruning)",
                     len(state.granger_result.significant_pairs),
-                    len(state.extra_vars),
                 )
     except Exception as exc:
         logger.warning("Granger causality failed: %s", exc)
@@ -247,6 +246,41 @@ def run_3_7_synergies(state: PipelineState) -> None:
         logger.warning("Pre-forecasting synergies failed: %s", exc)
 
 
+def run_3_8_feature_selection(state: PipelineState) -> None:
+    """3.8: Feature selection (Boruta + Regime-Conditional PIMP + mRMR).
+
+    Replaces the Granger-based pruning that was removed from 3.3.
+    This is the ONLY sub-stage that modifies extra_vars.
+    """
+    logger.info("Sub-stage 3.8: Feature selection (Boruta + PIMP + mRMR)")
+    cache = state.cache
+    if cache is None or cache.empty or not state.extra_vars:
+        logger.info("No cache or extra_vars -- skipping feature selection")
+        return
+
+    try:
+        from operator1.models.feature_selector import run_feature_selection
+
+        target = "equity_change_rate" if state.is_private else "return_1d"
+        regime_labels = cache.get("regime_label") if "regime_label" in cache.columns else None
+
+        selected, result = run_feature_selection(
+            cache,
+            state.extra_vars,
+            regime_labels=regime_labels,
+            target_col=target,
+            granger_result=state.granger_result,
+        )
+        state.extra_vars = selected
+        state.feature_selection_result = result
+        logger.info(
+            "Feature selection: %d -> %d features",
+            result.n_input, result.n_output,
+        )
+    except Exception as exc:
+        logger.warning("Feature selection failed (keeping all features): %s", exc)
+
+
 # Registry of all Stage 3 sub-stages in order
 STAGE_3_SUBSTAGES = [
     ("3.1", run_3_1_regime),
@@ -256,4 +290,5 @@ STAGE_3_SUBSTAGES = [
     ("3.5", run_3_5_cycles),
     ("3.6", run_3_6_patterns),
     ("3.7", run_3_7_synergies),
+    ("3.8", run_3_8_feature_selection),
 ]

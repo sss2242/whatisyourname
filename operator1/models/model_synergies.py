@@ -769,19 +769,11 @@ def apply_pre_forecasting_synergies(
     unified = build_unified_causal_network(granger_result, transfer_entropy_result)
     metadata["unified_causal_network"] = unified
 
-    # Prune using unified network
+    # Note: Unified causal pruning REMOVED -- feature selection is now handled
+    # by sub-stage 3.8 (Boruta + PIMP + mRMR) which runs after synergies.
+    # The unified causal network is still computed and stored in metadata
+    # for informational purposes (profile, report).
     pruned_vars = extra_variables or []
-    if unified["retained_variables"]:
-        # Include proxy variable names in always_keep so they survive
-        # causal pruning in private company mode (where close/return_1d
-        # are resolved from equity_value/equity_change_rate).
-        _keep = ["close", "return_1d", "volatility_21d",
-                 "equity_value", "equity_change_rate", "financial_volatility"]
-        pruned_vars = prune_by_unified_network(
-            pruned_vars,
-            unified,
-            always_keep=_keep + cycle_cols,
-        )
     metadata["variables_after_pruning"] = len(pruned_vars)
 
     # Synergy G: Peer-relative survival thresholds
