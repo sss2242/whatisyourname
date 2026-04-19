@@ -785,6 +785,7 @@ class USEdgarClient:
             # Use text-based segment extraction patterns
             from operator1.clients.fuzzy_pdf_parser import (
                 _extract_segments_from_text,
+                _extract_geo_segments_from_text,
                 _parse_segment_descriptions,
                 _parse_segment_paragraphs,
             )
@@ -798,9 +799,13 @@ class USEdgarClient:
                 if len(descriptions) < 2:
                     descriptions = _parse_segment_paragraphs(text)
 
+            # Extract geographic revenue breakdown (ASC 280 / ASC 606)
+            geo_segments = _extract_geo_segments_from_text(text)
+
             n_segments = max(len(segments), len(descriptions))
             return {
                 "segments": segments,
+                "geo_segments": geo_segments,
                 "descriptions": descriptions,
                 "has_revenue": len(segments) >= 2,
                 "has_descriptions": len(descriptions) >= 1,

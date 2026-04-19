@@ -107,6 +107,9 @@ class BacktestState:
         self._ohlcv_source_label: str = ""
         self._seg_result: dict = {}
         self._mode_weights = None
+        self.options_signal_result = None
+        self.cross_asset_result = None
+        self.event_calendar_result = None
         # Raw statement DataFrames (for multi-frequency Q/A direct construction)
         self._income_df: pd.DataFrame = pd.DataFrame()
         self._balance_df: pd.DataFrame = pd.DataFrame()
@@ -593,9 +596,12 @@ def run_stage1(state: BacktestState) -> None:
             cache, sector=state.target_profile.get("sector", ""),
         )
         if _ca_result and _ca_result.available:
+            state.cross_asset_result = _ca_result
             logger.info("Cross-asset signals: rank=%s, disp=%s",
                         _ca_result.sector_rank_12m or "N/A",
                         f"{_ca_result.sector_dispersion:.5f}" if _ca_result.sector_dispersion else "N/A")
+    except Exception:
+        pass
     # Options-derived forward-looking signals (Gap 1)
     try:
         from operator1.features.options_signals import compute_options_signals
@@ -603,6 +609,7 @@ def run_stage1(state: BacktestState) -> None:
             cache, ticker=ticker, market_id=state.market_id,
         )
         if _opt_result and _opt_result.available:
+            state.options_signal_result = _opt_result
             logger.info(
                 "Options signals: PCR=%.2f, RR25d=%s",
                 _opt_result.put_call_ratio or 0,
@@ -756,6 +763,8 @@ def run_stage1(state: BacktestState) -> None:
             cache, ticker=ticker, filing_calendar_result=state.filing_calendar_result,
             reference_date=_ref,
         )
+        if _evt_result and _evt_result.available:
+            state.event_calendar_result = _evt_result
     except Exception:
         pass
 
@@ -1993,6 +2002,9 @@ def _bt_mf_run_freq(state: BacktestState, freq: str) -> None:
     freq_state._is_private = state._is_private
     freq_state._ohlcv_source_label = state._ohlcv_source_label
     freq_state._seg_result = state._seg_result
+    freq_state.options_signal_result = state.options_signal_result
+    freq_state.cross_asset_result = state.cross_asset_result
+    freq_state.event_calendar_result = state.event_calendar_result
     freq_state._income_df = state._income_df
     freq_state._balance_df = state._balance_df
     freq_state._cashflow_df = state._cashflow_df
@@ -2591,6 +2603,24 @@ def run_stage3(state: BacktestState) -> None:
             }
         else:
             profile["supply_chain_stress"] = {"available": False}
+
+        # 10b. options_signals (Gap 1)
+        if state.options_signal_result is not None and state.options_signal_result.available:
+            profile["options_signals"] = state.options_signal_result.to_profile_dict()
+        else:
+            profile["options_signals"] = {"available": False}
+
+        # 10c. cross_asset_signals (Gap 3)
+        if state.cross_asset_result is not None and state.cross_asset_result.available:
+            profile["cross_asset_signals"] = state.cross_asset_result.to_profile_dict()
+        else:
+            profile["cross_asset_signals"] = {"available": False}
+
+        # 10d. event_calendar_signals (Gap 4)
+        if state.event_calendar_result is not None and state.event_calendar_result.available:
+            profile["event_calendar_signals"] = state.event_calendar_result.to_profile_dict()
+        else:
+            profile["event_calendar_signals"] = {"available": False}
 
         # 11. product_catalysts
         if state.catalyst_result is not None and state.catalyst_result.available:

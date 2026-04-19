@@ -88,8 +88,8 @@ class ReportMode(str, Enum):
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20, 2007},  # quick screening + position signal
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20, 2006, 2007, 2008, 2030},  # peers + macro + thesis scorecard + position signal + signal IC + product segments
-    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2023, 2024, 2025, 2026, 2027, 2028, 2029, 2030},  # all sections + multi-frequency + thesis scorecard + position signal + signal IC + hedge fund analysis + product segments
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20, 2006, 2007, 2008, 2030, 2031, 2032, 2033},  # + options signals, cross-asset, event calendar
+    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2023, 2024, 2025, 2026, 2027, 2028, 2029, 2030, 2031, 2032, 2033, 2034},  # + options signals, cross-asset, event calendar, regime shifts
 }
 
 
@@ -4073,6 +4073,196 @@ def _build_hf_position(profile: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _build_options_signals_section(profile: dict[str, Any]) -> str:
+    """Section 31: Options-Derived Forward Signals."""
+    opt = profile.get("options_signals", {})
+    if not opt.get("available"):
+        return "*Options signal data not available for this company.*\n"
+
+    lines: list[str] = []
+
+    # Composite signal badge
+    pcr = opt.get("put_call_ratio")
+    rr = opt.get("risk_reversal_25d")
+    vrp = opt.get("variance_risk_premium")
+    stress_count = sum([
+        1 if pcr is not None and pcr > 1.0 else 0,
+        1 if rr is not None and rr < -0.02 else 0,
+        1 if vrp is not None and vrp > 0.05 else 0,
+    ])
+    badge = "RISK OFF" if stress_count >= 2 else "RISK ON" if stress_count == 0 else "NEUTRAL"
+    lines.append(f"**Composite Signal:** {badge}\n")
+
+    lines.append("| Metric | Value | Interpretation |")
+    lines.append("|--------|-------|----------------|")
+
+    if pcr is not None:
+        interp = "Bearish (put demand)" if pcr > 1.0 else "Bullish (call demand)" if pcr < 0.7 else "Neutral"
+        lines.append(f"| Put/Call Ratio | {pcr:.2f} | {interp} |")
+    if rr is not None:
+        interp = "Institutional hedging" if rr < -0.02 else "Upside positioning" if rr > 0.02 else "Balanced"
+        lines.append(f"| 25-Delta Risk Reversal | {rr:.4f} | {interp} |")
+
+    iv_skew = opt.get("iv_skew")
+    if iv_skew is not None:
+        interp = "High crash fear premium" if iv_skew > 0.1 else "Low tail risk" if iv_skew < 0.02 else "Normal"
+        lines.append(f"| IV Skew | {iv_skew:.4f} | {interp} |")
+
+    vts = opt.get("vix_term_structure")
+    if vts is not None:
+        interp = "Backwardation (near-term fear)" if vts < 0 else "Contango (normal)" if vts > 0 else "Flat"
+        lines.append(f"| VIX Term Structure | {vts:.3f} | {interp} |")
+
+    skew = opt.get("skew_index")
+    if skew is not None:
+        interp = "Elevated tail risk" if skew > 130 else "Low tail risk" if skew < 110 else "Normal"
+        lines.append(f"| SKEW Index | {skew:.1f} | {interp} |")
+
+    if vrp is not None:
+        interp = "Markets overpricing risk" if vrp > 0.03 else "Markets underpricing risk" if vrp < -0.01 else "Fair"
+        lines.append(f"| Variance Risk Premium | {vrp:.4f} | {interp} |")
+
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _build_cross_asset_signals_section(profile: dict[str, Any]) -> str:
+    """Section 32: Cross-Asset Sector Rotation Signals."""
+    ca = profile.get("cross_asset_signals", {})
+    if not ca.get("available"):
+        return "*Cross-asset signal data not available.*\n"
+
+    lines: list[str] = []
+
+    rank = ca.get("sector_rank_12m")
+    rs = ca.get("sector_relative_strength")
+    disp = ca.get("sector_dispersion")
+    yc = ca.get("yield_curve_10y2y")
+    usd = ca.get("usd_momentum_21d")
+    stress = ca.get("cross_asset_stress")
+
+    if rank is not None:
+        color = "top-performing" if rank <= 3 else "bottom-performing" if rank >= 9 else "mid-pack"
+        lines.append(f"**Sector Ranking:** #{rank} of 11 GICS sectors over 12 months ({color})\n")
+
+    lines.append("| Signal | Value | Status |")
+    lines.append("|--------|-------|--------|")
+
+    if rs is not None:
+        status = "Outperforming" if rs > 0.02 else "Underperforming" if rs < -0.02 else "In-line"
+        lines.append(f"| Relative Strength vs S&P 500 | {rs:.3f} | {status} |")
+    if disp is not None:
+        status = "High dispersion (stock picking)" if disp > 0.02 else "Low dispersion (herding)" if disp < 0.005 else "Normal"
+        lines.append(f"| Sector Dispersion | {disp:.5f} | {status} |")
+    if yc is not None:
+        status = "INVERTED (recession signal)" if yc < 0 else "Steep (growth signal)" if yc > 1.5 else "Normal"
+        lines.append(f"| Yield Curve (10Y-2Y) | {yc:.3f} | {status} |")
+    if usd is not None:
+        status = "Strong dollar headwind" if usd > 0.02 else "Weak dollar tailwind" if usd < -0.02 else "Stable"
+        lines.append(f"| USD Momentum (21d) | {usd:.3f} | {status} |")
+    if stress is not None:
+        status = "ELEVATED" if stress > 0.7 else "MODERATE" if stress > 0.3 else "LOW"
+        lines.append(f"| Cross-Asset Stress Index | {stress:.3f} | {status} |")
+
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _build_event_calendar_section(profile: dict[str, Any]) -> str:
+    """Section 33: Upcoming Events & Uncertainty Calendar."""
+    ev = profile.get("event_calendar_signals", {})
+    if not ev.get("available"):
+        return "*Event calendar data not available.*\n"
+
+    lines: list[str] = []
+
+    days_next = ev.get("days_to_next_event")
+    premium = ev.get("event_uncertainty_premium")
+    fomc = ev.get("fomc_proximity")
+    earnings = ev.get("earnings_proximity")
+    density = ev.get("event_density_30d")
+
+    if days_next is not None:
+        lines.append(f"**Next Scheduled Event:** {int(days_next)} trading days away\n")
+
+    if premium is not None:
+        pct = premium * 100
+        lines.append(f"**Uncertainty Premium:** {pct:.1f}% confidence haircut applied to predictions\n")
+
+    lines.append("| Event Type | Proximity | Impact |")
+    lines.append("|------------|-----------|--------|")
+
+    if fomc is not None:
+        impact = "HIGH -- rate-sensitive" if fomc < 5 else "MODERATE" if fomc < 15 else "LOW"
+        lines.append(f"| FOMC Meeting | {int(fomc)} days | {impact} |")
+    if earnings is not None:
+        impact = "HIGH -- vol compression" if earnings < 10 else "MODERATE" if earnings < 30 else "LOW"
+        lines.append(f"| Earnings Release | {int(earnings)} days | {impact} |")
+
+    if density is not None:
+        label = "BUSY" if density > 5 else "MODERATE" if density > 2 else "QUIET"
+        lines.append(f"| 30-Day Event Density | {int(density)} events | {label} |")
+
+    # Next filing prediction from filing_calendar
+    fc = profile.get("filing_calendar", {})
+    nf = fc.get("next_expected_filing", {})
+    if nf.get("available", False) and nf.get("predicted_date"):
+        lines.append(f"| Next Expected Filing | {nf['predicted_date']} | Confidence: {nf.get('confidence', 'N/A')} |")
+
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _build_predicted_regime_shifts_section(profile: dict[str, Any]) -> str:
+    """Section 34: Predicted Regime Shifts."""
+    rs = profile.get("predicted_regime_shifts", {})
+    if not rs.get("available"):
+        return "*Regime shift prediction data not available.*\n"
+
+    lines: list[str] = []
+
+    current = rs.get("current_regime", "unknown")
+    p21 = rs.get("prob_exit_21d")
+    p252 = rs.get("prob_exit_252d")
+    exp_days = rs.get("expected_days_to_shift")
+    next_regime = rs.get("most_probable_next_regime")
+
+    lines.append(f"**Current Regime:** {current}\n")
+
+    if next_regime:
+        lines.append(f"**Most Probable Next Regime:** {next_regime}\n")
+    if exp_days is not None:
+        lines.append(f"**Expected Days to Regime Change:** {exp_days:.0f}\n")
+
+    lines.append("| Horizon | P(Regime Exit) | Interpretation |")
+    lines.append("|---------|---------------|----------------|")
+
+    if p21 is not None:
+        interp = "Likely shift imminent" if p21 > 0.5 else "Moderate transition risk" if p21 > 0.2 else "Regime stable"
+        lines.append(f"| 21 days | {p21:.1%} | {interp} |")
+    if p252 is not None:
+        interp = "Almost certain shift" if p252 > 0.8 else "Probable shift" if p252 > 0.5 else "May persist"
+        lines.append(f"| 252 days | {p252:.1%} | {interp} |")
+
+    # Transition matrix if available
+    tm = rs.get("transition_matrix_used")
+    if tm and isinstance(tm, (list, dict)):
+        lines.append("\n**Transition Probabilities (row = from, col = to):**\n")
+        regime_order = rs.get("regime_order")
+        if regime_order and isinstance(tm, list):
+            header = "| | " + " | ".join(str(r) for r in regime_order) + " |"
+            sep = "|---|" + "|".join("---" for _ in regime_order) + "|"
+            lines.append(header)
+            lines.append(sep)
+            for i, row in enumerate(tm):
+                if isinstance(row, list):
+                    cells = " | ".join(f"{v:.2f}" if isinstance(v, (int, float)) else str(v) for v in row)
+                    lines.append(f"| {regime_order[i] if i < len(regime_order) else i} | {cells} |")
+
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def _build_fallback_report(
     profile: dict[str, Any],
     tier: ReportTier = ReportTier.PREMIUM,
@@ -4144,6 +4334,10 @@ def _build_fallback_report(
         2028: ("28. Investment Thesis Scorecard (HF)", _build_hf_scorecard(profile)),
         2029: ("29. Position Signal & Sizing (HF)", _build_hf_position(profile)),
         2030: ("30. Product Portfolio Analysis", _build_product_segments_section(profile)),
+        2031: ("31. Options-Derived Forward Signals", _build_options_signals_section(profile)),
+        2032: ("32. Cross-Asset Sector Rotation Signals", _build_cross_asset_signals_section(profile)),
+        2033: ("33. Upcoming Events & Uncertainty Calendar", _build_event_calendar_section(profile)),
+        2034: ("34. Predicted Regime Shifts", _build_predicted_regime_shifts_section(profile)),
         22: ("22. Appendix & Methodology", _build_appendix(profile)),
     }
 
