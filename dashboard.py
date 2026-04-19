@@ -460,6 +460,16 @@ def render_home():
                     _card("Consensus", _rc.get("consensus_regime", "?"), f"{_rc.get('agreement_ratio', 0):.0%} agreement", "merge_type")
                     _card("Fused Survival", f"{_sv.get('fused_probability', 0):.0%}", f"Weakest: {_sv.get('weakest_frequency', '?')}", "link")
 
+            # Product Segments
+            ps = profile.get("product_segments", {})
+            if ps.get("available"):
+                ui.separator()
+                ui.label("Product Segments").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("Segments", str(ps.get("n_segments", 0)), ps.get("dominant_segment", ""), "category")
+                    _dom_pct = ps.get("dominant_segment_pct", 0)
+                    _card("Dominant Share", f"{_dom_pct:.0%}" if _dom_pct else "N/A", ps.get("source", ""), "pie_chart")
+
             # Signal IC
             sig_ic = profile.get("signal_ic", {})
             if sig_ic.get("available"):
