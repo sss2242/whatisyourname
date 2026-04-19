@@ -312,3 +312,13 @@ model_routing:
     tree: 0.8
     garch: 1.0
   reject_option_confidence_threshold: 0.15
+
+# --- Feature selection (Boruta + PIMP + mRMR) ---
+feature_selection:
+  boruta_n_trials: 50
+  boruta_alpha: 0.05
+  boruta_rf_max_depth: 7
+  pimp_n_permutations: 50
+  pimp_significance: 0.05
+  mrmr_max_features: 30
+  min_regime_samples: 30

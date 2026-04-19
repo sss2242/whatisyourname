@@ -1255,8 +1255,14 @@ def _init_extra_vars(state: BacktestState) -> None:
                      "cannibalization_rate", "net_new_revenue_pct",
                      "network_effect_score", "input_cost_pressure",
                      "growth_runway_quarters", "maturity_concentration",
-                     "estimated_market_share", "dominant_segment_growth")
-            or any(c.startswith(p) for p in _linked_prefixes))
+                     "estimated_market_share", "dominant_segment_growth",
+                     # Raw macro indicators (Gap C)
+                     "gdp_growth", "inflation_rate_yoy", "real_interest_rate",
+                     "unemployment_rate", "official_exchange_rate_lcu_per_usd")
+            or any(c.startswith(p) for p in _linked_prefixes)
+            # Estimation confidence columns (Gap B)
+            or c.endswith("_confidence")
+            or c.startswith("interp_confidence_"))
         and cache[c].dtype in ("float64", "float32", "int64")
         and not c.startswith("is_missing_")
         and c not in _hmm_lookahead_cols
@@ -1290,15 +1296,14 @@ def run_stage2a1(state: BacktestState) -> None:
     except Exception:
         pass
 
-    # Granger causality
+    # Granger causality (informational -- pruning replaced by feature selection below)
     try:
-        from operator1.models.granger_causality import compute_granger_causality, prune_features_by_causality
+        from operator1.models.granger_causality import compute_granger_causality
         gc_vars = [c for c in cache.columns if cache[c].dtype in ("float64", "float32") and cache[c].notna().sum() > 50][:25]
         if len(gc_vars) >= 3:
             state.granger_result = compute_granger_causality(cache, variables=gc_vars)
             if state.granger_result and state.granger_result.fitted:
-                keep = ["equity_value", "equity_change_rate", "financial_volatility"] if state._is_private else ["close", "return_1d", "volatility_21d"]
-                state._extra_vars = prune_features_by_causality(state._extra_vars, state.granger_result, always_keep=keep)
+                logger.info("Granger: %d significant pairs (informational)", len(state.granger_result.significant_pairs))
     except Exception:
         pass
 
@@ -1341,6 +1346,19 @@ def run_stage2a1(state: BacktestState) -> None:
         )
     except Exception:
         pass
+
+    # Feature selection (Boruta + PIMP + mRMR) -- replaces old Granger pruning
+    try:
+        from operator1.models.feature_selector import run_feature_selection
+        _fs_target = "equity_change_rate" if state._is_private else "return_1d"
+        _fs_regime = cache.get("regime_label") if "regime_label" in cache.columns else None
+        state._extra_vars, _ = run_feature_selection(
+            cache, state._extra_vars, regime_labels=_fs_regime,
+            target_col=_fs_target, granger_result=state.granger_result,
+        )
+        logger.info("Feature selection: %d features retained", len(state._extra_vars))
+    except Exception as exc:
+        logger.warning("Feature selection failed: %s", exc)
 
     state.cache = cache
     state.save_sub("2a1")
