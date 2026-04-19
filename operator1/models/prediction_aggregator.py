@@ -2237,6 +2237,7 @@ def run_prediction_aggregation(
     granger_result: Any | None = None,
     shap_result: Any | None = None,
     walk_forward_result: Any | None = None,
+    feature_selection_result: Any | None = None,
 ) -> PredictionAggregatorResult:
     """Run the full prediction aggregation pipeline.
 
@@ -2846,6 +2847,31 @@ def run_prediction_aggregation(
                                 _conf = getattr(_hp, "confidence", float("nan"))
                                 if not math.isnan(_conf):
                                     _hp.confidence = max(0.0, min(1.0, _conf * _rw))
+    except Exception:
+        pass
+
+    # --- Feature-weighted ensemble confidence ---
+    # When Boruta/PIMP/mRMR confirmed features, boost confidence proportionally.
+    # More confirmed features = more information supporting the prediction.
+    try:
+        if feature_selection_result is not None and getattr(feature_selection_result, "fitted", False):
+            _boruta = getattr(feature_selection_result, "boruta_confirmed", [])
+            _n_confirmed = len(_boruta) if _boruta else 0
+            # support ranges from 0.3 (0 features) to 1.0 (10+ features)
+            _support = min(1.0, max(0.3, _n_confirmed / 10.0))
+            # Confidence multiplier: 0.7 + 0.3*support => range [0.79, 1.0]
+            _feat_mult = 0.7 + 0.3 * _support
+            if hasattr(result, "predictions") and result.predictions:
+                for _var, _horizons in result.predictions.items():
+                    if isinstance(_horizons, dict):
+                        for _h, _hp in _horizons.items():
+                            _conf = getattr(_hp, "confidence", float("nan"))
+                            if not math.isnan(_conf):
+                                _hp.confidence = max(0.0, min(1.0, _conf * _feat_mult))
+            if result.metadata is None:
+                result.metadata = {}
+            result.metadata["feature_support_score"] = round(_support, 3)
+            result.metadata["feature_confidence_multiplier"] = round(_feat_mult, 3)
     except Exception:
         pass
 

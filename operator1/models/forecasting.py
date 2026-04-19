@@ -629,6 +629,8 @@ def fit_garch(
     n_forecast: int = 1,
     p: int = 1,
     q: int = 1,
+    cache: pd.DataFrame | None = None,
+    extra_variables: list[str] | None = None,
 ) -> tuple[np.ndarray | None, ModelMetrics]:
     """Fit a GARCH(p,q) model for conditional volatility forecasting.
 
@@ -640,6 +642,10 @@ def fit_garch(
         Number of steps ahead.
     p, q:
         GARCH order parameters.
+    cache:
+        Daily cache DataFrame (needed for GARCH-X exogenous regressors).
+    extra_variables:
+        Feature columns for GARCH-X mean model (ARX + GARCH volatility).
 
     Returns
     -------
@@ -661,6 +667,71 @@ def fit_garch(
         )
         logger.warning(metrics.error)
         return None, metrics
+
+    # ------------------------------------------------------------------
+    # GARCH-X: try ARX mean model with exogenous regressors first.
+    # Features from Boruta/PIMP/mRMR inform the conditional mean,
+    # while GARCH(1,1) handles conditional variance.
+    # ------------------------------------------------------------------
+    if extra_variables and cache is not None:
+        try:
+            from arch.univariate import ARX, GARCH as GARCHVol  # type: ignore[import-untyped]
+
+            _exog_cols = [c for c in extra_variables if c in cache.columns and cache[c].notna().sum() > 20]
+            if _exog_cols:
+                # Align exog with returns length
+                _exog = cache[_exog_cols].iloc[-len(clean):].copy()
+                _exog = _exog.dropna(axis=1)  # drop cols with NaN in this window
+                if len(_exog.columns) > 0 and len(_exog) == len(clean):
+                    # Z-score normalize (GARCH-X needs stationary regressors)
+                    _exog_std = _exog.std().clip(lower=1e-8)
+                    _exog_norm = (_exog - _exog.mean()) / _exog_std
+                    _scaled_x = clean * 100.0
+                    _train_n = max(1, int(len(_scaled_x) * 0.85))
+
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        _am = ARX(_scaled_x[:_train_n], lags=[1], x=_exog_norm.values[:_train_n])
+                        _am.volatility = GARCHVol(p=p, q=q)
+                        _res_x = _am.fit(disp="off", show_warning=False)
+
+                    # Validate on test set
+                    _test_n = len(_scaled_x) - _train_n
+                    if _test_n > 0:
+                        _fobj = _res_x.forecast(horizon=_test_n)
+                        _var_fcast = _fobj.variance.iloc[-1].values[:_test_n]
+                        _vol_pred = np.sqrt(_var_fcast) / 100.0
+                        _vol_actual = np.abs(clean[_train_n:]) 
+                        _gx_mae, _gx_rmse = _compute_metrics(
+                            _vol_actual[:len(_vol_pred)], _vol_pred[:len(_vol_actual)]
+                        )
+                    else:
+                        _gx_mae, _gx_rmse = float("nan"), float("nan")
+
+                    # Full refit
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        _am_full = ARX(_scaled_x, lags=[1], x=_exog_norm.values)
+                        _am_full.volatility = GARCHVol(p=p, q=q)
+                        _res_full = _am_full.fit(disp="off", show_warning=False)
+
+                    _fobj_full = _res_full.forecast(horizon=n_forecast)
+                    _var_full = _fobj_full.variance.iloc[-1].values[:n_forecast]
+                    _vol_forecasts = np.sqrt(_var_full) / 100.0
+
+                    metrics.model_name = "garch_x"
+                    metrics.mae = _gx_mae
+                    metrics.rmse = _gx_rmse
+                    metrics.n_train = _train_n
+                    metrics.n_test = _test_n
+                    metrics.fitted = True
+                    logger.info(
+                        "GARCH-X(%d,%d) fit with %d exog features: MAE=%.6f, RMSE=%.6f",
+                        p, q, len(_exog.columns), _gx_mae, _gx_rmse,
+                    )
+                    return _vol_forecasts, metrics
+        except Exception as _gx_exc:
+            logger.debug("GARCH-X failed, falling back to standard GARCH: %s", _gx_exc)
 
     try:
         # Scale returns to percentage for numerical stability.
@@ -1835,6 +1906,69 @@ def _burnout_refit(
 # ===========================================================================
 
 
+def apply_residual_feature_adjustment(
+    cache: pd.DataFrame,
+    variable: str,
+    forecast_value: float,
+    extra_variables: list[str],
+    fitted_values: pd.Series | None = None,
+    alpha: float = 1.0,
+) -> float:
+    """Adjust a univariate model's forecast using features via residual regression.
+
+    Pattern from Prophet/Greykite/Orbit: fit univariate model, regress
+    residuals on features, apply the adjustment. This allows Kalman, AR1,
+    ETS to benefit from exogenous features without modifying their core.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache DataFrame.
+    variable:
+        Target variable name (e.g. "close").
+    forecast_value:
+        Original univariate model forecast.
+    extra_variables:
+        List of feature column names.
+    fitted_values:
+        In-sample fitted values from the univariate model.
+    alpha:
+        Ridge regression regularization strength (higher = more conservative).
+
+    Returns
+    -------
+    Adjusted forecast value.
+    """
+    if fitted_values is None or len(extra_variables) == 0:
+        return forecast_value
+
+    try:
+        feature_cols = [c for c in extra_variables if c in cache.columns and cache[c].notna().sum() > 20]
+        if not feature_cols:
+            return forecast_value
+
+        # Compute residuals (in-sample only -- no look-ahead)
+        resid = cache[variable] - fitted_values
+        X = cache[feature_cols]
+        common = X.dropna().index.intersection(resid.dropna().index)
+        if len(common) < 30:
+            return forecast_value
+
+        from sklearn.linear_model import Ridge
+        model = Ridge(alpha=alpha)
+        model.fit(X.loc[common].values, resid.loc[common].values)
+
+        # Apply adjustment using latest feature values
+        latest = X.iloc[-1:].fillna(0).values
+        adjustment = float(model.predict(latest)[0])
+        # Cap adjustment to prevent wild swings (max 5% of forecast)
+        max_adj = abs(forecast_value) * 0.05 if forecast_value != 0 else 1.0
+        adjustment = max(-max_adj, min(max_adj, adjustment))
+        return forecast_value + adjustment
+    except Exception:
+        return forecast_value
+
+
 def run_forecasting(
     cache: pd.DataFrame,
     variables: list[str] | None = None,
@@ -2019,6 +2153,7 @@ def run_forecasting(
         max_horizon = max(HORIZONS.values())
         garch_fcast, garch_met = fit_garch(
             returns, n_forecast=max_horizon,
+            cache=cache, extra_variables=extra_variables,
         )
         garch_met.variable = "volatility_21d"
         result.metrics.append(garch_met)
@@ -2270,6 +2405,47 @@ def run_forecasting(
         if best_forecast is not None:
             result.forecasts[var_name] = _horizon_forecasts
             result.model_used[var_name] = best_model_name
+
+    # ------------------------------------------------------------------
+    # Parallel tree ensemble: run tree on key variables even when another
+    # model won the cascade, so features from Boruta/PIMP/mRMR are
+    # actually consumed by at least one model per variable.
+    # ------------------------------------------------------------------
+    _parallel_tree_vars = ["close", "return_1d", "volatility_21d"]
+    _tree_already_primary = {
+        v for v, m in result.model_used.items()
+        if "tree" in m or "xgboost" in m or "gbm" in m or "rf" in m
+    }
+    if extra_variables and len(extra_variables) > 0:
+        for _ptv in _parallel_tree_vars:
+            if _ptv in cache.columns and _ptv not in _tree_already_primary:
+                _pt_feat_df = _extract_features(_ptv)
+                if not _pt_feat_df.empty:
+                    try:
+                        _pt_fcast, _pt_met = fit_tree_ensemble(
+                            _pt_feat_df, _ptv,
+                            n_forecast=max(HORIZONS.values()),
+                            random_state=random_state,
+                        )
+                        _pt_met.variable = _ptv
+                        _pt_met.model_name = "tree_parallel"
+                        result.metrics.append(_pt_met)
+                        if _pt_fcast is not None and _pt_met.fitted:
+                            # Store as secondary forecast channel (does not
+                            # overwrite the primary cascade winner).
+                            if _ptv not in result.forecasts:
+                                result.forecasts[_ptv] = {}
+                            if isinstance(result.forecasts[_ptv], dict):
+                                result.forecasts[_ptv]["tree_parallel"] = {
+                                    label: float(_pt_fcast[min(h - 1, len(_pt_fcast) - 1)])
+                                    for label, h in HORIZONS.items()
+                                }
+                            logger.info(
+                                "Parallel tree for '%s': RMSE=%.6f",
+                                _ptv, _pt_met.rmse if np.isfinite(_pt_met.rmse) else -1.0,
+                            )
+                    except Exception as _pt_exc:
+                        logger.debug("Parallel tree for '%s' failed: %s", _ptv, _pt_exc)
 
     # ------------------------------------------------------------------
     # Summary

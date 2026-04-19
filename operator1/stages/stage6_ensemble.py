@@ -243,6 +243,7 @@ def run_6_5_aggregation(state: PipelineState) -> None:
             granger_result=state.granger_result,
             shap_result=state.shap_result,
             walk_forward_result=state.walk_forward_result,
+            feature_selection_result=getattr(state, "feature_selection_result", None),
         )
         logger.info("Predictions aggregated")
     except Exception as exc:

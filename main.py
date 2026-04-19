@@ -3301,6 +3301,7 @@ Non-interactive examples:
                     granger_result=granger_result,
                     shap_result=shap_result,
                     walk_forward_result=walk_forward_result,
+                    feature_selection_result=profile.get("feature_selection") if profile else None,
                 )
                 logger.info("Predictions aggregated (with %d sibling module results)",
                     sum(1 for r in [conformal_result, dual_regime_result,
