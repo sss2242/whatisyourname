@@ -70,6 +70,7 @@ class AdvancedMethodsResult:
     # P3 methods
     fama_french_alpha: float | None = None
     implied_cost_of_capital: float | None = None
+    merton_default_probability: dict = field(default_factory=dict)  # {"pd_1yr": float}
     cross_asset_regime: dict = field(default_factory=dict)
 
 

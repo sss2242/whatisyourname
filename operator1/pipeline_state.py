@@ -61,6 +61,7 @@ class PipelineState:
         self.buying_power_result: Any = None
         self.estimation_coverage: Any = None
         self.filing_calendar_result: Any = None
+        self.event_calendar_result: Any = None
 
         # ---- Stage 2: Feature Engineering ----
         self.weights: dict = {}

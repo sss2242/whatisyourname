@@ -1683,6 +1683,7 @@ def run_stage2c(state: BacktestState) -> None:
                 shap_result=state.shap_result,
                 walk_forward_result=state.walk_forward_result,
                 feature_selection_result=getattr(state, "feature_selection_result", None),
+                event_calendar_result=state.event_calendar_result,
             )
             logger.info("Predictions aggregated")
         except Exception as exc:
