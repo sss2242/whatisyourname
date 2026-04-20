@@ -2389,6 +2389,30 @@ def run_forecasting(
                 except Exception:
                     pass
 
+            # Step 2: Residual feature adjustment -- augment univariate model
+            # forecasts with feature-based residual regression (Prophet/Greykite
+            # pattern). Only applies when extra_variables are available.
+            if extra_variables:
+                try:
+                    _fitted_vals = None
+                    if best_metrics and best_metrics.test_residuals is not None:
+                        _n_resid = len(best_metrics.test_residuals)
+                        _actual = cache[var_name].dropna()
+                        if len(_actual) >= _n_resid and _n_resid > 0:
+                            _fitted_vals = _actual.iloc[-_n_resid:] - pd.Series(
+                                best_metrics.test_residuals,
+                                index=_actual.index[-_n_resid:],
+                            )
+                    for _rfa_label in _horizon_forecasts:
+                        _rfa_orig = _horizon_forecasts[_rfa_label]
+                        _rfa_adj = apply_residual_feature_adjustment(
+                            cache, var_name, _rfa_orig, extra_variables,
+                            fitted_values=_fitted_vals,
+                        )
+                        _horizon_forecasts[_rfa_label] = _rfa_adj
+                except Exception:
+                    pass  # graceful fallback: use unadjusted forecasts
+
             # For long horizons (21d, 252d): try tree ensemble as alternative
             # if the cascade winner was an autoregressive model (Kalman, GARCH, VAR, LSTM)
             _ar_models = {"kalman", "kalman_per_regime", "kalman_burnout", "kalman_dfm",
@@ -2461,10 +2485,13 @@ def run_forecasting(
                             if _ptv not in result.forecasts:
                                 result.forecasts[_ptv] = {}
                             if isinstance(result.forecasts[_ptv], dict):
-                                result.forecasts[_ptv]["tree_parallel"] = {
-                                    label: float(_pt_fcast[min(h - 1, len(_pt_fcast) - 1)])
-                                    for label, h in HORIZONS.items()
-                                }
+                                for label, h in HORIZONS.items():
+                                    # Store parallel tree forecast for each horizon
+                                    # only if the primary cascade didn't already set it.
+                                    if label not in result.forecasts[_ptv]:
+                                        result.forecasts[_ptv][label] = float(
+                                            _pt_fcast[min(h - 1, len(_pt_fcast) - 1)]
+                                        )
                             logger.info(
                                 "Parallel tree for '%s': RMSE=%.6f",
                                 _ptv, _pt_met.rmse if np.isfinite(_pt_met.rmse) else -1.0,

@@ -107,6 +107,7 @@ class BacktestState:
         self._ohlcv_source_label: str = ""
         self._seg_result: dict = {}
         self._mode_weights = None
+        self.feature_selection_result = None
         self.options_signal_result = None
         self.cross_asset_result = None
         self.event_calendar_result = None
@@ -1412,7 +1413,7 @@ def run_stage2a1(state: BacktestState) -> None:
         from operator1.models.feature_selector import run_feature_selection
         _fs_target = "equity_change_rate" if state._is_private else "return_1d"
         _fs_regime = cache.get("regime_label") if "regime_label" in cache.columns else None
-        state._extra_vars, _ = run_feature_selection(
+        state._extra_vars, state.feature_selection_result = run_feature_selection(
             cache, state._extra_vars, regime_labels=_fs_regime,
             target_col=_fs_target, granger_result=state.granger_result,
         )
