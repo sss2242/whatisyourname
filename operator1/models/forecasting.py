@@ -2364,6 +2364,31 @@ def run_forecasting(
             for label, h in HORIZONS.items():
                 _horizon_forecasts[label] = float(best_forecast[min(h - 1, len(best_forecast) - 1)])
 
+            # Regime probability-weighted directional shift (Method 5)
+            _prob_cols = [c for c in cache.columns if c.startswith("regime_hmm_prob_")]
+            if _prob_cols and var_name == "close" and len(cache) > 0:
+                try:
+                    _last_probs = cache[_prob_cols].iloc[-1].dropna()
+                    if len(_last_probs) > 0 and "regime_hmm" in cache.columns:
+                        _ret_col = "return_1d"
+                        if _ret_col in cache.columns:
+                            _regime_means = {}
+                            for _rpc in _prob_cols:
+                                _ridx = int(_rpc.split("_")[-1])
+                                _rmask = cache["regime_hmm"] == _ridx
+                                if _rmask.sum() > 5:
+                                    _regime_means[_ridx] = float(cache.loc[_rmask, _ret_col].mean())
+                            if _regime_means:
+                                _expected_daily = sum(
+                                    _regime_means.get(int(_rpc.split("_")[-1]), 0.0) * float(_last_probs[_rpc])
+                                    for _rpc in _last_probs.index
+                                )
+                                for _rl, _rh in HORIZONS.items():
+                                    _rshift = _expected_daily * _rh
+                                    _horizon_forecasts[_rl] *= (1 + _rshift)
+                except Exception:
+                    pass
+
             # For long horizons (21d, 252d): try tree ensemble as alternative
             # if the cascade winner was an autoregressive model (Kalman, GARCH, VAR, LSTM)
             _ar_models = {"kalman", "kalman_per_regime", "kalman_burnout", "kalman_dfm",

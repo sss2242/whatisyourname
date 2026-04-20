@@ -167,6 +167,30 @@ def run_6_3_conformal(state: PipelineState) -> None:
             )
             logger.info("Conformal prediction intervals computed")
 
+            # Replace conformal intervals at 21d+ with MC path percentiles
+            # (conformal has too few residuals at longer horizons)
+            if state.mc_result is not None and state.conformal_result is not None:
+                try:
+                    import numpy as _np
+                    _last_close = float(cache["close"].dropna().iloc[-1]) if "close" in cache.columns and cache["close"].notna().any() else None
+                    if _last_close and hasattr(state.conformal_result, "intervals"):
+                        for _mc_var, _mc_hd in state.conformal_result.intervals.items():
+                            if not isinstance(_mc_hd, dict):
+                                continue
+                            for _mc_hl, _mc_interval in _mc_hd.items():
+                                _mc_hdays = {"1d": 1, "5d": 5, "21d": 21, "252d": 252}.get(_mc_hl, 0)
+                                if _mc_hdays >= 21:
+                                    _mc_tv = state.mc_result.terminal_values.get(_mc_hl)
+                                    if _mc_tv is not None and len(_mc_tv) > 0:
+                                        _mc_prices = _last_close * (1 + _np.array(_mc_tv))
+                                        if hasattr(_mc_interval, "lower"):
+                                            _mc_interval.lower = float(_np.percentile(_mc_prices, 5))
+                                        if hasattr(_mc_interval, "upper"):
+                                            _mc_interval.upper = float(_np.percentile(_mc_prices, 95))
+                        logger.info("MC path intervals applied for 21d+ horizons")
+                except Exception:
+                    pass
+
             # G1: Quantile Regression for asymmetric intervals
             try:
                 from operator1.models.conformal import QuantileRegressionCalibrator
@@ -244,6 +268,7 @@ def run_6_5_aggregation(state: PipelineState) -> None:
             shap_result=state.shap_result,
             walk_forward_result=state.walk_forward_result,
             feature_selection_result=getattr(state, "feature_selection_result", None),
+            event_calendar_result=getattr(state, "event_calendar_result", None),
         )
         logger.info("Predictions aggregated")
     except Exception as exc:

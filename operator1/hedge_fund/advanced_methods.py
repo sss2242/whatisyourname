@@ -50,6 +50,7 @@ class AdvancedMethodsResult:
 
     # P1 methods
     piotroski_f_score: int = 0          # 0-9
+    piotroski_n_available: int = 0      # how many of 9 signals had data (0-9)
     piotroski_label: str = "unknown"    # strong/moderate/weak
     balance_sheet_velocity: dict = field(default_factory=dict)
     earnings_persistence: dict = field(default_factory=dict)
@@ -86,6 +87,7 @@ def compute_piotroski_f_score(
     Each signal is 1 (good) or 0 (bad). Score >= 7 = strong, <= 2 = weak.
     """
     score = 0
+    n_available = 0  # track how many signals have sufficient data
     try:
         ni = extract_latest_value(income_df, "net_income")
         ocf = extract_latest_value(cashflow_df, "operating_cash_flow")
@@ -133,15 +135,19 @@ def compute_piotroski_f_score(
             shares_prev = float(eq_s.iloc[-2])
 
         # Signal 1: Positive net income
-        if ni is not None and ni > 0:
-            score += 1
+        if ni is not None:
+            n_available += 1
+            if ni > 0:
+                score += 1
         # Signal 2: Positive OCF
-        if ocf is not None and ocf > 0:
-            score += 1
+        if ocf is not None:
+            n_available += 1
+            if ocf > 0:
+                score += 1
         # Signal 3: Rising ROA (Y/Y)
         if ni is not None and ta is not None and ta_prev is not None and ta > 0 and ta_prev > 0:
+            n_available += 1
             roa_curr = ni / ta
-            # Approximate prior ROA
             ni_prev = None
             ni_s = extract_quarterly_series(income_df, "net_income", 5)
             if len(ni_s) >= 2:
@@ -151,20 +157,29 @@ def compute_piotroski_f_score(
                 if roa_curr > roa_prev:
                     score += 1
         # Signal 4: OCF > NI (quality)
-        if ocf is not None and ni is not None and ocf > ni:
-            score += 1
+        if ocf is not None and ni is not None:
+            n_available += 1
+            if ocf > ni:
+                score += 1
         # Signal 5: Decreasing leverage
-        if debt is not None and debt_prev is not None and debt < debt_prev:
-            score += 1
+        if debt is not None and debt_prev is not None:
+            n_available += 1
+            if debt < debt_prev:
+                score += 1
         # Signal 6: Increasing current ratio
-        if cr is not None and cr_prev is not None and cr > cr_prev:
-            score += 1
-        # Signal 7: No equity dilution (total equity not decreasing from share issuance)
-        if shares is not None and shares_prev is not None and shares >= shares_prev:
-            score += 1
+        if cr is not None and cr_prev is not None:
+            n_available += 1
+            if cr > cr_prev:
+                score += 1
+        # Signal 7: No equity dilution
+        if shares is not None and shares_prev is not None:
+            n_available += 1
+            if shares >= shares_prev:
+                score += 1
         # Signal 8: Rising gross margin
         if gm is not None and gm_prev is not None and rev is not None and rev_prev is not None:
             if rev > 0 and rev_prev > 0:
+                n_available += 1
                 gm_pct = gm / rev
                 gm_pct_prev = gm_prev / rev_prev
                 if gm_pct > gm_pct_prev:
@@ -172,6 +187,7 @@ def compute_piotroski_f_score(
         # Signal 9: Rising asset turnover
         if rev is not None and ta is not None and rev_prev is not None and ta_prev is not None:
             if ta > 0 and ta_prev > 0:
+                n_available += 1
                 at_curr = rev / ta
                 at_prev = rev_prev / ta_prev
                 if at_curr > at_prev:
@@ -180,8 +196,18 @@ def compute_piotroski_f_score(
     except Exception as exc:
         logger.debug("Piotroski F-Score failed: %s", exc)
 
-    label = "strong" if score >= 7 else "weak" if score <= 2 else "moderate"
-    return score, label
+    # Normalize score by available signals to prevent NaN-as-zero penalty
+    if n_available < 9 and n_available >= 4:
+        normalized = round(score / n_available * 9)
+        label = "strong" if normalized >= 7 else "weak" if normalized <= 2 else "moderate"
+        label += f" ({n_available}/9 available)"
+        return normalized, n_available, label
+    elif n_available < 4:
+        label = f"insufficient ({n_available}/9 available)"
+        return score, n_available, label
+    else:
+        label = "strong" if score >= 7 else "weak" if score <= 2 else "moderate"
+        return score, n_available, label
 
 
 # ---------------------------------------------------------------------------
@@ -458,16 +484,42 @@ def compute_altman_z_double_prime(
         if ta is None or ta <= 0:
             return None, ""
 
-        wc = (ca or 0) - (cl or 0)
-        z = (6.56 * safe_divide(wc, ta, 0)
-             + 3.26 * safe_divide(re, ta, 0)
-             + 6.72 * safe_divide(ebit, ta, 0)
-             + 1.05 * safe_divide(equity, tl, 0))
+        # Track which terms have valid inputs to normalize partial data
+        z = 0.0
+        n_terms = 0
+        _coefficients = []
 
-        if z is None:
+        wc = None
+        if ca is not None and cl is not None:
+            wc = ca - cl
+        if wc is not None:
+            z += 6.56 * safe_divide(wc, ta, 0)
+            n_terms += 1
+            _coefficients.append("WC/TA")
+        if re is not None:
+            z += 3.26 * safe_divide(re, ta, 0)
+            n_terms += 1
+            _coefficients.append("RE/TA")
+        if ebit is not None:
+            z += 6.72 * safe_divide(ebit, ta, 0)
+            n_terms += 1
+            _coefficients.append("EBIT/TA")
+        if equity is not None and tl is not None and tl > 0:
+            z += 1.05 * safe_divide(equity, tl, 0)
+            n_terms += 1
+            _coefficients.append("BV/TL")
+
+        if n_terms == 0:
             return None, ""
 
+        # Normalize if partial: scale up proportionally
+        if n_terms < 4:
+            z = z / n_terms * 4
+            logger.debug("Altman Z'' partial: %d/4 terms (%s)", n_terms, ", ".join(_coefficients))
+
         zone = "safe" if z > 2.60 else "distress" if z < 1.10 else "grey"
+        if n_terms < 4:
+            zone += f" ({n_terms}/4 terms)"
         return round(z, 3), zone
 
     except Exception as exc:
@@ -849,7 +901,7 @@ def run_advanced_methods(
     result = AdvancedMethodsResult()
 
     # P1: Piotroski F-Score
-    result.piotroski_f_score, result.piotroski_label = compute_piotroski_f_score(
+    result.piotroski_f_score, result.piotroski_n_available, result.piotroski_label = compute_piotroski_f_score(
         income_df, balance_df, cashflow_df,
     )
 

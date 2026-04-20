@@ -2238,6 +2238,7 @@ def run_prediction_aggregation(
     shap_result: Any | None = None,
     walk_forward_result: Any | None = None,
     feature_selection_result: Any | None = None,
+    event_calendar_result: Any | None = None,
 ) -> PredictionAggregatorResult:
     """Run the full prediction aggregation pipeline.
 
@@ -2879,6 +2880,29 @@ def run_prediction_aggregation(
     try:
         if hasattr(result, "predictions") and result.predictions:
             apply_reject_option(result.predictions, cache)
+    except Exception:
+        pass
+
+    # --- PEAD: pre-earnings drift adjustment (Method 7) ---
+    # When an earnings event is imminent, apply a small directional shift
+    # based on event uncertainty premium (positive premium = downward pressure
+    # from uncertainty, Bernard & Thomas 1989).
+    try:
+        if event_calendar_result is not None and getattr(event_calendar_result, "available", False):
+            _ec_days = getattr(event_calendar_result, "days_to_next_event", None)
+            _ec_prem = getattr(event_calendar_result, "event_uncertainty_premium", None)
+            if _ec_days is not None and _ec_days < 30 and _ec_prem is not None and abs(_ec_prem) > 0.001:
+                _ec_drift = -_ec_prem * 0.001 * min(_ec_days, 21)
+                _ec_n = 0
+                for _ecv in result.predictions:
+                    if _ecv == "close" and isinstance(result.predictions[_ecv], dict):
+                        for _ech, _echp in result.predictions[_ecv].items():
+                            if hasattr(_echp, "point_forecast") and _echp.point_forecast:
+                                _echp.point_forecast *= (1 + _ec_drift)
+                                _ec_n += 1
+                if _ec_n > 0:
+                    logger.debug("PEAD drift applied: %.4f (%d days to event, premium=%.4f)",
+                                _ec_drift, _ec_days, _ec_prem)
     except Exception:
         pass
 

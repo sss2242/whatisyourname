@@ -42,6 +42,69 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+
+# ---------------------------------------------------------------------------
+# Market-cap survival floor (Fama-French size quintile calibration)
+# ---------------------------------------------------------------------------
+
+def get_mcap_survival_floor(market_cap: float) -> float:
+    """Return minimum credible survival probability based on market cap quintile.
+
+    Based on Fama-French size quintile analysis: mega-caps almost never
+    experience >40% drawdowns that trigger survival mode.
+    """
+    if market_cap >= 200e9:
+        return 0.92   # mega-cap: >$200B
+    elif market_cap >= 10e9:
+        return 0.82   # large-cap: $10B-$200B
+    elif market_cap >= 2e9:
+        return 0.70   # mid-cap: $2B-$10B
+    elif market_cap >= 300e6:
+        return 0.55   # small-cap: $300M-$2B
+    else:
+        return 0.40   # micro-cap: <$300M
+
+
+def anchor_mc_survival(
+    mc_result: "MonteCarloResult | None",
+    market_cap: float | None = None,
+    merton_pd: float | None = None,
+) -> None:
+    """Anchor MC survival probabilities using market-cap floor and Merton default.
+
+    Modifies mc_result.survival_probability in place. Applied after MC simulation
+    and optionally again after HF analysis produces Merton default probability.
+    """
+    if mc_result is None:
+        return
+
+    floor = 0.0
+    source = ""
+    if market_cap is not None and market_cap > 0:
+        _mcap_floor = get_mcap_survival_floor(market_cap)
+        if _mcap_floor > floor:
+            floor = _mcap_floor
+            source = "mcap"
+    if merton_pd is not None and 0 < merton_pd < 1:
+        _merton_floor = 1.0 - merton_pd
+        if _merton_floor > floor:
+            floor = _merton_floor
+            source = "merton"
+
+    if floor <= 0:
+        return
+
+    _logger = logging.getLogger(__name__)
+    for horizon, data in mc_result.survival_probability.items():
+        if isinstance(data, dict) and "mean" in data:
+            if data["mean"] < floor:
+                _logger.info(
+                    "MC survival anchor [%s]: %.1f%% -> %.1f%% (floor=%s)",
+                    horizon, data["mean"] * 100, floor * 100, source,
+                )
+                data["mean"] = floor
+                data["floor_source"] = source
+
 import numpy as np
 import pandas as pd
 

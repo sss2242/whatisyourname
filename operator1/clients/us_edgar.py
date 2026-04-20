@@ -52,6 +52,11 @@ _USGAAP_INCOME_CONCEPTS: dict[str, str] = {
     "IncomeTaxExpenseBenefit": "taxes",
     "SellingGeneralAndAdministrativeExpense": "sga_expense",
     "ResearchAndDevelopmentExpense": "research_and_development",
+    "OperatingExpenses": "operating_expenses",
+    "CostOfGoodsSold": "cost_of_revenue",
+    "SalesRevenueNet": "revenue",
+    "SalesRevenueGoodsNet": "revenue",
+    "RevenueFromContractWithCustomerIncludingAssessedTax": "revenue",
 }
 
 _USGAAP_BALANCE_CONCEPTS: dict[str, str] = {
@@ -61,6 +66,10 @@ _USGAAP_BALANCE_CONCEPTS: dict[str, str] = {
     "AssetsCurrent": "current_assets",
     "LiabilitiesCurrent": "current_liabilities",
     "CashAndCashEquivalentsAtCarryingValue": "cash_and_equivalents",
+    # Apple and many tech companies use this broader restricted-cash concept
+    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents": "cash_and_equivalents",
+    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsIncludingDisposalGroupAndDiscontinuedOperations": "cash_and_equivalents",
+    "CashAndCashEquivalents": "cash_and_equivalents",
     "ShortTermBorrowings": "short_term_debt",
     "LongTermDebt": "long_term_debt",
     "LongTermDebtNoncurrent": "long_term_debt",
@@ -68,8 +77,11 @@ _USGAAP_BALANCE_CONCEPTS: dict[str, str] = {
     "Goodwill": "goodwill",
     "IntangibleAssetsNetExcludingGoodwill": "intangible_assets",
     "AccountsReceivableNetCurrent": "receivables",
+    "AccountsReceivableNet": "receivables",
     "InventoryNet": "inventory",
     "AccountsPayableCurrent": "payables",
+    "PropertyPlantAndEquipmentNet": "ppe_net",
+    "MarketableSecuritiesCurrent": "short_term_investments",
 }
 
 _USGAAP_CASHFLOW_CONCEPTS: dict[str, str] = {
