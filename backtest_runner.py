@@ -657,6 +657,66 @@ def run_stage1(state: BacktestState) -> None:
         except Exception as exc:
             logger.warning("Merge %s failed: %s", label, exc)
 
+    # --- CompanyFacts fallback for missing critical balance sheet fields ---
+    # edgartools XBRL extraction sometimes returns incomplete data due to
+    # SEC rate limiting (429 responses) during concurrent ThreadPoolExecutor
+    # calls. When critical balance sheet fields are missing, fill them from
+    # the SEC CompanyFacts API which provides ALL reported XBRL facts.
+    _critical_balance_fields = {
+        "current_assets": ["AssetsCurrent"],
+        "cash_and_equivalents": [
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+            "CashAndCashEquivalentsAtCarryingValue",
+            "CashAndCashEquivalents",
+        ],
+        "total_liabilities": ["Liabilities"],
+        "retained_earnings": ["RetainedEarningsAccumulatedDeficit"],
+    }
+    _missing_critical = [f for f in _critical_balance_fields if f not in cache.columns]
+    if _missing_critical and state.market_id == "us_sec_edgar":
+        try:
+            import requests as _req
+            _cik = state.target_profile.get("cik", "")
+            if not _cik:
+                _cik = pit_client._resolve_cik_fallback(identifier)
+            _cik_padded = str(_cik).zfill(10)
+            _headers = {"User-Agent": pit_client._user_agent, "Accept": "application/json"}
+            _facts_resp = _req.get(
+                f"https://data.sec.gov/api/xbrl/companyfacts/CIK{_cik_padded}.json",
+                headers=_headers, timeout=30,
+            )
+            if _facts_resp.status_code == 200:
+                _usgaap = _facts_resp.json().get("facts", {}).get("us-gaap", {})
+                _filled = 0
+                for _field, _concepts in _critical_balance_fields.items():
+                    if _field in cache.columns:
+                        continue
+                    for _concept in _concepts:
+                        _cdata = _usgaap.get(_concept, {})
+                        _entries = _cdata.get("units", {}).get("USD", [])
+                        if not _entries:
+                            continue
+                        # Build a Series from filing data, aligned to report_date
+                        _rows = []
+                        for _e in _entries:
+                            if _e.get("form") in ("10-K", "10-Q") and _e.get("val") is not None and _e.get("end"):
+                                _rows.append({"date": pd.Timestamp(_e["end"]), "value": float(_e["val"])})
+                        if _rows:
+                            _fdf = pd.DataFrame(_rows).drop_duplicates(subset=["date"], keep="last").set_index("date").sort_index()
+                            # Forward-fill to daily index
+                            _ci = cache.index.union(_fdf.index).sort_values()
+                            _aligned = _fdf["value"].reindex(_ci).ffill().reindex(cache.index)
+                            if _aligned.notna().sum() > 0:
+                                cache[_field] = _aligned
+                                _filled += 1
+                                logger.info("CompanyFacts filled '%s' from %s: %d non-NaN days",
+                                           _field, _concept, _aligned.notna().sum())
+                            break  # stop trying alternative concepts
+                if _filled > 0:
+                    logger.info("CompanyFacts fallback: filled %d/%d missing critical fields", _filled, len(_missing_critical))
+        except Exception as exc:
+            logger.debug("CompanyFacts fallback failed: %s", exc)
+
     # Backtest date filter
     bt_end = pd.Timestamp(end_dt)
     bt_start = bt_end - pd.Timedelta(days=int(state.years * 365))
@@ -1684,6 +1744,7 @@ def run_stage2c(state: BacktestState) -> None:
                 shap_result=state.shap_result,
                 walk_forward_result=state.walk_forward_result,
                 feature_selection_result=getattr(state, "feature_selection_result", None),
+                event_calendar_result=state.event_calendar_result,
             )
             logger.info("Predictions aggregated")
         except Exception as exc:

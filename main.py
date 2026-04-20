@@ -3302,6 +3302,7 @@ Non-interactive examples:
                     shap_result=shap_result,
                     walk_forward_result=walk_forward_result,
                     feature_selection_result=feature_selection_result,
+                    event_calendar_result=event_calendar_result,
                 )
                 logger.info("Predictions aggregated (with %d sibling module results)",
                     sum(1 for r in [conformal_result, dual_regime_result,

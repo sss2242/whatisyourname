@@ -353,6 +353,22 @@ def run_7_5_hedge_fund(state: PipelineState) -> None:
     except Exception as exc:
         logger.warning("Hedge fund analysis failed: %s", exc)
 
+    # Anchor MC survival with Merton default probability + market-cap floor
+    try:
+        from operator1.models.monte_carlo import anchor_mc_survival
+        _mcap = None
+        if state.cache is not None and "market_cap" in state.cache.columns:
+            if state.cache["market_cap"].notna().any():
+                _mcap = float(state.cache["market_cap"].dropna().iloc[-1])
+        _merton_pd = None
+        if state.hf_result and hasattr(state.hf_result, "advanced_methods"):
+            _adv = state.hf_result.advanced_methods
+            if hasattr(_adv, "merton_default_probability") and isinstance(_adv.merton_default_probability, dict):
+                _merton_pd = _adv.merton_default_probability.get("pd_1yr")
+        anchor_mc_survival(state.mc_result, market_cap=_mcap, merton_pd=_merton_pd)
+    except Exception:
+        pass
+
 
 # Registry
 STAGE_7_SUBSTAGES = [

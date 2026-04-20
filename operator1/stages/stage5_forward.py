@@ -252,6 +252,16 @@ def run_5_4_monte_carlo(state: PipelineState) -> None:
     except Exception as exc:
         logger.debug("Regime shift prediction skipped: %s", exc)
 
+    # Market-cap survival floor (anchor MC survival for mega/large-caps)
+    try:
+        from operator1.models.monte_carlo import anchor_mc_survival
+        _mcap = None
+        if "market_cap" in cache.columns and cache["market_cap"].notna().any():
+            _mcap = float(cache["market_cap"].dropna().iloc[-1])
+        anchor_mc_survival(state.mc_result, market_cap=_mcap)
+    except Exception:
+        pass
+
 
 def run_5_5_copula(state: PipelineState) -> None:
     """5.5: Copula analysis (Gaussian + Student-t + Clayton, AIC selection)."""

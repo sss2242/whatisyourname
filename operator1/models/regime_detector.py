@@ -806,6 +806,50 @@ def detect_regimes_and_breaks(
         logger.warning("No regime model succeeded -- regime_label is all NaN")
 
     # ------------------------------------------------------------------
+    # PELT fallback for degenerate HMM states
+    # ------------------------------------------------------------------
+    # If any HMM state has <5% of observations, the regime detection is
+    # degenerate (e.g. 495/502 days in one state). Fall back to PELT-based
+    # labeling which uses structural breakpoints to segment the series.
+    if "regime_label" in cache.columns:
+        _rl_counts = cache["regime_label"].value_counts(normalize=True, dropna=True)
+        if len(_rl_counts) > 0 and _rl_counts.min() < 0.05:
+            _degen = _rl_counts.idxmin()
+            logger.warning(
+                "HMM degenerate: state '%s' has %.1f%% -- applying PELT fallback",
+                _degen, _rl_counts.min() * 100,
+            )
+            if "structural_break" in cache.columns:
+                _bp_idx = cache.index[cache["structural_break"] == 1].tolist()
+                if _bp_idx:
+                    _bp_positions = [cache.index.get_loc(bp) for bp in _bp_idx]
+                    _segments = [0] + _bp_positions + [len(cache)]
+                    _ret_col = "return_1d" if "return_1d" in cache.columns else None
+                    _vol_col = "volatility_21d" if "volatility_21d" in cache.columns else None
+                    _overall_vol_median = float(cache[_vol_col].median()) if _vol_col and cache[_vol_col].notna().any() else 0.015
+                    _new_labels = pd.Series(index=cache.index, dtype="object")
+                    for _si in range(len(_segments) - 1):
+                        _s, _e = _segments[_si], _segments[_si + 1]
+                        _seg = cache.iloc[_s:_e]
+                        _mr = float(_seg[_ret_col].mean()) if _ret_col and _ret_col in _seg.columns and _seg[_ret_col].notna().any() else 0
+                        _mv = float(_seg[_vol_col].mean()) if _vol_col and _vol_col in _seg.columns and _seg[_vol_col].notna().any() else _overall_vol_median
+                        if _mr > 0.0005:
+                            _lbl = "bull"
+                        elif _mr < -0.0005:
+                            _lbl = "bear"
+                        elif _mv > _overall_vol_median:
+                            _lbl = "high_vol"
+                        else:
+                            _lbl = "low_vol"
+                        _new_labels.iloc[_s:_e] = _lbl
+                    cache["regime_label"] = _new_labels
+                    logger.info(
+                        "PELT fallback: %d segments from %d breakpoints, distribution: %s",
+                        len(_segments) - 1, len(_bp_positions),
+                        cache["regime_label"].value_counts().to_dict(),
+                    )
+
+    # ------------------------------------------------------------------
     # Summary logging
     # ------------------------------------------------------------------
     n_breaks = int(cache["structural_break"].sum())
