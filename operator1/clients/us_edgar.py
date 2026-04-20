@@ -52,11 +52,6 @@ _USGAAP_INCOME_CONCEPTS: dict[str, str] = {
     "IncomeTaxExpenseBenefit": "taxes",
     "SellingGeneralAndAdministrativeExpense": "sga_expense",
     "ResearchAndDevelopmentExpense": "research_and_development",
-    "OperatingExpenses": "operating_expenses",
-    "CostOfGoodsSold": "cost_of_revenue",
-    "SalesRevenueNet": "revenue",
-    "SalesRevenueGoodsNet": "revenue",
-    "RevenueFromContractWithCustomerIncludingAssessedTax": "revenue",
 }
 
 _USGAAP_BALANCE_CONCEPTS: dict[str, str] = {
@@ -66,10 +61,6 @@ _USGAAP_BALANCE_CONCEPTS: dict[str, str] = {
     "AssetsCurrent": "current_assets",
     "LiabilitiesCurrent": "current_liabilities",
     "CashAndCashEquivalentsAtCarryingValue": "cash_and_equivalents",
-    # Apple and many tech companies use this broader restricted-cash concept
-    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents": "cash_and_equivalents",
-    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsIncludingDisposalGroupAndDiscontinuedOperations": "cash_and_equivalents",
-    "CashAndCashEquivalents": "cash_and_equivalents",
     "ShortTermBorrowings": "short_term_debt",
     "LongTermDebt": "long_term_debt",
     "LongTermDebtNoncurrent": "long_term_debt",
@@ -77,11 +68,8 @@ _USGAAP_BALANCE_CONCEPTS: dict[str, str] = {
     "Goodwill": "goodwill",
     "IntangibleAssetsNetExcludingGoodwill": "intangible_assets",
     "AccountsReceivableNetCurrent": "receivables",
-    "AccountsReceivableNet": "receivables",
     "InventoryNet": "inventory",
     "AccountsPayableCurrent": "payables",
-    "PropertyPlantAndEquipmentNet": "ppe_net",
-    "MarketableSecuritiesCurrent": "short_term_investments",
 }
 
 _USGAAP_CASHFLOW_CONCEPTS: dict[str, str] = {
@@ -1938,15 +1926,9 @@ class USEdgarClient:
         # Cache each filing period to disk
         self._cache_filings(identifier, df)
 
-        # Translate to canonical format -- use LLM fallback to auto-discover
-        # company-specific XBRL taxonomy extensions when static mapping misses
-        # critical fields (e.g. Apple's non-standard cash concept names).
-        try:
-            from operator1.clients.canonical_translator import translate_with_llm_fallback
-            return translate_with_llm_fallback(df, self.market_id, statement_type)
-        except ImportError:
-            from operator1.clients.canonical_translator import translate_financials
-            return translate_financials(df, self.market_id, statement_type)
+        # Translate to canonical format
+        from operator1.clients.canonical_translator import translate_financials
+        return translate_financials(df, self.market_id, statement_type)
 
     def _resolve_cik_fallback(self, identifier: str) -> str:
         """Resolve a ticker symbol to a CIK using the company list."""
