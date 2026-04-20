@@ -1938,9 +1938,15 @@ class USEdgarClient:
         # Cache each filing period to disk
         self._cache_filings(identifier, df)
 
-        # Translate to canonical format
-        from operator1.clients.canonical_translator import translate_financials
-        return translate_financials(df, self.market_id, statement_type)
+        # Translate to canonical format -- use LLM fallback to auto-discover
+        # company-specific XBRL taxonomy extensions when static mapping misses
+        # critical fields (e.g. Apple's non-standard cash concept names).
+        try:
+            from operator1.clients.canonical_translator import translate_with_llm_fallback
+            return translate_with_llm_fallback(df, self.market_id, statement_type)
+        except ImportError:
+            from operator1.clients.canonical_translator import translate_financials
+            return translate_financials(df, self.market_id, statement_type)
 
     def _resolve_cik_fallback(self, identifier: str) -> str:
         """Resolve a ticker symbol to a CIK using the company list."""
