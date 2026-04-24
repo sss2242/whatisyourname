@@ -2800,7 +2800,7 @@ Non-interactive examples:
                 cycle_result=cycle_result,
                 granger_result=granger_result,
                 transfer_entropy_result=transfer_entropy_result,
-                peer_result=None,
+                peer_result=peer_ranking_result,
                 linked_caches=linked_caches or None,
                 extra_variables=_extra_vars,
                 economic_plane=_economic_plane,
