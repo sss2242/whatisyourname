@@ -497,6 +497,28 @@ def discover_linked_entities(
         ]
 
     # ------------------------------------------------------------------
+    # P10: Static competitor fallback for well-known companies.
+    # When entity discovery fails (LLM timeout, API rate limit, no key),
+    # provide a curated competitor list for major companies so peer
+    # features, DTW analogs, and competitive pressure index still work.
+    # ------------------------------------------------------------------
+    _STATIC_COMPETITORS: dict[str, list[str]] = {
+        "AAPL": ["MSFT", "GOOG", "AMZN", "META", "SAMSUNG"],
+        "MSFT": ["AAPL", "GOOG", "AMZN", "META", "ORCL"],
+        "GOOG": ["MSFT", "META", "AMZN", "AAPL", "SNAP"],
+        "AMZN": ["MSFT", "GOOG", "WMT", "BABA", "SHOP"],
+        "META": ["GOOG", "SNAP", "PINS", "TWTR", "MSFT"],
+        "TSLA": ["F", "GM", "RIVN", "NIO", "BYD"],
+        "NVDA": ["AMD", "INTC", "QCOM", "AVGO", "TSM"],
+        "JPM": ["BAC", "GS", "MS", "C", "WFC"],
+        "7203": ["7267", "7201", "7211", "7261", "STLA"],  # Toyota
+        "005930": ["000660", "066570", "051910", "AAPL", "INTC"],  # Samsung
+        "2330": ["NVDA", "INTC", "AMD", "UMC", "ASML"],  # TSMC
+        "PETR4": ["PBR", "E", "COP", "CVX", "XOM"],  # Petrobras
+        "600519": ["000858", "000568", "002304", "603369", "000596"],  # Moutai
+    }
+
+    # ------------------------------------------------------------------
     # 0. Build cross-region PIT clients for resolving entities from
     #    other markets (e.g. a JP company's US competitor)
     # ------------------------------------------------------------------
@@ -548,6 +570,17 @@ def discover_linked_entities(
         )
     else:
         logger.info("No LLM client -- skipping entity proposals")
+
+    # P10: Static competitor fallback when LLM proposals are empty.
+    # When entity discovery fails (LLM timeout, API rate limit, no key),
+    # use curated competitor lists for well-known companies.
+    _target_ticker = (target_profile.get("ticker") or "").upper()
+    if not proposals.get("competitors") and _target_ticker in _STATIC_COMPETITORS:
+        proposals["competitors"] = _STATIC_COMPETITORS[_target_ticker]
+        logger.info(
+            "Static competitor fallback for %s: %s",
+            _target_ticker, proposals["competitors"],
+        )
 
     # ------------------------------------------------------------------
     # 2. Resolve each proposal via PIT provider search

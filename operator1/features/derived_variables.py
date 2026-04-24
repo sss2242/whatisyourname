@@ -370,6 +370,22 @@ def _compute_valuation(df: pd.DataFrame) -> pd.DataFrame:
     result, ism, inv = safe_ratio(close, eps_calc, "pe_ratio_calc")
     _set_ratio_columns(df, "pe_ratio_calc", result, ism, inv)
 
+    # P9: Synthetic PE fallback -- when net_income/EPS is NaN but
+    # operating_income is available, compute PE from operating income
+    # per share. This enables the fundamental fair value anchor in
+    # the prediction aggregator even without net_income.
+    if df.get("pe_ratio_calc") is not None and df["pe_ratio_calc"].isna().all():
+        _oi = df.get("operating_income", pd.Series(np.nan, index=df.index))
+        if _oi.notna().any() and shares.notna().any():
+            _oi_eps = _oi / shares.where(shares.abs() > EPSILON, other=np.nan)
+            _synth_pe, _synth_ism, _synth_inv = safe_ratio(close, _oi_eps, "pe_ratio_calc")
+            if _synth_pe.notna().any():
+                df["pe_ratio_calc"] = _synth_pe
+                df["is_missing_pe_ratio_calc"] = _synth_ism
+                df["invalid_math_pe_ratio_calc"] = _synth_inv
+                logger.info("Synthetic PE from operating_income: %.1f (latest)",
+                           float(_synth_pe.dropna().iloc[-1]) if _synth_pe.notna().any() else 0)
+
     # Earnings yield = EPS / close
     result, ism, inv = safe_ratio(eps_calc, close, "earnings_yield_calc")
     _set_ratio_columns(df, "earnings_yield_calc", result, ism, inv)

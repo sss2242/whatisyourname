@@ -143,6 +143,34 @@ def compute_company_survival_flag(
     for c in conditions[1:]:
         combined = combined | c
 
+    # P6: Cash adequacy floor -- prevent survival over-triggering for
+    # cash-rich companies. A company with $30B cash and current_ratio=1.01
+    # (e.g. AAPL) is fundamentally different from one with $1M cash and
+    # the same ratio. When absolute cash exceeds a market-cap-relative
+    # threshold, suppress liquidity-driven survival triggers.
+    if ("cash_and_equivalents" in df.columns and "market_cap" in df.columns
+            and df["cash_and_equivalents"].notna().any()
+            and df["market_cap"].notna().any()):
+        try:
+            _cash = df["cash_and_equivalents"].astype(float)
+            _mcap = df["market_cap"].astype(float)
+            # Cash > 5% of market cap = cash-adequate, suppress liquidity triggers
+            _cash_adequate = (_cash > 0) & (_mcap > 0) & (_cash / _mcap > 0.05)
+            if _cash_adequate.any():
+                # Only suppress for the liquidity triggers (current_ratio, cash_ratio)
+                # not for drawdown, conflict, or institutional flow triggers
+                _n_before = int(combined.sum())
+                combined = combined & ~_cash_adequate
+                _n_after = int(combined.sum())
+                if _n_before != _n_after:
+                    logger.info(
+                        "Cash adequacy floor: suppressed %d/%d survival days "
+                        "(cash/mcap > 5%%)",
+                        _n_before - _n_after, _n_before,
+                    )
+        except Exception:
+            pass
+
     flag = combined.astype(int)
     flag.name = "company_survival_mode_flag"
 

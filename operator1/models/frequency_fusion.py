@@ -503,6 +503,22 @@ def _m5_mint_reconciliation(
             err = freq_errors.get(freq, 1.0)
             weights[freq] = 1.0 / max(err ** 2, 1e-10)
 
+        # P4: Disagreement penalty -- when frequencies diverge significantly,
+        # reduce the contribution of outlier frequencies. This prevents the
+        # MF fusion close prediction from being WORSE than daily-only when
+        # monthly disagrees with daily/weekly (e.g. 5.91% vs 2.05%).
+        _vals = list(values.values())
+        if len(_vals) >= 2:
+            _median = float(sorted(_vals)[len(_vals) // 2])
+            _mad = max(1e-10, float(np.median([abs(v - _median) for v in _vals])))
+            _disagreement_threshold = 0.5  # > 50% relative spread
+            for freq, val in values.items():
+                _rel_dev = abs(val - _median) / max(abs(_median), 1e-10)
+                if _rel_dev > _disagreement_threshold:
+                    # Penalize outlier frequency proportionally to its deviation
+                    _penalty = max(0.1, 1.0 - (_rel_dev - _disagreement_threshold))
+                    weights[freq] *= _penalty
+
         total_w = sum(weights.values())
         if total_w <= 0:
             total_w = 1.0

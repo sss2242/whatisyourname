@@ -850,6 +850,62 @@ def detect_regimes_and_breaks(
                     )
 
     # ------------------------------------------------------------------
+    # P5: GMM secondary + volatility quintile overlay for degenerate regimes.
+    # When PELT fallback also produces a single regime (all segments have
+    # same label), use GMM labels as secondary source. If GMM also
+    # degenerate, fall back to volatility quintile classification which is
+    # deterministic and cannot produce single-state output.
+    # ------------------------------------------------------------------
+    if "regime_label" in cache.columns:
+        _rl_unique = cache["regime_label"].dropna().nunique()
+        if _rl_unique <= 1 and gmm_regimes is not None:
+            # Try GMM labels as secondary source
+            _gmm_clean = returns[valid_ret]
+            _gmm_label_map = _order_regimes_by_mean_return(
+                gmm_regimes, _gmm_clean, n_regimes,
+                has_volatility_info=False,
+            )
+            _gmm_labels = cache["regime_gmm"].map(_gmm_label_map)
+            if _gmm_labels.dropna().nunique() > 1:
+                cache["regime_label"] = _gmm_labels
+                logger.info(
+                    "GMM secondary source applied: %s",
+                    cache["regime_label"].value_counts().to_dict(),
+                )
+            else:
+                logger.info("GMM also degenerate -- applying volatility quintile overlay")
+
+        # Final fallback: volatility quintile classification
+        # (deterministic, always produces multiple states)
+        _rl_unique = cache["regime_label"].dropna().nunique()
+        if _rl_unique <= 1 and vol_col in cache.columns and cache[vol_col].notna().sum() > 20:
+            _vol = cache[vol_col].dropna()
+            _q20, _q40, _q60, _q80 = (
+                float(_vol.quantile(0.2)),
+                float(_vol.quantile(0.4)),
+                float(_vol.quantile(0.6)),
+                float(_vol.quantile(0.8)),
+            )
+            _vol_labels = pd.Series(index=cache.index, dtype="object")
+            _v = cache[vol_col]
+            _vol_labels[_v <= _q20] = "low_vol"
+            _vol_labels[(_v > _q20) & (_v <= _q60)] = "bull"
+            _vol_labels[(_v > _q60) & (_v <= _q80)] = "high_vol"
+            _vol_labels[_v > _q80] = "bear"
+            # Incorporate return direction: high_vol + negative return = bear
+            if returns_col in cache.columns:
+                _r = cache[returns_col]
+                _neg_mask = _r.notna() & (_r < -0.005) & (_vol_labels == "high_vol")
+                _vol_labels[_neg_mask] = "bear"
+                _pos_mask = _r.notna() & (_r > 0.005) & (_vol_labels.isin(["low_vol", "bull"]))
+                _vol_labels[_pos_mask] = "bull"
+            cache["regime_label"] = _vol_labels
+            logger.info(
+                "Volatility quintile overlay applied: %s",
+                cache["regime_label"].value_counts().to_dict(),
+            )
+
+    # ------------------------------------------------------------------
     # Summary logging
     # ------------------------------------------------------------------
     n_breaks = int(cache["structural_break"].sum())

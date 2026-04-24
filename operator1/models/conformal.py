@@ -473,6 +473,50 @@ def build_conformal_result(
                 interval["total_widen_factor"] = round(total_widen_factor, 3)
             result.intervals[var][h_label] = interval
 
+    # P7: Cap interval width to prevent degenerate intervals at longer
+    # horizons. When the conformal calibrator has few residuals at 21d+,
+    # intervals can explode (e.g. -$60 to $559 for a $250 stock = 107%
+    # width). Cap at MAX_CI_WIDTH_PCT of the point forecast.
+    _MAX_CI_WIDTH_PCT = {1: 0.25, 5: 0.35, 21: 0.40, 63: 0.50, 252: 0.60}
+    for var, horizon_dict in result.intervals.items():
+        if not isinstance(horizon_dict, dict):
+            continue
+        for h_label, interval in horizon_dict.items():
+            h_days = horizons.get(h_label, 1)
+            # Find the applicable width cap
+            _cap = 0.60  # default
+            for _hd, _c in sorted(_MAX_CI_WIDTH_PCT.items()):
+                if h_days <= _hd:
+                    _cap = _c
+                    break
+            # Get point forecast and interval bounds
+            _pf = None
+            _lo = None
+            _hi = None
+            if isinstance(interval, dict):
+                _pf = interval.get("forecast") or interval.get("point_forecast")
+                _lo = interval.get("lower")
+                _hi = interval.get("upper")
+            elif hasattr(interval, "point_forecast"):
+                _pf = getattr(interval, "point_forecast", None) or getattr(interval, "forecast", None)
+                _lo = getattr(interval, "lower", None)
+                _hi = getattr(interval, "upper", None)
+            if _pf is not None and _lo is not None and _hi is not None and _pf > 0:
+                _width = abs(_hi - _lo)
+                _max_width = abs(_pf) * _cap
+                if _width > _max_width and _max_width > 0:
+                    _center = _pf
+                    _half = _max_width / 2.0
+                    if isinstance(interval, dict):
+                        interval["lower"] = _center - _half
+                        interval["upper"] = _center + _half
+                        interval["width_capped"] = True
+                    else:
+                        if hasattr(interval, "lower"):
+                            interval.lower = _center - _half
+                        if hasattr(interval, "upper"):
+                            interval.upper = _center + _half
+
     result.calibration_scores_count = sum(
         len(s) for s in calibrator._scores.values()
     )
