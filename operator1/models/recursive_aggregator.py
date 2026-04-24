@@ -20,7 +20,6 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import date, timedelta
 from typing import Any
 
 import numpy as np
@@ -38,20 +37,6 @@ DEFAULT_SNAPSHOT_DAYS: dict[str, int] = {
     "63d": 63,
     "252d": 252,
 }
-
-# Variables that get rolling-window feature updates during recursion.
-_ROLLING_FEATURES = {
-    "return_1d",
-    "log_return_1d",
-    "return_5d",
-    "return_21d",
-    "volatility_21d",
-    "volatility_63d",
-    "drawdown_252d",
-}
-
-# Variables derived from close that are recomputed each recursive step.
-_CLOSE_DERIVED = {"return_1d", "log_return_1d"}
 
 
 # ---------------------------------------------------------------------------
@@ -230,10 +215,13 @@ def _ensemble_predict_1d(
     model_states: dict[str, Any],
     extended_cache: pd.DataFrame,
     variables: list[str],
-    ensemble_weights: dict[str, dict[str, float]] | None = None,
     momentum_blend: float = 0.3,
 ) -> dict[str, float]:
     """Produce a 1-step-ahead prediction for each variable using the ensemble.
+
+    Uses the single best fitted model per variable from the forward pass
+    model_states. For close predictions, applies a momentum overlay
+    (P1 fix: 70% model + 30% momentum signal).
 
     Parameters
     ----------
@@ -243,8 +231,6 @@ def _ensemble_predict_1d(
         Current cache (real + synthetic rows).
     variables:
         Which variables to predict.
-    ensemble_weights:
-        Optional per-variable per-model weights from GA/inverse-RMSE.
     momentum_blend:
         Weight for momentum overlay on close predictions (P1 fix).
 
@@ -339,7 +325,6 @@ def run_recursive_predictions(
     cache: pd.DataFrame,
     model_states: dict[str, Any],
     *,
-    ensemble_weights: dict[str, dict[str, float]] | None = None,
     horizon_days: int = 252,
     snapshot_days: dict[str, int] | None = None,
     transition_matrix: np.ndarray | None = None,
@@ -360,9 +345,8 @@ def run_recursive_predictions(
         Full daily cache up to the reference date (DatetimeIndex).
     model_states:
         Dict of {variable: BaseModelWrapper} from ForwardPassResult.
-        These are the fitted models from the forward pass.
-    ensemble_weights:
-        Optional per-variable per-model weight dicts from GA/inverse-RMSE.
+        These are the fitted models from the forward pass. One model
+        per variable (the best model that fitted successfully).
     horizon_days:
         Maximum number of recursive steps (default 252 = 1 year).
     snapshot_days:
@@ -445,7 +429,10 @@ def run_recursive_predictions(
             except Exception:
                 pass
 
-    # Extended cache for appending synthetic rows
+    # Pre-allocate synthetic rows list (B4 fix: avoid O(n^2) concat in loop).
+    # We collect rows in a list and only concat once at the end of each step
+    # into the extended cache. We also maintain the extended_cache incrementally
+    # by appending one row at a time using loc assignment on a pre-grown index.
     extended_cache = cache.copy()
 
     # Determine next business date
@@ -454,6 +441,18 @@ def run_recursive_predictions(
         next_date = last_date + pd.offsets.BDay(1)
     else:
         next_date = pd.Timestamp(last_date) + pd.offsets.BDay(1)
+
+    # Pre-generate all future business dates
+    future_dates = pd.bdate_range(start=next_date, periods=horizon_days)
+
+    # Pre-allocate the extended cache with NaN rows for all future dates
+    # This avoids O(n^2) concat -- we fill rows by index assignment instead
+    empty_rows = pd.DataFrame(
+        index=future_dates,
+        columns=extended_cache.columns,
+        dtype=float,
+    )
+    extended_cache = pd.concat([extended_cache, empty_rows])
 
     # Trajectory storage
     trajectory: dict[str, list[float]] = {v: [] for v in predictable_vars}
@@ -468,12 +467,17 @@ def run_recursive_predictions(
     decay_rate = 0.012
 
     for step in range(1, horizon_days + 1):
+        current_date = future_dates[step - 1]
+
         # Step 1: Ensemble predict 1 step ahead
+        # Use only the already-filled portion of extended_cache (up to previous row)
+        filled_end = future_dates[step - 2] if step > 1 else last_date
+        working_cache = extended_cache.loc[:filled_end]
+
         predicted = _ensemble_predict_1d(
             model_states=model_states,
-            extended_cache=extended_cache,
+            extended_cache=working_cache,
             variables=predictable_vars,
-            ensemble_weights=ensemble_weights,
             momentum_blend=momentum_blend,
         )
 
@@ -494,37 +498,29 @@ def run_recursive_predictions(
             # Blend: 95% recursive + 5% trend anchor
             predicted["close"] = 0.95 * current_pred + 0.05 * expected_by_trend
 
-        # Step 3: Build synthetic row
-        synthetic_row = _build_synthetic_row(extended_cache, predicted, next_date)
+        # Step 3: Build synthetic row and fill into pre-allocated slot
+        synthetic_row = _build_synthetic_row(working_cache, predicted, current_date)
+        for col in synthetic_row.index:
+            if col in extended_cache.columns:
+                extended_cache.at[current_date, col] = synthetic_row[col]
 
-        # Step 4: Append to extended cache
-        synthetic_df = pd.DataFrame([synthetic_row])
-        synthetic_df.index = pd.DatetimeIndex([next_date])
-        extended_cache = pd.concat([extended_cache, synthetic_df])
+        # B1 FIX: Do NOT update model wrappers with synthetic predictions.
+        # Feeding a model its own prediction as "ground truth" corrupts the
+        # Kalman gain (innovation -> 0, gain -> 0, model ignores new data).
+        # Models retain their calibration from the real forward pass instead.
 
-        # Step 5: Update online models with the synthetic observation
-        for var in predictable_vars:
-            wrapper = model_states.get(var)
-            if wrapper is None or var not in predicted:
-                continue
-            try:
-                state = np.array([predicted[var]])
-                wrapper.update(state, state, {})
-            except Exception:
-                pass  # Not all wrappers support update
-
-        # Step 6: Evolve regime
+        # Step 4: Evolve regime
         current_regime = _evolve_regime(
             current_regime, transition_matrix, regime_order, rng
         )
 
-        # Step 7: Store trajectory
-        step_date = next_date.strftime("%Y-%m-%d") if hasattr(next_date, "strftime") else str(next_date)
+        # Step 5: Store trajectory
+        step_date = current_date.strftime("%Y-%m-%d")
         trajectory_dates.append(step_date)
         for var in predictable_vars:
             trajectory[var].append(predicted.get(var, float("nan")))
 
-        # Step 8: Snapshot if this step matches a horizon
+        # Step 6: Snapshot if this step matches a horizon
         step_confidence = base_confidence * math.exp(-decay_rate * step)
         for label, snap_day in snapshot_days.items():
             if step == snap_day:
@@ -558,9 +554,6 @@ def run_recursive_predictions(
                     predicted.get("close", 0.0),
                     step_confidence,
                 )
-
-        # Advance date
-        next_date = next_date + pd.offsets.BDay(1)
 
     result = RecursivePredictionResult(
         snapshots=snapshots,
