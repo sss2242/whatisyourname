@@ -130,6 +130,7 @@ class PipelineState:
         self.pattern_drift: float = 1.0
         self.tv_granger_result: Any = None
         self.mv_mc_result: Any = None
+        self.recursive_result: Any = None
 
         # ---- Stage 7: Integration ----
         self.scenario_result: Any = None

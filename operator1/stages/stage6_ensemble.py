@@ -11,6 +11,7 @@ Sub-stages:
   6.8   Time-varying Granger + multivariate MC
   6.9   Genetic optimizer
   6.10  OHLC predictor + predicted patterns
+  6.11  Recursive day-by-day predictions
 """
 
 from __future__ import annotations
@@ -439,6 +440,52 @@ def run_6_10_ohlc(state: PipelineState) -> None:
         logger.warning("OHLC prediction failed: %s", exc)
 
 
+def run_6_11_recursive_predictions(state: PipelineState) -> None:
+    """6.11: Recursive day-by-day predictions.
+
+    Chains 1d predictions recursively to build multi-horizon forecasts.
+    Uses fitted model states from the forward pass and evolves regime
+    labels via the MC transition matrix.
+    """
+    logger.info("Sub-stage 6.11: Recursive day-by-day predictions")
+    cache = state.cache
+    fp = state.forward_pass_result
+    if fp is None or not getattr(fp, "model_states", None):
+        logger.info("Skipping recursive predictions: no forward pass model states")
+        return
+
+    try:
+        from operator1.models.recursive_aggregator import run_recursive_predictions
+
+        # Extract transition matrix and regime order from MC result
+        transition_matrix = None
+        regime_order = None
+        if state.mc_result is not None:
+            transition_matrix = getattr(state.mc_result, "transition_matrix", None)
+            regime_order = getattr(state.mc_result, "regime_order", None)
+
+        # Extract ensemble weights from GA result
+        ensemble_weights = None
+        if state.ga_result is not None:
+            ensemble_weights = getattr(state.ga_result, "best_weights", None)
+
+        state.recursive_result = run_recursive_predictions(
+            cache=cache,
+            model_states=fp.model_states,
+            ensemble_weights=ensemble_weights,
+            transition_matrix=transition_matrix,
+            regime_order=regime_order,
+        )
+        if state.recursive_result and state.recursive_result.available:
+            logger.info(
+                "Recursive predictions complete: %d steps, %d snapshots",
+                state.recursive_result.total_steps,
+                len(state.recursive_result.snapshots),
+            )
+    except Exception as exc:
+        logger.warning("Recursive predictions failed: %s", exc)
+
+
 # Registry
 STAGE_6_SUBSTAGES = [
     ("6.1", run_6_1_transformer),
@@ -451,4 +498,5 @@ STAGE_6_SUBSTAGES = [
     ("6.8", run_6_8_tv_granger_mv_mc),
     ("6.9", run_6_9_genetic),
     ("6.10", run_6_10_ohlc),
+    ("6.11", run_6_11_recursive_predictions),
 ]

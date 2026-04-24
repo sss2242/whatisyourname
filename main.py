@@ -2507,6 +2507,7 @@ Non-interactive examples:
     granger_result = None
     ga_result = None
     ohlc_result = None
+    recursive_result = None
     regime_shift_result = None
     _synergy_meta = {}
     _pattern_drift = 1.0
@@ -2799,7 +2800,7 @@ Non-interactive examples:
                 cycle_result=cycle_result,
                 granger_result=granger_result,
                 transfer_entropy_result=transfer_entropy_result,
-                peer_result=None,
+                peer_result=peer_ranking_result,
                 linked_caches=linked_caches or None,
                 extra_variables=_extra_vars,
                 economic_plane=_economic_plane,
@@ -3475,6 +3476,28 @@ Non-interactive examples:
                     logger.debug("Predicted OHLC pattern detection failed: %s", _pp_exc)
         except Exception as exc:
             logger.warning("OHLC candlestick prediction failed: %s", exc)
+
+        # Recursive day-by-day predictions (sub-stage 6.11)
+        recursive_result = None
+        try:
+            from operator1.models.recursive_aggregator import run_recursive_predictions
+            if forward_pass_result is not None and hasattr(forward_pass_result, "model_states") and forward_pass_result.model_states:
+                _rc_transition_matrix = None
+                _rc_regime_order = None
+                if mc_result is not None:
+                    _rc_transition_matrix = getattr(mc_result, "transition_matrix", None)
+                    _rc_regime_order = getattr(mc_result, "regime_order", None)
+                recursive_result = run_recursive_predictions(
+                    cache=cache,
+                    model_states=forward_pass_result.model_states,
+                    transition_matrix=_rc_transition_matrix,
+                    regime_order=_rc_regime_order,
+                )
+                if recursive_result and recursive_result.available:
+                    logger.info("Recursive predictions complete: %d steps, %d snapshots",
+                               recursive_result.total_steps, len(recursive_result.snapshots))
+        except Exception as exc:
+            logger.warning("Recursive day-by-day predictions failed: %s", exc)
     else:
         logger.info("Step 6: Skipped (--skip-models)")
         # regime_detector may have been set in Step 5.5; keep it if so.
@@ -4197,6 +4220,13 @@ Non-interactive examples:
                 "n_generations": ga_result.n_generations,
                 "converged": ga_result.converged,
             }
+
+        # Recursive day-by-day predictions
+        if recursive_result is not None and getattr(recursive_result, "available", False):
+            try:
+                profile["extended_models"]["recursive_predictions"] = recursive_result.to_dict()
+            except Exception:
+                profile["extended_models"]["recursive_predictions"] = {"available": True}
 
         # Synergy metadata
         # Module contribution scores (Section F.1 Category 7 from core idea)
