@@ -88,32 +88,39 @@ def compute_company_survival_flag(
     """
     t = thresholds or _COMPANY_THRESHOLDS
 
-    conditions: list[pd.Series] = []
+    # Two-category condition architecture: liquidity triggers (suppressible
+    # by cash adequacy) vs non-liquidity triggers (never suppressed).
+    liquidity_conditions: list[pd.Series] = []
+    non_liquidity_conditions: list[pd.Series] = []
+
+    # --- Liquidity / solvency triggers (suppressible by cash adequacy) ---
 
     # Current ratio < 1.0
     if "current_ratio" in df.columns:
         cr = df["current_ratio"]
-        conditions.append(cr.notna() & (cr < t.get("current_ratio_lt", 1.0)))
+        liquidity_conditions.append(cr.notna() & (cr < t.get("current_ratio_lt", 1.0)))
 
     # Debt-to-equity (absolute) > 3.0
     if "debt_to_equity_abs" in df.columns:
         de = df["debt_to_equity_abs"]
-        conditions.append(de.notna() & (de > t.get("debt_to_equity_abs_gt", 3.0)))
+        liquidity_conditions.append(de.notna() & (de > t.get("debt_to_equity_abs_gt", 3.0)))
 
     # FCF yield < 0
     if "fcf_yield" in df.columns:
         fy = df["fcf_yield"]
-        conditions.append(fy.notna() & (fy < t.get("fcf_yield_lt", 0.0)))
+        liquidity_conditions.append(fy.notna() & (fy < t.get("fcf_yield_lt", 0.0)))
+
+    # --- Non-liquidity triggers (never suppressed by cash adequacy) ---
 
     # Drawdown < -40%
     if "drawdown_252d" in df.columns:
         dd = df["drawdown_252d"]
-        conditions.append(dd.notna() & (dd < t.get("drawdown_252d_lt", -0.40)))
+        non_liquidity_conditions.append(dd.notna() & (dd < t.get("drawdown_252d_lt", -0.40)))
 
     # Institutional selling: extreme outflow triggers survival mode
     if "inst_flow_momentum" in df.columns:
         ifm = df["inst_flow_momentum"]
-        conditions.append(ifm.notna() & (ifm < t.get("inst_flow_momentum_lt", -0.15)))
+        non_liquidity_conditions.append(ifm.notna() & (ifm < t.get("inst_flow_momentum_lt", -0.15)))
 
     # Crowded + illiquid: fragile ownership structure
     if "inst_crowding_score" in df.columns and "inst_amihud_illiquidity" in df.columns:
@@ -121,33 +128,41 @@ def compute_company_survival_flag(
         ai = df["inst_amihud_illiquidity"]
         high_crowd = cs.notna() & (cs > t.get("inst_crowding_score_gt", 0.8))
         high_illiq = ai.notna() & (ai > ai.quantile(0.9))
-        conditions.append(high_crowd & high_illiq)
+        non_liquidity_conditions.append(high_crowd & high_illiq)
 
     # Geopolitical conflict: country_conflict_flag OR intensity > 0.7 OR sanctions
     if "country_conflict_flag" in df.columns:
         cf = df["country_conflict_flag"]
-        conditions.append(cf.notna() & (cf == 1))
+        non_liquidity_conditions.append(cf.notna() & (cf == 1))
     elif "conflict_intensity_score" in df.columns:
         ci = df["conflict_intensity_score"]
-        conditions.append(ci.notna() & (ci > t.get("conflict_intensity_gt", 0.7)))
+        non_liquidity_conditions.append(ci.notna() & (ci > t.get("conflict_intensity_gt", 0.7)))
     if "sanctions_flag" in df.columns:
         sf = df["sanctions_flag"]
-        conditions.append(sf.notna() & (sf == 1))
+        non_liquidity_conditions.append(sf.notna() & (sf == 1))
 
-    if not conditions:
+    all_conditions = liquidity_conditions + non_liquidity_conditions
+    if not all_conditions:
         logger.warning("No company survival trigger columns found -- defaulting to 0")
         return pd.Series(0, index=df.index, name="company_survival_mode_flag")
 
-    # ANY condition true triggers survival mode
-    combined = conditions[0]
-    for c in conditions[1:]:
-        combined = combined | c
+    # Build separate OR masks for each category
+    _zero = pd.Series(False, index=df.index)
 
-    # P6: Cash adequacy floor -- prevent survival over-triggering for
+    liquidity_combined = _zero.copy()
+    for c in liquidity_conditions:
+        liquidity_combined = liquidity_combined | c
+
+    non_liquidity_combined = _zero.copy()
+    for c in non_liquidity_conditions:
+        non_liquidity_combined = non_liquidity_combined | c
+
+    # P6: Cash adequacy floor -- suppress ONLY liquidity triggers for
     # cash-rich companies. A company with $30B cash and current_ratio=1.01
     # (e.g. AAPL) is fundamentally different from one with $1M cash and
-    # the same ratio. When absolute cash exceeds a market-cap-relative
-    # threshold, suppress liquidity-driven survival triggers.
+    # the same ratio. Non-liquidity triggers (drawdown, conflict, sanctions,
+    # institutional flow) are NEVER suppressed -- those signal real problems
+    # that cash reserves cannot mitigate.
     if ("cash_and_equivalents" in df.columns and "market_cap" in df.columns
             and df["cash_and_equivalents"].notna().any()
             and df["market_cap"].notna().any()):
@@ -157,19 +172,22 @@ def compute_company_survival_flag(
             # Cash > 5% of market cap = cash-adequate, suppress liquidity triggers
             _cash_adequate = (_cash > 0) & (_mcap > 0) & (_cash / _mcap > 0.05)
             if _cash_adequate.any():
-                # Only suppress for the liquidity triggers (current_ratio, cash_ratio)
-                # not for drawdown, conflict, or institutional flow triggers
-                _n_before = int(combined.sum())
-                combined = combined & ~_cash_adequate
-                _n_after = int(combined.sum())
+                _n_before = int(liquidity_combined.sum())
+                liquidity_combined = liquidity_combined & ~_cash_adequate
+                _n_after = int(liquidity_combined.sum())
                 if _n_before != _n_after:
                     logger.info(
-                        "Cash adequacy floor: suppressed %d/%d survival days "
-                        "(cash/mcap > 5%%)",
+                        "Cash adequacy floor: suppressed %d/%d liquidity-triggered "
+                        "survival days (cash/mcap > 5%%). Non-liquidity triggers "
+                        "preserved: %d days.",
                         _n_before - _n_after, _n_before,
+                        int(non_liquidity_combined.sum()),
                     )
         except Exception:
             pass
+
+    # Final combined: liquidity (after cash floor) OR non-liquidity (always preserved)
+    combined = liquidity_combined | non_liquidity_combined
 
     flag = combined.astype(int)
     flag.name = "company_survival_mode_flag"
