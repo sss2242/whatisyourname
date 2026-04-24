@@ -298,6 +298,20 @@ def run_single_frequency_pipeline(
             ret_col = "return_1d" if "return_1d" in cache.columns else None
             if ret_col and cache[ret_col].notna().sum() >= 10:
                 mc_result = run_monte_carlo(cache, returns_col=ret_col)
+                # P4: Apply market-cap survival floor to per-frequency MC.
+                # Without this, the daily frequency MC produces marginal
+                # survival (e.g. 50%) for mega-caps where current_ratio is
+                # just barely above threshold, dragging the fused survival
+                # down via harmonic mean.
+                if mc_result is not None:
+                    try:
+                        from operator1.models.monte_carlo import anchor_mc_survival
+                        _mcap = None
+                        if "market_cap" in cache.columns and cache["market_cap"].notna().any():
+                            _mcap = float(cache["market_cap"].dropna().iloc[-1])
+                        anchor_mc_survival(mc_result, market_cap=_mcap)
+                    except (ImportError, Exception):
+                        pass
                 if mc_result and hasattr(mc_result, "survival_probability"):
                     mc_survival = mc_result.survival_probability
                     logger.info("[%s] Monte Carlo: survival=%.4f", freq, mc_survival or 0)

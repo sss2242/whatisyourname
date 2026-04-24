@@ -672,7 +672,38 @@ def run_stage1(state: BacktestState) -> None:
         "total_liabilities": ["Liabilities"],
         "retained_earnings": ["RetainedEarningsAccumulatedDeficit"],
     }
-    _missing_critical = [f for f in _critical_balance_fields if f not in cache.columns]
+    # P2/P3/P9: Extend CompanyFacts fallback to income statement fields.
+    # Missing net_income/EPS disables PE anchor, full Piotroski, and HF
+    # valuation tier. These are the highest-impact fields for prediction
+    # accuracy improvement.
+    _critical_income_fields = {
+        "net_income": [
+            "NetIncomeLoss",
+            "ProfitLoss",
+            "NetIncomeLossAvailableToCommonStockholdersBasic",
+        ],
+        "eps_diluted": [
+            "EarningsPerShareDiluted",
+            "EarningsPerShareBasic",
+        ],
+        "operating_income": [
+            "OperatingIncomeLoss",
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        ],
+        "gross_profit": ["GrossProfit"],
+        "ebit": [
+            "OperatingIncomeLoss",
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+        ],
+        "interest_expense": [
+            "InterestExpense",
+            "InterestExpenseDebt",
+            "InterestPaid",
+        ],
+    }
+    _all_critical_fields = {**_critical_balance_fields, **_critical_income_fields}
+    _missing_critical = [f for f in _all_critical_fields if f not in cache.columns
+                         or (f in cache.columns and cache[f].isna().all())]
     if _missing_critical and state.market_id == "us_sec_edgar":
         try:
             import requests as _req
@@ -688,12 +719,16 @@ def run_stage1(state: BacktestState) -> None:
             if _facts_resp.status_code == 200:
                 _usgaap = _facts_resp.json().get("facts", {}).get("us-gaap", {})
                 _filled = 0
-                for _field, _concepts in _critical_balance_fields.items():
-                    if _field in cache.columns:
+                for _field, _concepts in _all_critical_fields.items():
+                    if _field in cache.columns and not cache[_field].isna().all():
                         continue
                     for _concept in _concepts:
                         _cdata = _usgaap.get(_concept, {})
-                        _entries = _cdata.get("units", {}).get("USD", [])
+                        # EPS fields use USD/shares units, not USD
+                        _unit_key = "USD/shares" if _field in ("eps_diluted",) else "USD"
+                        _entries = _cdata.get("units", {}).get(_unit_key, [])
+                        if not _entries and _unit_key == "USD/shares":
+                            _entries = _cdata.get("units", {}).get("USD", [])
                         if not _entries:
                             continue
                         # Build a Series from filing data, aligned to report_date
@@ -712,6 +747,50 @@ def run_stage1(state: BacktestState) -> None:
                                 logger.info("CompanyFacts filled '%s' from %s: %d non-NaN days",
                                            _field, _concept, _aligned.notna().sum())
                             break  # stop trying alternative concepts
+                # P10: Auto-discovery of company-specific XBRL concepts.
+                # When explicit concept names don't match, scan ALL us-gaap
+                # concepts for substring matches. This catches non-standard
+                # filers like Apple who use extended taxonomy entries.
+                if _filled < len(_missing_critical):
+                    _KEYWORD_MAP = {
+                        "net_income": ["NetIncome", "ProfitLoss", "NetEarnings"],
+                        "gross_profit": ["GrossProfit", "GrossMargin"],
+                        "operating_income": ["OperatingIncome", "OperatingProfit"],
+                        "interest_expense": ["InterestExpense", "InterestCost"],
+                        "eps_diluted": ["EarningsPerShare"],
+                        "current_assets": ["AssetsCurrent"],
+                        "current_liabilities": ["LiabilitiesCurrent"],
+                        "cash_and_equivalents": ["Cash", "CashEquivalent"],
+                    }
+                    _still_missing = [
+                        f for f in _all_critical_fields
+                        if (f not in cache.columns or cache[f].isna().all())
+                        and f in _KEYWORD_MAP
+                    ]
+                    for _field in _still_missing:
+                        _keywords = _KEYWORD_MAP[_field]
+                        # Search all us-gaap concepts for keyword matches
+                        for _concept_name, _cdata in _usgaap.items():
+                            if any(kw.lower() in _concept_name.lower() for kw in _keywords):
+                                _unit_key = "USD/shares" if _field == "eps_diluted" else "USD"
+                                _entries = _cdata.get("units", {}).get(_unit_key, [])
+                                if not _entries and _unit_key == "USD/shares":
+                                    _entries = _cdata.get("units", {}).get("USD", [])
+                                _rows = []
+                                for _e in _entries:
+                                    if _e.get("form") in ("10-K", "10-Q") and _e.get("val") is not None and _e.get("end"):
+                                        _rows.append({"date": pd.Timestamp(_e["end"]), "value": float(_e["val"])})
+                                if _rows:
+                                    _fdf = pd.DataFrame(_rows).drop_duplicates(subset=["date"], keep="last").set_index("date").sort_index()
+                                    _ci = cache.index.union(_fdf.index).sort_values()
+                                    _aligned = _fdf["value"].reindex(_ci).ffill().reindex(cache.index)
+                                    if _aligned.notna().sum() > 0:
+                                        cache[_field] = _aligned
+                                        _filled += 1
+                                        logger.info("Auto-discovered '%s' from concept '%s': %d non-NaN days",
+                                                   _field, _concept_name, _aligned.notna().sum())
+                                        break  # found a match, stop searching
+
                 if _filled > 0:
                     logger.info("CompanyFacts fallback: filled %d/%d missing critical fields", _filled, len(_missing_critical))
         except Exception as exc:

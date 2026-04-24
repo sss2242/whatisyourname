@@ -2389,6 +2389,28 @@ def run_forecasting(
                 except Exception:
                     pass
 
+            # P1 fix: Momentum overlay for close predictions.
+            # The Kalman/baseline models anchor near the last price, missing
+            # directional moves. Blend with a momentum-based prediction using
+            # recent returns to reduce systematic upward bias at ATH.
+            if var_name == "close" and "return_1d" in cache.columns:
+                try:
+                    _ret = cache["return_1d"].dropna()
+                    if len(_ret) >= 21:
+                        _last_close = float(cache["close"].dropna().iloc[-1])
+                        _mom_21d = float(_ret.iloc[-21:].mean())
+                        _mom_5d = float(_ret.iloc[-5:].mean())
+                        for _ml, _mh in HORIZONS.items():
+                            # Use shorter-window momentum for short horizons
+                            _mom = _mom_5d if _mh <= 5 else _mom_21d
+                            _mom_pred = _last_close * (1 + _mom * _mh)
+                            # Blend: 70% model, 30% momentum
+                            _horizon_forecasts[_ml] = (
+                                0.7 * _horizon_forecasts[_ml] + 0.3 * _mom_pred
+                            )
+                except Exception:
+                    pass
+
             # Step 2: Residual feature adjustment -- augment univariate model
             # forecasts with feature-based residual regression (Prophet/Greykite
             # pattern). Only applies when extra_variables are available.
