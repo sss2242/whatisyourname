@@ -501,7 +501,7 @@ def build_conformal_result(
                 _pf = getattr(interval, "point_forecast", None) or getattr(interval, "forecast", None)
                 _lo = getattr(interval, "lower", None)
                 _hi = getattr(interval, "upper", None)
-            if _pf is not None and _lo is not None and _hi is not None and _pf > 0:
+            if _pf is not None and _lo is not None and _hi is not None and abs(_pf) > 0:
                 _width = abs(_hi - _lo)
                 _max_width = abs(_pf) * _cap
                 if _width > _max_width and _max_width > 0:

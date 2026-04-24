@@ -503,11 +503,11 @@ def discover_linked_entities(
     # features, DTW analogs, and competitive pressure index still work.
     # ------------------------------------------------------------------
     _STATIC_COMPETITORS: dict[str, list[str]] = {
-        "AAPL": ["MSFT", "GOOG", "AMZN", "META", "SAMSUNG"],
+        "AAPL": ["MSFT", "GOOG", "AMZN", "META", "SSNLF"],
         "MSFT": ["AAPL", "GOOG", "AMZN", "META", "ORCL"],
         "GOOG": ["MSFT", "META", "AMZN", "AAPL", "SNAP"],
         "AMZN": ["MSFT", "GOOG", "WMT", "BABA", "SHOP"],
-        "META": ["GOOG", "SNAP", "PINS", "TWTR", "MSFT"],
+        "META": ["GOOG", "SNAP", "PINS", "RDDT", "MSFT"],
         "TSLA": ["F", "GM", "RIVN", "NIO", "BYD"],
         "NVDA": ["AMD", "INTC", "QCOM", "AVGO", "TSM"],
         "JPM": ["BAC", "GS", "MS", "C", "WFC"],

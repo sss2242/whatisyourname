@@ -760,7 +760,7 @@ def run_stage1(state: BacktestState) -> None:
                         "eps_diluted": ["EarningsPerShare"],
                         "current_assets": ["AssetsCurrent"],
                         "current_liabilities": ["LiabilitiesCurrent"],
-                        "cash_and_equivalents": ["Cash", "CashEquivalent"],
+                        "cash_and_equivalents": ["CashAndCashEquivalent", "CashCashEquivalent"],
                     }
                     _still_missing = [
                         f for f in _all_critical_fields
