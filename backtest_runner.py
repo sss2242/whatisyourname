@@ -1036,20 +1036,29 @@ def run_stage1(state: PipelineState) -> None:
 # Stage 2: Temporal models
 # ---------------------------------------------------------------------------
 
-def run_stage2(state) -> None:
-    """Run all temporal model stages via the staged runner.
+def run_stage2(state, stage_spec: str = "all") -> None:
+    """Run temporal model stages via the staged runner.
     
-    Replaces the old run_stage2a/2b/2c/2d functions with a single
-    call to the staged runner, ensuring perfect parity with main.py.
+    Args:
+        state: PipelineState with cache populated from Stage 1.
+        stage_spec: Which sub-stages to run. Examples:
+            'all'  -- all stages 3-7 (default)
+            '3'    -- all regime/causality/pattern sub-stages
+            '3.1'  -- just regime detection
+            '4.1'  -- just forecasting
+            '5.4'  -- just Monte Carlo
+            '6.11' -- just recursive predictions
+            '7.4'  -- just multi-frequency pipeline
+            '3-6'  -- stages 3 through 6
     """
     from operator1.stages.runner import run_stages
     
     # Ensure PipelineState has output_dir set for checkpoints
     if not state.output_dir:
-        state.output_dir = state.output_dir if hasattr(state, 'run_dir') else 'cache'
+        state.output_dir = 'cache'
     
-    run_stages(state, "all", save_checkpoints=True)
-    logger.info("Stage 2 complete via staged runner")
+    run_stages(state, stage_spec, save_checkpoints=True)
+    logger.info("Stage 2 complete via staged runner (spec=%s)", stage_spec)
 
 def run_stage3(state: PipelineState) -> None:
     """Build profile, extract predictions, optionally validate against actuals."""
@@ -1910,19 +1919,24 @@ Examples:
         validate_predictions(state)
         return 0
 
-    # Build ordered list of stages to run
+    # Build ordered list of stages to run.
     # Stage 1: Data fetch + cache build + features (backtest-specific)
     # Stage 2: Temporal models via staged runner (stages 3-7, shared with main.py)
+    #   Supports sub-stage specs: 3.1, 4.1, 5.4, 6.11, 7.4, etc.
     # Stage 3: Profile build + prediction extraction (backtest-specific)
     if args.stage == "all":
         stages = ["1", "2", "3"]
-    else:
+    elif args.stage in ("1", "2", "3"):
         stages = [args.stage]
+    else:
+        # Sub-stage spec (e.g., "3.1", "4.1", "6.11", "3-6")
+        # Route through Stage 2 with the spec passed to the staged runner
+        stages = [f"2:{args.stage}"]
 
     _STAGE_FUNCS = {
-        "1": run_stage1,
-        "2": run_stage2,  # delegates to staged runner (stages 3-7)
-        "3": run_stage3,  # profile build + prediction extraction
+        "1": lambda s: run_stage1(s),
+        "2": lambda s: run_stage2(s, "all"),
+        "3": lambda s: run_stage3(s),
     }
     # Map stages to their dependency for state loading
     _STAGE_DEPS = {
@@ -1930,6 +1944,14 @@ Examples:
         "2": "1",   # temporal models depend on Stage 1 (data fetch)
         "3": "2",   # profile build depends on Stage 2 (temporal models)
     }
+
+    # Handle sub-stage routing: "2:3.1" means "load Stage 1 state, run sub-stage 3.1"
+    for i, stage_key in enumerate(stages):
+        if ":" in stage_key:
+            parent, sub_spec = stage_key.split(":", 1)
+            _STAGE_FUNCS[stage_key] = lambda s, spec=sub_spec: run_stage2(s, spec)
+            _STAGE_DEPS[stage_key] = "1"  # sub-stages depend on Stage 1
+            stages[i] = stage_key
 
     for stage_key in stages:
         dep = _STAGE_DEPS[stage_key]
