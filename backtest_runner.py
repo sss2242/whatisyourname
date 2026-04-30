@@ -1028,7 +1028,7 @@ def run_stage1(state: PipelineState) -> None:
             logger.debug("Geographic metrics computation failed: %s", exc)
 
     state.cache = cache
-    state.save_sub("1")
+    state.save("1")
     logger.info("STAGE 1 COMPLETE: %d rows x %d cols", len(cache), len(cache.columns))
 
 
@@ -1588,7 +1588,7 @@ def run_stage3(state: PipelineState) -> None:
     except Exception as exc:
         logger.info("Report generation skipped: %s", exc)
 
-    state.save_sub("3")
+    state.save("3")
     logger.info("STAGE 3 COMPLETE")
 
 
@@ -1906,7 +1906,7 @@ Examples:
 
     # Validation mode
     if args.validate:
-        state.load(stage=3)
+        state.load_checkpoint("3")
         validate_predictions(state)
         return 0
 
@@ -1939,7 +1939,7 @@ Examples:
             _loaded = False
             _dep_pkl = Path(state.output_dir) / f"state_{dep_key}.pkl"
             if _dep_pkl.exists():
-                state.load_sub(dep_key)
+                state.load_checkpoint(dep_key)
                 _loaded = True
             else:
                 # Fallback: walk backwards through the dependency chain
@@ -1953,7 +1953,7 @@ Examples:
                             "Stage %s dep '%s' not found, falling back to '%s'",
                             stage_key, dep_key, _fallback,
                         )
-                        state.load_sub(_fallback)
+                        state.load_checkpoint(_fallback)
                         _loaded = True
                         break
                 if not _loaded:
