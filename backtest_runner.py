@@ -1875,13 +1875,9 @@ Examples:
 """,
     )
     parser.add_argument("--stage", type=str, default="all",
-                        choices=["1", "2", "2a", "2a1", "2a2", "2b", "2c", "2d",
-                                 "2d.mf.prep", "2d.mf.A", "2d.mf.Q", "2d.mf.M",
-                                 "2d.mf.W", "2d.mf.D", "2d.mf.fuse",
-                                 "mf.prep", "mf.A", "mf.Q", "mf.M",
-                                 "mf.W", "mf.D", "mf.fuse",
-                                 "3", "all"],
-                        help="Which stage to run. Stage 2a is split into 2a1 (regime+causality+patterns) "
+                        help="Which stage to run. Top-level: 1 (data), 2 (temporal), 3 (profile), all. "
+                             "Sub-stages: 3.1 (regime), 4.1 (forecast), 5.4 (MC), 6.11 (recursive), "
+                             "7.4 (multi-freq), 7.5 (HF). Ranges: 3-6. "
                              "and 2a2 (forecasting). Use '2a' to run both, '2' for all sub-stages.")
     parser.add_argument("--market", type=str, default="us_sec_edgar",
                         help="Market ID (e.g. us_sec_edgar, kr_dart, jp_jquants)")
