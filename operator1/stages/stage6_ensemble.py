@@ -464,15 +464,9 @@ def run_6_11_recursive_predictions(state: PipelineState) -> None:
             transition_matrix = getattr(state.mc_result, "transition_matrix", None)
             regime_order = getattr(state.mc_result, "regime_order", None)
 
-        # Extract ensemble weights from GA result
-        ensemble_weights = None
-        if state.ga_result is not None:
-            ensemble_weights = getattr(state.ga_result, "best_weights", None)
-
         state.recursive_result = run_recursive_predictions(
             cache=cache,
             model_states=fp.model_states,
-            ensemble_weights=ensemble_weights,
             transition_matrix=transition_matrix,
             regime_order=regime_order,
         )

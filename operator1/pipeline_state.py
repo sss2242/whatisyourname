@@ -62,6 +62,8 @@ class PipelineState:
         self.estimation_coverage: Any = None
         self.filing_calendar_result: Any = None
         self.event_calendar_result: Any = None
+        self.options_signal_result: Any = None
+        self.cross_asset_result: Any = None
 
         # ---- Stage 2: Feature Engineering ----
         self.weights: dict = {}
@@ -141,6 +143,12 @@ class PipelineState:
 
         # ---- Stage 8: Output ----
         self.profile: dict = {}
+        self.predictions_summary: dict = {}
+
+        # ---- Transient runtime objects (not serialized) ----
+        self._secrets: dict = {}
+        self._llm_client: Any = None
+        self._pit_client: Any = None
 
     # ------------------------------------------------------------------
     # Serialization
@@ -172,6 +180,7 @@ class PipelineState:
         # Save non-DataFrame state as pickle
         skip_keys = {
             "cache", "linked_caches", "linked_agg_df",
+            "_secrets", "_llm_client", "_pit_client",
             "income_df", "balance_df", "cashflow_df", "quotes_df",
         }
         state_dict = {}

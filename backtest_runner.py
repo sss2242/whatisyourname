@@ -58,329 +58,19 @@ logger = logging.getLogger("backtest_runner")
 # State container -- serialized between stages
 # ---------------------------------------------------------------------------
 
-class BacktestState:
-    """Mutable state bag passed between stages and persisted to disk."""
+from operator1.pipeline_state import PipelineState
 
-    def __init__(self) -> None:
-        # Config
-        self.market_id: str = ""
-        self.company: str = ""
-        self.end_date: str = ""
-        self.years: float = 2.0
-        self.run_dir: str = ""
-
-        # Stage 1 outputs
-        self.cache: pd.DataFrame | None = None
-        self.target_profile: dict = {}
-        self.relationships: dict = {}
-        self.linked_caches: dict = {}
-        self.macro_data: dict = {}
-        self.macro_dataset = None
-        self.weights: dict = {}
-        self.fh_result = None
-        self.conflict_result = None
-        self.buying_power_result = None
-        self.catalyst_result = None
-        self.sentiment_result = None
-        self.peer_ranking_result = None
-        self.filing_calendar_result = None
-        self.estimation_coverage = None
-        self.fuzzy_result = None
-        self.macro_quadrant_result = None
-        self.graph_risk_result = None
-        self.game_theory_result = None
-        self.contagion_result = None
-        self.six_proxy_result = None
-        self.target_holders: list = []
-        self.target_insiders: list = []
-        self.signal_ic_result = None
-        self.prediction_log_summary = None
-        self.linked_agg_df = None
-        self.linked_conflict = None
-        self.enriched_timeline_result = None
-        self.early_regime_result = None
-        self.regime_detector = None
-        self._is_private: bool = False
-        self._adaptive_thresholds = None
-        self._adaptive_model_params = None
-        self._adaptive_tier3 = None
-        self._ohlcv_source_label: str = ""
-        self._seg_result: dict = {}
-        self._mode_weights = None
-        self.feature_selection_result = None
-        self.options_signal_result = None
-        self.cross_asset_result = None
-        self.event_calendar_result = None
-        # Raw statement DataFrames (for multi-frequency Q/A direct construction)
-        self._income_df: pd.DataFrame = pd.DataFrame()
-        self._balance_df: pd.DataFrame = pd.DataFrame()
-        self._cashflow_df: pd.DataFrame = pd.DataFrame()
-        self._quotes_df: pd.DataFrame = pd.DataFrame()
-
-        # USS (Unified Survival System) outputs
-        self.survival_controller = None
-        self.scenario_result = None
-
-        # Stage 2 outputs
-        self.forecast_result = None
-        self.forward_pass_result = None
-        self.walk_forward_result = None
-        self.burnout_result = None
-        self.mc_result = None
-        self.pred_result = None
-        self.transfer_entropy_result = None
-        self.cycle_result = None
-        self.pattern_result = None
-        self.copula_result = None
-        self.conformal_result = None
-        self.dtw_result = None
-        self.shap_result = None
-        self.sobol_result = None
-        self.particle_filter_result = None
-        self.transformer_result = None
-        self.dual_regime_result = None
-        self.granger_result = None
-        self.ga_result = None
-        self.ohlc_result = None
-        self._synergy_meta: dict = {}
-        self._pattern_drift: float = 1.0
-        self._retro_params = None
-        self._tv_granger_result = None
-        self._mv_mc_result = None
-        self._extra_vars: list = []
-
-        # Stage 2.5 outputs
-        self.multi_frequency_result = None
-
-        # Stage 3 outputs
-        self.profile: dict = {}
-        self.predictions_summary: dict = {}
-
-        # Secrets (not persisted)
-        self._secrets: dict = {}
-        self._llm_client = None
-        self._pit_client = None
-
-    def save(self, stage: int) -> None:
-        """Persist state after a stage completes."""
-        run_dir = Path(self.run_dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save cache as parquet (fast, compact)
-        if self.cache is not None:
-            self.cache.to_parquet(run_dir / "cache.parquet")
-
-        # Save linked caches
-        if self.linked_caches:
-            lc_dir = run_dir / "linked_caches"
-            lc_dir.mkdir(exist_ok=True)
-            for eid, lc in self.linked_caches.items():
-                safe_name = eid.replace("/", "_").replace("\\", "_")[:50]
-                lc.to_parquet(lc_dir / f"{safe_name}.parquet")
-            # Save the ID mapping
-            with open(lc_dir / "_ids.json", "w") as f:
-                json.dump(list(self.linked_caches.keys()), f)
-
-        # Save linked_agg_df
-        if self.linked_agg_df is not None and not self.linked_agg_df.empty:
-            self.linked_agg_df.to_parquet(run_dir / "linked_agg.parquet")
-
-        # Save non-DataFrame state as pickle
-        # Exclude large DataFrames and non-picklable objects
-        state_dict = {}
-        skip_keys = {
-            "cache", "linked_caches", "linked_agg_df",
-            "_secrets", "_llm_client", "_pit_client",
-        }
-        for k, v in self.__dict__.items():
-            if k in skip_keys:
-                continue
-            try:
-                pickle.dumps(v)
-                state_dict[k] = v
-            except (pickle.PicklingError, TypeError, AttributeError) as exc:
-                logger.debug("Skipping non-picklable state key %s: %s", k, exc)
-
-        with open(run_dir / f"state_stage{stage}.pkl", "wb") as f:
-            pickle.dump(state_dict, f)
-
-        # Save config as JSON for human readability
-        config = {
-            "market_id": self.market_id,
-            "company": self.company,
-            "end_date": self.end_date,
-            "years": self.years,
-            "run_dir": self.run_dir,
-            "stage_completed": stage,
-            "timestamp": datetime.now().isoformat(),
-        }
-        with open(run_dir / "config.json", "w") as f:
-            json.dump(config, f, indent=2)
-
-        logger.info("State saved to %s (stage %d)", run_dir, stage)
-
-    def save_sub(self, sub_stage: str) -> None:
-        """Persist state after a sub-stage completes (e.g. '2a', '2b')."""
-        run_dir = Path(self.run_dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        if self.cache is not None:
-            self.cache.to_parquet(run_dir / "cache.parquet")
-
-        if self.linked_caches:
-            lc_dir = run_dir / "linked_caches"
-            lc_dir.mkdir(exist_ok=True)
-            for eid, lc in self.linked_caches.items():
-                safe_name = eid.replace("/", "_").replace("\\", "_")[:50]
-                lc.to_parquet(lc_dir / f"{safe_name}.parquet")
-            with open(lc_dir / "_ids.json", "w") as f:
-                json.dump(list(self.linked_caches.keys()), f)
-
-        if self.linked_agg_df is not None and not self.linked_agg_df.empty:
-            self.linked_agg_df.to_parquet(run_dir / "linked_agg.parquet")
-
-        state_dict = {}
-        skip_keys = {"cache", "linked_caches", "linked_agg_df", "_secrets", "_llm_client", "_pit_client"}
-        for k, v in self.__dict__.items():
-            if k in skip_keys:
-                continue
-            try:
-                pickle.dumps(v)
-                state_dict[k] = v
-            except (pickle.PicklingError, TypeError, AttributeError):
-                pass
-
-        with open(run_dir / f"state_{sub_stage}.pkl", "wb") as f:
-            pickle.dump(state_dict, f)
-
-        config = {
-            "market_id": self.market_id, "company": self.company,
-            "end_date": self.end_date, "years": self.years,
-            "run_dir": self.run_dir, "sub_stage_completed": sub_stage,
-            "timestamp": datetime.now().isoformat(),
-        }
-        with open(run_dir / "config.json", "w") as f:
-            json.dump(config, f, indent=2)
-
-        logger.info("State saved to %s (sub-stage %s)", run_dir, sub_stage)
-
-    def load_sub(self, sub_stage: str) -> None:
-        """Load state from a previous sub-stage (e.g. '1', '2a', '2b')."""
-        run_dir = Path(self.run_dir)
-
-        config_path = run_dir / "config.json"
-        if config_path.exists():
-            with open(config_path) as f:
-                config = json.load(f)
-            self.market_id = config.get("market_id", self.market_id)
-            self.company = config.get("company", self.company)
-            self.end_date = config.get("end_date", self.end_date)
-            self.years = config.get("years", self.years)
-
-        cache_path = run_dir / "cache.parquet"
-        if cache_path.exists():
-            self.cache = pd.read_parquet(cache_path)
-            logger.info("Loaded cache: %d rows x %d cols", len(self.cache), len(self.cache.columns))
-
-        lc_dir = run_dir / "linked_caches"
-        ids_path = lc_dir / "_ids.json"
-        if ids_path.exists():
-            with open(ids_path) as f:
-                ids = json.load(f)
-            self.linked_caches = {}
-            for eid in ids:
-                safe_name = eid.replace("/", "_").replace("\\", "_")[:50]
-                pq = lc_dir / f"{safe_name}.parquet"
-                if pq.exists():
-                    self.linked_caches[eid] = pd.read_parquet(pq)
-
-        lag_path = run_dir / "linked_agg.parquet"
-        if lag_path.exists():
-            self.linked_agg_df = pd.read_parquet(lag_path)
-
-        # Try the exact sub-stage pickle, then fall back to stage number pickles
-        pkl_candidates = [
-            run_dir / f"state_{sub_stage}.pkl",
-            run_dir / f"state_stage{sub_stage}.pkl",
-        ]
-        # Also try numeric stages for backward compat
-        if sub_stage.isdigit():
-            pkl_candidates.append(run_dir / f"state_stage{sub_stage}.pkl")
-
-        for pkl_path in pkl_candidates:
-            if pkl_path.exists():
-                with open(pkl_path, "rb") as f:
-                    state_dict = pickle.load(f)
-                for k, v in state_dict.items():
-                    if hasattr(self, k):
-                        setattr(self, k, v)
-                logger.info("Loaded state from %s (%d keys)", pkl_path.name, len(state_dict))
-                break
-
-        # Reload secrets (not persisted)
-        try:
-            from operator1.secrets_loader import load_secrets
-            self._secrets = load_secrets()
-        except Exception:
-            pass
-
-    def load(self, stage: int) -> None:
-        """Load state from a previous stage."""
-        run_dir = Path(self.run_dir)
-
-        # Load config
-        config_path = run_dir / "config.json"
-        if config_path.exists():
-            with open(config_path) as f:
-                config = json.load(f)
-            self.market_id = config.get("market_id", self.market_id)
-            self.company = config.get("company", self.company)
-            self.end_date = config.get("end_date", self.end_date)
-            self.years = config.get("years", self.years)
-
-        # Load cache
-        cache_path = run_dir / "cache.parquet"
-        if cache_path.exists():
-            self.cache = pd.read_parquet(cache_path)
-            logger.info("Loaded cache: %d rows x %d cols", len(self.cache), len(self.cache.columns))
-
-        # Load linked caches
-        lc_dir = run_dir / "linked_caches"
-        ids_path = lc_dir / "_ids.json"
-        if ids_path.exists():
-            with open(ids_path) as f:
-                ids = json.load(f)
-            self.linked_caches = {}
-            for eid in ids:
-                safe_name = eid.replace("/", "_").replace("\\", "_")[:50]
-                pq = lc_dir / f"{safe_name}.parquet"
-                if pq.exists():
-                    self.linked_caches[eid] = pd.read_parquet(pq)
-            logger.info("Loaded %d linked caches", len(self.linked_caches))
-
-        # Load linked_agg
-        lag_path = run_dir / "linked_agg.parquet"
-        if lag_path.exists():
-            self.linked_agg_df = pd.read_parquet(lag_path)
-
-        # Load pickle state (try latest stage first, then earlier)
-        for s in range(stage, 0, -1):
-            pkl_path = run_dir / f"state_stage{s}.pkl"
-            if pkl_path.exists():
-                with open(pkl_path, "rb") as f:
-                    state_dict = pickle.load(f)
-                for k, v in state_dict.items():
-                    if hasattr(self, k):
-                        setattr(self, k, v)
-                logger.info("Loaded state from stage %d (%d keys)", s, len(state_dict))
-                break
+# BacktestState is now PipelineState. The backtest_runner uses PipelineState
+# for all state management, with transient runtime objects stored as simple
+# attributes (_secrets, _llm_client, _pit_client) that aren't serialized.
+BacktestState = PipelineState  # backward compat alias
 
 
 # ---------------------------------------------------------------------------
 # Stage 1: Data fetch + cache build + features
 # ---------------------------------------------------------------------------
 
-def run_stage1(state: BacktestState) -> None:
+def run_stage1(state: PipelineState) -> None:
     """Fetch data, build cache, compute features, survival, linked entities."""
     logger.info("=" * 60)
     logger.info("STAGE 1: Data Fetch + Cache Build + Features")
@@ -492,13 +182,13 @@ def run_stage1(state: BacktestState) -> None:
                 logger.warning("%s failed: %s", lbl, exc)
 
     # OHLCV fallback
-    state._ohlcv_source_label = market_info.pit_api_name
+    state.ohlcv_source_label = market_info.pit_api_name
     if quotes_df.empty and ticker:
         try:
             from operator1.clients.ohlcv_provider import fetch_ohlcv
             quotes_df = fetch_ohlcv(ticker, market_id=state.market_id)
             if not quotes_df.empty:
-                state._ohlcv_source_label = "yfinance"
+                state.ohlcv_source_label = "yfinance"
                 logger.info("OHLCV from yfinance: %d rows", len(quotes_df))
         except Exception as exc:
             logger.warning("OHLCV fallback failed: %s", exc)
@@ -535,10 +225,10 @@ def run_stage1(state: BacktestState) -> None:
         logger.warning("Pivot failed: %s", exc)
 
     # Save raw statement DataFrames for multi-frequency Q/A direct construction
-    state._income_df = income_df
-    state._balance_df = balance_df
-    state._cashflow_df = cashflow_df
-    state._quotes_df = quotes_df
+    state.income_df = income_df
+    state.balance_df = balance_df
+    state.cashflow_df = cashflow_df
+    state.quotes_df = quotes_df
 
     # Build cache
     if not quotes_df.empty:
@@ -919,8 +609,8 @@ def run_stage1(state: BacktestState) -> None:
     # Private company proxies
     try:
         from operator1.features.private_company_proxies import is_private_company, compute_private_company_proxies, resolve_proxies
-        state._is_private = is_private_company(cache)
-        if state._is_private:
+        state.is_private = is_private_company(cache)
+        if state.is_private:
             cache = compute_private_company_proxies(cache)
             cache = resolve_proxies(cache)
     except Exception:
@@ -1108,12 +798,12 @@ def run_stage1(state: BacktestState) -> None:
     # Adaptive thresholds
     try:
         from operator1.analysis.adaptive_thresholds import compute_adaptive_thresholds, threshold_set_to_survival_dict
-        state._adaptive_thresholds = compute_adaptive_thresholds(
+        state.adaptive_thresholds = compute_adaptive_thresholds(
             cache, linked_caches=state.linked_caches or None,
             fh_composite_scores=cache.get("fh_composite_score"),
         )
-        if state._adaptive_thresholds.adapted:
-            adapted = threshold_set_to_survival_dict(state._adaptive_thresholds)
+        if state.adaptive_thresholds.adapted:
+            adapted = threshold_set_to_survival_dict(state.adaptive_thresholds)
             cache["company_survival_mode_flag"] = compute_company_survival_flag(cache, thresholds=adapted)
             cache["survival_probability"] = compute_survival_probability(cache, thresholds=adapted)
             cache = compute_hierarchy_weights(cache)
@@ -1128,25 +818,25 @@ def run_stage1(state: BacktestState) -> None:
             compute_adaptive_mc_params, compute_adaptive_participation_rate,
             AdaptiveModelParams,
         )
-        state._adaptive_model_params = AdaptiveModelParams()
+        state.adaptive_model_params = AdaptiveModelParams()
         if "survival_probability" in cache.columns and "cox_survival_score" in cache.columns:
             _sig = cache.get("survival_probability")
             _cox = cache.get("cox_survival_score")
             _actual = cache.get("company_survival_mode_flag", pd.Series(0, index=cache.index))
             if _sig is not None and _cox is not None:
                 w_sig, w_cox = compute_blend_weights(_sig, _cox, _actual)
-                state._adaptive_model_params.blend_w_sig = w_sig
-                state._adaptive_model_params.blend_w_cox = w_cox
+                state.adaptive_model_params.blend_w_sig = w_sig
+                state.adaptive_model_params.blend_w_cox = w_cox
                 cache["survival_probability"] = w_sig * _sig + w_cox * _cox.fillna(_sig)
-        state._adaptive_model_params.survival_risk_multiplier = compute_regime_risk_multiplier(
+        state.adaptive_model_params.survival_risk_multiplier = compute_regime_risk_multiplier(
             state.regime_detector, cache,
         )
-        state._adaptive_model_params.intraday_low_factor = compute_garman_klass_factor(cache)
-        state._adaptive_model_params.mc_n_paths, state._adaptive_model_params.mc_is_tilt = (
+        state.adaptive_model_params.intraday_low_factor = compute_garman_klass_factor(cache)
+        state.adaptive_model_params.mc_n_paths, state.adaptive_model_params.mc_is_tilt = (
             compute_adaptive_mc_params(cache)
         )
-        state._adaptive_model_params.participation_rate = compute_adaptive_participation_rate(cache)
-        state._adaptive_model_params.adapted = True
+        state.adaptive_model_params.participation_rate = compute_adaptive_participation_rate(cache)
+        state.adaptive_model_params.adapted = True
         logger.info("Adaptive model params computed")
     except Exception as exc:
         logger.debug("Adaptive model params skipped: %s", exc)
@@ -1164,16 +854,16 @@ def run_stage1(state: BacktestState) -> None:
             if state.filing_calendar_result is not None
             else "quarterly"
         )
-        state._adaptive_tier3 = AdaptiveTier3Params()
-        state._adaptive_tier3.windows = compute_adaptive_windows(_freq)
-        state._adaptive_tier3.stale_threshold_days = compute_stale_threshold(_freq)
+        state.adaptive_tier3 = AdaptiveTier3Params()
+        state.adaptive_tier3.windows = compute_adaptive_windows(_freq)
+        state.adaptive_tier3.stale_threshold_days = compute_stale_threshold(_freq)
         _n_eff = compute_effective_sample_size(cache, "close")
         _n_feat = sum(1 for c in cache.columns if cache[c].dtype in ("float64", "float32") and cache[c].notna().sum() > 10)
-        state._adaptive_tier3.nn_params = compute_nn_hyperparams(n_eff=_n_eff, n_features=min(_n_feat, 30))
-        state._adaptive_tier3.pattern_body_threshold, state._adaptive_tier3.pattern_doji_threshold = (
-            compute_pattern_thresholds(cache, lookback=state._adaptive_tier3.windows.medium)
+        state.adaptive_tier3.nn_params = compute_nn_hyperparams(n_eff=_n_eff, n_features=min(_n_feat, 30))
+        state.adaptive_tier3.pattern_body_threshold, state.adaptive_tier3.pattern_doji_threshold = (
+            compute_pattern_thresholds(cache, lookback=state.adaptive_tier3.windows.medium)
         )
-        state._adaptive_tier3.adapted = True
+        state.adaptive_tier3.adapted = True
         logger.info("Adaptive windows computed")
     except Exception as exc:
         logger.debug("Adaptive windows skipped: %s", exc)
@@ -1205,7 +895,7 @@ def run_stage1(state: BacktestState) -> None:
     try:
         from operator1.models.regime_detector import run_early_regime_detection
         from operator1.analysis.survival_timeline import compute_enriched_survival_timeline
-        target_var = "equity_change_rate" if state._is_private else "return_1d"
+        target_var = "equity_change_rate" if state.is_private else "return_1d"
         cache, state.early_regime_result = run_early_regime_detection(cache, target_variable=target_var)
         if state.early_regime_result and state.early_regime_result.fitted:
             state.regime_detector = state.early_regime_result.detector
@@ -1224,7 +914,7 @@ def run_stage1(state: BacktestState) -> None:
         # ChangeFinder online change point scores (no look-ahead)
         try:
             from operator1.models.regime_detector import compute_online_change_scores
-            _regime_target = "equity_change_rate" if state._is_private else "return_1d"
+            _regime_target = "equity_change_rate" if state.is_private else "return_1d"
             _ret_for_cf = cache.get(_regime_target)
             if _ret_for_cf is not None and _ret_for_cf.notna().sum() > 30:
                 _cf_scores = compute_online_change_scores(_ret_for_cf.fillna(0).values)
@@ -1311,7 +1001,7 @@ def run_stage1(state: BacktestState) -> None:
             logger.debug("Ownership contagion skipped: %s", exc)
 
     # Save segment result for Stage 3 profile injection
-    state._seg_result = _seg_result
+    state.seg_result = _seg_result
 
     # Product segment metrics (for _extra_vars + MC concentration risk)
     if _seg_result and _seg_result.get("n_segments", 0) >= 2:
@@ -1338,7 +1028,7 @@ def run_stage1(state: BacktestState) -> None:
             logger.debug("Geographic metrics computation failed: %s", exc)
 
     state.cache = cache
-    state.save_sub("1")
+    state.save("1")
     logger.info("STAGE 1 COMPLETE: %d rows x %d cols", len(cache), len(cache.columns))
 
 
@@ -1346,1150 +1036,31 @@ def run_stage1(state: BacktestState) -> None:
 # Stage 2: Temporal models
 # ---------------------------------------------------------------------------
 
-def _init_extra_vars(state: BacktestState) -> None:
-    """Build the _extra_vars list from cache columns.
-
-    Mirrors main.py Step 6 _extra_vars construction (lines 2437-2473).
+def run_stage2(state, stage_spec: str = "all") -> None:
+    """Run temporal model stages via the staged runner.
+    
+    Args:
+        state: PipelineState with cache populated from Stage 1.
+        stage_spec: Which sub-stages to run. Examples:
+            'all'  -- all stages 3-7 (default)
+            '3'    -- all regime/causality/pattern sub-stages
+            '3.1'  -- just regime detection
+            '4.1'  -- just forecasting
+            '5.4'  -- just Monte Carlo
+            '6.11' -- just recursive predictions
+            '7.4'  -- just multi-frequency pipeline
+            '3-6'  -- stages 3 through 6
     """
-    cache = state.cache
-    _linked_prefixes = (
-        "competitors_", "suppliers_", "customers_",
-        "financial_institutions_", "sector_peers_", "industry_peers_",
-        "rel_", "valuation_premium_",
-    )
-    # Columns derived from full-cache HMM that would cause look-ahead
-    # bias if fed as features to the forward pass temporal models.
-    _hmm_lookahead_cols = {
-        "survival_intensity",       # blends rule-based (clean) + HMM (look-ahead)
-        "regime_confidence",        # from HMM posteriors fitted on full cache
-        "regime_transition_prob",   # from enriched timeline using HMM labels
-    }
-    state._extra_vars = [
-        c for c in cache.columns
-        if (c.startswith("fh_") or c.startswith("sentiment_")
-            or c.startswith("peer_") or c.startswith("macro_")
-            or c.startswith("inst_")
-            or c.startswith("buying_power_") or c.startswith("catalyst_")
-            or c.startswith("conflict_") or c.startswith("demand_")
-            or c.startswith("merton_") or c.startswith("rv_")
-            or c.startswith("policy_risk_") or c.startswith("sector_leader_")
-            or c.startswith("segment_") or c.startswith("product_")
-            or c.startswith("pricing_") or c.startswith("margin_")
-            or c.startswith("som_") or c.startswith("customer_")
-            or c in ("stability_score_21d",
-                     "buying_power_index", "sector_demand_momentum",
-                     "catalyst_score", "online_change_score",
-                     "iv30", "iv_rv_spread",
-                     "days_to_next_event", "event_uncertainty_premium",
-                     "fomc_proximity", "earnings_proximity",
-                     "event_density_30d",
-                     "sector_relative_strength", "sector_rank_12m",
-                     "sector_dispersion", "yield_curve_10y2y",
-                     "usd_momentum_21d", "cross_asset_stress",
-                     "geo_hhi", "china_revenue_pct",
-                     "supply_chain_geo_hhi", "trade_policy_uncertainty",
-                     "tariff_exposure_score",
-                     "put_call_ratio", "risk_reversal_25d",
-                     "iv_skew", "vix_term_structure",
-                     "skew_index", "variance_risk_premium",
-                     "cannibalization_rate", "net_new_revenue_pct",
-                     "network_effect_score", "input_cost_pressure",
-                     "growth_runway_quarters", "maturity_concentration",
-                     "estimated_market_share", "dominant_segment_growth",
-                     # Raw macro indicators (Gap C)
-                     "gdp_growth", "inflation_rate_yoy", "real_interest_rate",
-                     "unemployment_rate", "official_exchange_rate_lcu_per_usd")
-            or any(c.startswith(p) for p in _linked_prefixes)
-            # Estimation confidence columns (Gap B)
-            or c.endswith("_confidence")
-            or c.startswith("interp_confidence_"))
-        and cache[c].dtype in ("float64", "float32", "int64")
-        and not c.startswith("is_missing_")
-        and c not in _hmm_lookahead_cols
-    ]
-
-
-def run_stage2a1(state: BacktestState) -> None:
-    """Stage 2a1: Regime detection + causality + cycle/pattern + synergies."""
-    logger.info("=" * 60)
-    logger.info("STAGE 2a1: Regime + Causality + Patterns")
-    logger.info("=" * 60)
-
-    cache = state.cache
-    if cache is None or cache.empty:
-        raise ValueError("No cache data -- run Stage 1 first")
-
-    _init_extra_vars(state)
-
-    # Regime detection
-    if state.regime_detector is None or "regime_label" not in cache.columns:
-        try:
-            from operator1.models.regime_detector import detect_regimes_and_breaks
-            cache, state.regime_detector = detect_regimes_and_breaks(cache)
-        except Exception as exc:
-            logger.warning("Regime detection failed: %s", exc)
-
-    # Dual regimes
-    try:
-        from operator1.models.regime_mixer import compute_dual_regimes
-        state.dual_regime_result = compute_dual_regimes(cache)
-    except Exception:
-        pass
-
-    # Granger causality (informational -- pruning replaced by feature selection below)
-    try:
-        from operator1.models.granger_causality import compute_granger_causality
-        gc_vars = [c for c in cache.columns if cache[c].dtype in ("float64", "float32") and cache[c].notna().sum() > 50][:25]
-        if len(gc_vars) >= 3:
-            state.granger_result = compute_granger_causality(cache, variables=gc_vars)
-            if state.granger_result and state.granger_result.fitted:
-                logger.info("Granger: %d significant pairs (informational)", len(state.granger_result.significant_pairs))
-    except Exception:
-        pass
-
-    # Transfer entropy
-    try:
-        from operator1.models.causality import compute_transfer_entropy
-        te_vars = [c for c in cache.columns if cache[c].dtype in ("float64", "float32") and cache[c].notna().sum() > 30][:20]
-        if len(te_vars) >= 2:
-            state.transfer_entropy_result = compute_transfer_entropy(cache, variables=te_vars)
-    except Exception:
-        pass
-
-    # Cycle decomposition
-    try:
-        from operator1.models.cycle_decomposition import run_cycle_decomposition
-        cv = "equity_value" if state._is_private else "close"
-        if cv not in cache.columns:
-            cv = "revenue" if "revenue" in cache.columns else "total_equity"
-        state.cycle_result = run_cycle_decomposition(cache, variable=cv)
-    except Exception:
-        pass
-
-    # Pattern detection
-    try:
-        from operator1.models.pattern_detector import detect_patterns
-        state.pattern_result = detect_patterns(cache)
-    except Exception:
-        pass
-
-    # Pre-forecasting synergies
-    try:
-        from operator1.models.model_synergies import apply_pre_forecasting_synergies
-        from operator1.analysis.economic_planes import classify_economic_plane
-        ep = classify_economic_plane(sector=state.target_profile.get("sector"), industry=state.target_profile.get("industry"))
-        cache, state._extra_vars, state._synergy_meta = apply_pre_forecasting_synergies(
-            cache, cycle_result=state.cycle_result, granger_result=state.granger_result,
-            transfer_entropy_result=state.transfer_entropy_result,
-            linked_caches=state.linked_caches or None, extra_variables=state._extra_vars,
-            economic_plane=ep,
-        )
-    except Exception:
-        pass
-
-    # Feature selection (Boruta + PIMP + mRMR) -- replaces old Granger pruning
-    try:
-        from operator1.models.feature_selector import run_feature_selection
-        _fs_target = "equity_change_rate" if state._is_private else "return_1d"
-        _fs_regime = cache.get("regime_label") if "regime_label" in cache.columns else None
-        state._extra_vars, state.feature_selection_result = run_feature_selection(
-            cache, state._extra_vars, regime_labels=_fs_regime,
-            target_col=_fs_target, granger_result=state.granger_result,
-        )
-        logger.info("Feature selection: %d features retained", len(state._extra_vars))
-    except Exception as exc:
-        logger.warning("Feature selection failed: %s", exc)
-
-    state.cache = cache
-    state.save_sub("2a1")
-    logger.info("STAGE 2a1 COMPLETE")
-
-
-def run_stage2a2(state: BacktestState) -> None:
-    """Stage 2a2: Forecasting (heavyweight, may take >5min)."""
-    logger.info("=" * 60)
-    logger.info("STAGE 2a2: Forecasting")
-    logger.info("=" * 60)
-
-    cache = state.cache
-    if cache is None or cache.empty:
-        raise ValueError("No cache data -- run Stage 2a1 first")
-
-    if not state._extra_vars:
-        _init_extra_vars(state)
-
-    try:
-        from operator1.models.forecasting import run_forecasting
-        cache, state.forecast_result = run_forecasting(
-            cache, extra_variables=state._extra_vars,
-            windows=state._adaptive_tier3.windows if state._adaptive_tier3 is not None and state._adaptive_tier3.adapted else None,
-        )
-        logger.info("Forecasting complete")
-    except Exception as exc:
-        logger.warning("Forecasting failed: %s", exc)
-
-    state.cache = cache
-    state.save_sub("2a2")
-    logger.info("STAGE 2a2 COMPLETE")
-
-
-def run_stage2a(state: BacktestState) -> None:
-    """Stage 2a: Regime + causality + forecasting (runs 2a1 + 2a2)."""
-    run_stage2a1(state)
-    run_stage2a2(state)
-
-
-def run_stage2b(state: BacktestState) -> None:
-    """Stage 2b: Forward pass + burnout + walk-forward + Monte Carlo."""
-    logger.info("=" * 60)
-    logger.info("STAGE 2b: Forward Pass + Burnout + Walk-Forward + MC")
-    logger.info("=" * 60)
-
-    cache = state.cache
-    if cache is None or cache.empty:
-        raise ValueError("No cache data -- run Stage 2a first")
-
-    if not state._extra_vars:
-        _init_extra_vars(state)
-
-    from operator1.models.forecasting import run_forward_pass, run_burnout
-    from operator1.models.monte_carlo import run_monte_carlo
-
-    regime_labels = cache.get("regime_label") if "regime_label" in cache.columns else None
-
-    # Forward pass
-    try:
-        state.forward_pass_result = run_forward_pass(
-            cache, hierarchy_weights=state.weights, regime_labels=regime_labels,
-            extra_variables=state._extra_vars,
-        )
-        logger.info("Forward pass: %d days", state.forward_pass_result.total_days)
-    except Exception as exc:
-        import traceback as _tb
-        logger.warning("Forward pass failed: %s\n%s", exc, _tb.format_exc())
-
-    # Burnout
-    try:
-        state.burnout_result = run_burnout(
-            cache, hierarchy_weights=state.weights, regime_labels=regime_labels,
-            extra_variables=state._extra_vars, forward_pass_result=state.forward_pass_result,
-        )
-    except Exception:
-        pass
-
-    # Walk-forward
-    try:
-        from operator1.models.walk_forward import run_walk_forward
-        from operator1.analysis.survival_timeline import compute_survival_timeline
-        tl = compute_survival_timeline(cache)
-        tl_df = tl.timeline if hasattr(tl, "timeline") else tl
-        modes = tl_df["survival_mode"] if isinstance(tl_df, pd.DataFrame) and "survival_mode" in tl_df.columns else None
-        switches = tl_df["switch_point"] if isinstance(tl_df, pd.DataFrame) and "switch_point" in tl_df.columns else None
-        state.walk_forward_result = run_walk_forward(cache, modes, switches)
-        if state.walk_forward_result and state.walk_forward_result.fitted:
-            logger.info("Walk-forward: best=%s, MAE=%.6f",
-                        state.walk_forward_result.overall_best_model,
-                        state.walk_forward_result.overall_mae if not pd.isna(state.walk_forward_result.overall_mae) else 0)
-    except Exception as exc:
-        logger.warning("Walk-forward failed: %s", exc)
-
-    # Monte Carlo
-    try:
-        mc_ret = "equity_change_rate" if state._is_private else "return_1d"
-        _mc_n = (
-            state._adaptive_model_params.mc_n_paths
-            if state._adaptive_model_params is not None and getattr(state._adaptive_model_params, "adapted", False)
-            else 10_000
-        )
-        _mc_tilt = (
-            state._adaptive_model_params.mc_is_tilt
-            if state._adaptive_model_params is not None and getattr(state._adaptive_model_params, "adapted", False)
-            else 1.5
-        )
-        _mc_thresholds = None
-        if state._adaptive_thresholds is not None and state._adaptive_thresholds.adapted:
-            try:
-                from operator1.analysis.adaptive_thresholds import threshold_set_to_mc_dict
-                _mc_thresholds = threshold_set_to_mc_dict(state._adaptive_thresholds)
-            except Exception:
-                pass
-        _burnout_dists = (
-            state.burnout_result.regime_distributions
-            if state.burnout_result is not None and getattr(state.burnout_result, "calibrated", False)
-            else None
-        )
-        state.mc_result = run_monte_carlo(
-            cache, returns_col=mc_ret,
-            n_paths=_mc_n,
-            importance_tilt=_mc_tilt,
-            survival_thresholds=_mc_thresholds,
-            burnout_distributions=_burnout_dists,
-        )
-        logger.info("Monte Carlo complete")
-    except Exception as exc:
-        logger.warning("Monte Carlo failed: %s", exc)
-
-    # Fix 11: segment_hhi MC injection
-    if state.mc_result is not None and "segment_hhi" in cache.columns:
-        _seg_hhi = float(cache["segment_hhi"].iloc[-1]) if cache["segment_hhi"].notna().any() else 0
-        state.mc_result.segment_hhi = _seg_hhi
-        state.mc_result.concentration_risk_flag = _seg_hhi > 0.5
-
-    # Fix 6: FixedShare/MCS pipeline (mode-conditioned weights)
-    state._mode_weights = None
-    try:
-        if state.forward_pass_result is not None and hasattr(state.forward_pass_result, "predictions_log"):
-            from operator1.models.walk_forward import (
-                aggregate_forward_pass_errors,
-                compute_mode_confidence_sets,
-            )
-            from operator1.models.prediction_aggregator import FixedShareForecaster
-
-            _fp_log = getattr(state.forward_pass_result, "predictions_log", [])
-            if _fp_log:
-                _mode_errors = aggregate_forward_pass_errors(_fp_log, cache)
-                if _mode_errors:
-                    _mode_confidence_sets = compute_mode_confidence_sets(_mode_errors)
-                    _all_model_names = set()
-                    for mode_models in _mode_errors.values():
-                        _all_model_names.update(mode_models.keys())
-                    if _all_model_names:
-                        _fixed_share = FixedShareForecaster(sorted(_all_model_names))
-                        for mode_models in _mode_errors.values():
-                            _min_len = min(len(v) for v in mode_models.values()) if mode_models else 0
-                            for step in range(min(_min_len, 50)):
-                                step_losses = {
-                                    name: errs[step]
-                                    for name, errs in mode_models.items()
-                                    if step < len(errs)
-                                }
-                                _fixed_share.update(step_losses)
-                        state._mode_weights = {"global": _fixed_share.get_weights()}
-    except Exception:
-        pass
-
-    # Merge burn-out regime weights into mode_weights
-    if (
-        state.burnout_result is not None
-        and getattr(state.burnout_result, "calibrated", False)
-        and state.burnout_result.regime_weights
-    ):
-        if state._mode_weights is None:
-            state._mode_weights = {}
-        for regime, model_weights in state.burnout_result.regime_weights.items():
-            state._mode_weights[regime] = model_weights
-
-    # Regime shift prediction
-    try:
-        from operator1.models.regime_shift_predictor import predict_regime_shifts
-        _mc_trans = state.mc_result.transition_matrix if state.mc_result is not None else None
-        _mc_order = getattr(state.mc_result, "regime_order", None) if state.mc_result else None
-        _stab = None
-        if "stability_score_21d" in cache.columns:
-            _ss = cache["stability_score_21d"].dropna()
-            if len(_ss) > 0:
-                _stab = float(_ss.iloc[-1])
-        _thl = (
-            state._adaptive_model_params.transition_halflife
-            if state._adaptive_model_params is not None and getattr(state._adaptive_model_params, "adapted", False)
-            else None
-        )
-        from datetime import datetime as _dt
-        _ref = _dt.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None
-        regime_shift_result = predict_regime_shifts(
-            cache, transition_matrix=_mc_trans, regime_order=_mc_order,
-            stability_score=_stab, transition_halflife=_thl, reference_date=_ref,
-        )
-        if regime_shift_result and regime_shift_result.available:
-            logger.info("Regime shift: P(exit 21d)=%.1f%%", regime_shift_result.prob_exit_21d * 100)
-    except Exception as exc:
-        logger.debug("Regime shift prediction skipped: %s", exc)
-
-    # Copula
-    try:
-        from operator1.models.copula import run_copula_analysis
-        state.copula_result = run_copula_analysis(cache)
-    except Exception:
-        pass
-
-    state.cache = cache
-    state.save_sub("2b")
-    logger.info("STAGE 2b COMPLETE")
-
-
-def run_stage2c(state: BacktestState) -> None:
-    """Stage 2c: Transformer + Particle + Conformal + DTW + Aggregation + SHAP + Sobol + GA + OHLC."""
-    logger.info("=" * 60)
-    logger.info("STAGE 2c: Ensemble Models + Aggregation")
-    logger.info("=" * 60)
-
-    cache = state.cache
-    if cache is None or cache.empty:
-        raise ValueError("No cache data -- run Stage 2b first")
-
-    from operator1.models.prediction_aggregator import run_prediction_aggregation
-
-    # Transformer
-    try:
-        from operator1.models.transformer_forecaster import train_transformer
-        tf_vars = [c for c in cache.columns if cache[c].dtype in ("float64", "float32") and cache[c].notna().sum() > 100][:15]
-        if len(tf_vars) >= 2:
-            state.transformer_result = train_transformer(cache, variables=tf_vars)
-    except Exception:
-        pass
-
-    # Particle filter
-    try:
-        from operator1.models.particle_filter import run_particle_filter
-        pf_vars = [v for v in ["cash_ratio", "free_cash_flow_ttm", "current_ratio", "debt_to_equity"] if v in cache.columns]
-        if pf_vars:
-            state.particle_filter_result = run_particle_filter(cache, variables=pf_vars)
-    except Exception:
-        pass
-
-    # Conformal prediction (Fix 7: reuse forward pass calibrator when available)
-    try:
-        from operator1.models.conformal import ConformalPIDCalibrator, ConformalCalibrator, build_conformal_result
-        if state.forecast_result is not None:
-            calibrator = None
-            if (state.forward_pass_result is not None
-                    and hasattr(state.forward_pass_result, "conformal_calibrator")
-                    and state.forward_pass_result.conformal_calibrator is not None):
-                calibrator = state.forward_pass_result.conformal_calibrator
-            else:
-                try:
-                    calibrator = ConformalPIDCalibrator(target_coverage=0.9)
-                except Exception:
-                    calibrator = ConformalCalibrator(coverage=0.9, adaptive=True)
-                if hasattr(state.forecast_result, "residuals") and state.forecast_result.residuals:
-                    for r in state.forecast_result.residuals:
-                        calibrator.update(r)
-            nested = {}
-            if hasattr(state.forecast_result, "forecasts"):
-                for var, vf in state.forecast_result.forecasts.items():
-                    if isinstance(vf, dict):
-                        nested[var] = {h: float(v) for h, v in vf.items() if isinstance(v, (int, float))}
-            state.conformal_result = build_conformal_result(
-                calibrator, forecasts=nested, horizons={"1d": 1, "5d": 5, "21d": 21, "252d": 252},
-            )
-
-            # Fix 8: G1 Quantile Regression for asymmetric intervals
-            try:
-                from operator1.models.conformal import QuantileRegressionCalibrator
-                _qr_cal = QuantileRegressionCalibrator(lower_quantile=0.05, upper_quantile=0.95)
-                _residuals_list = list(state.forecast_result.residuals) if hasattr(state.forecast_result, "residuals") and state.forecast_result.residuals else []
-                if len(_residuals_list) >= _qr_cal._min_samples:
-                    if _qr_cal.fit(_residuals_list):
-                        if state.conformal_result is not None and hasattr(state.conformal_result, "intervals"):
-                            for var, horizons_dict in state.conformal_result.intervals.items():
-                                if isinstance(horizons_dict, dict):
-                                    for h, interval in horizons_dict.items():
-                                        pf = getattr(interval, "point_forecast", None) or getattr(interval, "forecast", None)
-                                        if pf is not None:
-                                            _lo, _hi = _qr_cal.predict_interval(float(pf))
-                                            if _lo is not None and _hi is not None:
-                                                if hasattr(interval, "lower"): interval.lower = _lo
-                                                if hasattr(interval, "upper"): interval.upper = _hi
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # DTW analogs
-    try:
-        from operator1.models.dtw_analogs import find_historical_analogs
-        dtw_vars = None
-        if state._is_private:
-            dtw_vars = [c for c in ["equity_value", "revenue", "net_income"] if c in cache.columns and cache[c].notna().sum() > 30]
-        state.dtw_result = find_historical_analogs(
-            cache, variables=dtw_vars, linked_caches=state.linked_caches or None,
-        )
-    except Exception:
-        pass
-
-    # Prediction aggregation (Fix 3: pass mode_weights, signal_ic, prediction_log)
-    if state.forecast_result is not None:
-        try:
-            state.pred_result = run_prediction_aggregation(
-                cache, state.forecast_result, state.mc_result,
-                mode_weights=getattr(state, "_mode_weights", None),
-                signal_ic_result=state.signal_ic_result,
-                prediction_log_summary=state.prediction_log_summary,
-                conformal_result=state.conformal_result,
-                dual_regime_result=state.dual_regime_result,
-                copula_result=state.copula_result,
-                dtw_result=state.dtw_result,
-                granger_result=state.granger_result,
-                shap_result=state.shap_result,
-                walk_forward_result=state.walk_forward_result,
-                feature_selection_result=getattr(state, "feature_selection_result", None),
-                event_calendar_result=state.event_calendar_result,
-            )
-            logger.info("Predictions aggregated")
-        except Exception as exc:
-            logger.warning("Prediction aggregation failed: %s", exc)
-
-    # Fix 9: USS aggregated prediction bounding
-    if (state.survival_controller is not None
-            and state.survival_controller.is_survival
-            and state.pred_result is not None
-            and hasattr(state.pred_result, "predictions")):
-        try:
-            from operator1.analysis.survival_regime_controller import bound_survival_forecast
-            for var, horizons_dict in state.pred_result.predictions.items():
-                if isinstance(horizons_dict, dict):
-                    for h, hp in horizons_dict.items():
-                        pf = getattr(hp, "point_forecast", None)
-                        if pf is not None:
-                            bounded = bound_survival_forecast(
-                                var, float(pf), cache,
-                                state.survival_controller.current_regime,
-                            )
-                            if bounded != float(pf):
-                                hp.point_forecast = bounded
-        except Exception:
-            pass
-
-    # SHAP
-    try:
-        from operator1.models.explainability import compute_shap_explanations
-        if state.pred_result is not None:
-            preds = {}
-            if hasattr(state.pred_result, "predictions"):
-                for var, hd in state.pred_result.predictions.items():
-                    if isinstance(hd, dict):
-                        hp = hd.get("1d")
-                        if hp is not None:
-                            pf = getattr(hp, "point_forecast", None)
-                            if pf is not None:
-                                preds[var] = pf
-            state.shap_result = compute_shap_explanations(cache, predictions=preds)
-    except Exception:
-        pass
-
-    # Sobol
-    try:
-        from operator1.models.sensitivity import run_sensitivity_analysis
-        sv = "equity_change_rate" if state._is_private else "return_1d"
-        state.sobol_result = run_sensitivity_analysis(cache, target_variable=sv)
-    except Exception:
-        pass
-
-    # GA
-    try:
-        from operator1.models.genetic_optimizer import run_genetic_optimization
-        state.ga_result = run_genetic_optimization(cache, forecast_result=state.forecast_result)
-    except Exception:
-        pass
-
-    # Sobol -> Hierarchy feedback loop
-    try:
-        from operator1.models.sensitivity import adjust_hierarchy_from_sobol
-        _adj = adjust_hierarchy_from_sobol(state.sobol_result, state.weights)
-        if _adj != state.weights:
-            state.weights = _adj
-    except Exception:
-        pass
-
-    # Time-varying Granger causality
-    try:
-        from operator1.models.granger_causality import compute_time_varying_granger
-        _gc_vars = [c for c in cache.columns if cache[c].dtype in ("float64", "float32") and cache[c].notna().sum() > 50][:15]
-        if _gc_vars:
-            state._tv_granger_result = compute_time_varying_granger(cache, variables=_gc_vars)
-    except Exception:
-        pass
-
-    # Multivariate Monte Carlo
-    try:
-        from operator1.models.monte_carlo import run_multivariate_monte_carlo
-        state._mv_mc_result = run_multivariate_monte_carlo(cache)
-    except Exception:
-        pass
-
-    # OHLC predictor
-    try:
-        from operator1.models.ohlc_predictor import predict_ohlc_series
-        from operator1.models.model_synergies import compute_pattern_drift_adjustment
-        state._pattern_drift = compute_pattern_drift_adjustment(state.pattern_result)
-        state.ohlc_result = predict_ohlc_series(
-            cache, forecast_result=state.forecast_result, mc_result=state.mc_result,
-            pattern_drift_multiplier=state._pattern_drift, cycle_result=state.cycle_result,
-        )
-        # Predicted OHLC patterns
-        if state.ohlc_result and state.ohlc_result.fitted and state.pattern_result is not None:
-            try:
-                from operator1.models.pattern_detector import detect_patterns_on_predicted_ohlc
-                _last_candle = None
-                if "close" in cache.columns and "open" in cache.columns:
-                    _last_candle = {
-                        "open": float(cache["open"].iloc[-1]) if cache["open"].notna().any() else None,
-                        "high": float(cache["high"].iloc[-1]) if "high" in cache.columns and cache["high"].notna().any() else None,
-                        "low": float(cache["low"].iloc[-1]) if "low" in cache.columns and cache["low"].notna().any() else None,
-                        "close": float(cache["close"].iloc[-1]) if cache["close"].notna().any() else None,
-                    }
-                _pred_patterns = detect_patterns_on_predicted_ohlc(state.ohlc_result, _last_candle)
-                if _pred_patterns:
-                    state.pattern_result.predicted_patterns_week = _pred_patterns
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # E2: Anticipated survival (path-wise MC trigger checking)
-    if state.mc_result is not None:
-        try:
-            from operator1.models.monte_carlo import compute_anticipated_survival
-            for _h_label, _h_days in [("63d", 63), ("252d", 252)]:
-                _as_prob = compute_anticipated_survival(cache, state.mc_result, horizon_days=_h_days)
-                state.mc_result.anticipated_survival[_h_label] = _as_prob
-        except Exception:
-            pass
-
-    state.cache = cache
-    state.save_sub("2c")
-    logger.info("STAGE 2c COMPLETE")
-
-
-def run_stage2d(state: BacktestState) -> None:
-    """Stage 2d: USS + Multi-frequency + Retroactive calibration + Diagnostics."""
-    logger.info("=" * 60)
-    logger.info("STAGE 2d: USS + Multi-Frequency + Calibration")
-    logger.info("=" * 60)
-
-    cache = state.cache
-    if cache is None or cache.empty:
-        raise ValueError("No cache data -- run Stage 2c first")
-
-    # USS: Unified Survival System integration
-    try:
-        from operator1.analysis.survival_regime_controller import (
-            SurvivalRegimeController, bound_forecast_dict,
-        )
-        state.survival_controller = SurvivalRegimeController.from_cache(cache)
-        if state.survival_controller.is_survival:
-            if state.forecast_result is not None and hasattr(state.forecast_result, "forecasts"):
-                state.forecast_result.forecasts = bound_forecast_dict(
-                    state.forecast_result.forecasts, cache,
-                    state.survival_controller.current_regime,
-                )
-                logger.info("USS forecast bounding applied")
-            from operator1.analysis.scenario_engine import run_scenario_engine
-            state.scenario_result = run_scenario_engine(
-                cache, regime=state.survival_controller.current_regime,
-                n_paths=state.survival_controller.model_config.mc_n_paths,
-            )
-            if state.scenario_result and state.scenario_result.available:
-                logger.info(
-                    "USS scenario engine: orderly=%.1f%% / muddle=%.1f%% / catastrophic=%.1f%%",
-                    state.scenario_result.orderly.survival_prob_252d * 100,
-                    state.scenario_result.muddle_through.survival_prob_252d * 100,
-                    state.scenario_result.catastrophic.survival_prob_252d * 100,
-                )
-    except Exception as exc:
-        logger.debug("USS integration skipped: %s", exc)
-
-    # Multi-frequency forecasting (per-frequency sub-stages)
-    try:
-        _run_bt_mf_all(state)
-    except Exception as exc:
-        logger.warning("Multi-frequency failed: %s", exc)
-
-    # Retroactive calibration
-    try:
-        from operator1.analysis.retroactive_calibration import run_retroactive_calibration
-        _entity_groups_for_retro = {}
-        if state.relationships:
-            for grp, ents in state.relationships.items():
-                if isinstance(ents, list):
-                    ids = []
-                    for e in ents:
-                        eid = ""
-                        if isinstance(e, dict):
-                            eid = e.get("isin", "") or e.get("ticker", "")
-                        elif hasattr(e, "isin"):
-                            eid = e.isin or getattr(e, "ticker", "")
-                        if eid:
-                            ids.append(eid)
-                    _entity_groups_for_retro[grp] = ids
-        state._retro_params = run_retroactive_calibration(
-            cache=cache,
-            linked_caches=state.linked_caches if state.linked_caches else None,
-            entity_groups=_entity_groups_for_retro if _entity_groups_for_retro else None,
-            walk_forward_result=state.walk_forward_result,
-            forecast_result=state.forecast_result,
-            sobol_result=state.sobol_result,
-            target_profile=state.target_profile,
-        )
-        if state._retro_params.n_calibrated > 0:
-            logger.info("Retroactive calibration: %d groups calibrated", state._retro_params.n_calibrated)
-    except Exception as exc:
-        logger.warning("Retroactive calibration failed: %s", exc)
-
-    # Model diagnostics
-    try:
-        from operator1.monitoring.model_diagnostics import compute_model_diagnostics
-        _diag = compute_model_diagnostics(
-            cache, forecast_result=state.forecast_result, mc_result=state.mc_result,
-            copula_result=state.copula_result, granger_result=state.granger_result,
-            cycle_result=state.cycle_result, dtw_result=state.dtw_result,
-            conformal_result=state.conformal_result,
-        )
-        if _diag and _diag.available:
-            logger.info("Model diagnostics: %d/%d on track", _diag.n_models_on_track, _diag.n_models_assessed)
-    except Exception as exc:
-        logger.debug("Model diagnostics failed: %s", exc)
-
-    state.cache = cache
-    state.save_sub("2d")
-    logger.info("STAGE 2d COMPLETE")
-
-
-# Keep backward compat: run_stage2 runs all sub-stages
-def run_stage2(state: BacktestState) -> None:
-    """Run all Stage 2 sub-stages sequentially (backward compat)."""
-    run_stage2a(state)
-    run_stage2b(state)
-    run_stage2c(state)
-    run_stage2d(state)
-
-
-# ---------------------------------------------------------------------------
-# Multi-frequency per-frequency sub-stages (used by run_stage2d and dispatch)
-# ---------------------------------------------------------------------------
-
-def _bt_mf_prep(state: BacktestState) -> None:
-    """Build all ResampledCache objects and save to disk."""
-    from operator1.features.frequency_resampler import (
-        build_cache_from_raw_filings, detect_all_filing_frequencies,
-        detect_native_filing_frequency, get_frequencies_slow_to_fast,
-        is_annual_only_market, resample_cache_to_frequency,
-    )
-    cache = state.cache
-    _bt_end = datetime.strptime(state.end_date, "%Y-%m-%d").date()
-    _has_raw = any(not df.empty for df in [state._income_df, state._balance_df, state._cashflow_df])
-    _is_ann = is_annual_only_market(state.market_id)
-    freqs = get_frequencies_slow_to_fast()
-    # Detect semi-annual
-    if _has_raw and "Q" in freqs:
-        _all_f = detect_all_filing_frequencies(state._income_df, state._balance_df, state._cashflow_df)
-        _nat = detect_native_filing_frequency(state._income_df, state._balance_df, state._cashflow_df)
-        if "Q" in _all_f and "S" in _all_f:
-            if "S" not in freqs:
-                freqs.insert(freqs.index("Q"), "S")
-        elif _nat == "S" and "Q" not in _all_f:
-            freqs = [("S" if f == "Q" else f) for f in freqs]
-    # Save freq list
-    import json as _json
-    _mf_dir = Path(state.run_dir) / "mf"
-    _mf_dir.mkdir(parents=True, exist_ok=True)
-    (_mf_dir / "frequencies.json").write_text(_json.dumps(freqs))
-    # Build each cache
-    for freq in freqs:
-        inc = state._income_df if not state._income_df.empty else None
-        bal = state._balance_df if not state._balance_df.empty else None
-        cf = state._cashflow_df if not state._cashflow_df.empty else None
-        qt = state._quotes_df if not state._quotes_df.empty else None
-        if freq in ("Q", "A", "W", "M", "S") and _has_raw:
-            resampled = build_cache_from_raw_filings(
-                income_df=inc, balance_df=bal, cashflow_df=cf, quotes_df=qt,
-                frequency=freq, reference_date=_bt_end,
-            )
-        else:
-            resampled = resample_cache_to_frequency(cache, frequency=freq, reference_date=_bt_end)
-        if resampled.n_periods < 3:
-            logger.info("[%s] Skipping -- %d periods (need 3+)", freq, resampled.n_periods)
-            continue
-        resampled.cache.to_parquet(_mf_dir / f"{freq}_cache.parquet")
-        meta = {"frequency": resampled.frequency, "label": resampled.label,
-                "n_periods": resampled.n_periods, "lookback_years": resampled.lookback_years,
-                "is_partial_last_period": resampled.is_partial_last_period,
-                "original_daily_rows": resampled.original_daily_rows,
-                "resampled_rows": resampled.resampled_rows}
-        (_mf_dir / f"{freq}_meta.json").write_text(_json.dumps(meta, indent=2))
-        logger.info("[%s] Resampled: %d periods", freq, resampled.n_periods)
-
-
-def _bt_mf_run_freq(state: BacktestState, freq: str) -> None:
-    """Run the FULL temporal pipeline (2a1->2a2->2b->2c) for a single frequency.
-
-    Each frequency gets its own BacktestState with the resampled cache.
-    The existing stage functions operate on whatever state.cache contains,
-    so no changes needed to them.  Results are saved to {run_dir}/mf/{freq}/.
-    """
-    import json as _json
-    _mf_dir = Path(state.run_dir) / "mf"
-    cp = _mf_dir / f"{freq}_cache.parquet"
-    if not cp.exists():
-        logger.info("[%s] No cache -- skipping", freq)
-        return
-
-    logger.info("=" * 60)
-    logger.info("FULL TEMPORAL PIPELINE: frequency=%s", freq)
-    logger.info("=" * 60)
-
-    # Create a per-frequency state by copying the shared Stage 1 state
-    freq_state = BacktestState()
-    freq_state.market_id = state.market_id
-    freq_state.company = state.company
-    freq_state.end_date = state.end_date
-    freq_state.years = state.years
-    freq_state.run_dir = str(_mf_dir / freq)  # per-freq output dir
-    freq_state._secrets = state._secrets
-    freq_state._llm_client = state._llm_client
-    freq_state._pit_client = state._pit_client
-
-    # Copy Stage 1 results that don't depend on frequency
-    freq_state.target_profile = state.target_profile
-    freq_state.relationships = state.relationships
-    freq_state.linked_caches = state.linked_caches
-    freq_state.macro_data = state.macro_data
-    freq_state.macro_dataset = state.macro_dataset
-    freq_state.weights = state.weights.copy() if state.weights else {}
-    freq_state.fh_result = state.fh_result
-    freq_state.conflict_result = state.conflict_result
-    freq_state.buying_power_result = state.buying_power_result
-    freq_state.filing_calendar_result = state.filing_calendar_result
-    freq_state.estimation_coverage = state.estimation_coverage
-    freq_state.fuzzy_result = state.fuzzy_result
-    freq_state.macro_quadrant_result = state.macro_quadrant_result
-    freq_state.target_holders = state.target_holders
-    freq_state.target_insiders = state.target_insiders
-    freq_state.signal_ic_result = state.signal_ic_result
-    freq_state._adaptive_thresholds = state._adaptive_thresholds
-    freq_state._adaptive_model_params = state._adaptive_model_params
-    freq_state._adaptive_tier3 = state._adaptive_tier3
-    freq_state._is_private = state._is_private
-    freq_state._ohlcv_source_label = state._ohlcv_source_label
-    freq_state._seg_result = state._seg_result
-    freq_state.options_signal_result = state.options_signal_result
-    freq_state.cross_asset_result = state.cross_asset_result
-    freq_state.event_calendar_result = state.event_calendar_result
-    freq_state._income_df = state._income_df
-    freq_state._balance_df = state._balance_df
-    freq_state._cashflow_df = state._cashflow_df
-    freq_state._quotes_df = state._quotes_df
-
-    # Load the resampled cache for this frequency
-    freq_state.cache = pd.read_parquet(cp)
-    logger.info("[%s] Loaded resampled cache: %d rows x %d cols",
-                freq, len(freq_state.cache), len(freq_state.cache.columns))
-
-    # Run the full temporal pipeline (2a1 -> 2a2 -> 2b -> 2c)
-    t0 = time.time()
-    try:
-        run_stage2a1(freq_state)
-    except Exception as exc:
-        logger.warning("[%s] Stage 2a1 failed: %s", freq, exc)
-
-    try:
-        run_stage2a2(freq_state)
-    except Exception as exc:
-        logger.warning("[%s] Stage 2a2 failed: %s", freq, exc)
-
-    try:
-        run_stage2b(freq_state)
-    except Exception as exc:
-        logger.warning("[%s] Stage 2b failed: %s", freq, exc)
-
-    try:
-        run_stage2c(freq_state)
-    except Exception as exc:
-        logger.warning("[%s] Stage 2c failed: %s", freq, exc)
-
-    elapsed = time.time() - t0
-
-    # Save full per-frequency state
-    freq_state.save_sub("2c")
-
-    logger.info("[%s] Full temporal pipeline complete: %.1fs", freq, elapsed)
-
-
-def _bt_mf_fuse(state: BacktestState) -> None:
-    """Fuse all per-frequency full states, then run USS + diagnostics + HF.
-
-    1. Load each frequency's BacktestState from mf/{freq}/
-    2. Extract FrequencyResult summaries for the fusion engine
-    3. Fuse into FusedMultiFreqResult
-    4. Run USS (forecast bounding + scenario engine)
-    5. Run retroactive calibration + model diagnostics
-    6. Run HF analysis on fused result
-    7. Save everything back to the main state
-    """
-    import json as _json
-    from operator1.models.frequency_fusion import fuse_multi_frequency_results
-    from operator1.steps.multi_frequency_runner import (
-        MultiFrequencyResult, FrequencyResult, FrequencyContext,
-    )
-
-    _mf_dir = Path(state.run_dir) / "mf"
-    fp = _mf_dir / "frequencies.json"
-    freqs = _json.loads(fp.read_text()) if fp.exists() else []
-
-    # Load each frequency's state and build FrequencyResult summaries
-    freq_states: dict[str, BacktestState] = {}
-    freq_results: dict[str, FrequencyResult] = {}
-
-    for freq in freqs:
-        freq_dir = _mf_dir / freq
-        state_pkl = freq_dir / "state_2c.pkl"
-        if not state_pkl.exists():
-            logger.info("[%s] No state_2c.pkl -- skipping", freq)
-            continue
-
-        # Load per-frequency state
-        fs = BacktestState()
-        fs.run_dir = str(freq_dir)
-        fs.market_id = state.market_id
-        fs.company = state.company
-        fs.end_date = state.end_date
-        fs.years = state.years
-        fs.load_sub("2c")
-        freq_states[freq] = fs
-
-        # Build FrequencyResult summary from the full state
-        _surv_prob = 1.0
-        _surv_regime = "normal"
-        _trend = "flat"
-        _regime = "unknown"
-        _forecast_summary = {}
-        _wf_mae = None
-
-        if fs.cache is not None:
-            if "survival_probability" in fs.cache.columns:
-                sp = fs.cache["survival_probability"].dropna()
-                if len(sp) > 0:
-                    _surv_prob = float(sp.iloc[-1])
-            if "survival_regime" in fs.cache.columns:
-                sr = fs.cache["survival_regime"].dropna()
-                if len(sr) > 0:
-                    _surv_regime = str(sr.iloc[-1])
-            if "regime_label" in fs.cache.columns:
-                rl = fs.cache["regime_label"].dropna()
-                if len(rl) > 0:
-                    _regime = str(rl.iloc[-1])
-            # Trend from close
-            if "close" in fs.cache.columns:
-                closes = fs.cache["close"].dropna()
-                if len(closes) >= 3:
-                    first = closes.iloc[:len(closes)//3].mean()
-                    last = closes.iloc[-len(closes)//3:].mean()
-                    _trend = "up" if last > first * 1.05 else ("down" if last < first * 0.95 else "flat")
-
-        if fs.forecast_result is not None and hasattr(fs.forecast_result, "forecasts"):
-            for var, horizons in fs.forecast_result.forecasts.items():
-                if isinstance(horizons, dict):
-                    for h, val in horizons.items():
-                        _forecast_summary[f"{var}_{h}"] = float(val) if val is not None else None
-
-        if fs.walk_forward_result is not None and hasattr(fs.walk_forward_result, "overall_mae"):
-            if not pd.isna(fs.walk_forward_result.overall_mae):
-                _wf_mae = fs.walk_forward_result.overall_mae
-
-        fr = FrequencyResult(
-            frequency=freq, label=freq,
-            n_periods=len(fs.cache) if fs.cache is not None else 0,
-            elapsed_seconds=0,
-            regime_label=_regime,
-            survival_probability=_surv_prob,
-            survival_regime=_surv_regime,
-            trend_direction=_trend,
-            forecast_summary=_forecast_summary,
-            walk_forward_mae=_wf_mae,
-            context_for_next=FrequencyContext(
-                frequency=freq, trend_direction=_trend,
-                survival_probability_latest=_surv_prob,
-                survival_regime=_surv_regime,
-            ),
-        )
-        freq_results[freq] = fr
-        logger.info("[%s] Loaded: %d periods, regime=%s, survival=%.3f, forecasts=%d",
-                    freq, fr.n_periods, _regime, _surv_prob, len(_forecast_summary))
-
-    if not freq_results:
-        logger.warning("No per-frequency results to fuse")
-        return
-
-    # Fuse all frequency results
-    mfr = MultiFrequencyResult(
-        results=freq_results,
-        execution_order=list(freq_results.keys()),
-        total_elapsed_seconds=0,
-    )
-    state.multi_frequency_result = fuse_multi_frequency_results(mfr)
-    logger.info("MF fusion: %d freqs, survival=%.1f%%",
-                state.multi_frequency_result.n_frequencies_used,
-                state.multi_frequency_result.survival.fused_probability * 100)
-
-    # Use the Daily frequency's state as the base for downstream (USS, HF, profile)
-    # since it has the most complete data (504 days, all models)
-    daily_state = freq_states.get("D")
-    if daily_state is not None:
-        # Copy Daily's temporal model results into the main state
-        for attr in ("cache", "forecast_result", "forward_pass_result",
-                     "walk_forward_result", "burnout_result", "mc_result",
-                     "pred_result", "conformal_result", "copula_result",
-                     "transformer_result", "particle_filter_result",
-                     "shap_result", "sobol_result", "ga_result",
-                     "ohlc_result", "dual_regime_result", "granger_result",
-                     "transfer_entropy_result", "cycle_result", "pattern_result",
-                     "regime_detector", "enriched_timeline_result",
-                     "_mode_weights", "_synergy_meta", "_pattern_drift",
-                     "_tv_granger_result", "_mv_mc_result", "_extra_vars"):
-            val = getattr(daily_state, attr, None)
-            if val is not None:
-                setattr(state, attr, val)
-        logger.info("Daily state merged into main state")
-
-    # USS: forecast bounding + scenario engine
-    cache = state.cache
-    if cache is not None:
-        try:
-            from operator1.analysis.survival_regime_controller import (
-                SurvivalRegimeController, bound_forecast_dict,
-            )
-            state.survival_controller = SurvivalRegimeController.from_cache(cache)
-            if state.survival_controller.is_survival:
-                if state.forecast_result is not None and hasattr(state.forecast_result, "forecasts"):
-                    state.forecast_result.forecasts = bound_forecast_dict(
-                        state.forecast_result.forecasts, cache,
-                        state.survival_controller.current_regime,
-                    )
-                from operator1.analysis.scenario_engine import run_scenario_engine
-                state.scenario_result = run_scenario_engine(
-                    cache, regime=state.survival_controller.current_regime,
-                    n_paths=state.survival_controller.model_config.mc_n_paths,
-                )
-        except Exception as exc:
-            logger.debug("USS skipped: %s", exc)
-
-    # Retroactive calibration
-    try:
-        from operator1.analysis.retroactive_calibration import run_retroactive_calibration
-        _eg = {}
-        if state.relationships:
-            for grp, ents in state.relationships.items():
-                if isinstance(ents, list):
-                    ids = [
-                        (e.get("isin", "") or e.get("ticker", "")) if isinstance(e, dict)
-                        else (getattr(e, "isin", "") or getattr(e, "ticker", ""))
-                        for e in ents
-                    ]
-                    _eg[grp] = [i for i in ids if i]
-        state._retro_params = run_retroactive_calibration(
-            cache=cache, linked_caches=state.linked_caches or None,
-            entity_groups=_eg or None, walk_forward_result=state.walk_forward_result,
-            forecast_result=state.forecast_result, sobol_result=state.sobol_result,
-            target_profile=state.target_profile,
-        )
-    except Exception as exc:
-        logger.debug("Retro-cal skipped: %s", exc)
-
-    # Model diagnostics
-    try:
-        from operator1.monitoring.model_diagnostics import compute_model_diagnostics
-        compute_model_diagnostics(
-            cache, forecast_result=state.forecast_result, mc_result=state.mc_result,
-            copula_result=state.copula_result, granger_result=state.granger_result,
-            cycle_result=state.cycle_result, dtw_result=state.dtw_result,
-            conformal_result=state.conformal_result,
-        )
-    except Exception as exc:
-        logger.debug("Diagnostics skipped: %s", exc)
-
-    # HF analysis (runs on fused result)
-    try:
-        from operator1.hedge_fund.engine import run_hedge_fund_analysis
-        from operator1.clients.llm_factory import create_llm_client
-        if state._llm_client is None:
-            state._llm_client = create_llm_client(state._secrets)
-        hf_result = run_hedge_fund_analysis(
-            income_df=state._income_df,
-            balance_df=state._balance_df,
-            cashflow_df=state._cashflow_df,
-            cache=cache,
-            target_profile=state.target_profile,
-            forecast_result=state.forecast_result,
-            mc_result=state.mc_result,
-            scenario_result=state.scenario_result,
-            multi_frequency_result=state.multi_frequency_result,
-            signal_ic_result=state.signal_ic_result,
-            filing_calendar_result=state.filing_calendar_result,
-            fh_result=state.fh_result,
-            peer_ranking_result=state.peer_ranking_result if isinstance(state.peer_ranking_result, dict) else None,
-            sentiment_result=state.sentiment_result,
-            survival_controller=state.survival_controller,
-            linked_caches=state.linked_caches,
-            macro_data=state.macro_data,
-        )
-        if hf_result and hf_result.available:
-            # Store HF result -- will be picked up by Stage 3
-            state.profile["hedge_fund"] = hf_result.to_profile_dict()
-            logger.info("HF Analysis: grade=%s, signal=%+.2f",
-                        hf_result.scorecard.investment_grade, hf_result.position.signal)
-    except Exception as exc:
-        logger.warning("HF analysis failed: %s", exc)
-
-    logger.info("Fusion + USS + HF complete")
-
-
-def _run_bt_mf_all(state: BacktestState) -> None:
-    """Run full per-frequency pipeline: prep -> all freqs -> fuse + USS + HF."""
-    import json as _json
-    _bt_mf_prep(state)
-    _mf_dir = Path(state.run_dir) / "mf"
-    fp = _mf_dir / "frequencies.json"
-    freqs = _json.loads(fp.read_text()) if fp.exists() else []
-    for freq in freqs:
-        if (_mf_dir / f"{freq}_cache.parquet").exists():
-            _bt_mf_run_freq(state, freq)
-    _bt_mf_fuse(state)
-
-
-# Per-frequency dispatch wrappers for CLI --stage
-def _run_bt_mf_prep(state: BacktestState) -> None:
-    _bt_mf_prep(state)
-    state.save_sub("2d.mf.prep")
-
-def _run_bt_mf_A(state: BacktestState) -> None:
-    _bt_mf_run_freq(state, "A")
-    state.save_sub("2d.mf.A")
-
-def _run_bt_mf_Q(state: BacktestState) -> None:
-    # Run Q and/or S depending on what prep detected
-    import json as _json
-    _mf_dir = Path(state.run_dir) / "mf"
-    fp = _mf_dir / "frequencies.json"
-    freqs = _json.loads(fp.read_text()) if fp.exists() else []
-    for f in freqs:
-        if f in ("Q", "S") and (_mf_dir / f"{f}_cache.parquet").exists():
-            _bt_mf_run_freq(state, f)
-    state.save_sub("2d.mf.Q")
-
-def _run_bt_mf_M(state: BacktestState) -> None:
-    _bt_mf_run_freq(state, "M")
-    state.save_sub("2d.mf.M")
-
-def _run_bt_mf_W(state: BacktestState) -> None:
-    _bt_mf_run_freq(state, "W")
-    state.save_sub("2d.mf.W")
-
-def _run_bt_mf_D(state: BacktestState) -> None:
-    _bt_mf_run_freq(state, "D")
-    state.save_sub("2d.mf.D")
-
-def _run_bt_mf_fuse(state: BacktestState) -> None:
-    _bt_mf_fuse(state)
-    state.save_sub("2d.mf.fuse")
-    # Also save as "2d" so Stage 3 can load via its dep ("3" -> "2d")
-    state.save_sub("2d")
-
-
-# ---------------------------------------------------------------------------
-# Stage 3: Profile build + prediction extraction + validation
-# ---------------------------------------------------------------------------
-
-def run_stage3(state: BacktestState) -> None:
+    from operator1.stages.runner import run_stages
+    
+    # Ensure PipelineState has output_dir set for checkpoints
+    if not state.output_dir:
+        state.output_dir = 'cache'
+    
+    run_stages(state, stage_spec, save_checkpoints=True)
+    logger.info("Stage 2 complete via staged runner (spec=%s)", stage_spec)
+
+def run_stage3(state: PipelineState) -> None:
     """Build profile, extract predictions, optionally validate against actuals."""
     logger.info("=" * 60)
     logger.info("STAGE 3: Profile Build + Prediction Extraction")
@@ -2544,9 +1115,9 @@ def run_stage3(state: BacktestState) -> None:
         try:
             from operator1.hedge_fund.engine import run_hedge_fund_analysis
             hf_result = run_hedge_fund_analysis(
-                income_df=state._income_df,
-                balance_df=state._balance_df,
-                cashflow_df=state._cashflow_df,
+                income_df=state.income_df,
+                balance_df=state.balance_df,
+                cashflow_df=state.cashflow_df,
                 cache=cache,
                 target_profile=state.target_profile,
                 forecast_result=state.forecast_result,
@@ -2588,7 +1159,7 @@ def run_stage3(state: BacktestState) -> None:
         state.profile = profile
 
         # Save profile
-        run_dir = Path(state.run_dir)
+        run_dir = Path(state.output_dir)
         profile_path = run_dir / "company_profile.json"
 
         def _sanitize(obj):
@@ -2642,8 +1213,8 @@ def run_stage3(state: BacktestState) -> None:
         profile.setdefault("meta", {})
         profile["meta"]["market_id"] = state.market_id
         profile["meta"]["pit_source"] = True
-        profile["meta"]["ohlcv_source"] = state._ohlcv_source_label
-        profile["meta"]["is_private_company"] = state._is_private
+        profile["meta"]["ohlcv_source"] = state.ohlcv_source_label
+        profile["meta"]["is_private_company"] = state.is_private
         _has_ohlcv = "close" in cache.columns and cache["close"].notna().sum() >= 5
         profile["meta"]["has_ohlcv"] = _has_ohlcv
 
@@ -2795,7 +1366,7 @@ def run_stage3(state: BacktestState) -> None:
             profile["product_catalysts"] = {"available": False}
 
         # 12. product_segments
-        _seg = state._seg_result
+        _seg = state.seg_result
         if _seg and _seg.get("n_segments", 0) >= 2:
             _seg_rev = _seg.get("segments", {})
             _dominant = max(_seg_rev, key=_seg_rev.get) if _seg_rev else ""
@@ -2809,9 +1380,41 @@ def run_stage3(state: BacktestState) -> None:
         else:
             profile["product_segments"] = {"available": False}
 
-        # 13. model_diagnostics (computed in Stage 2d)
-        # model_diagnostics_result is local to run_stage2d; use profile injection if available
-        profile.setdefault("model_diagnostics", {"available": False})
+        # 13. model_diagnostics
+        if state.model_diagnostics_result is not None and getattr(state.model_diagnostics_result, "available", False):
+            profile["model_diagnostics"] = state.model_diagnostics_result.to_dict()
+        else:
+            profile["model_diagnostics"] = {"available": False}
+
+        # 14. predicted_regime_shifts
+        if state.regime_shift_result is not None and getattr(state.regime_shift_result, "available", False):
+            profile["predicted_regime_shifts"] = state.regime_shift_result.to_dict()
+        else:
+            profile["predicted_regime_shifts"] = {"available": False}
+
+        # 15. feature_selection
+        if state.feature_selection_result is not None and getattr(state.feature_selection_result, "fitted", False):
+            profile["feature_selection"] = {
+                "available": True,
+                "n_input": state.feature_selection_result.n_input,
+                "n_output": state.feature_selection_result.n_output,
+                "boruta_confirmed": state.feature_selection_result.boruta_confirmed[:20],
+                "boruta_tentative": getattr(state.feature_selection_result, "boruta_tentative", [])[:10],
+                "regime_selected": {
+                    k: v[:10] for k, v in getattr(state.feature_selection_result, "regime_selected", {}).items()
+                },
+                "mrmr_selected": state.feature_selection_result.mrmr_selected[:15],
+                "method_contributions": getattr(state.feature_selection_result, "method_contributions", {}),
+            }
+        else:
+            profile["feature_selection"] = {"available": False}
+
+        # 16. recursive_predictions
+        if state.recursive_result is not None and getattr(state.recursive_result, "available", False):
+            try:
+                profile.setdefault("extended_models", {})["recursive_predictions"] = state.recursive_result.to_dict()
+            except Exception:
+                profile.setdefault("extended_models", {})["recursive_predictions"] = {"available": True}
 
         # 14. ohlc_predictions
         if state.ohlc_result is not None and state.ohlc_result.fitted:
@@ -2871,18 +1474,18 @@ def run_stage3(state: BacktestState) -> None:
             }
         if state.ga_result is not None and state.ga_result.fitted:
             profile["extended_models"]["genetic_optimizer"] = {"available": True}
-        if state._tv_granger_result is not None and state._tv_granger_result.get("n_windows", 0) > 0:
+        if state.tv_granger_result is not None and state.tv_granger_result.get("n_windows", 0) > 0:
             profile["extended_models"]["time_varying_granger"] = {
-                "available": True, "n_windows": state._tv_granger_result["n_windows"],
+                "available": True, "n_windows": state.tv_granger_result["n_windows"],
             }
-        if state._mv_mc_result is not None and state._mv_mc_result.get("available"):
-            profile["extended_models"]["multivariate_monte_carlo"] = state._mv_mc_result
+        if state.mv_mc_result is not None and state.mv_mc_result.get("available"):
+            profile["extended_models"]["multivariate_monte_carlo"] = state.mv_mc_result
 
         # 17. synergies_applied
-        if state._synergy_meta:
+        if state.synergy_meta:
             profile["synergies_applied"] = {
-                "cycle_features_added": state._synergy_meta.get("cycle_features_added", []),
-                "variables_after_pruning": state._synergy_meta.get("variables_after_pruning", 0),
+                "cycle_features_added": state.synergy_meta.get("cycle_features_added", []),
+                "variables_after_pruning": state.synergy_meta.get("variables_after_pruning", 0),
             }
 
         # Linked conflict injection
@@ -2966,7 +1569,7 @@ def run_stage3(state: BacktestState) -> None:
     # Extract predictions summary
     preds_summary = extract_predictions(state)
     state.predictions_summary = preds_summary
-    preds_path = Path(state.run_dir) / "predictions_summary.json"
+    preds_path = Path(state.output_dir) / "predictions_summary.json"
     with open(preds_path, "w") as f:
         json.dump(preds_summary, f, indent=2, default=str)
     logger.info("Predictions saved: %s", preds_path)
@@ -2977,7 +1580,7 @@ def run_stage3(state: BacktestState) -> None:
         from operator1.clients.llm_factory import create_llm_client
 
         llm_client = create_llm_client(state._secrets) if state._secrets else None
-        report_dir = Path(state.run_dir) / "report"
+        report_dir = Path(state.output_dir) / "report"
         all_reports = generate_all_reports(
             profile=state.profile,
             llm_client=llm_client,
@@ -2994,11 +1597,11 @@ def run_stage3(state: BacktestState) -> None:
     except Exception as exc:
         logger.info("Report generation skipped: %s", exc)
 
-    state.save_sub("3")
+    state.save("3")
     logger.info("STAGE 3 COMPLETE")
 
 
-def extract_predictions(state: BacktestState) -> dict:
+def extract_predictions(state: PipelineState) -> dict:
     """Extract all predictions into a flat summary dict for validation."""
     summary = {
         "market_id": state.market_id,
@@ -3084,7 +1687,7 @@ def extract_predictions(state: BacktestState) -> dict:
 # Validation: compare predictions to actual 2025 data
 # ---------------------------------------------------------------------------
 
-def validate_predictions(state: BacktestState) -> dict:
+def validate_predictions(state: PipelineState) -> dict:
     """Fetch actual data for the prediction period and compare."""
     logger.info("=" * 60)
     logger.info("VALIDATION: Comparing predictions to actuals")
@@ -3114,7 +1717,7 @@ def validate_predictions(state: BacktestState) -> dict:
         return {"error": str(exc)}
 
     # Load predictions
-    preds_path = Path(state.run_dir) / "predictions_summary.json"
+    preds_path = Path(state.output_dir) / "predictions_summary.json"
     if preds_path.exists():
         with open(preds_path) as f:
             preds = json.load(f)
@@ -3238,7 +1841,7 @@ def validate_predictions(state: BacktestState) -> dict:
         logger.info("  Actual total return to date: %.2f%%", validation["actual_total_return"] * 100)
 
     # Save validation
-    val_path = Path(state.run_dir) / "validation_results.json"
+    val_path = Path(state.output_dir) / "validation_results.json"
     with open(val_path, "w") as f:
         json.dump(validation, f, indent=2, default=str)
     logger.info("Validation saved: %s", val_path)
@@ -3272,13 +1875,9 @@ Examples:
 """,
     )
     parser.add_argument("--stage", type=str, default="all",
-                        choices=["1", "2", "2a", "2a1", "2a2", "2b", "2c", "2d",
-                                 "2d.mf.prep", "2d.mf.A", "2d.mf.Q", "2d.mf.M",
-                                 "2d.mf.W", "2d.mf.D", "2d.mf.fuse",
-                                 "mf.prep", "mf.A", "mf.Q", "mf.M",
-                                 "mf.W", "mf.D", "mf.fuse",
-                                 "3", "all"],
-                        help="Which stage to run. Stage 2a is split into 2a1 (regime+causality+patterns) "
+                        help="Which stage to run. Top-level: 1 (data), 2 (temporal), 3 (profile), all. "
+                             "Sub-stages: 3.1 (regime), 4.1 (forecast), 5.4 (MC), 6.11 (recursive), "
+                             "7.4 (multi-freq), 7.5 (HF). Ranges: 3-6. "
                              "and 2a2 (forecasting). Use '2a' to run both, '2' for all sub-stages.")
     parser.add_argument("--market", type=str, default="us_sec_edgar",
                         help="Market ID (e.g. us_sec_edgar, kr_dart, jp_jquants)")
@@ -3308,65 +1907,47 @@ Examples:
     state.company = args.company
     state.end_date = args.end_date
     state.years = args.years
-    state.run_dir = args.run_dir
+    state.output_dir = args.run_dir
 
     # Validation mode
     if args.validate:
-        state.load(stage=3)
+        state.load_checkpoint("3")
         validate_predictions(state)
         return 0
 
-    # Build ordered list of stages to run
+    # Build ordered list of stages to run.
+    # Stage 1: Data fetch + cache build + features (backtest-specific)
+    # Stage 2: Temporal models via staged runner (stages 3-7, shared with main.py)
+    #   Supports sub-stage specs: 3.1, 4.1, 5.4, 6.11, 7.4, etc.
+    # Stage 3: Profile build + prediction extraction (backtest-specific)
     if args.stage == "all":
-        # New flow: Stage 1 (shared) -> per-frequency full pipelines -> fusion + HF -> profile
-        stages = ["1", "2d.mf.prep", "2d.mf.A", "2d.mf.Q", "2d.mf.M", "2d.mf.W", "2d.mf.D", "2d.mf.fuse", "3"]
-    elif args.stage == "2":
-        stages = ["2d.mf.prep", "2d.mf.A", "2d.mf.Q", "2d.mf.M", "2d.mf.W", "2d.mf.D", "2d.mf.fuse"]
-    elif args.stage == "2a":
-        stages = ["2a1", "2a2"]
+        stages = ["1", "2", "3"]
+    elif args.stage in ("1", "2", "3"):
+        stages = [args.stage]
     else:
-        # Map short aliases: mf.prep -> 2d.mf.prep, mf.A -> 2d.mf.A, etc.
-        _alias = args.stage
-        if _alias.startswith("mf."):
-            _alias = f"2d.{_alias}"
-        stages = [_alias]
+        # Sub-stage spec (e.g., "3.1", "4.1", "6.11", "3-6")
+        # Route through Stage 2 with the spec passed to the staged runner
+        stages = [f"2:{args.stage}"]
 
     _STAGE_FUNCS = {
-        "1": run_stage1,
-        "2a": run_stage2a,
-        "2a1": run_stage2a1,
-        "2a2": run_stage2a2,
-        "2b": run_stage2b,
-        "2c": run_stage2c,
-        "2d": run_stage2d,
-        # Per-frequency multi-frequency sub-stages
-        "2d.mf.prep": _run_bt_mf_prep,
-        "2d.mf.A": _run_bt_mf_A,
-        "2d.mf.Q": _run_bt_mf_Q,
-        "2d.mf.M": _run_bt_mf_M,
-        "2d.mf.W": _run_bt_mf_W,
-        "2d.mf.D": _run_bt_mf_D,
-        "2d.mf.fuse": _run_bt_mf_fuse,
-        "3": run_stage3,
+        "1": lambda s: run_stage1(s),
+        "2": lambda s: run_stage2(s, "all"),
+        "3": lambda s: run_stage3(s),
     }
-    # Map sub-stages to the stage they depend on for loading state
+    # Map stages to their dependency for state loading
     _STAGE_DEPS = {
         "1": None,
-        "2a": 1,
-        "2a1": 1,
-        "2a2": "2a1",
-        "2b": "2a2",
-        "2c": "2b",
-        "2d": "2c",
-        "2d.mf.prep": "2c",
-        "2d.mf.A": "2d.mf.prep",
-        "2d.mf.Q": "2d.mf.A",
-        "2d.mf.M": "2d.mf.Q",
-        "2d.mf.W": "2d.mf.M",
-        "2d.mf.D": "2d.mf.W",
-        "2d.mf.fuse": "2d.mf.D",
-        "3": "2d",
+        "2": "1",   # temporal models depend on Stage 1 (data fetch)
+        "3": "2",   # profile build depends on Stage 2 (temporal models)
     }
+
+    # Handle sub-stage routing: "2:3.1" means "load Stage 1 state, run sub-stage 3.1"
+    for i, stage_key in enumerate(stages):
+        if ":" in stage_key:
+            parent, sub_spec = stage_key.split(":", 1)
+            _STAGE_FUNCS[stage_key] = lambda s, spec=sub_spec: run_stage2(s, spec)
+            _STAGE_DEPS[stage_key] = "1"  # sub-stages depend on Stage 1
+            stages[i] = stage_key
 
     for stage_key in stages:
         dep = _STAGE_DEPS[stage_key]
@@ -3374,9 +1955,9 @@ Examples:
             # Load state from the dependency stage, with fallback chain
             dep_key = str(dep)
             _loaded = False
-            _dep_pkl = Path(state.run_dir) / f"state_{dep_key}.pkl"
+            _dep_pkl = Path(state.output_dir) / f"state_{dep_key}.pkl"
             if _dep_pkl.exists():
-                state.load_sub(dep_key)
+                state.load_checkpoint(dep_key)
                 _loaded = True
             else:
                 # Fallback: walk backwards through the dependency chain
@@ -3384,13 +1965,13 @@ Examples:
                 _fallback = dep_key
                 while _fallback in _STAGE_DEPS and _STAGE_DEPS.get(_fallback) is not None:
                     _fallback = str(_STAGE_DEPS[_fallback])
-                    _fb_pkl = Path(state.run_dir) / f"state_{_fallback}.pkl"
+                    _fb_pkl = Path(state.output_dir) / f"state_{_fallback}.pkl"
                     if _fb_pkl.exists():
                         logger.warning(
                             "Stage %s dep '%s' not found, falling back to '%s'",
                             stage_key, dep_key, _fallback,
                         )
-                        state.load_sub(_fallback)
+                        state.load_checkpoint(_fallback)
                         _loaded = True
                         break
                 if not _loaded:
