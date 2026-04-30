@@ -108,6 +108,9 @@ class BacktestState:
         self._seg_result: dict = {}
         self._mode_weights = None
         self.feature_selection_result = None
+        self.recursive_result = None
+        self.regime_shift_result = None
+        self.model_diagnostics_result = None
         self.options_signal_result = None
         self.cross_asset_result = None
         self.event_calendar_result = None
@@ -1696,12 +1699,12 @@ def run_stage2b(state: BacktestState) -> None:
         )
         from datetime import datetime as _dt
         _ref = _dt.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None
-        regime_shift_result = predict_regime_shifts(
+        state.regime_shift_result = predict_regime_shifts(
             cache, transition_matrix=_mc_trans, regime_order=_mc_order,
             stability_score=_stab, transition_halflife=_thl, reference_date=_ref,
         )
-        if regime_shift_result and regime_shift_result.available:
-            logger.info("Regime shift: P(exit 21d)=%.1f%%", regime_shift_result.prob_exit_21d * 100)
+        if state.regime_shift_result and state.regime_shift_result.available:
+            logger.info("Regime shift: P(exit 21d)=%.1f%%", state.regime_shift_result.prob_exit_21d * 100)
     except Exception as exc:
         logger.debug("Regime shift prediction skipped: %s", exc)
 
@@ -1936,6 +1939,24 @@ def run_stage2c(state: BacktestState) -> None:
     except Exception:
         pass
 
+    # Recursive day-by-day predictions (sub-stage 6.11)
+    try:
+        from operator1.models.recursive_aggregator import run_recursive_predictions
+        if state.forward_pass_result is not None and hasattr(state.forward_pass_result, "model_states") and state.forward_pass_result.model_states:
+            _rc_tm = getattr(state.mc_result, "transition_matrix", None) if state.mc_result else None
+            _rc_ro = getattr(state.mc_result, "regime_order", None) if state.mc_result else None
+            state.recursive_result = run_recursive_predictions(
+                cache=cache,
+                model_states=state.forward_pass_result.model_states,
+                transition_matrix=_rc_tm,
+                regime_order=_rc_ro,
+            )
+            if state.recursive_result and state.recursive_result.available:
+                logger.info("Recursive predictions: %d steps, %d snapshots",
+                            state.recursive_result.total_steps, len(state.recursive_result.snapshots))
+    except Exception as exc:
+        logger.warning("Recursive predictions failed: %s", exc)
+
     # E2: Anticipated survival (path-wise MC trigger checking)
     if state.mc_result is not None:
         try:
@@ -2029,14 +2050,14 @@ def run_stage2d(state: BacktestState) -> None:
     # Model diagnostics
     try:
         from operator1.monitoring.model_diagnostics import compute_model_diagnostics
-        _diag = compute_model_diagnostics(
+        state.model_diagnostics_result = compute_model_diagnostics(
             cache, forecast_result=state.forecast_result, mc_result=state.mc_result,
             copula_result=state.copula_result, granger_result=state.granger_result,
             cycle_result=state.cycle_result, dtw_result=state.dtw_result,
             conformal_result=state.conformal_result,
         )
-        if _diag and _diag.available:
-            logger.info("Model diagnostics: %d/%d on track", _diag.n_models_on_track, _diag.n_models_assessed)
+        if state.model_diagnostics_result and state.model_diagnostics_result.available:
+            logger.info("Model diagnostics: %d/%d on track", state.model_diagnostics_result.n_models_on_track, state.model_diagnostics_result.n_models_assessed)
     except Exception as exc:
         logger.debug("Model diagnostics failed: %s", exc)
 
@@ -2388,7 +2409,7 @@ def _bt_mf_fuse(state: BacktestState) -> None:
     # Model diagnostics
     try:
         from operator1.monitoring.model_diagnostics import compute_model_diagnostics
-        compute_model_diagnostics(
+        state.model_diagnostics_result = compute_model_diagnostics(
             cache, forecast_result=state.forecast_result, mc_result=state.mc_result,
             copula_result=state.copula_result, granger_result=state.granger_result,
             cycle_result=state.cycle_result, dtw_result=state.dtw_result,
@@ -2809,9 +2830,41 @@ def run_stage3(state: BacktestState) -> None:
         else:
             profile["product_segments"] = {"available": False}
 
-        # 13. model_diagnostics (computed in Stage 2d)
-        # model_diagnostics_result is local to run_stage2d; use profile injection if available
-        profile.setdefault("model_diagnostics", {"available": False})
+        # 13. model_diagnostics
+        if state.model_diagnostics_result is not None and getattr(state.model_diagnostics_result, "available", False):
+            profile["model_diagnostics"] = state.model_diagnostics_result.to_dict()
+        else:
+            profile["model_diagnostics"] = {"available": False}
+
+        # 14. predicted_regime_shifts
+        if state.regime_shift_result is not None and getattr(state.regime_shift_result, "available", False):
+            profile["predicted_regime_shifts"] = state.regime_shift_result.to_dict()
+        else:
+            profile["predicted_regime_shifts"] = {"available": False}
+
+        # 15. feature_selection
+        if state.feature_selection_result is not None and getattr(state.feature_selection_result, "fitted", False):
+            profile["feature_selection"] = {
+                "available": True,
+                "n_input": state.feature_selection_result.n_input,
+                "n_output": state.feature_selection_result.n_output,
+                "boruta_confirmed": state.feature_selection_result.boruta_confirmed[:20],
+                "boruta_tentative": getattr(state.feature_selection_result, "boruta_tentative", [])[:10],
+                "regime_selected": {
+                    k: v[:10] for k, v in getattr(state.feature_selection_result, "regime_selected", {}).items()
+                },
+                "mrmr_selected": state.feature_selection_result.mrmr_selected[:15],
+                "method_contributions": getattr(state.feature_selection_result, "method_contributions", {}),
+            }
+        else:
+            profile["feature_selection"] = {"available": False}
+
+        # 16. recursive_predictions
+        if state.recursive_result is not None and getattr(state.recursive_result, "available", False):
+            try:
+                profile.setdefault("extended_models", {})["recursive_predictions"] = state.recursive_result.to_dict()
+            except Exception:
+                profile.setdefault("extended_models", {})["recursive_predictions"] = {"available": True}
 
         # 14. ohlc_predictions
         if state.ohlc_result is not None and state.ohlc_result.fitted:

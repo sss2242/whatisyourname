@@ -2586,7 +2586,9 @@ Non-interactive examples:
         granger_result = _ps.granger_result
         ga_result = _ps.ga_result
         ohlc_result = _ps.ohlc_result
+        recursive_result = _ps.recursive_result
         regime_shift_result = _ps.regime_shift_result
+        feature_selection_result = _ps.feature_selection_result
         _synergy_meta = _ps.synergy_meta
         _pattern_drift = _ps.pattern_drift
         weights = _ps.weights
