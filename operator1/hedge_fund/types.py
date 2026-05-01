@@ -133,6 +133,12 @@ class ReturnSpreadResult:
     spread_bps: float | None = None  # CROA - ROIC in basis points
     spread_trend: str = "stable"    # widening, stable, narrowing
     quality_label: str = "neutral"  # healthy, neutral, concerning
+    # Layer 4 enhancement: 5-factor DuPont decomposition (4.5A)
+    dupont_tax_burden: float | None = None       # NI / EBT
+    dupont_interest_burden: float | None = None   # EBT / EBIT
+    dupont_asset_turnover: float | None = None    # Revenue / Total Assets
+    dupont_equity_multiplier: float | None = None  # TA / Equity
+    dupont_quality_driver: str = ""               # margin / leverage / turnover
     narrative: str = ""
     error: str = ""
 
@@ -231,6 +237,9 @@ class MomentumCompositeResult:
     roic_trajectory: float | None = None
     price_momentum_divergence: float | None = None  # fundamental vs price
     inflection_detected: bool = False
+    # Layer 4 enhancement: regime-conditional momentum (4.10A)
+    regime_adjusted_momentum: float | None = None
+    momentum_regime_bias: str = ""  # which component drives score in this regime
     narrative: str = ""
     error: str = ""
 
@@ -287,6 +296,12 @@ class DCFResult:
     implied_growth_rate: float | None = None  # Gap 5: reverse DCF implied growth
     reliable: bool | None = None              # Gap 5: sanity gate (DCF/price ratio check)
     warning: str = ""                         # Gap 5: sanity gate warning message
+    # Layer 4 enhancement: market-implied growth + RIV (4.13A/B)
+    growth_gap: float | None = None           # implied minus actual growth
+    priced_for_perfection_flag: bool = False   # growth_gap > 2x actual
+    riv_intrinsic: float | None = None        # residual income valuation
+    riv_excess_return: float | None = None    # RI / book value
+    riv_vs_dcf_divergence: float | None = None  # riv - dcf difference
     narrative: str = ""
     error: str = ""
 
@@ -369,6 +384,10 @@ class PositionSignalResult:
     stop_price: float | None = None
     target_price: float | None = None
     risk_reward_ratio: float | None = None
+    # Layer 4 enhancement: Kelly criterion sizing (4.17A)
+    kelly_fraction: float | None = None       # full Kelly optimal bet size
+    half_kelly_size: float | None = None      # conservative half-Kelly
+    kelly_edge: float | None = None           # p*b - q (is there an edge?)
     narrative: str = ""
     error: str = ""
 

@@ -173,6 +173,26 @@ def _compute_return_spread(
             result.quality_label = "healthy" if result.spread_bps > 50 else "concerning" if result.spread_bps < -100 else "neutral"
             result.narrative = f"CROA {result.croa:.1%} vs ROIC {result.roic:.1%} = {result.spread_bps:.0f}bps"
             result.available = True
+
+        # 5-factor DuPont decomposition (Palepu, Healy & Peek 2019)
+        ni = extract_latest_value(income_df, "net_income")
+        ebt = extract_latest_value(income_df, "ebt")
+        revenue = extract_latest_value(income_df, "revenue")
+        if ebt is None and ni is not None and taxes is not None:
+            ebt = ni + abs(taxes)  # approximate EBT
+        _eps_d = 1e-10
+        if all(v is not None for v in [ni, ebt, ebit, revenue, ta, equity]):
+            result.dupont_tax_burden = safe_divide(ni, ebt, default=None) if abs(ebt or 0) > _eps_d else None
+            result.dupont_interest_burden = safe_divide(ebt, ebit, default=None) if abs(ebit or 0) > _eps_d else None
+            result.dupont_asset_turnover = safe_divide(revenue, ta, default=None) if abs(ta or 0) > _eps_d else None
+            result.dupont_equity_multiplier = safe_divide(ta, equity, default=None) if abs(equity or 0) > _eps_d else None
+            # Identify quality driver: which component changed most?
+            components = {
+                "margin": abs(ebit / max(abs(revenue), _eps_d)) if revenue else 0,
+                "leverage": abs(ta / max(abs(equity), _eps_d)) if equity else 0,
+                "turnover": abs(revenue / max(abs(ta), _eps_d)) if ta else 0,
+            }
+            result.dupont_quality_driver = max(components, key=components.get) if components else ""
     except Exception as exc:
         logger.debug("Return spread failed: %s", exc)
         result.error = str(exc)
@@ -1107,6 +1127,32 @@ def _compute_position_signal(
                 result.target_price = float(recent.max()) * 1.03
                 if result.stop_price and result.target_price and abs(current - result.stop_price) > 1e-6:
                     result.risk_reward_ratio = abs(result.target_price - current) / abs(current - result.stop_price)
+
+        # Kelly criterion position sizing (Kelly 1956)
+        # Uses MC terminal values to estimate P(win) and avg win/loss ratio
+        if mc_result is not None and hasattr(mc_result, "terminal_values"):
+            try:
+                import numpy as _np
+                _tv = mc_result.terminal_values
+                # Get 252d terminal values if available, else longest horizon
+                _horizon_key = "252d" if "252d" in _tv else (max(_tv.keys()) if _tv else None)
+                if _horizon_key and _tv[_horizon_key] is not None:
+                    _terminals = _np.array(_tv[_horizon_key])
+                    _wins = _terminals[_terminals > 1.0] - 1.0  # returns > 0
+                    _losses = 1.0 - _terminals[_terminals <= 1.0]  # returns < 0
+                    if len(_wins) > 0 and len(_losses) > 0:
+                        p_win = len(_wins) / len(_terminals)
+                        avg_win = float(_np.mean(_wins))
+                        avg_loss = float(_np.mean(_losses))
+                        if avg_loss > 1e-10:
+                            b = avg_win / avg_loss  # odds ratio
+                            q = 1 - p_win
+                            kelly = (p_win * b - q) / b
+                            result.kelly_fraction = float(_np.clip(kelly, -1.0, 1.0))
+                            result.half_kelly_size = float(_np.clip(kelly / 2, -0.5, 0.5))
+                            result.kelly_edge = float(p_win * b - q)
+            except Exception:
+                pass
 
         result.available = True
     except Exception as exc:
