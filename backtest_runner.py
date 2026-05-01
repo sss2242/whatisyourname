@@ -1103,6 +1103,26 @@ def run_stage2(state, stage_spec: str = "all") -> None:
         state.output_dir = 'cache'
     
     run_stages(state, stage_spec, save_checkpoints=True)
+
+    # Post-pipeline hierarchy weight recalibration with forward pass errors
+    if state.forward_pass_result is not None and hasattr(state.forward_pass_result, 'errors_by_tier'):
+        try:
+            _fp_errors = {
+                f"tier{k}": v
+                for k, v in state.forward_pass_result.errors_by_tier.items()
+                if v
+            }
+            if _fp_errors:
+                from operator1.analysis.hierarchy_weights import compute_hierarchy_weights
+                state.cache = compute_hierarchy_weights(state.cache, forward_pass_errors=_fp_errors)
+                for i in range(1, 6):
+                    col = f"hierarchy_tier{i}_weight"
+                    if col in state.cache.columns:
+                        state.weights[f"tier{i}"] = float(state.cache[col].iloc[-1])
+                logger.info("Hierarchy weights recalibrated with forward-pass error feedback")
+        except Exception as _hw_exc:
+            logger.debug("Hierarchy weight recalibration skipped: %s", _hw_exc)
+
     logger.info("Stage 2 complete via staged runner (spec=%s)", stage_spec)
 
 def run_stage3(state: PipelineState) -> None:

@@ -2678,6 +2678,24 @@ Non-interactive examples:
         _mv_mc_result = _ps.mv_mc_result
         signal_ic_result = _ps.signal_ic_result or signal_ic_result
 
+        # Post-pipeline hierarchy weight recalibration with forward pass errors
+        if forward_pass_result is not None and hasattr(forward_pass_result, 'errors_by_tier'):
+            try:
+                _fp_errors = {
+                    f"tier{k}": v
+                    for k, v in forward_pass_result.errors_by_tier.items()
+                    if v
+                }
+                if _fp_errors:
+                    cache = compute_hierarchy_weights(cache, forward_pass_errors=_fp_errors)
+                    for i in range(1, 6):
+                        col = f"hierarchy_tier{i}_weight"
+                        if col in cache.columns:
+                            weights[f"tier{i}"] = float(cache[col].iloc[-1])
+                    logger.info("Hierarchy weights recalibrated with forward-pass error feedback")
+            except Exception as _hw_exc:
+                logger.debug("Hierarchy weight recalibration skipped: %s", _hw_exc)
+
         logger.info("Temporal modeling complete via staged runner")
 
     else:  # --skip-models

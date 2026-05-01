@@ -586,7 +586,23 @@ class SurvivalRegimeController:
         # Configure all 5 dimensions based on current regime
         all_vars = list(cache.columns)
         controller.triage = triage_variables(controller.current_regime, all_vars)
-        controller.model_config = get_model_config(controller.current_regime)
+
+        # Use soft transition if a regime switch was recently detected
+        _prev_regime: str | None = None
+        _days_since: int = 0
+        if controller.regime_switches > 0 and len(controller.regime_timeline) > 1:
+            tl = controller.regime_timeline.dropna()
+            shifted = tl.shift(1)
+            switch_mask = tl != shifted
+            if switch_mask.any():
+                last_switch_idx = switch_mask[switch_mask].index[-1]
+                _days_since = int((tl.index[-1] - last_switch_idx).days) if hasattr(tl.index[-1], 'days') else len(tl) - tl.index.get_loc(last_switch_idx)
+                prev_vals = tl[tl.index < last_switch_idx]
+                if not prev_vals.empty:
+                    _prev_regime = str(prev_vals.iloc[-1])
+        controller.model_config = get_soft_transition_config(
+            controller.current_regime, _prev_regime, _days_since,
+        )
         controller.horizons = get_active_horizons(controller.current_regime)
         controller.primary_horizon = get_primary_horizon(controller.current_regime)
         controller.correlation_override = get_crisis_correlation_override(
