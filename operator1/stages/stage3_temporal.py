@@ -72,6 +72,14 @@ def _init_extra_vars(state: PipelineState) -> None:
             or c.startswith("sga_effic") or c.startswith("capex_intens")
             or c.endswith("_zscore_63d") or c.endswith("_percentile_252d")
             or c.endswith("_regime_zscore") or c.endswith("_change_21d")
+            # Layer 2 enhancement: survival velocity, uncertainty,
+            # semi-Markov duration, ensemble distress, CVaR composite
+            or c.startswith("survival_velocity") or c.startswith("survival_deterioration")
+            or c.startswith("survival_prob_") or c.startswith("survival_probability_p")
+            or c.startswith("survival_uncertainty")
+            or c.startswith("expected_remaining") or c.startswith("mode_exit_")
+            or c.startswith("fh_ensemble_") or c.startswith("fh_cvar_")
+            or c.startswith("dominant_risk_")
             or c in ("stability_score_21d",
                      "buying_power_index", "sector_demand_momentum",
                      "catalyst_score", "online_change_score",

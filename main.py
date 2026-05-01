@@ -1484,6 +1484,23 @@ Non-interactive examples:
                 logger.info("Cox PH survival score computed and blended (w_sig=%.2f, w_cox=%.2f)", _w_sig, _w_cox)
         except Exception as _exc:
             logger.debug("Cox PH survival score skipped: %s", _exc)
+        # Gradient-based early warning: deterioration velocity (Duffie et al. 2007)
+        try:
+            from operator1.analysis.survival_mode import compute_survival_velocity
+            _vel_flag, _vel_rate = compute_survival_velocity(cache)
+            cache["survival_velocity_flag"] = _vel_flag
+            cache["survival_deterioration_rate"] = _vel_rate
+        except Exception as _vel_exc:
+            logger.debug("Survival velocity skipped: %s", _vel_exc)
+        # Survival uncertainty bands (bootstrap P10/P90)
+        try:
+            from operator1.analysis.survival_mode import compute_survival_uncertainty
+            _p10, _p90, _unc = compute_survival_uncertainty(cache, probability=cache.get("survival_probability"))
+            cache["survival_probability_p10"] = _p10
+            cache["survival_probability_p90"] = _p90
+            cache["survival_uncertainty"] = _unc
+        except Exception as _unc_exc:
+            logger.debug("Survival uncertainty skipped: %s", _unc_exc)
         cache = compute_hierarchy_weights(cache)
         for i in range(1, 6):
             col = f"hierarchy_tier{i}_weight"

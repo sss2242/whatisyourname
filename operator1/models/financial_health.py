@@ -343,6 +343,7 @@ def _normalize_series(
     lower: float | None = None,
     upper: float | None = None,
     invert: bool = False,
+    halflife: int | None = None,
 ) -> pd.Series:
     """Normalize a series to 0-100 using rolling percentile rank.
 
@@ -356,6 +357,12 @@ def _normalize_series(
     invert : bool
         If True, higher raw values map to *lower* scores (e.g. debt ratios,
         volatility).
+    halflife : int, optional
+        When set, uses exponentially weighted percentile rank where recent
+        observations are weighted more heavily (half-life in business days).
+        This prevents long healthy periods from diluting recent deterioration.
+        Typical values: 63 (quarterly filer), 126 (semi-annual), 252 (annual).
+        When None (default), uses the original expanding percentile rank.
 
     Returns
     -------
@@ -369,13 +376,55 @@ def _normalize_series(
     if lower is not None or upper is not None:
         work = work.clip(lower=lower, upper=upper)
 
-    # Use expanding percentile rank for a stable, non-leaking normalization
-    ranked = work.expanding(min_periods=1).rank(pct=True) * 100.0
+    if halflife is not None and halflife > 0:
+        # Exponentially weighted percentile rank: recent values matter more.
+        # For each day, compute weighted rank where weights decay with age.
+        ranked = _ewm_percentile_rank(work, halflife=halflife) * 100.0
+    else:
+        # Original expanding percentile rank (stable, equal-weight)
+        ranked = work.expanding(min_periods=1).rank(pct=True) * 100.0
 
     if invert:
         ranked = 100.0 - ranked
 
     return ranked
+
+
+def _ewm_percentile_rank(s: pd.Series, halflife: int = 63) -> pd.Series:
+    """Exponentially weighted percentile rank.
+
+    For each day t, computes what fraction of historical values (weighted
+    by recency) are below the current value. Recent observations contribute
+    more to the rank, making the score more responsive to deterioration.
+
+    Complexity: O(n * min(n, 2*halflife)) -- capped window for efficiency.
+    """
+    values = s.values.astype(float)
+    n = len(values)
+    result = np.full(n, np.nan)
+    decay = np.log(2) / max(halflife, 1)
+    # Cap lookback to 4 half-lives (97% of total weight) for performance
+    max_lookback = min(4 * halflife, n)
+
+    for i in range(1, n):
+        if np.isnan(values[i]):
+            continue
+        start = max(0, i - max_lookback)
+        window = values[start:i + 1]
+        valid_mask = ~np.isnan(window)
+        if valid_mask.sum() < 2:
+            continue
+        valid_vals = window[valid_mask]
+        ages = np.arange(len(window))[valid_mask]
+        # Weights: newest (index=len-1) has weight 1.0, older decays
+        weights = np.exp(-decay * (len(window) - 1 - ages))
+        # Weighted rank: sum of weights where value <= current
+        current_val = values[i]
+        below_weight = np.sum(weights[valid_vals <= current_val])
+        total_weight = np.sum(weights)
+        result[i] = below_weight / max(total_weight, _EPS)
+
+    return pd.Series(result, index=s.index)
 
 
 def _score_liquidity(cache: pd.DataFrame) -> pd.Series:

@@ -639,6 +639,23 @@ def run_stage1(state: PipelineState) -> None:
                 cache["survival_probability"] = 0.4 * sig + 0.6 * cox.fillna(sig)
         except Exception:
             pass
+        # Gradient-based early warning: deterioration velocity
+        try:
+            from operator1.analysis.survival_mode import compute_survival_velocity
+            _vel_flag, _vel_rate = compute_survival_velocity(cache)
+            cache["survival_velocity_flag"] = _vel_flag
+            cache["survival_deterioration_rate"] = _vel_rate
+        except Exception:
+            pass
+        # Survival uncertainty bands (bootstrap P10/P90)
+        try:
+            from operator1.analysis.survival_mode import compute_survival_uncertainty
+            _p10, _p90, _unc = compute_survival_uncertainty(cache, probability=cache.get("survival_probability"))
+            cache["survival_probability_p10"] = _p10
+            cache["survival_probability_p90"] = _p90
+            cache["survival_uncertainty"] = _unc
+        except Exception:
+            pass
         cache = compute_hierarchy_weights(cache)
         for i in range(1, 6):
             col = f"hierarchy_tier{i}_weight"

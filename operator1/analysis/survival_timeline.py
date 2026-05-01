@@ -268,6 +268,122 @@ def _compute_stability_score(
 
 
 # ---------------------------------------------------------------------------
+# Semi-Markov Duration Modeling (Barbu & Limnios 2008)
+# ---------------------------------------------------------------------------
+
+
+def _compute_semi_markov_exit(
+    modes: pd.Series,
+    days_in_mode: pd.Series,
+    switch_points: pd.Series,
+    horizon: int = 21,
+) -> tuple[pd.Series, pd.Series]:
+    """Compute duration-aware mode exit probability and expected remaining time.
+
+    Uses a Weibull distribution (generalizes geometric/Markov) fitted on
+    historical dwell times per mode. Shape < 1 = decreasing hazard (distress
+    trap), Shape > 1 = increasing hazard (recovery more likely over time).
+
+    Falls back to geometric distribution (standard Markov) when fewer than
+    3 dwell episodes are available for a mode.
+
+    Parameters
+    ----------
+    modes:
+        Daily survival mode labels.
+    days_in_mode:
+        Running day count in current mode.
+    switch_points:
+        Binary series (1 on mode switch days).
+    horizon:
+        Forecast horizon for exit probability (default 21 days).
+
+    Returns
+    -------
+    tuple[pd.Series, pd.Series]
+        (expected_remaining_days_in_mode, mode_exit_probability_21d)
+    """
+    import numpy as np
+
+    expected_remaining = pd.Series(np.nan, index=modes.index, dtype=float)
+    exit_prob = pd.Series(np.nan, index=modes.index, dtype=float)
+
+    # Collect completed dwell times per mode from history
+    mode_dwells: dict[str, list[float]] = {}
+    current_mode = None
+    current_dwell = 0
+    for i in range(len(modes)):
+        m = modes.iloc[i]
+        if m != current_mode:
+            if current_mode is not None and current_dwell > 0:
+                mode_dwells.setdefault(current_mode, []).append(float(current_dwell))
+            current_mode = m
+            current_dwell = 1
+        else:
+            current_dwell += 1
+
+    # Fit Weibull per mode and compute exit probabilities
+    try:
+        from scipy.stats import weibull_min
+    except ImportError:
+        logger.debug("scipy not available for semi-Markov; returning NaN")
+        return expected_remaining, exit_prob
+
+    weibull_params: dict[str, tuple[float, float]] = {}  # mode -> (shape, scale)
+    for mode_name, dwells in mode_dwells.items():
+        if len(dwells) < 3:
+            # Fallback: geometric distribution (mean dwell time)
+            mean_d = np.mean(dwells) if dwells else 63.0
+            weibull_params[mode_name] = (1.0, mean_d)  # shape=1 = geometric
+        else:
+            try:
+                shape, _loc, scale = weibull_min.fit(dwells, floc=0)
+                shape = float(np.clip(shape, 0.1, 10.0))
+                scale = float(np.clip(scale, 1.0, 1000.0))
+                weibull_params[mode_name] = (shape, scale)
+            except Exception:
+                mean_d = np.mean(dwells)
+                weibull_params[mode_name] = (1.0, mean_d)
+
+    # Compute per-day exit probability and expected remaining days
+    for i in range(len(modes)):
+        mode = modes.iloc[i]
+        d = float(days_in_mode.iloc[i])
+        params = weibull_params.get(mode)
+        if params is None:
+            continue
+
+        shape, scale = params
+        try:
+            # Hazard rate at current dwell time d
+            sf_d = weibull_min.sf(d, shape, loc=0, scale=scale)
+            sf_d_h = weibull_min.sf(d + horizon, shape, loc=0, scale=scale)
+            if sf_d > 1e-10:
+                # P(exit within horizon | survived to d) = 1 - S(d+h)/S(d)
+                exit_prob.iloc[i] = float(np.clip(1.0 - sf_d_h / sf_d, 0, 1))
+                # Expected remaining = integral of S(t)/S(d) from d to infinity
+                # For Weibull: approximate as scale * Gamma(1 + 1/shape) - d (residual life)
+                from math import gamma as gamma_fn
+                mean_total = scale * gamma_fn(1.0 + 1.0 / max(shape, 0.1))
+                expected_remaining.iloc[i] = max(mean_total - d, 0.0)
+        except Exception:
+            continue
+
+    expected_remaining.name = "expected_remaining_days_in_mode"
+    exit_prob.name = "mode_exit_probability_21d"
+
+    n_valid = exit_prob.notna().sum()
+    if n_valid > 0:
+        logger.info(
+            "Semi-Markov duration: %d modes fitted, mean exit prob=%.3f, "
+            "mean expected remaining=%.0f days",
+            len(weibull_params), exit_prob.mean(), expected_remaining.mean(),
+        )
+
+    return expected_remaining, exit_prob
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -355,6 +471,17 @@ def compute_survival_timeline(
         daily_cache["switch_point"] = switch_flags
         daily_cache["days_in_mode"] = days_counter
         daily_cache["stability_score_21d"] = stability
+
+        # 6. Semi-Markov duration modeling (Barbu & Limnios 2008)
+        # Computes duration-aware exit probability and expected remaining days
+        try:
+            exp_remaining, exit_prob = _compute_semi_markov_exit(
+                modes, days_counter, switch_flags,
+            )
+            daily_cache["expected_remaining_days_in_mode"] = exp_remaining
+            daily_cache["mode_exit_probability_21d"] = exit_prob
+        except Exception as _sm_exc:
+            logger.debug("Semi-Markov duration skipped: %s", _sm_exc)
 
         # Also keep a reference as the result timeline for backward compat.
         result.timeline = daily_cache
