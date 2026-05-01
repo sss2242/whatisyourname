@@ -2160,6 +2160,42 @@ Non-interactive examples:
         logger.debug("Segment extraction failed: %s", _seg_exc)
 
     # ------------------------------------------------------------------
+    # Step 5i.6b: Operational efficiency features (Phase 5 enhancement)
+    # ------------------------------------------------------------------
+    try:
+        from operator1.features.product_metrics import compute_operational_efficiency
+        cache = compute_operational_efficiency(cache)
+    except Exception as exc:
+        logger.debug("Operational efficiency features skipped: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 5i.7: Behavioral finance signals
+    # ------------------------------------------------------------------
+    try:
+        from operator1.features.behavioral_signals import compute_behavioral_signals
+        cache = compute_behavioral_signals(cache)
+    except Exception as exc:
+        logger.debug("Behavioral signals skipped: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 5i.8: Information theory / complexity signals
+    # ------------------------------------------------------------------
+    try:
+        from operator1.features.complexity_signals import compute_complexity_signals
+        cache = compute_complexity_signals(cache)
+    except Exception as exc:
+        logger.debug("Complexity signals skipped: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 5i.9: Feature normalization (MUST run LAST before temporal)
+    # ------------------------------------------------------------------
+    try:
+        from operator1.features.feature_normalization import compute_feature_normalization
+        cache = compute_feature_normalization(cache)
+    except Exception as exc:
+        logger.debug("Feature normalization skipped: %s", exc)
+
+    # ------------------------------------------------------------------
     # Step 5j: Adaptive threshold calibration
     # ------------------------------------------------------------------
     # Replaces fixed textbook survival thresholds with peer-calibrated,

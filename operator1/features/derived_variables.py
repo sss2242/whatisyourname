@@ -938,6 +938,410 @@ def _compute_merton_distance_to_default(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------------------
+# Stage 18: Market Microstructure Signals
+# Corwin-Schultz spread (2012, JF), Kyle lambda (1985), Parkinson vol
+# (1980), Yang-Zhang vol (2000), volume clock intensity.
+# Ref implementations: RiskLabAI/corwin_schultz.py, mgao6767/frds,
+# Jensenberg/volatility-and-option, scikit-portfolio.
+# ---------------------------------------------------------------------------
+
+_CS_DENOM = 3 - 2 * (2 ** 0.5)  # Corwin-Schultz constant
+
+
+def _compute_microstructure_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """Market microstructure features from daily OHLCV data.
+
+    1. Corwin-Schultz bid-ask spread estimator (Corwin & Schultz 2012)
+    2. Kyle lambda -- daily price impact proxy (Kyle 1985)
+    3. Parkinson volatility -- range-based, 5x more efficient (Parkinson 1980)
+    4. Yang-Zhang volatility -- overnight + intraday composite (Yang & Zhang 2000)
+    5. Volume clock intensity -- z-scored volume anomaly (AFML concept)
+    """
+    has_ohlcv = all(
+        c in df.columns and df[c].notna().sum() > 5
+        for c in ("open", "high", "low", "close", "volume")
+    )
+    if not has_ohlcv:
+        return df
+
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    opn = df["open"].astype(float)
+    close = df["close"].astype(float)
+    volume = df["volume"].astype(float)
+    eps = EPSILON
+
+    # --- Corwin-Schultz spread (RiskLabAI pattern) ---
+    log_hl_sq = np.log(high / low.clip(lower=eps)) ** 2
+    cs_beta = log_hl_sq.rolling(2).sum().rolling(20).mean()
+    h2 = high.rolling(2).max()
+    l2 = low.rolling(2).min()
+    cs_gamma = np.log(h2 / l2.clip(lower=eps)) ** 2
+    cs_t1 = (2 ** 0.5 - 1) * np.sqrt(cs_beta.clip(lower=0)) / _CS_DENOM
+    cs_t2 = np.sqrt((cs_gamma / _CS_DENOM).clip(lower=0))
+    cs_alpha = (cs_t1 - cs_t2).clip(lower=0)
+    df["corwin_schultz_spread"] = 2 * (np.exp(cs_alpha) - 1) / (1 + np.exp(cs_alpha))
+
+    # --- Kyle lambda (frds pattern: OLS of |return| on signed volume) ---
+    if "return_1d" in df.columns:
+        ret = df["return_1d"].fillna(0)
+        signed_vol = volume * np.sign(ret)
+        # Rolling 21-day regression slope via cov/var
+        cov_rv = ret.rolling(21, min_periods=10).cov(signed_vol)
+        var_sv = signed_vol.rolling(21, min_periods=10).var()
+        df["kyle_lambda"] = (cov_rv / var_sv.clip(lower=eps)) * 1e6
+
+    # --- Parkinson volatility (scikit-portfolio pattern) ---
+    log_hl = np.log(high / low.clip(lower=eps))
+    df["parkinson_vol_21d"] = np.sqrt(
+        (log_hl ** 2).rolling(21, min_periods=10).sum()
+        / (4 * 21 * np.log(2))
+    )
+
+    # --- Yang-Zhang volatility (Jensenberg pattern) ---
+    # Overnight: log(open_t / close_{t-1})
+    oc = np.log(opn / close.shift(1).clip(lower=eps))
+    oc_mean = oc.rolling(21, min_periods=10).mean()
+    oc_var = ((oc - oc_mean) ** 2).rolling(21, min_periods=10).mean()
+    # Close-to-open: log(close_t / open_t)
+    co = np.log(close / opn.clip(lower=eps))
+    co_mean = co.rolling(21, min_periods=10).mean()
+    co_var = ((co - co_mean) ** 2).rolling(21, min_periods=10).mean()
+    # Rogers-Satchell component
+    rs = (
+        np.log(high / close.clip(lower=eps)) * np.log(high / opn.clip(lower=eps))
+        + np.log(low / close.clip(lower=eps)) * np.log(low / opn.clip(lower=eps))
+    ).rolling(21, min_periods=10).mean()
+    # Optimal blend factor (from Yang-Zhang 2000 paper)
+    n = 21
+    k = 0.34 / (1.34 + (n + 1) / max(n - 1, 1))
+    yz_var = oc_var + k * co_var + (1 - k) * rs.clip(lower=0)
+    df["yang_zhang_vol_21d"] = np.sqrt(yz_var.clip(lower=0))
+
+    # --- Volume clock intensity (z-scored volume anomaly) ---
+    if "volume_avg_21d" in df.columns:
+        vol_std = volume.rolling(21, min_periods=5).std().clip(lower=eps)
+        df["volume_clock_intensity"] = (
+            (volume - df["volume_avg_21d"]) / vol_std
+        )
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Stage 19: Stationarity & Time-Series Structure Features
+# Fractional diff (Lopez de Prado 2018), rolling Hurst (Mandelbrot 1971),
+# autocorrelation at lag 1 and 5 (Lo & MacKinlay 1988).
+# Ref implementations: OmniQuant/advanced_features.py, Nixtla/tsfeatures.
+# ---------------------------------------------------------------------------
+
+def _frac_diff_weights(d: float, max_window: int = 100) -> np.ndarray:
+    """Compute fractional differentiation weights (Lopez de Prado AFML Ch.5).
+
+    Uses a fixed window approach (AFML Snippet 5.3) capped at max_window
+    to keep the convolution practical for typical 504-day caches.
+    """
+    weights = [1.0]
+    for k_idx in range(1, max_window):
+        w = -weights[-1] * (d - k_idx + 1) / k_idx
+        weights.append(w)
+    return np.array(weights[::-1])
+
+
+def _hurst_rs(x: np.ndarray) -> float:
+    """Hurst exponent via R/S analysis (Nixtla/tsfeatures compact version)."""
+    n = x.size
+    if n < 20:
+        return float("nan")
+    t = np.arange(1, n + 1)
+    y = x.cumsum()
+    mean_t = y / t
+    s_t = np.sqrt(
+        np.array([np.mean((x[: i + 1] - mean_t[i]) ** 2) for i in range(n)])
+    )
+    r_t = np.array(
+        [np.ptp(y[: i + 1] - t[: i + 1] * mean_t[i]) for i in range(n)]
+    )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r_s = np.log(r_t / np.where(s_t > 0, s_t, np.nan))[1:]
+    n_log = np.log(t)[1:]
+    valid = np.isfinite(r_s) & np.isfinite(n_log)
+    if valid.sum() < 5:
+        return float("nan")
+    a = np.column_stack((n_log[valid], np.ones(valid.sum())))
+    result = np.linalg.lstsq(a, r_s[valid], rcond=-1)
+    return float(np.clip(result[0][0], 0.0, 1.0))
+
+
+def _compute_stationarity_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Time-series structure features: fractional diff, Hurst, autocorrelation.
+
+    1. close_frac_diff -- fractionally differentiated close (d=0.4)
+    2. hurst_exponent_rolling -- rolling 63d Hurst via R/S analysis
+    3. autocorr_lag1 -- rolling 63d lag-1 autocorrelation
+    4. autocorr_lag5 -- rolling 63d lag-5 autocorrelation (weekly reversal)
+    """
+    # --- Fractional differentiation of close (OmniQuant pattern) ---
+    close = df.get("close")
+    if close is not None and close.notna().sum() > 30:
+        weights = _frac_diff_weights(d=0.4, max_window=100)
+        w_len = len(weights)
+        vals = close.values.astype(float)
+        fd = np.full(len(vals), np.nan)
+        for i in range(w_len, len(vals)):
+            window = vals[i - w_len + 1: i + 1]
+            if not np.any(np.isnan(window)):
+                fd[i] = np.dot(weights, window)
+        df["close_frac_diff"] = fd
+
+    # --- Rolling Hurst exponent (tsfeatures pattern) ---
+    ret = df.get("return_1d")
+    if ret is not None and ret.notna().sum() > 70:
+        _window = 63
+        hurst_vals = np.full(len(df), np.nan)
+        ret_arr = ret.fillna(0).values
+        for i in range(_window, len(ret_arr)):
+            hurst_vals[i] = _hurst_rs(ret_arr[i - _window: i])
+        df["hurst_exponent_rolling"] = hurst_vals
+
+    # --- Autocorrelation at lag 1 and 5 ---
+    if ret is not None and ret.notna().sum() > 70:
+        df["autocorr_lag1"] = ret.rolling(63, min_periods=30).apply(
+            lambda x: x.autocorr(lag=1) if len(x) > 5 else float("nan"),
+            raw=False,
+        )
+        df["autocorr_lag5"] = ret.rolling(63, min_periods=30).apply(
+            lambda x: x.autocorr(lag=5) if len(x) > 10 else float("nan"),
+            raw=False,
+        )
+
+    # --- Momentum 12-1 (Jegadeesh & Titman 1993; Novy-Marx 2012) ---
+    if close is not None and close.notna().sum() > 260:
+        ret_12m = close / close.shift(252) - 1
+        ret_1m = close / close.shift(21) - 1
+        df["momentum_12_1"] = ret_12m - ret_1m
+
+    # --- Idiosyncratic volatility (Ang et al. 2006) ---
+    if ret is not None and "beta_252d" in df.columns:
+        bench = df.get("benchmark_return_1d")
+        if bench is not None and bench.notna().sum() > 30:
+            residual = ret - df["beta_252d"].fillna(1.0) * bench.fillna(0)
+            df["idiosyncratic_vol_63d"] = residual.rolling(63, min_periods=20).std()
+
+    # --- Earnings revision proxy (Chan, Jegadeesh & Lakonishok 1996) ---
+    eps_col = df.get("eps_calc")
+    if eps_col is None:
+        eps_col = df.get("net_income_ttm_asof")
+    if eps_col is not None and eps_col.notna().sum() > 70:
+        shifted = eps_col.shift(63)
+        safe_shifted = shifted.where(shifted.abs() > EPSILON)
+        df["earnings_revision_proxy"] = (eps_col - shifted) / safe_shifted.abs()
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Stage 20: Credit Risk & Distress Signals
+# Cash burn rate, debt maturity pressure, cash conversion cycle,
+# Altman Z momentum, covenant proximity score.
+# ---------------------------------------------------------------------------
+
+def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """Credit risk and distress early-warning features.
+
+    1. cash_burn_rate_monthly -- monthly cash depletion when OCF negative
+    2. debt_maturity_pressure -- fraction of debt due within 1 year
+    3. cash_conversion_cycle -- DSO + DIO - DPO (Richards & Laughlin 1980)
+    4. altman_z_momentum_63d -- 63-day change in Altman Z-score
+    5. covenant_proximity_score -- max distance-to-threshold (0-1) across triggers
+    """
+    eps = EPSILON
+
+    # --- Cash burn rate (monthly) ---
+    ocf = df.get("operating_cash_flow")
+    if ocf is not None:
+        df["cash_burn_rate_monthly"] = np.maximum(0.0, -ocf.astype(float)) / 30.0
+
+    # --- Debt maturity pressure (short-term / total) ---
+    std = df.get("short_term_debt")
+    td = df.get("total_debt_asof")
+    if std is not None and td is not None:
+        safe_td = td.where(td.abs() > eps)
+        df["debt_maturity_pressure"] = std.astype(float) / safe_td.astype(float)
+
+    # --- Cash conversion cycle = DSO + DIO - DPO ---
+    revenue = df.get("revenue")
+    receivables = df.get("receivables")
+    inventory = df.get("inventory")
+    payables = df.get("payables")
+    # COGS proxy: cost_of_revenue if available, else revenue - gross_profit
+    cogs = df.get("cost_of_revenue")
+    if cogs is None or (cogs is not None and cogs.isna().all()):
+        gp = df.get("gross_profit")
+        if revenue is not None and gp is not None:
+            cogs = (revenue.astype(float) - gp.astype(float)).clip(lower=eps)
+
+    if revenue is not None:
+        rev_daily = revenue.astype(float) / 90.0  # quarterly approximation
+        safe_rev_daily = rev_daily.where(rev_daily.abs() > eps)
+        if receivables is not None:
+            df["dso"] = receivables.astype(float) / safe_rev_daily
+    if cogs is not None:
+        cogs_daily = cogs.astype(float) / 90.0
+        safe_cogs_daily = cogs_daily.where(cogs_daily.abs() > eps)
+        if inventory is not None:
+            df["dio"] = inventory.astype(float) / safe_cogs_daily
+        if payables is not None:
+            df["dpo"] = payables.astype(float) / safe_cogs_daily
+
+    dso = df.get("dso")
+    dio = df.get("dio")
+    dpo = df.get("dpo")
+    if dso is not None and dio is not None and dpo is not None:
+        df["cash_conversion_cycle"] = dso + dio - dpo
+    elif dso is not None and dpo is not None:
+        # No inventory data -- partial CCC
+        df["cash_conversion_cycle"] = dso - dpo
+
+    # --- Altman Z momentum (directional change over 63 days) ---
+    az = df.get("fh_altman_z_score")
+    if az is not None and az.notna().sum() > 70:
+        df["altman_z_momentum_63d"] = az - az.shift(63)
+
+    # --- Covenant proximity score ---
+    # Max of normalized distances to each survival trigger threshold (0-1)
+    _triggers = [
+        ("current_ratio", 1.0, "below"),
+        ("debt_to_equity_abs", 3.0, "above"),
+        ("fcf_yield", 0.0, "below"),
+        ("drawdown_252d", -0.40, "below"),
+    ]
+    try:
+        from operator1.scoring_weights import get_weight
+        _triggers = [
+            ("current_ratio", float(get_weight("survival_thresholds.current_ratio", 1.0)), "below"),
+            ("debt_to_equity_abs", float(get_weight("survival_thresholds.debt_to_equity", 3.0)), "above"),
+            ("fcf_yield", float(get_weight("survival_thresholds.fcf_yield", 0.0)), "below"),
+            ("drawdown_252d", float(get_weight("survival_thresholds.drawdown_252d", -0.40)), "below"),
+        ]
+    except Exception:
+        pass  # use defaults
+
+    proximity_parts = []
+    for col_name, threshold, direction in _triggers:
+        series = df.get(col_name)
+        if series is None or series.isna().all():
+            continue
+        s = series.astype(float)
+        if direction == "below":
+            # Score = how close actual is to falling below threshold (0=safe, 1=at threshold)
+            prox = ((threshold - s) / abs(threshold) if abs(threshold) > eps else (threshold - s)).clip(0, 1)
+        else:
+            # Score = how close actual is to exceeding threshold
+            prox = ((s - threshold) / abs(threshold) if abs(threshold) > eps else (s - threshold)).clip(0, 1)
+        proximity_parts.append(prox)
+
+    if proximity_parts:
+        stacked = pd.concat(proximity_parts, axis=1)
+        df["covenant_proximity_score"] = stacked.max(axis=1)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Stage 22: Tail Risk & Higher-Moment Features
+# Skewness, kurtosis, tail ratio, max daily loss, vol-of-vol.
+# Ref: Harvey & Siddique 2000, Dittmar 2002, quantstats/empyrical.
+# ---------------------------------------------------------------------------
+
+def _compute_tail_risk_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Higher-moment and tail-risk features from return distribution.
+
+    1. skewness_63d -- rolling return skewness (Harvey & Siddique 2000)
+    2. kurtosis_63d -- rolling return excess kurtosis (Dittmar 2002)
+    3. tail_ratio_63d -- |P95/P5| asymmetry (empyrical convention)
+    4. max_daily_loss_63d -- worst single-day return in 63d window
+    5. vol_of_vol_21d -- volatility of volatility (Cont & da Fonseca 2002)
+    """
+    ret = df.get("return_1d")
+    if ret is None or ret.notna().sum() < 70:
+        return df
+
+    df["skewness_63d"] = ret.rolling(63, min_periods=30).skew()
+    df["kurtosis_63d"] = ret.rolling(63, min_periods=30).kurt()
+
+    # Tail ratio: |P95 / P5| -- >1 means right tail larger (positive skew)
+    p95 = ret.rolling(63, min_periods=30).quantile(0.95)
+    p05 = ret.rolling(63, min_periods=30).quantile(0.05)
+    safe_p05 = p05.where(p05.abs() > EPSILON)
+    df["tail_ratio_63d"] = (p95 / safe_p05).abs()
+
+    df["max_daily_loss_63d"] = ret.rolling(63, min_periods=10).min()
+
+    # Vol-of-vol: std of volatility_21d over 21 days
+    vol = df.get("volatility_21d")
+    if vol is not None and vol.notna().sum() > 30:
+        df["vol_of_vol_21d"] = vol.rolling(21, min_periods=10).std()
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Stage 24: Forensic Accounting Signals
+# Revenue-receivables divergence (Lev & Thiagarajan 1993), capex/depreciation
+# ratio (Sloan 1996), soft asset ratio (Barton & Simko 2002), OCF ratio
+# (Dechow & Dichev 2002).
+# ---------------------------------------------------------------------------
+
+def _compute_forensic_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """Forensic accounting red-flag signals from financial statements.
+
+    1. revenue_receivables_divergence -- channel stuffing detector
+    2. capex_depreciation_ratio -- investment quality proxy
+    3. soft_asset_ratio -- manipulation risk (high = easy to inflate)
+    4. ocf_ratio -- cash conversion quality (OCF / NI)
+    """
+    eps = EPSILON
+
+    # --- Revenue-receivables divergence (Lev & Thiagarajan 1993) ---
+    revenue = df.get("revenue")
+    receivables = df.get("receivables")
+    if revenue is not None and receivables is not None:
+        rev_g = revenue.astype(float).pct_change(252)
+        rec_g = receivables.astype(float).pct_change(252)
+        df["revenue_receivables_divergence"] = rev_g - rec_g  # positive = healthy
+
+    # --- CapEx / Depreciation ratio (Sloan 1996) ---
+    capex = df.get("capex")
+    ebitda_val = df.get("ebitda")
+    ebit_val = df.get("ebit")
+    if ebit_val is None:
+        ebit_val = df.get("operating_income")
+    if capex is not None and ebitda_val is not None and ebit_val is not None:
+        # Depreciation proxy = EBITDA - EBIT
+        depreciation = (ebitda_val.astype(float) - ebit_val.astype(float)).clip(lower=eps)
+        df["capex_depreciation_ratio"] = capex.astype(float).abs() / depreciation
+
+    # --- Soft asset ratio (Barton & Simko 2002) ---
+    total_assets = df.get("total_assets")
+    cash = df.get("cash_and_equivalents")
+    if total_assets is not None:
+        hard_assets = cash.fillna(0).astype(float) if cash is not None else 0.0
+        ta = total_assets.astype(float)
+        safe_ta = ta.where(ta.abs() > eps)
+        df["soft_asset_ratio"] = (ta - hard_assets) / safe_ta
+
+    # --- OCF ratio -- operating cash flow / net income (Dechow & Dichev 2002) ---
+    ocf = df.get("operating_cash_flow")
+    ni = df.get("net_income")
+    if ocf is not None and ni is not None:
+        safe_ni = ni.astype(float).where(ni.astype(float).abs() > eps)
+        df["ocf_ratio"] = ocf.astype(float) / safe_ni
+
+    return df
+
+
 # Ordered pipeline of computation stages
 _COMPUTE_STAGES = (
     _compute_returns_and_risk,
@@ -957,6 +1361,11 @@ _COMPUTE_STAGES = (
     _compute_earnings_quality_signals,
     _compute_realized_vol_decomposition,  # A2: vol decomposition
     _compute_merton_distance_to_default,  # G2: Merton DD
+    _compute_microstructure_signals,      # Stage 18: market microstructure
+    _compute_stationarity_features,       # Stage 19: stationarity + factor
+    _compute_credit_signals,              # Stage 20: credit risk
+    _compute_tail_risk_features,          # Stage 22: tail risk
+    _compute_forensic_signals,            # Stage 24: forensic accounting
 )
 
 # All derived variable names (for inspection / downstream reference)
@@ -993,6 +1402,23 @@ DERIVED_VARIABLES: tuple[str, ...] = (
     "recovery_time_avg", "recovery_time_max", "n_recovery_episodes",
     # Earnings quality & alpha signals
     "accruals", "accruals_signal", "eps_surprise_proxy", "sue_score", "pead_signal",
+    # Stage 18: Microstructure signals
+    "corwin_schultz_spread", "kyle_lambda",
+    "parkinson_vol_21d", "yang_zhang_vol_21d", "volume_clock_intensity",
+    # Stage 19: Stationarity & factor features
+    "close_frac_diff", "hurst_exponent_rolling", "autocorr_lag1", "autocorr_lag5",
+    "momentum_12_1", "earnings_revision_proxy",
+    # idiosyncratic_vol_63d: conditionally produced (needs benchmark_return_1d)
+    # Stage 20: Credit signals
+    "cash_burn_rate_monthly", "debt_maturity_pressure",
+    "cash_conversion_cycle", "covenant_proximity_score",
+    # altman_z_momentum_63d: conditionally produced (needs fh_altman_z_score from Step 5d)
+    # Stage 22: Tail risk
+    "skewness_63d", "kurtosis_63d", "tail_ratio_63d",
+    "max_daily_loss_63d", "vol_of_vol_21d",
+    # Stage 24: Forensic accounting
+    "revenue_receivables_divergence", "capex_depreciation_ratio",
+    "soft_asset_ratio", "ocf_ratio",
 )
 
 

@@ -492,3 +492,75 @@ def compute_geographic_metrics(
         )
 
     return cache
+
+
+# ---------------------------------------------------------------------------
+# Operational Efficiency Features (Phase 5 enhancement)
+# ---------------------------------------------------------------------------
+
+def compute_operational_efficiency(cache: pd.DataFrame) -> pd.DataFrame:
+    """Compute turnover ratios and operational efficiency metrics.
+
+    Features:
+      - inventory_turnover: revenue / inventory
+      - receivables_turnover: revenue / receivables
+      - payables_turnover: COGS / payables
+      - sga_efficiency: revenue / SGA expenses
+      - capex_intensity: |capex| / revenue
+
+    All use safe_ratio to handle zero/NaN denominators.
+    """
+    result = cache.copy()
+    eps = EPSILON
+    revenue = result.get("revenue")
+    if revenue is None or revenue.isna().all():
+        return result
+
+    rev = revenue.astype(float)
+    safe_rev = rev.where(rev.abs() > eps)
+
+    # COGS: prefer cost_of_revenue, fallback to revenue - gross_profit
+    cogs = result.get("cost_of_revenue")
+    if cogs is None or (hasattr(cogs, "isna") and cogs.isna().all()):
+        gp = result.get("gross_profit")
+        if gp is not None:
+            cogs = (rev - gp.astype(float)).clip(lower=eps)
+
+    # Inventory turnover
+    inventory = result.get("inventory")
+    if inventory is not None and inventory.notna().any():
+        safe_inv = inventory.astype(float).where(inventory.astype(float).abs() > eps)
+        result["inventory_turnover"] = rev / safe_inv
+
+    # Receivables turnover
+    receivables = result.get("receivables")
+    if receivables is not None and receivables.notna().any():
+        safe_rec = receivables.astype(float).where(receivables.astype(float).abs() > eps)
+        result["receivables_turnover"] = rev / safe_rec
+
+    # Payables turnover (uses COGS, not revenue)
+    payables = result.get("payables")
+    if payables is not None and cogs is not None and payables.notna().any():
+        safe_pay = payables.astype(float).where(payables.astype(float).abs() > eps)
+        result["payables_turnover"] = cogs.astype(float) / safe_pay
+
+    # SGA efficiency (revenue per dollar of overhead)
+    sga = result.get("sga_expenses")
+    if sga is not None and sga.notna().any():
+        safe_sga = sga.astype(float).where(sga.astype(float).abs() > eps)
+        result["sga_efficiency"] = rev / safe_sga
+
+    # CapEx intensity
+    capex = result.get("capex")
+    if capex is not None and capex.notna().any():
+        result["capex_intensity"] = capex.astype(float).abs() / safe_rev
+
+    n_new = sum(
+        1 for c in ("inventory_turnover", "receivables_turnover", "payables_turnover",
+                     "sga_efficiency", "capex_intensity")
+        if c in result.columns and c not in cache.columns
+    )
+    if n_new > 0:
+        logger.info("Operational efficiency: %d features computed", n_new)
+
+    return result

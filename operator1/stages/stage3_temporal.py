@@ -53,6 +53,25 @@ def _init_extra_vars(state: PipelineState) -> None:
             or c.startswith("segment_") or c.startswith("product_")
             or c.startswith("pricing_") or c.startswith("margin_")
             or c.startswith("som_") or c.startswith("customer_")
+            # Layer 1 enhancement: microstructure, stationarity, credit,
+            # behavioral, complexity, tail risk, forensic, normalization
+            or c.startswith("corwin_") or c.startswith("kyle_")
+            or c.startswith("parkinson_") or c.startswith("yang_zhang_")
+            or c.startswith("hurst_") or c.startswith("autocorr_")
+            or c.startswith("anchoring_") or c.startswith("disposition_")
+            or c.startswith("lottery_") or c.startswith("attention_")
+            or c.startswith("cash_burn_") or c.startswith("debt_maturity_")
+            or c.startswith("covenant_") or c.startswith("sample_entropy")
+            or c.startswith("perm_entropy") or c.startswith("lz_")
+            or c.startswith("approx_entropy") or c.startswith("skewness_")
+            or c.startswith("kurtosis_") or c.startswith("tail_ratio")
+            or c.startswith("vol_of_vol") or c.startswith("revenue_rec")
+            or c.startswith("capex_depr") or c.startswith("soft_asset")
+            or c.startswith("ocf_ratio") or c.startswith("inventory_turn")
+            or c.startswith("receivables_turn") or c.startswith("payables_turn")
+            or c.startswith("sga_effic") or c.startswith("capex_intens")
+            or c.endswith("_zscore_63d") or c.endswith("_percentile_252d")
+            or c.endswith("_regime_zscore") or c.endswith("_change_21d")
             or c in ("stability_score_21d",
                      "buying_power_index", "sector_demand_momentum",
                      "catalyst_score", "online_change_score",
