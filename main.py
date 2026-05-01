@@ -1484,6 +1484,23 @@ Non-interactive examples:
                 logger.info("Cox PH survival score computed and blended (w_sig=%.2f, w_cox=%.2f)", _w_sig, _w_cox)
         except Exception as _exc:
             logger.debug("Cox PH survival score skipped: %s", _exc)
+        # Gradient-based early warning: deterioration velocity (Duffie et al. 2007)
+        try:
+            from operator1.analysis.survival_mode import compute_survival_velocity
+            _vel_flag, _vel_rate = compute_survival_velocity(cache)
+            cache["survival_velocity_flag"] = _vel_flag
+            cache["survival_deterioration_rate"] = _vel_rate
+        except Exception as _vel_exc:
+            logger.debug("Survival velocity skipped: %s", _vel_exc)
+        # Survival uncertainty bands (bootstrap P10/P90)
+        try:
+            from operator1.analysis.survival_mode import compute_survival_uncertainty
+            _p10, _p90, _unc = compute_survival_uncertainty(cache, probability=cache.get("survival_probability"))
+            cache["survival_probability_p10"] = _p10
+            cache["survival_probability_p90"] = _p90
+            cache["survival_uncertainty"] = _unc
+        except Exception as _unc_exc:
+            logger.debug("Survival uncertainty skipped: %s", _unc_exc)
         cache = compute_hierarchy_weights(cache)
         for i in range(1, 6):
             col = f"hierarchy_tier{i}_weight"
@@ -2661,6 +2678,24 @@ Non-interactive examples:
         _mv_mc_result = _ps.mv_mc_result
         signal_ic_result = _ps.signal_ic_result or signal_ic_result
 
+        # Post-pipeline hierarchy weight recalibration with forward pass errors
+        if forward_pass_result is not None and hasattr(forward_pass_result, 'errors_by_tier'):
+            try:
+                _fp_errors = {
+                    f"tier{k}": v
+                    for k, v in forward_pass_result.errors_by_tier.items()
+                    if v
+                }
+                if _fp_errors:
+                    cache = compute_hierarchy_weights(cache, forward_pass_errors=_fp_errors)
+                    for i in range(1, 6):
+                        col = f"hierarchy_tier{i}_weight"
+                        if col in cache.columns:
+                            weights[f"tier{i}"] = float(cache[col].iloc[-1])
+                    logger.info("Hierarchy weights recalibrated with forward-pass error feedback")
+            except Exception as _hw_exc:
+                logger.debug("Hierarchy weight recalibration skipped: %s", _hw_exc)
+
         logger.info("Temporal modeling complete via staged runner")
 
     else:  # --skip-models
@@ -3258,6 +3293,21 @@ Non-interactive examples:
             profile["scenario_analysis"] = scenario_result.to_dict()
         else:
             profile["scenario_analysis"] = {"available": False}
+
+        # Reverse stress test (Basel III): minimum shock to trigger survival
+        try:
+            from operator1.analysis.scenario_engine import compute_reverse_stress_test
+            _reverse = compute_reverse_stress_test(cache)
+            if _reverse.available:
+                profile.setdefault("scenario_analysis", {})["reverse_stress"] = {
+                    "revenue_shock_pct": _reverse.revenue_shock_pct,
+                    "margin_shock_pp": _reverse.margin_shock_pp,
+                    "rate_shock_bps": _reverse.rate_shock_bps,
+                    "triggered_variable": _reverse.triggered_variable,
+                    "available": True,
+                }
+        except Exception as _rs_exc:
+            logger.debug("Reverse stress test skipped: %s", _rs_exc)
 
         # Inject multi-frequency fusion results
         if multi_frequency_result is not None and hasattr(multi_frequency_result, "available") and multi_frequency_result.available:

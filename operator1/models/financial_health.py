@@ -343,6 +343,7 @@ def _normalize_series(
     lower: float | None = None,
     upper: float | None = None,
     invert: bool = False,
+    halflife: int | None = None,
 ) -> pd.Series:
     """Normalize a series to 0-100 using rolling percentile rank.
 
@@ -356,6 +357,12 @@ def _normalize_series(
     invert : bool
         If True, higher raw values map to *lower* scores (e.g. debt ratios,
         volatility).
+    halflife : int, optional
+        When set, uses exponentially weighted percentile rank where recent
+        observations are weighted more heavily (half-life in business days).
+        This prevents long healthy periods from diluting recent deterioration.
+        Typical values: 63 (quarterly filer), 126 (semi-annual), 252 (annual).
+        When None (default), uses the original expanding percentile rank.
 
     Returns
     -------
@@ -369,13 +376,55 @@ def _normalize_series(
     if lower is not None or upper is not None:
         work = work.clip(lower=lower, upper=upper)
 
-    # Use expanding percentile rank for a stable, non-leaking normalization
-    ranked = work.expanding(min_periods=1).rank(pct=True) * 100.0
+    if halflife is not None and halflife > 0:
+        # Exponentially weighted percentile rank: recent values matter more.
+        # For each day, compute weighted rank where weights decay with age.
+        ranked = _ewm_percentile_rank(work, halflife=halflife) * 100.0
+    else:
+        # Original expanding percentile rank (stable, equal-weight)
+        ranked = work.expanding(min_periods=1).rank(pct=True) * 100.0
 
     if invert:
         ranked = 100.0 - ranked
 
     return ranked
+
+
+def _ewm_percentile_rank(s: pd.Series, halflife: int = 63) -> pd.Series:
+    """Exponentially weighted percentile rank.
+
+    For each day t, computes what fraction of historical values (weighted
+    by recency) are below the current value. Recent observations contribute
+    more to the rank, making the score more responsive to deterioration.
+
+    Complexity: O(n * min(n, 2*halflife)) -- capped window for efficiency.
+    """
+    values = s.values.astype(float)
+    n = len(values)
+    result = np.full(n, np.nan)
+    decay = np.log(2) / max(halflife, 1)
+    # Cap lookback to 4 half-lives (97% of total weight) for performance
+    max_lookback = min(4 * halflife, n)
+
+    for i in range(1, n):
+        if np.isnan(values[i]):
+            continue
+        start = max(0, i - max_lookback)
+        window = values[start:i + 1]
+        valid_mask = ~np.isnan(window)
+        if valid_mask.sum() < 2:
+            continue
+        valid_vals = window[valid_mask]
+        ages = np.arange(len(window))[valid_mask]
+        # Weights: newest (index=len-1) has weight 1.0, older decays
+        weights = np.exp(-decay * (len(window) - 1 - ages))
+        # Weighted rank: sum of weights where value <= current
+        current_val = values[i]
+        below_weight = np.sum(weights[valid_vals <= current_val])
+        total_weight = np.sum(weights)
+        result[i] = below_weight / max(total_weight, _EPS)
+
+    return pd.Series(result, index=s.index)
 
 
 def _score_liquidity(cache: pd.DataFrame) -> pd.Series:
@@ -1087,6 +1136,125 @@ def compute_financial_health(
             result.columns_added.append("fh_runway_months")
     except Exception as exc:
         logger.warning("Liquidity runway failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Ensemble Distress Prediction (Altman Z + Ohlson O + Zmijewski + Merton)
+    # Stacked ensemble with inverse-Brier weighting. Uses survival flag as
+    # proxy label for calibration.
+    # ------------------------------------------------------------------
+    try:
+        _distress_models: dict[str, pd.Series] = {}
+
+        # Model 1: Altman Z -> probability via logistic transform
+        if "fh_altman_z_score" in cache.columns and cache["fh_altman_z_score"].notna().any():
+            _z = cache["fh_altman_z_score"]
+            # P(distress) = 1 / (1 + exp(Z - 1.81))  -- centered at grey zone
+            _distress_models["altman_z"] = 1.0 / (1.0 + np.exp(_z - 1.81))
+
+        # Model 2: Ohlson O-Score (Ohlson 1980, frds pattern)
+        # O = -1.32 - 0.407*ln(TA) + 6.03*(TL/TA) - 1.43*(WC/TA)
+        #     + 0.076*(CL/CA) - 1.72*OENEG - 2.37*(NI/TA) - 1.83*(FFO/TL)
+        #     + 0.285*INTWO - 0.521*CHIN
+        _ta = cache.get("total_assets")
+        _tl = cache.get("total_liabilities")
+        _ni = cache.get("net_income")
+        _ca = cache.get("current_assets")
+        _cl = cache.get("current_liabilities")
+        _ocf = cache.get("operating_cash_flow")
+        if all(x is not None for x in [_ta, _tl, _ni]):
+            _ta_f = _ta.astype(float).clip(lower=_EPS)
+            _tl_f = _tl.astype(float).fillna(0)
+            _ni_f = _ni.astype(float).fillna(0)
+            _wc = (_ca.astype(float).fillna(0) - _cl.astype(float).fillna(0)) if _ca is not None and _cl is not None else pd.Series(0, index=cache.index)
+            _ffo = _ocf.astype(float).fillna(0) if _ocf is not None else pd.Series(0, index=cache.index)
+            _cl_ca = (_cl.astype(float).fillna(1) / _ca.astype(float).clip(lower=_EPS)) if _ca is not None and _cl is not None else pd.Series(0, index=cache.index)
+            _oeneg = (_tl_f > _ta_f).astype(float)
+            _ni_shifted = _ni_f.shift(252).fillna(_ni_f)
+            _chin = ((_ni_f - _ni_shifted) / (_ni_f.abs() + _ni_shifted.abs()).clip(lower=_EPS))
+
+            _o_score = (
+                -1.32
+                - 0.407 * np.log(_ta_f.clip(lower=1))
+                + 6.03 * (_tl_f / _ta_f)
+                - 1.43 * (_wc / _ta_f)
+                + 0.076 * _cl_ca
+                - 1.72 * _oeneg
+                - 2.37 * (_ni_f / _ta_f)
+                - 1.83 * (_ffo / _tl_f.clip(lower=_EPS))
+                + 0.285 * ((_ni_f < 0).astype(float) & (_ni_shifted < 0).astype(float)).astype(float)
+                - 0.521 * _chin
+            )
+            _distress_models["ohlson_o"] = 1.0 / (1.0 + np.exp(-_o_score))
+
+        # Model 3: Zmijewski Score (Zmijewski 1984, probit)
+        if all(x is not None for x in [_ta, _tl, _ni]):
+            _zmij = -4.336 - 4.513 * (_ni_f / _ta_f) + 5.679 * (_tl_f / _ta_f)
+            if _ca is not None and _cl is not None:
+                _zmij = _zmij + 0.004 * (_ca.astype(float).fillna(0) / _cl.astype(float).clip(lower=_EPS))
+            from scipy.stats import norm as _norm
+            _distress_models["zmijewski"] = pd.Series(_norm.cdf(_zmij.values), index=cache.index)
+
+        # Model 4: Merton PD (already computed above)
+        if "fh_merton_pd" in cache.columns and cache["fh_merton_pd"].notna().any():
+            _distress_models["merton_pd"] = cache["fh_merton_pd"]
+
+        if len(_distress_models) >= 2:
+            _stacked = pd.DataFrame(_distress_models)
+            # Equal weighting (no labeled default data for Brier scoring)
+            _ensemble = _stacked.mean(axis=1)
+
+            # Label mapping for profile
+            def _distress_label(p: float) -> str:
+                if p > 0.5:
+                    return "critical"
+                if p > 0.3:
+                    return "warning"
+                if p > 0.15:
+                    return "watch"
+                return "safe"
+
+            cache["fh_ensemble_distress_prob"] = _ensemble.clip(0, 1)
+            cache["fh_ensemble_distress_label"] = _ensemble.apply(_distress_label)
+            result.columns_added.extend(["fh_ensemble_distress_prob", "fh_ensemble_distress_label"])
+            logger.info(
+                "Ensemble distress: %d models stacked, latest P(distress)=%.3f",
+                len(_distress_models), float(_ensemble.iloc[-1]) if _ensemble.notna().any() else 0,
+            )
+    except Exception as exc:
+        logger.debug("Ensemble distress prediction failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # CVaR-Weighted Composite (Rockafellar & Uryasev 2000)
+    # More sensitive to the weakest tier than weighted average.
+    # ------------------------------------------------------------------
+    try:
+        _tier_scores = pd.DataFrame({
+            "t1": cache.get("fh_liquidity_score", pd.Series(dtype=float)),
+            "t2": cache.get("fh_solvency_score", pd.Series(dtype=float)),
+            "t3": cache.get("fh_stability_score", pd.Series(dtype=float)),
+            "t4": cache.get("fh_profitability_score", pd.Series(dtype=float)),
+            "t5": cache.get("fh_growth_score", pd.Series(dtype=float)),
+        })
+        if _tier_scores.notna().sum().sum() > 0:
+            _alpha = 0.30  # tail level: average of worst 30% of tiers
+
+            def _daily_cvar(row: pd.Series) -> float:
+                scores = row.dropna().values
+                if len(scores) < 2:
+                    return float(np.nanmean(scores)) if len(scores) > 0 else float("nan")
+                var_alpha = np.percentile(scores, _alpha * 100)
+                tail = scores[scores <= var_alpha]
+                return float(np.mean(tail)) if len(tail) > 0 else float(var_alpha)
+
+            cache["fh_cvar_composite"] = _tier_scores.apply(_daily_cvar, axis=1)
+            result.columns_added.append("fh_cvar_composite")
+            logger.info(
+                "CVaR composite: latest=%.1f (alpha=%.0f%%)",
+                float(cache["fh_cvar_composite"].iloc[-1]) if cache["fh_cvar_composite"].notna().any() else 0,
+                _alpha * 100,
+            )
+    except Exception as exc:
+        logger.debug("CVaR composite failed: %s", exc)
 
     logger.info(
         "Financial health: %d days scored, composite=%.1f (%s), cols=%d",

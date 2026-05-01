@@ -66,6 +66,22 @@ def run_7_1_uss(state: PipelineState) -> None:
     except Exception as exc:
         logger.warning("Scenario engine failed: %s", exc)
 
+    # Reverse stress test (Basel III): minimum shock to trigger survival
+    try:
+        from operator1.analysis.scenario_engine import compute_reverse_stress_test
+        _reverse = compute_reverse_stress_test(cache)
+        if _reverse.available:
+            # Attach to scenario_result for profile injection
+            if state.scenario_result is not None:
+                state.scenario_result.reverse_stress = _reverse
+            logger.info(
+                "Reverse stress: revenue=%.1f%%, margin=%.1fpp, rates=+%.0fbps -> %s",
+                _reverse.revenue_shock_pct, _reverse.margin_shock_pp,
+                _reverse.rate_shock_bps, _reverse.triggered_variable,
+            )
+    except Exception as exc:
+        logger.debug("Reverse stress test skipped: %s", exc)
+
 
 def run_7_2_retro_calibration(state: PipelineState) -> None:
     """7.2: Retroactive calibration (empirical Bayes: first-pass data -> second-pass priors)."""

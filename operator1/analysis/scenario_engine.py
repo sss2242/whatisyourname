@@ -385,3 +385,147 @@ def run_scenario_engine(
 
     result.available = True
     return result
+
+
+# ---------------------------------------------------------------------------
+# Reverse Stress Testing (Basel III requirement)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ReverseStressResult:
+    """Minimum shock combination that triggers survival mode."""
+
+    revenue_shock_pct: float = 0.0
+    margin_shock_pp: float = 0.0
+    rate_shock_bps: float = 0.0
+    shock_magnitude: float = float("inf")
+    triggered_variable: str = ""
+    available: bool = False
+    error: str = ""
+
+
+def compute_reverse_stress_test(
+    cache: pd.DataFrame,
+    thresholds: dict[str, float] | None = None,
+) -> ReverseStressResult:
+    """Find the minimum joint shock that would trigger survival mode.
+
+    Works backwards from the survival trigger thresholds: "What is the
+    smallest combination of revenue drop, margin compression, and rate
+    increase that pushes this company into survival?"
+
+    Uses scipy.optimize.minimize with SLSQP for constrained optimization.
+
+    Parameters
+    ----------
+    cache:
+        Daily cache with financial statement columns.
+    thresholds:
+        Survival thresholds (uses defaults if None).
+
+    Returns
+    -------
+    ReverseStressResult
+        Minimum shock magnitudes and the variable that triggers first.
+    """
+    result = ReverseStressResult()
+
+    try:
+        from scipy.optimize import minimize as _minimize
+    except ImportError:
+        result.error = "scipy not available"
+        return result
+
+    # Extract latest values
+    _get_latest = lambda col, default: (
+        float(cache[col].dropna().iloc[-1]) if col in cache.columns and cache[col].notna().any() else default
+    )
+
+    latest_revenue = _get_latest("revenue", 0)
+    latest_margin = _get_latest("operating_margin", 0)
+    latest_ocf = _get_latest("operating_cash_flow", 0)
+    latest_capex = abs(_get_latest("capex", 0))
+    latest_mcap = _get_latest("market_cap", 1)
+    latest_cr = _get_latest("current_ratio", 2.0)
+    latest_dte = _get_latest("debt_to_equity_abs", 1.0)
+
+    if latest_revenue <= 0 or latest_mcap <= 0:
+        result.error = "Insufficient financial data for reverse stress test"
+        return result
+
+    # Default thresholds
+    if thresholds is None:
+        try:
+            from operator1.analysis.survival_mode import _load_company_thresholds
+            thresholds = _load_company_thresholds()
+        except Exception:
+            thresholds = {"fcf_yield_lt": 0.0, "debt_to_equity_abs_gt": 3.0, "current_ratio_lt": 1.0}
+
+    fcf_threshold = thresholds.get("fcf_yield_lt", 0.0)
+    dte_threshold = thresholds.get("debt_to_equity_abs_gt", 3.0)
+    cr_threshold = thresholds.get("current_ratio_lt", 1.0)
+
+    def _objective(x: np.ndarray) -> float:
+        """Minimize total shock magnitude (L2 norm)."""
+        return float(x[0] ** 2 + x[1] ** 2 + (x[2] / 100) ** 2)
+
+    def _survival_constraint(x: np.ndarray) -> float:
+        """Negative when any survival trigger fires (constraint violated)."""
+        rev_shock, margin_shock, _rate_shock = x
+        new_revenue = latest_revenue * (1 + rev_shock)
+        new_margin = latest_margin + margin_shock
+        new_ocf = new_revenue * max(new_margin, -0.5)
+        new_fcf = new_ocf - latest_capex
+        new_fcf_yield = new_fcf / max(latest_mcap, 1)
+
+        # Check triggers
+        if new_fcf_yield < fcf_threshold:
+            return -1.0  # triggered
+        # Approximate: rate shock increases D/E via higher debt service
+        shock_dte = latest_dte * (1 + _rate_shock / 10000)
+        if shock_dte > dte_threshold:
+            return -1.0
+        # CR deteriorates with revenue miss (less current assets)
+        shock_cr = latest_cr * (1 + rev_shock * 0.5)
+        if shock_cr < cr_threshold:
+            return -1.0
+        return 1.0  # not triggered
+
+    try:
+        opt = _minimize(
+            _objective,
+            x0=[0.0, 0.0, 0.0],
+            method="SLSQP",
+            bounds=[(-0.50, 0.0), (-0.20, 0.0), (0.0, 500.0)],
+            constraints={"type": "ineq", "fun": lambda x: -_survival_constraint(x)},
+            options={"maxiter": 200, "ftol": 1e-8},
+        )
+
+        if opt.success or opt.fun < 10:
+            result.revenue_shock_pct = float(opt.x[0] * 100)
+            result.margin_shock_pp = float(opt.x[1] * 100)
+            result.rate_shock_bps = float(opt.x[2])
+            result.shock_magnitude = float(opt.fun)
+
+            # Determine which variable triggers first
+            triggers = []
+            if abs(opt.x[0]) > 0.01:
+                triggers.append(("fcf_yield", abs(opt.x[0])))
+            if abs(opt.x[1]) > 0.001:
+                triggers.append(("operating_margin", abs(opt.x[1])))
+            if opt.x[2] > 1:
+                triggers.append(("debt_to_equity", opt.x[2] / 500))
+            result.triggered_variable = triggers[0][0] if triggers else "fcf_yield"
+            result.available = True
+
+            logger.info(
+                "Reverse stress: revenue=%.1f%%, margin=%.1fpp, rates=+%.0fbps -> triggers %s",
+                result.revenue_shock_pct, result.margin_shock_pp,
+                result.rate_shock_bps, result.triggered_variable,
+            )
+        else:
+            result.error = f"Optimizer did not converge: {opt.message}"
+    except Exception as exc:
+        result.error = f"Reverse stress test failed: {exc}"
+
+    return result

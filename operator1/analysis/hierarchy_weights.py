@@ -211,9 +211,85 @@ def _apply_vanity_adjustment(
 # ---------------------------------------------------------------------------
 
 
+def _entropy_blend_weights(
+    base_weights: list[float],
+    forward_pass_errors: dict[str, list[float]] | None,
+    alpha: float = 0.7,
+) -> list[float]:
+    """Blend regime-default weights with entropy-derived weights.
+
+    Information-theoretic approach (Jaynes 1957): allocate more attention
+    (weight) to tiers where prediction errors have higher entropy
+    (more uncertainty = more information needed).
+
+    Parameters
+    ----------
+    base_weights:
+        Regime-default weights (sum to 1.0).
+    forward_pass_errors:
+        Dict of ``tier{i}`` -> list of prediction errors from a prior
+        forward pass. When None or empty, returns base_weights unchanged.
+    alpha:
+        Blend factor: 1.0 = pure regime defaults, 0.0 = pure entropy.
+        Decays toward 0.5 as more data accumulates.
+
+    Returns
+    -------
+    list[float]
+        Blended weights (sum to ~1.0).
+    """
+    if not forward_pass_errors:
+        return base_weights
+
+    import numpy as np
+
+    n_tiers = len(base_weights)
+    entropies = []
+    for i in range(1, n_tiers + 1):
+        errors = forward_pass_errors.get(f"tier{i}", [])
+        if len(errors) < 10:
+            entropies.append(1.0)  # neutral entropy when insufficient data
+            continue
+        arr = np.array(errors, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if len(arr) < 10:
+            entropies.append(1.0)
+            continue
+        # Histogram-based Shannon entropy
+        hist, _ = np.histogram(arr, bins=min(20, len(arr) // 3), density=True)
+        hist = hist[hist > 0]
+        if len(hist) < 2:
+            entropies.append(1.0)
+            continue
+        hist = hist / hist.sum()
+        entropies.append(float(-np.sum(hist * np.log2(hist + 1e-15))))
+
+    total_entropy = sum(entropies)
+    if total_entropy < 1e-10:
+        return base_weights
+
+    entropy_weights = [e / total_entropy for e in entropies]
+
+    # Blend: alpha * regime_default + (1-alpha) * entropy_derived
+    # Cap shift at +/- 10% from regime defaults
+    blended = []
+    for bw, ew in zip(base_weights, entropy_weights):
+        shift = (1 - alpha) * (ew - bw)
+        shift = max(-0.10, min(0.10, shift))
+        blended.append(bw + shift)
+
+    # Re-normalize to sum to 1.0
+    s = sum(blended)
+    if s > 1e-10:
+        blended = [w / s for w in blended]
+
+    return blended
+
+
 def compute_hierarchy_weights(
     df: pd.DataFrame,
     config: dict[str, Any] | None = None,
+    forward_pass_errors: dict[str, list[float]] | None = None,
 ) -> pd.DataFrame:
     """Compute survival hierarchy tier weights for every day.
 
@@ -280,6 +356,13 @@ def compute_hierarchy_weights(
     for idx in range(len(result)):
         regime = result["survival_regime"].iloc[idx]
         base_weights = list(regime_weights_cache.get(regime, [0.2] * _NUM_TIERS))
+
+        # Apply entropy-based blending (Jaynes 1957 maximum entropy)
+        # Shifts weight toward tiers with higher prediction uncertainty
+        if forward_pass_errors:
+            base_weights = _entropy_blend_weights(
+                base_weights, forward_pass_errors, alpha=0.7,
+            )
 
         # Apply vanity adjustment (only active in survival regimes)
         vp = vanity_pct.iloc[idx]

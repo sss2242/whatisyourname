@@ -78,6 +78,21 @@ _SIGNAL_SPEED: dict[str, str] = {
     "macd_histogram": "fast",
     "online_change_score": "fast",
     "beta_252d": "fast",
+    # Layer 2 enhancements: survival velocity, uncertainty, duration, distress
+    # Slow (fundamental, quarterly frequency)
+    "survival_prob_liquidity": "slow",
+    "survival_prob_solvency": "slow",
+    "fh_ensemble_distress_prob": "slow",
+    "fh_cvar_composite": "slow",
+    # Medium (derived, changes with regimes)
+    "survival_deterioration_rate": "medium",
+    "dominant_risk_channel": "medium",
+    "mode_exit_probability_21d": "medium",
+    "covenant_proximity_score": "medium",
+    # Fast (daily updates)
+    "survival_velocity_flag": "fast",
+    "survival_uncertainty": "fast",
+    "early_warning_score": "fast",
 }
 
 

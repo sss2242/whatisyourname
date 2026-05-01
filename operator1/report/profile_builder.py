@@ -328,6 +328,14 @@ def _build_survival_section(cache: pd.DataFrame | None) -> dict[str, Any]:
             f"tier{i}": _safe_float(latest.get(f"hierarchy_tier{i}_weight"))
             for i in range(1, 6)
         },
+        # Layer 2 enhancements: gradient velocity, uncertainty bands, semi-Markov
+        "survival_velocity_flag": int(latest.get("survival_velocity_flag", 0)),
+        "survival_deterioration_rate": _safe_float(latest.get("survival_deterioration_rate")),
+        "survival_probability_p10": _safe_float(latest.get("survival_probability_p10")),
+        "survival_probability_p90": _safe_float(latest.get("survival_probability_p90")),
+        "survival_uncertainty": _safe_float(latest.get("survival_uncertainty")),
+        "expected_remaining_days_in_mode": _safe_float(latest.get("expected_remaining_days_in_mode")),
+        "mode_exit_probability_21d": _safe_float(latest.get("mode_exit_probability_21d")),
     }
 
 
@@ -918,6 +926,15 @@ def _build_financial_health_section(
             section["label_distribution_pct"] = {
                 str(k): round(float(v), 4) for k, v in vc.items()
             }
+
+        # Layer 2 enhancements: ensemble distress + CVaR composite
+        latest = _latest_row(cache)
+        if latest is not None:
+            if "fh_ensemble_distress_prob" in cache.columns:
+                section["ensemble_distress_prob"] = _safe_float(latest.get("fh_ensemble_distress_prob"))
+                section["ensemble_distress_label"] = _safe_str(latest.get("fh_ensemble_distress_label"))
+            if "fh_cvar_composite" in cache.columns:
+                section["cvar_composite"] = _safe_float(latest.get("fh_cvar_composite"))
 
     return section
 

@@ -194,6 +194,65 @@ def get_model_config(regime: str) -> ModelConfig:
     return _MODEL_CONFIGS.get(regime, _MODEL_CONFIGS["normal"])
 
 
+def get_soft_transition_config(
+    current_regime: str,
+    previous_regime: str | None = None,
+    days_since_switch: int = 0,
+    halflife: int = 5,
+) -> ModelConfig:
+    """Return model config with gradual transition between regimes.
+
+    Instead of hard-switching all parameters simultaneously when a regime
+    changes, interpolates between old and new configs over a transition
+    window. This prevents discontinuities in model behavior.
+
+    Parameters
+    ----------
+    current_regime:
+        Active regime label.
+    previous_regime:
+        Previous regime label (before the switch). When None or same as
+        current_regime, returns the current config unchanged.
+    days_since_switch:
+        Number of days since the regime switch occurred.
+    halflife:
+        Transition half-life in days (default 5). At halflife days,
+        parameters are 50% transitioned; at 2*halflife, 75%; at
+        3*halflife, 87.5%.
+
+    Returns
+    -------
+    ModelConfig
+        Interpolated config (or current if no transition needed).
+    """
+    import numpy as np
+    from dataclasses import asdict
+
+    current_config = get_model_config(current_regime)
+
+    if previous_regime is None or previous_regime == current_regime or days_since_switch <= 0:
+        return current_config
+
+    previous_config = get_model_config(previous_regime)
+
+    # Exponential transition: lambda goes from 0 (old config) to 1 (new config)
+    lam = float(1.0 - np.exp(-days_since_switch * np.log(2) / max(halflife, 1)))
+
+    # Interpolate numeric fields only
+    current_d = asdict(current_config)
+    previous_d = asdict(previous_config)
+    blended = {}
+    for key in current_d:
+        cv, pv = current_d[key], previous_d[key]
+        if isinstance(cv, (int, float)) and isinstance(pv, (int, float)):
+            blended[key] = (1 - lam) * pv + lam * cv
+        else:
+            # Non-numeric (strings, None): switch immediately to current
+            blended[key] = cv
+
+    return ModelConfig(**blended)
+
+
 # ---------------------------------------------------------------------------
 # Dimension 3: Horizon Compression
 # ---------------------------------------------------------------------------
@@ -527,7 +586,23 @@ class SurvivalRegimeController:
         # Configure all 5 dimensions based on current regime
         all_vars = list(cache.columns)
         controller.triage = triage_variables(controller.current_regime, all_vars)
-        controller.model_config = get_model_config(controller.current_regime)
+
+        # Use soft transition if a regime switch was recently detected
+        _prev_regime: str | None = None
+        _days_since: int = 0
+        if controller.regime_switches > 0 and len(controller.regime_timeline) > 1:
+            tl = controller.regime_timeline.dropna()
+            shifted = tl.shift(1)
+            switch_mask = tl != shifted
+            if switch_mask.any():
+                last_switch_idx = switch_mask[switch_mask].index[-1]
+                _days_since = int((tl.index[-1] - last_switch_idx).days) if hasattr(tl.index[-1], 'days') else len(tl) - tl.index.get_loc(last_switch_idx)
+                prev_vals = tl[tl.index < last_switch_idx]
+                if not prev_vals.empty:
+                    _prev_regime = str(prev_vals.iloc[-1])
+        controller.model_config = get_soft_transition_config(
+            controller.current_regime, _prev_regime, _days_since,
+        )
         controller.horizons = get_active_horizons(controller.current_regime)
         controller.primary_horizon = get_primary_horizon(controller.current_regime)
         controller.correlation_override = get_crisis_correlation_override(

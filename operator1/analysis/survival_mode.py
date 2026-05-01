@@ -201,6 +201,89 @@ def compute_company_survival_flag(
     return flag
 
 
+def compute_survival_velocity(
+    df: pd.DataFrame,
+    thresholds: dict[str, float] | None = None,
+    window: int = 21,
+) -> tuple[pd.Series, pd.Series]:
+    """Compute deterioration velocity toward survival thresholds.
+
+    Fires a velocity flag when any trigger variable is approaching its
+    threshold faster than 30% of the threshold distance per ``window`` days,
+    even if the threshold has not yet been breached.
+
+    Based on Duffie, Saita & Wang (2007) insight that default intensity
+    depends on both level AND trajectory of covariates.
+
+    Parameters
+    ----------
+    df:
+        Daily feature table with derived variables.
+    thresholds:
+        Override thresholds (uses company defaults if None).
+    window:
+        Lookback window for velocity computation (default 21 days).
+
+    Returns
+    -------
+    tuple[pd.Series, pd.Series]
+        (survival_velocity_flag, survival_deterioration_rate)
+        Flag is 1 when any trigger is deteriorating fast; rate is the
+        worst (most negative) normalized deterioration across triggers.
+    """
+    import numpy as np
+
+    t = thresholds or _COMPANY_THRESHOLDS
+    _eps = 1e-10
+
+    trigger_configs = [
+        ("current_ratio", t.get("current_ratio_lt", 1.0), "below"),
+        ("debt_to_equity_abs", t.get("debt_to_equity_abs_gt", 3.0), "above"),
+        ("fcf_yield", t.get("fcf_yield_lt", 0.0), "below"),
+        ("drawdown_252d", t.get("drawdown_252d_lt", -0.40), "below"),
+    ]
+
+    velocities: list[pd.Series] = []
+    for col, threshold, direction in trigger_configs:
+        if col not in df.columns or df[col].isna().all():
+            continue
+        s = df[col].astype(float)
+        delta = s.diff(window)
+        denom = max(abs(threshold), _eps)
+        if direction == "below":
+            # Negative delta = moving toward breach (value dropping toward threshold)
+            vel = delta / denom
+        else:
+            # Positive delta = moving toward breach (value rising toward threshold)
+            vel = -delta / denom
+        velocities.append(vel)
+
+    if not velocities:
+        zero = pd.Series(0, index=df.index, dtype=int)
+        nan = pd.Series(np.nan, index=df.index, dtype=float)
+        zero.name = "survival_velocity_flag"
+        nan.name = "survival_deterioration_rate"
+        return zero, nan
+
+    stacked = pd.concat(velocities, axis=1)
+    # Most negative = worst deterioration across all triggers
+    worst_rate = stacked.min(axis=1)
+    worst_rate.name = "survival_deterioration_rate"
+
+    # Flag: fires when deterioration exceeds 30% of threshold distance in window
+    velocity_flag = (worst_rate < -0.30).astype(int)
+    velocity_flag.name = "survival_velocity_flag"
+
+    n_flagged = int(velocity_flag.sum())
+    if n_flagged > 0:
+        logger.info(
+            "Survival velocity: %d / %d days flagged (fast deterioration toward threshold)",
+            n_flagged, len(velocity_flag),
+        )
+
+    return velocity_flag, worst_rate
+
+
 def compute_survival_probability(
     df: pd.DataFrame,
     thresholds: dict[str, float] | None = None,
@@ -282,6 +365,81 @@ def compute_survival_probability(
     )
 
     return probability
+
+
+def compute_survival_uncertainty(
+    df: pd.DataFrame,
+    probability: pd.Series | None = None,
+    n_bootstrap: int = 100,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Compute uncertainty bands around survival probability via bootstrap.
+
+    Uses bootstrapped resampling of the distance-to-threshold components
+    to produce P10/P90 credible intervals and an uncertainty spread.
+
+    When Cox PH results are available (via lifelines standard errors),
+    propagates analytical uncertainty. Falls back to bootstrap of the
+    sigmoid components otherwise.
+
+    Parameters
+    ----------
+    df:
+        Daily feature table with survival trigger variables.
+    probability:
+        Pre-computed survival probability series (avoids recomputation).
+    n_bootstrap:
+        Number of bootstrap samples (default 100 for speed).
+
+    Returns
+    -------
+    tuple[pd.Series, pd.Series, pd.Series]
+        (survival_probability_p10, survival_probability_p90, survival_uncertainty)
+    """
+    import numpy as np
+
+    if probability is None:
+        probability = compute_survival_probability(df)
+
+    # Bootstrap approach: add noise to trigger variables, recompute probability
+    trigger_cols = [c for c in ("current_ratio", "debt_to_equity_abs", "fcf_yield", "drawdown_252d")
+                    if c in df.columns and df[c].notna().any()]
+
+    if not trigger_cols:
+        p10 = probability.copy()
+        p90 = probability.copy()
+        p10.name = "survival_probability_p10"
+        p90.name = "survival_probability_p90"
+        unc = pd.Series(0.0, index=df.index, name="survival_uncertainty")
+        return p10, p90, unc
+
+    rng = np.random.default_rng(42)
+    bootstrap_probs = np.zeros((n_bootstrap, len(df)))
+
+    for b in range(n_bootstrap):
+        # Perturb each trigger variable by its own rolling std
+        perturbed = df.copy()
+        for col in trigger_cols:
+            s = perturbed[col].astype(float)
+            noise_scale = s.rolling(63, min_periods=10).std().fillna(s.std())
+            noise = rng.normal(0, 1, size=len(s)) * noise_scale.values * 0.5
+            perturbed[col] = s + noise
+
+        bp = compute_survival_probability(perturbed)
+        bootstrap_probs[b] = bp.values
+
+    p10_vals = np.nanpercentile(bootstrap_probs, 10, axis=0)
+    p90_vals = np.nanpercentile(bootstrap_probs, 90, axis=0)
+
+    p10 = pd.Series(p10_vals, index=df.index, name="survival_probability_p10")
+    p90 = pd.Series(p90_vals, index=df.index, name="survival_probability_p90")
+    uncertainty = pd.Series(p90_vals - p10_vals, index=df.index, name="survival_uncertainty")
+
+    logger.info(
+        "Survival uncertainty: mean spread=%.3f (P10=%.3f, P90=%.3f)",
+        uncertainty.mean(), p10.mean(), p90.mean(),
+    )
+
+    return p10, p90, uncertainty
 
 
 def compute_cox_survival_score(

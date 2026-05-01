@@ -639,6 +639,23 @@ def run_stage1(state: PipelineState) -> None:
                 cache["survival_probability"] = 0.4 * sig + 0.6 * cox.fillna(sig)
         except Exception:
             pass
+        # Gradient-based early warning: deterioration velocity
+        try:
+            from operator1.analysis.survival_mode import compute_survival_velocity
+            _vel_flag, _vel_rate = compute_survival_velocity(cache)
+            cache["survival_velocity_flag"] = _vel_flag
+            cache["survival_deterioration_rate"] = _vel_rate
+        except Exception:
+            pass
+        # Survival uncertainty bands (bootstrap P10/P90)
+        try:
+            from operator1.analysis.survival_mode import compute_survival_uncertainty
+            _p10, _p90, _unc = compute_survival_uncertainty(cache, probability=cache.get("survival_probability"))
+            cache["survival_probability_p10"] = _p10
+            cache["survival_probability_p90"] = _p90
+            cache["survival_uncertainty"] = _unc
+        except Exception:
+            pass
         cache = compute_hierarchy_weights(cache)
         for i in range(1, 6):
             col = f"hierarchy_tier{i}_weight"
@@ -1086,6 +1103,26 @@ def run_stage2(state, stage_spec: str = "all") -> None:
         state.output_dir = 'cache'
     
     run_stages(state, stage_spec, save_checkpoints=True)
+
+    # Post-pipeline hierarchy weight recalibration with forward pass errors
+    if state.forward_pass_result is not None and hasattr(state.forward_pass_result, 'errors_by_tier'):
+        try:
+            _fp_errors = {
+                f"tier{k}": v
+                for k, v in state.forward_pass_result.errors_by_tier.items()
+                if v
+            }
+            if _fp_errors:
+                from operator1.analysis.hierarchy_weights import compute_hierarchy_weights
+                state.cache = compute_hierarchy_weights(state.cache, forward_pass_errors=_fp_errors)
+                for i in range(1, 6):
+                    col = f"hierarchy_tier{i}_weight"
+                    if col in state.cache.columns:
+                        state.weights[f"tier{i}"] = float(state.cache[col].iloc[-1])
+                logger.info("Hierarchy weights recalibrated with forward-pass error feedback")
+        except Exception as _hw_exc:
+            logger.debug("Hierarchy weight recalibration skipped: %s", _hw_exc)
+
     logger.info("Stage 2 complete via staged runner (spec=%s)", stage_spec)
 
 def run_stage3(state: PipelineState) -> None:

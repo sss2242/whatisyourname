@@ -1,14 +1,16 @@
-# Layer 2: Analysis Modules -- Complete Variable Chart
+# Layer 2: Analysis Modules -- Complete Variable Chart (v2)
 
 Every variable produced by the 10 Layer 2 modules in `operator1/analysis/` + the Financial Health module in `operator1/models/`. These modules produce survival flags, regime classifications, protection assessments, adaptive calibration, and health scores that control how all downstream temporal models behave.
+
+**v2 update (2026-05-01):** Added 10 expert-method enhancements from PR #2: gradient velocity early warning, bootstrap uncertainty bands, semi-Markov duration modeling, EWM percentile rank, entropy-based hierarchy weights, ensemble distress prediction (Altman Z + Ohlson O + Zmijewski + Merton PD), CVaR-weighted composite, soft regime transition, reverse stress testing.
 
 ---
 
 ## 2.1 Survival Mode Detection
 
-**File:** `operator1/analysis/survival_mode.py` (618 lines)
+**File:** `operator1/analysis/survival_mode.py` (~822 lines)
 **Pipeline step:** Step 5
-**Entry points:** `compute_company_survival_flag()`, `compute_country_survival_flag()`, `compute_country_protected_flag()`, `compute_survival_probability()`, `compute_cox_survival_score()`
+**Entry points:** `compute_company_survival_flag()`, `compute_country_survival_flag()`, `compute_country_protected_flag()`, `compute_survival_probability()`, `compute_cox_survival_score()`, `compute_survival_velocity()`, `compute_survival_uncertainty()`
 
 ### Cache Variables
 
@@ -20,15 +22,30 @@ Every variable produced by the 10 Layer 2 modules in `operator1/analysis/` + the
 | 4 | `survival_probability` | Sigmoid of distance to each trigger threshold (6 components weighted by severity). Blended: `0.4 * sigmoid + 0.6 * cox` | Continuous (0-1) | Profile, report, Monte Carlo, MF fusion |
 | 5 | `cox_survival_score` | `CoxPHFitter.fit(df, duration, event_observed)` with covariates: current_ratio, debt_to_equity_abs, fcf_yield, drawdown_252d. Learns hazard ratios from own distress episodes (via `lifelines`) | Continuous (0-1) | Survival probability blending |
 
-**5 cache columns**
+### Gradient Early Warning Variables (from `compute_survival_velocity`) -- NEW PR #2
+
+| # | Variable | Formula / Logic | Type | Consumers |
+|---|----------|----------------|------|-----------|
+| 6 | `survival_velocity_flag` | `1` when any trigger variable is deteriorating toward its threshold faster than 30% of threshold distance per 21 days (Duffie, Saita & Wang 2007) | Integer (0/1) | USS early warning, extra vars |
+| 7 | `survival_deterioration_rate` | Worst (most negative) normalized deterioration rate across all trigger variables: `delta / abs(threshold)` over 21-day window | Continuous | Extra vars, conformal band widening |
+
+### Uncertainty Band Variables (from `compute_survival_uncertainty`) -- NEW PR #2
+
+| # | Variable | Formula / Logic | Type | Consumers |
+|---|----------|----------------|------|-----------|
+| 8 | `survival_probability_p10` | 10th percentile from 100 bootstrap resamples of trigger variable noise | Continuous (0-1) | Profile, report |
+| 9 | `survival_probability_p90` | 90th percentile from bootstrap | Continuous (0-1) | Profile, report |
+| 10 | `survival_uncertainty` | `p90 - p10` spread -- wider = more uncertain about survival status | Continuous | Conformal band scaling, extra vars |
+
+**10 cache columns** (was 5)
 
 ---
 
 ## 2.2 Hierarchy Weights
 
-**File:** `operator1/analysis/hierarchy_weights.py` (322 lines)
+**File:** `operator1/analysis/hierarchy_weights.py` (~400 lines)
 **Pipeline step:** Step 5
-**Entry point:** `compute_hierarchy_weights(cache)`
+**Entry point:** `compute_hierarchy_weights(cache, config=None, forward_pass_errors=None)`
 
 ### Cache Variables
 
@@ -52,13 +69,15 @@ Every variable produced by the 10 Layer 2 modules in `operator1/analysis/` + the
 
 **Vanity adjustment:** When `vanity_percentage > threshold` AND in survival regime, shifts 5% from T4/T5 to T1.
 
+**Entropy-based blending (NEW PR #2):** When `forward_pass_errors` dict is provided (from prior pipeline run), applies `_entropy_blend_weights()` (Jaynes 1957 maximum entropy) to shift weight toward tiers with higher prediction uncertainty. Shannon entropy of per-tier error distributions drives allocation. Capped at +/-10% shift from regime defaults. Falls back to pure regime defaults when no errors available.
+
 **6 cache columns**
 
 ---
 
 ## 2.3 Survival Timeline
 
-**File:** `operator1/analysis/survival_timeline.py` (664 lines)
+**File:** `operator1/analysis/survival_timeline.py` (~780 lines)
 **Pipeline step:** Step 5.5
 **Entry points:** `compute_survival_timeline()`, `compute_enriched_survival_timeline()`
 
@@ -69,21 +88,28 @@ Every variable produced by the 10 Layer 2 modules in `operator1/analysis/` + the
 | 1 | `survival_mode` | 6-mode classification from 3 flags: normal, company_only, country_protected, country_exposed, both_protected, both_unprotected | Categorical | Walk-forward (mode-conditioned scoring), USS |
 | 2 | `survival_mode_code` | Integer code for survival_mode (0-5) | Integer | Walk-forward |
 | 3 | `switch_point` | 1 on days where mode changes, 0 otherwise | Binary (0/1) | Walk-forward (retrain trigger), profile |
-| 4 | `days_in_mode` | Running counter since last switch (resets at each switch_point) | Integer | Profile, stability score |
+| 4 | `days_in_mode` | Running counter since last switch (resets at each switch_point) | Integer | Profile, stability score, semi-Markov |
 | 5 | `stability_score_21d` | Rolling 21-day fraction of same mode (1.0 = fully stable) | Continuous (0-1) | Extra vars, regime shift predictor, adaptive model params |
+
+### Semi-Markov Duration Variables (from `_compute_semi_markov_exit`) -- NEW PR #2
+
+| # | Variable | Formula | Type | Consumers |
+|---|----------|---------|------|-----------|
+| 6 | `expected_remaining_days_in_mode` | Weibull residual life: `scale * Gamma(1 + 1/shape) - days_in_mode` (Barbu & Limnios 2008). Shape <1 = distress trap, >1 = recovery likely. Falls back to geometric (Markov) for <3 dwell episodes. | Integer | Profile, report |
+| 7 | `mode_exit_probability_21d` | Duration-aware exit probability: `1 - S(d+21)/S(d)` from Weibull survival function fitted on per-mode dwell times via `scipy.stats.weibull_min` | Continuous (0-1) | Extra vars, prediction aggregator |
 
 ### Enriched Timeline Variables (from `compute_enriched_survival_timeline`)
 
 | # | Variable | Formula | Type | Consumers |
 |---|----------|---------|------|-----------|
-| 6 | `regime_state` | 11 combined states from (survival_mode x market_regime): stable_growth, elevated_risk, market_stress, company_distress_mild/severe, country_crisis_mild/severe, protected_stress/crisis, crisis, extreme_crisis | Categorical | Profile, report |
-| 7 | `survival_intensity` | Continuous 0-1 metric blending rule-based intensity + HMM regime confidence | Continuous (0-1) | Extra vars, prediction aggregator |
-| 8 | `regime_confidence` | HMM posterior probability of the assigned regime state | Continuous (0-1) | Extra vars |
-| 9 | `regime_switch` | 1 on enriched regime transition days | Binary (0/1) | Profile |
-| 10 | `regime_transition_prob` | Probability of transitioning to a different regime on next day | Continuous (0-1) | Conformal widening, prediction aggregator |
-| 11 | `market_regime` | HMM-derived market regime label (bull/bear/high_vol/low_vol/unknown) | Categorical | Combined state mapping |
+| 8 | `regime_state` | 11 combined states from (survival_mode x market_regime): stable_growth, elevated_risk, market_stress, company_distress_mild/severe, country_crisis_mild/severe, protected_stress/crisis, crisis, extreme_crisis | Categorical | Profile, report |
+| 9 | `survival_intensity` | Continuous 0-1 metric blending rule-based intensity + HMM regime confidence | Continuous (0-1) | Extra vars, prediction aggregator |
+| 10 | `regime_confidence` | HMM posterior probability of the assigned regime state | Continuous (0-1) | Extra vars |
+| 11 | `regime_switch` | 1 on enriched regime transition days | Binary (0/1) | Profile |
+| 12 | `regime_transition_prob` | Probability of transitioning to a different regime on next day | Continuous (0-1) | Conformal widening, prediction aggregator |
+| 13 | `market_regime` | HMM-derived market regime label (bull/bear/high_vol/low_vol/unknown) | Categorical | Combined state mapping |
 
-**11 cache columns**
+**13 cache columns** (was 11)
 
 ---
 
@@ -177,15 +203,17 @@ Every variable produced by the 10 Layer 2 modules in `operator1/analysis/` + the
 
 ## 2.8 Financial Health Scoring
 
-**File:** `operator1/models/financial_health.py` (1,081 lines)
+**File:** `operator1/models/financial_health.py` (~1,260 lines)
 **Pipeline step:** Step 5d
 **Entry point:** `compute_financial_health(cache, hierarchy_weights)`
+
+**EWM percentile rank (NEW PR #2):** `_normalize_series()` now accepts optional `halflife` parameter for exponentially weighted percentile ranking. When set, recent observations are weighted more heavily, preventing long healthy periods from diluting recent deterioration. Typical values: 63 (quarterly filer), 126 (semi-annual), 252 (annual).
 
 ### Cache Variables
 
 | # | Variable | Formula | Type | Consumers |
 |---|----------|---------|------|-----------|
-| 1 | `fh_liquidity_score` | Expanding percentile rank: cash_ratio, current_ratio, free_cash_flow | Continuous (0-100) | Composite score (T1 weight) |
+| 1 | `fh_liquidity_score` | Expanding (or EWM) percentile rank: cash_ratio, current_ratio, free_cash_flow | Continuous (0-100) | Composite score (T1 weight) |
 | 2 | `fh_solvency_score` | Expanding percentile rank: debt_to_equity, interest_coverage, net_debt_to_ebitda | Continuous (0-100) | Composite score (T2 weight) |
 | 3 | `fh_stability_score` | Expanding percentile rank: volatility_21d, drawdown_252d, volume trend | Continuous (0-100) | Composite score (T3 weight) |
 | 4 | `fh_profitability_score` | Expanding percentile rank: gross_margin, operating_margin, net_margin | Continuous (0-100) | Composite score (T4 weight) |
@@ -202,7 +230,20 @@ Every variable produced by the 10 Layer 2 modules in `operator1/analysis/` + the
 | 15 | `fh_merton_pd` | Merton probability of default | Continuous (0-1) | MC survival anchor, HF |
 | 16 | `fh_runway_months` | `cash / abs(monthly_burn_rate)` -- months until cash exhaustion | Continuous (months) | Profile, report, triage card |
 
-**16 cache columns**
+### Ensemble Distress Prediction (NEW PR #2)
+
+| # | Variable | Formula | Type | Consumers |
+|---|----------|---------|------|-----------|
+| 17 | `fh_ensemble_distress_prob` | Stacked ensemble of 4 models: Altman Z (logistic transform), Ohlson O-Score (Ohlson 1980, 9 coefficients), Zmijewski (probit, 3 covariates), Merton PD (structural). Equal-weighted average, clipped (0-1). | Continuous (0-1) | Profile, report, USS early warning, HF risk decomposition |
+| 18 | `fh_ensemble_distress_label` | safe (<0.15) / watch (0.15-0.30) / warning (0.30-0.50) / critical (>0.50) | Categorical | Profile, report |
+
+### CVaR-Weighted Composite (NEW PR #2)
+
+| # | Variable | Formula | Type | Consumers |
+|---|----------|---------|------|-----------|
+| 19 | `fh_cvar_composite` | `E[tier_scores | tier_scores < VaR_30%]` -- average of worst 30% of tier scores (Rockafellar & Uryasev 2000). More sensitive to weakest tier than weighted average. | Continuous (0-100) | Profile |
+
+**19 cache columns** (was 16)
 
 ---
 
@@ -282,7 +323,7 @@ Every variable produced by the 10 Layer 2 modules in `operator1/analysis/` + the
 
 ## 2.12 Survival Regime Controller (USS)
 
-**File:** `operator1/analysis/survival_regime_controller.py` (653 lines)
+**File:** `operator1/analysis/survival_regime_controller.py` (~780 lines)
 **Pipeline step:** Step 5-USS
 **Entry point:** `SurvivalRegimeController.from_cache(cache)`
 
@@ -303,17 +344,23 @@ Every variable produced by the 10 Layer 2 modules in `operator1/analysis/` + the
 | 6 | `model_config` | Regime-specific params: Kalman noise 3-5x, LSTM lookback 5-10, MC paths 20-30K | Model switching |
 | 7 | `correlation_override` | 0.85-0.90 crisis correlation + Clayton copula for lower tail | Correlation switching |
 
-**1 cache column + 6 controller parameters**
+### Soft Regime Transition (NEW PR #2)
+
+| # | Variable | Description | Consumers |
+|---|----------|-------------|-----------|
+| 8 | `get_soft_transition_config()` | Exponentially interpolates between old and new `ModelConfig` over a transition halflife (default 5 days). `lam = 1 - exp(-days_since_switch * ln(2) / halflife)`. Numeric fields interpolated, categorical switch immediately. Prevents discontinuities when regimes change. | Forward pass, forecasting, MC (available but not auto-wired yet -- needs controller state tracking for `previous_regime`) |
+
+**1 cache column + 7 controller parameters** (was 6)
 
 ---
 
 ## 2.13 Scenario Engine (USS)
 
-**File:** `operator1/analysis/scenario_engine.py` (387 lines)
-**Pipeline step:** Step 6-USS
-**Entry point:** `run_scenario_engine(cache, regime, n_paths, horizon_days)`
+**File:** `operator1/analysis/scenario_engine.py` (~532 lines)
+**Pipeline step:** Step 6-USS (Stage 7.1)
+**Entry points:** `run_scenario_engine(cache, regime, n_paths, horizon_days)`, `compute_reverse_stress_test(cache, thresholds)`
 
-### Output (ScenarioEngineResult, not cache columns)
+### Forward Scenarios (from `run_scenario_engine`)
 
 | # | Output | Description | Per-Scenario Variables |
 |---|--------|-------------|----------------------|
@@ -321,27 +368,41 @@ Every variable produced by the 10 Layer 2 modules in `operator1/analysis/` + the
 | 2 | `muddle_through` | Status quo: full historical return distribution | Same 10 variables |
 | 3 | `catastrophic` | Fire sale: assets -40%, all debt called, revenue -40% | Same 10 variables |
 
-**0 cache columns** (result object stored in profile)
+### Reverse Stress Test (from `compute_reverse_stress_test`) -- NEW PR #2
+
+| # | Output | Description | Type | Profile Key |
+|---|--------|-------------|------|-------------|
+| 4 | `revenue_shock_pct` | Minimum revenue drop (%) that triggers survival mode | Float (%) | `scenario_analysis.reverse_stress.revenue_shock_pct` |
+| 5 | `margin_shock_pp` | Minimum margin compression (pp) | Float (pp) | `scenario_analysis.reverse_stress.margin_shock_pp` |
+| 6 | `rate_shock_bps` | Minimum interest rate increase (bps) | Float (bps) | `scenario_analysis.reverse_stress.rate_shock_bps` |
+| 7 | `triggered_variable` | Which survival trigger fires first under the minimum shock | Categorical | `scenario_analysis.reverse_stress.triggered_variable` |
+| 8 | `shock_magnitude` | L2 norm of the shock vector (lower = more fragile) | Float | Internal |
+
+Uses `scipy.optimize.minimize` with SLSQP to find the minimum-norm shock that triggers any survival threshold. Basel III reverse stress testing concept.
+
+**0 cache columns** (result objects stored in profile `scenario_analysis`)
 
 ---
 
-## Layer 2 Grand Total
+## Layer 2 UPDATED Grand Total
 
-| Module | Cache Columns | Result-Only Fields | Total |
-|--------|--------------|-------------------|-------|
-| 2.1 Survival Mode | 5 | 0 | 5 |
-| 2.2 Hierarchy Weights | 6 | 0 | 6 |
-| 2.3 Survival Timeline | 11 | 0 | 11 |
-| 2.4 Fuzzy Protection | 7 | 0 | 7 |
-| 2.5 Ethical Filters | 0 | 4 verdicts | 0 |
-| 2.6 Economic Planes | 0 | 2 fields | 0 |
-| 2.7 Vanity | 15 | 0 | 15 |
-| 2.8 Financial Health | 16 | 0 | 16 |
-| 2.9 Adaptive Thresholds | 0 | 6 fields | 0 |
-| 2.10 Adaptive Model Params | 0 | 12 fields | 0 |
-| 2.11 Adaptive Windows | 0 | 11 fields | 0 |
-| 2.12 USS Controller | 1 | 6 params | 1 |
-| 2.13 Scenario Engine | 0 | 30 (3x10) | 0 |
-| **Total** | **61** | **71** | **61 cache + 71 result** |
+| Module | Cache Columns | Result-Only Fields | Total | Status |
+|--------|--------------|-------------------|-------|--------|
+| 2.1 Survival Mode | **10** (was 5) | 0 | **10** | **ENHANCED PR #2** (+5: velocity flag/rate, P10/P90, uncertainty) |
+| 2.2 Hierarchy Weights | 6 | 0 | 6 | **ENHANCED PR #2** (entropy blending via `forward_pass_errors` param) |
+| 2.3 Survival Timeline | **13** (was 11) | 0 | **13** | **ENHANCED PR #2** (+2: semi-Markov expected days, exit probability) |
+| 2.4 Fuzzy Protection | 7 | 0 | 7 | |
+| 2.5 Ethical Filters | 0 | 4 verdicts | 0 | |
+| 2.6 Economic Planes | 0 | 2 fields | 0 | |
+| 2.7 Vanity | 15 | 0 | 15 | |
+| 2.8 Financial Health | **19** (was 16) | 0 | **19** | **ENHANCED PR #2** (+3: ensemble distress prob/label, CVaR composite) |
+| 2.9 Adaptive Thresholds | 0 | 6 fields | 0 | |
+| 2.10 Adaptive Model Params | 0 | 12 fields | 0 | |
+| 2.11 Adaptive Windows | 0 | 11 fields | 0 | |
+| 2.12 USS Controller | 1 | **7** (was 6) | 1 | **ENHANCED PR #2** (+1: soft transition config) |
+| 2.13 Scenario Engine | 0 | **35** (was 30) | 0 | **ENHANCED PR #2** (+5: reverse stress test results) |
+| **Total** | **71** | **77** | **71 cache + 77 result** | |
 
-These 61 cache columns are added on top of the ~311 from Layer 1, bringing the total cache to **~372 columns** before temporal models run.
+These 71 cache columns are added on top of the ~428 from Layer 1 (v3), bringing the total cache to **~499 columns** before temporal models run.
+
+**PR #2 delta:** +10 new cache columns (5 survival mode + 2 survival timeline + 3 financial health), +6 new result fields (1 USS controller + 5 reverse stress), **+16 total new variables** vs v1.
