@@ -845,6 +845,8 @@ def run_simulation(
             all_weights.append(1.0)
 
     # Importance-sampled paths (tilted toward danger).
+    # Jump params passed (jumps are real events), but antithetic=False
+    # because antithetic variates conflict with importance sampling.
     if n_importance > 0:
         ret_is, lw_is = simulate_return_paths(
             n_importance,
@@ -854,6 +856,10 @@ def run_simulation(
             regime_distributions,
             rng,
             importance_tilt=importance_tilt,
+            jump_lambda=jump_lambda,
+            jump_mean=jump_mean,
+            jump_std=jump_std,
+            antithetic=False,
         )
 
         vars_is = evolve_variables(
