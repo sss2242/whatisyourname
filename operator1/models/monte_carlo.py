@@ -518,6 +518,10 @@ def simulate_return_paths(
     rng: np.random.Generator,
     *,
     importance_tilt: float = 0.0,
+    jump_lambda: float = 0.0,
+    jump_mean: float = 0.0,
+    jump_std: float = 0.01,
+    antithetic: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Simulate return paths with optional importance sampling tilt.
 
@@ -546,10 +550,23 @@ def simulate_return_paths(
         ``log_weight_paths`` has shape ``(n_paths,)`` -- log importance
         weights (0 if no tilt applied).
     """
-    return_paths = np.zeros((n_paths, n_steps))
-    log_weights = np.zeros(n_paths)
+    # Antithetic variates (Hammersley & Handscomb 1964): generate half
+    # the paths, then mirror random draws for the other half. Cuts
+    # variance by ~2x for the same computational cost. Only used when
+    # importance sampling is NOT active (antithetic and IS conflict).
+    effective_n = n_paths
+    use_antithetic = antithetic and importance_tilt <= 0 and n_paths >= 4
+    if use_antithetic:
+        effective_n = (n_paths + 1) // 2  # generate half, mirror the rest
 
-    for i in range(n_paths):
+    return_paths = np.zeros((effective_n, n_steps))
+    log_weights = np.zeros(effective_n)
+
+    # Jump-diffusion parameters (Merton 1976): dt = 1 day
+    _dt = 1.0 / 252.0
+    _jump_active = jump_lambda > 0 and jump_std > 0
+
+    for i in range(effective_n):
         regime_path = _simulate_regime_path(
             n_steps, current_regime_idx, transition_matrix, rng,
         )
@@ -581,6 +598,17 @@ def simulate_return_paths(
                     z = rng.normal(tilted_mean, tilted_std)
             else:
                 z = rng.normal(tilted_mean, tilted_std)
+
+            # Jump-diffusion component (Merton 1976): add Poisson-distributed
+            # jumps to the continuous diffusion. Calibrated from Layer 1
+            # jump_spike_flag statistics. Captures sudden discontinuities
+            # (Black Monday, Flash Crash) that regime switching alone misses.
+            if _jump_active:
+                n_jumps = rng.poisson(jump_lambda * _dt)
+                if n_jumps > 0:
+                    jump_return = rng.normal(jump_mean, jump_std, size=n_jumps).sum()
+                    z += jump_return
+
             return_paths[i, t] = z
 
             if importance_tilt > 0:
@@ -590,6 +618,12 @@ def simulate_return_paths(
                 path_log_w += log_p_nom - log_p_tilt
 
         log_weights[i] = path_log_w
+
+    # Apply antithetic mirroring: negate return paths for the second half
+    if use_antithetic:
+        mirror_paths = -return_paths  # mirror all draws
+        return_paths = np.concatenate([return_paths, mirror_paths], axis=0)[:n_paths]
+        log_weights = np.concatenate([log_weights, log_weights], axis=0)[:n_paths]
 
     return return_paths, log_weights
 
@@ -791,6 +825,10 @@ def run_simulation(
             regime_distributions,
             rng,
             importance_tilt=0.0,
+            jump_lambda=jump_lambda,
+            jump_mean=jump_mean,
+            jump_std=jump_std,
+            antithetic=True,
         )
 
         vars_nom = evolve_variables(
@@ -1122,6 +1160,7 @@ def run_monte_carlo(
     regime_col: str = "regime_label",
     returns_col: str = "return_1d",
     burnout_distributions: dict[str, dict[str, float]] | None = None,
+    jump_params: dict[str, float] | None = None,
 ) -> MonteCarloResult:
     """Run the full Monte Carlo simulation pipeline.
 
@@ -1167,6 +1206,34 @@ def run_monte_carlo(
 
     result = MonteCarloResult(n_paths=n_paths)
     rng = np.random.default_rng(random_state)
+
+    # Jump-diffusion parameters (Merton 1976): calibrate from cache if
+    # jump_spike_flag is available (from Layer 1 Stage 16 vol decomposition).
+    # When jump_params is None, auto-calibrate from data; when explicitly
+    # passed, use the provided values.
+    jump_lambda = 0.0
+    jump_mean = 0.0
+    jump_std = 0.01
+    if jump_params is not None:
+        jump_lambda = jump_params.get("lambda", 0.0)
+        jump_mean = jump_params.get("mean", 0.0)
+        jump_std = jump_params.get("std", 0.01)
+    elif "jump_spike_flag" in cache.columns:
+        _spikes = cache["jump_spike_flag"].fillna(0)
+        if _spikes.sum() > 0:
+            jump_lambda = float(_spikes.mean() * 252)  # annualized
+            _spike_mask = _spikes.astype(bool)
+            if returns_col in cache.columns:
+                _spike_returns = cache[returns_col].loc[_spike_mask].dropna()
+                if len(_spike_returns) > 2:
+                    jump_mean = float(_spike_returns.mean())
+                    jump_std = float(max(_spike_returns.std(), 0.005))
+            # Cap lambda at 50 (max ~1 jump per 5 trading days)
+            jump_lambda = min(jump_lambda, 50.0)
+            logger.info(
+                "Jump-diffusion calibrated: lambda=%.1f/yr, jump_mu=%.4f, jump_sigma=%.4f",
+                jump_lambda, jump_mean, jump_std,
+            )
 
     if horizons is None:
         horizons = _build_frequency_aware_horizons(len(cache))
