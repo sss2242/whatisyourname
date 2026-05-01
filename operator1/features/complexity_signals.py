@@ -240,7 +240,7 @@ def compute_complexity_signals(
     # ------------------------------------------------------------------
     close = result.get("close")
     if close is not None and close.notna().sum() > price_window + 10:
-        close_arr = close.fillna(method="ffill").values
+        close_arr = close.ffill().values
         ae_vals = np.full(len(close_arr), np.nan)
         for i in range(price_window, len(close_arr)):
             chunk = close_arr[i - price_window: i]

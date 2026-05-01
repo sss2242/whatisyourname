@@ -1407,10 +1407,12 @@ DERIVED_VARIABLES: tuple[str, ...] = (
     "parkinson_vol_21d", "yang_zhang_vol_21d", "volume_clock_intensity",
     # Stage 19: Stationarity & factor features
     "close_frac_diff", "hurst_exponent_rolling", "autocorr_lag1", "autocorr_lag5",
-    "momentum_12_1", "idiosyncratic_vol_63d", "earnings_revision_proxy",
+    "momentum_12_1", "earnings_revision_proxy",
+    # idiosyncratic_vol_63d: conditionally produced (needs benchmark_return_1d)
     # Stage 20: Credit signals
     "cash_burn_rate_monthly", "debt_maturity_pressure",
-    "cash_conversion_cycle", "altman_z_momentum_63d", "covenant_proximity_score",
+    "cash_conversion_cycle", "covenant_proximity_score",
+    # altman_z_momentum_63d: conditionally produced (needs fh_altman_z_score from Step 5d)
     # Stage 22: Tail risk
     "skewness_63d", "kurtosis_63d", "tail_ratio_63d",
     "max_daily_loss_63d", "vol_of_vol_21d",

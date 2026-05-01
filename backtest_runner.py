@@ -1027,6 +1027,34 @@ def run_stage1(state: PipelineState) -> None:
         except Exception as exc:
             logger.debug("Geographic metrics computation failed: %s", exc)
 
+    # Operational efficiency features
+    try:
+        from operator1.features.product_metrics import compute_operational_efficiency
+        cache = compute_operational_efficiency(cache)
+    except Exception:
+        pass
+
+    # Behavioral finance signals
+    try:
+        from operator1.features.behavioral_signals import compute_behavioral_signals
+        cache = compute_behavioral_signals(cache)
+    except Exception:
+        pass
+
+    # Complexity / entropy signals
+    try:
+        from operator1.features.complexity_signals import compute_complexity_signals
+        cache = compute_complexity_signals(cache)
+    except Exception:
+        pass
+
+    # Feature normalization (MUST run last before temporal models)
+    try:
+        from operator1.features.feature_normalization import compute_feature_normalization
+        cache = compute_feature_normalization(cache)
+    except Exception:
+        pass
+
     state.cache = cache
     state.save("1")
     logger.info("STAGE 1 COMPLETE: %d rows x %d cols", len(cache), len(cache.columns))
