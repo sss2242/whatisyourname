@@ -3276,6 +3276,21 @@ Non-interactive examples:
         else:
             profile["scenario_analysis"] = {"available": False}
 
+        # Reverse stress test (Basel III): minimum shock to trigger survival
+        try:
+            from operator1.analysis.scenario_engine import compute_reverse_stress_test
+            _reverse = compute_reverse_stress_test(cache)
+            if _reverse.available:
+                profile.setdefault("scenario_analysis", {})["reverse_stress"] = {
+                    "revenue_shock_pct": _reverse.revenue_shock_pct,
+                    "margin_shock_pp": _reverse.margin_shock_pp,
+                    "rate_shock_bps": _reverse.rate_shock_bps,
+                    "triggered_variable": _reverse.triggered_variable,
+                    "available": True,
+                }
+        except Exception as _rs_exc:
+            logger.debug("Reverse stress test skipped: %s", _rs_exc)
+
         # Inject multi-frequency fusion results
         if multi_frequency_result is not None and hasattr(multi_frequency_result, "available") and multi_frequency_result.available:
             profile["multi_frequency"] = multi_frequency_result.to_profile_dict()
