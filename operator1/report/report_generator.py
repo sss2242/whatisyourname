@@ -465,6 +465,21 @@ def _build_financial_health(profile: dict[str, Any]) -> str:
     else:
         lines.append("Capital allocation quality data unavailable.")
 
+    # Extended Financial Health Signals (ensemble distress + CVaR)
+    ensemble = fh.get("ensemble_distress_score")
+    ewm_rank = fh.get("ewm_percentile_rank")
+    cvar = fh.get("cvar_composite")
+    if any(v is not None for v in (ensemble, ewm_rank, cvar)):
+        lines.extend(["", "### Advanced Distress Signals", ""])
+        if ensemble is not None:
+            _label = "HIGH" if ensemble > 0.6 else "moderate" if ensemble > 0.3 else "low"
+            lines.append(f"- **Ensemble distress score**: {ensemble:.3f} ({_label})")
+            lines.append("  *(Combines Altman Z-Score, Ohlson O-Score, Zmijewski, and Merton PD)*")
+        if ewm_rank is not None:
+            lines.append(f"- **EWM percentile rank**: {ewm_rank:.1%}")
+        if cvar is not None:
+            lines.append(f"- **CVaR composite**: {cvar:.4f}")
+
     if not lines:
         return "Financial health data unavailable."
 
@@ -553,6 +568,33 @@ def _build_survival_analysis(profile: dict[str, Any]) -> str:
         if both > 0:
             lines.append(f"- **Simultaneous company + country distress**: {both} days "
                         "*(highest risk periods)*")
+
+    # Survival velocity early warning (Duffie et al. 2007)
+    vel_flag = survival.get("survival_velocity_flag")
+    det_rate = survival.get("survival_deterioration_rate")
+    if vel_flag is not None or det_rate is not None:
+        lines.extend(["", "### Deterioration Velocity"])
+        lines.append("")
+        if vel_flag:
+            lines.append("- **Velocity flag**: ACTIVE -- survival probability declining rapidly")
+        else:
+            lines.append("- **Velocity flag**: inactive")
+        if det_rate is not None:
+            lines.append(f"- **Deterioration rate**: {det_rate:.4f} per day")
+
+    # Survival uncertainty bands (bootstrap P10/P90)
+    p10 = survival.get("survival_probability_p10")
+    p90 = survival.get("survival_probability_p90")
+    unc = survival.get("survival_uncertainty")
+    if any(v is not None for v in (p10, p90, unc)):
+        lines.extend(["", "### Survival Probability Confidence Bands"])
+        lines.append("")
+        if p10 is not None and p90 is not None:
+            lines.append(f"- **80% confidence interval**: [{p10:.1%}, {p90:.1%}]")
+        if unc is not None:
+            lines.append(f"- **Uncertainty score**: {unc:.3f}")
+            if unc > 0.15:
+                lines.append("  *High uncertainty -- survival estimate is unreliable.*")
 
     return "\n".join(lines)
 
@@ -2061,6 +2103,24 @@ def _build_scenario_analysis_section(profile: dict[str, Any]) -> str:
         s = sa.get(key, {})
         if s.get("description"):
             lines.append(f"\n**{s.get('name', key)}:** {s['description']}")
+
+    # Reverse stress test (SLSQP optimization -- what breaks the company?)
+    rev = sa.get("reverse_stress")
+    if isinstance(rev, dict) and rev.get("converged"):
+        lines.extend(["", "### Reverse Stress Test", ""])
+        lines.append("*Finds the minimum shock required to trigger survival mode:*")
+        lines.append("")
+        shocks = rev.get("shocks", {})
+        if shocks:
+            lines.append("| Variable | Required Shock |")
+            lines.append("|----------|---------------|")
+            for var, shock in sorted(shocks.items(), key=lambda x: abs(x[1]), reverse=True):
+                lines.append(f"| {var} | {shock:+.1%} |")
+        dist = rev.get("distance")
+        if dist is not None:
+            lines.append(f"\n- **Distance to failure**: {dist:.3f} (Euclidean norm of shock vector)")
+            if dist < 0.5:
+                lines.append("  *Very close to failure -- small shocks could trigger survival mode.*")
 
     return "\n".join(lines) + "\n"
 
@@ -3583,6 +3643,30 @@ def _build_multi_frequency_section(profile: dict[str, Any]) -> str:
         lines.append(f"**Cointegration:** Frequencies are cointegrated "
                      f"(ECT = {mf.get('cointegration_ect', 0):.4f})\n")
 
+    # Cross-frequency momentum (Moskowitz, Ooi & Pedersen 2012)
+    cfm_score = mf.get("cross_freq_momentum_score")
+    cfm_agreement = mf.get("cross_freq_momentum_agreement")
+    cfm_leading = mf.get("momentum_leading_frequency")
+    cfm_regime = mf.get("momentum_regime_label")
+    if cfm_score is not None:
+        lines.append("### Cross-Frequency Momentum\n")
+        lines.append(f"**Momentum Score:** {cfm_score:+.3f}")
+        if cfm_agreement is not None:
+            lines.append(f"**Agreement Ratio:** {cfm_agreement:.0%}")
+        if cfm_leading:
+            _freq_labels = {"A": "Annual", "Q": "Quarterly", "M": "Monthly", "W": "Weekly", "D": "Daily"}
+            lines.append(f"**Leading Frequency:** {_freq_labels.get(cfm_leading, cfm_leading)}")
+        if cfm_regime:
+            lines.append(f"**Momentum Regime:** {cfm_regime}")
+        cfm_scores = mf.get("cross_freq_momentum_scores", {})
+        if cfm_scores:
+            lines.append("\n| Frequency | Momentum |")
+            lines.append("|-----------|----------|")
+            for f, s in cfm_scores.items():
+                label = _freq_labels.get(f, f)
+                lines.append(f"| {label} | {s:+.3f} |")
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -3752,6 +3836,15 @@ def _build_position_signal_section(profile: dict[str, Any]) -> str:
     lines.append(f"| Return Forecast (5d) | {pos.get('return_forecast', 0):+.6f} |")
     lines.append(f"| IC Confidence | {pos.get('ic_confidence', 1.0):.2f}x |")
     lines.append(f"| Survival Multiplier | {pos.get('survival_multiplier', 1.0):.2f}x |")
+    kelly = pos.get("kelly_fraction")
+    if kelly is not None:
+        lines.append(f"| Kelly Fraction | {kelly:.2%} |")
+    kelly_edge = pos.get("kelly_edge")
+    if kelly_edge is not None:
+        lines.append(f"| Kelly Edge | {kelly_edge:+.4f} |")
+    kelly_cap = pos.get("kelly_capped")
+    if kelly_cap is not None:
+        lines.append(f"| Kelly (capped) | {kelly_cap:.2%} |")
     if pos.get("recovery_active"):
         lines.append("| Recovery Signal | ACTIVE (boost applied) |")
     lines.append("")
@@ -3849,6 +3942,17 @@ def _build_hf_cash_flow(profile: dict[str, Any]) -> str:
     if rs.get("available"):
         spread = rs.get("spread_bps")
         lines.append(f"**CROA vs ROIC Spread:** {spread:.0f} bps ({rs.get('quality_label', '')})" if spread else "**CROA vs ROIC:** N/A")
+        # DuPont 5-factor decomposition (Palepu, Healy & Peek 2019)
+        dupont_keys = [("dupont_tax_burden", "Tax Burden"), ("dupont_interest_burden", "Interest Burden"),
+                       ("dupont_operating_margin", "Operating Margin"), ("dupont_asset_turnover", "Asset Turnover"),
+                       ("dupont_equity_multiplier", "Equity Multiplier")]
+        dupont_vals = {k: rs.get(k) for k, _ in dupont_keys if rs.get(k) is not None}
+        if dupont_vals:
+            lines.append("\n**DuPont Decomposition:**")
+            for key, label in dupont_keys:
+                v = rs.get(key)
+                if v is not None:
+                    lines.append(f"  - {label}: {v:.3f}")
     ol = hf.get("operating_leverage", {})
     if ol.get("available"):
         lines.append(f"**Operating Leverage (DOL):** {ol.get('dol', 'N/A')}, sensitivity={ol.get('earnings_sensitivity', '')}")

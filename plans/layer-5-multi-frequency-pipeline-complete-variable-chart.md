@@ -1,6 +1,8 @@
-# Layer 5: Multi-Frequency Pipeline -- Complete Variable Chart
+# Layer 5: Multi-Frequency Pipeline -- Complete Variable Chart (v2)
 
 Every variable produced by the 3 Layer 5 modules. This layer runs the full analytical pipeline at 5 frequencies (Annual -> Daily) with cascading context, then fuses results via a 13-method architecture. All outputs are result objects stored in `profile["multi_frequency"]` -- no direct cache columns added to the daily cache.
+
+**v2 update (2026-05-01):** Added cross-frequency momentum signal (Moskowitz, Ooi & Pedersen 2012) with direction agreement scoring and potential reversal detection.
 
 ---
 
@@ -220,9 +222,20 @@ For each `ResampledCache`, the runner executes:
 | 12 | `cointegration_ect` | Float | (internal, not serialized to profile) |
 | 13 | `methods_applied` | List | `multi_frequency.methods_applied` |
 
+### Cross-Frequency Momentum Signal (NEW -- Moskowitz, Ooi & Pedersen 2012)
+
+| # | Variable | Type | Profile Key |
+|---|----------|------|-------------|
+| 14 | `cross_freq_momentum_score` | Float (-1 to +1) | `multi_frequency.cross_freq_momentum_score` |
+| 15 | `cross_freq_direction_agreement` | Float (0-1) | `multi_frequency.cross_freq_direction_agreement` |
+| 16 | `potential_reversal_flag` | Boolean | `multi_frequency.potential_reversal_flag` |
+| 17 | `regime_vote_weights` | Dict | `multi_frequency.regime_vote_weights` |
+
+**Cross-frequency momentum:** When ALL frequencies agree on trend direction (annual up, quarterly up, weekly up, daily up), the signal is much stronger than any single frequency. When long-term (A/Q) and short-term (D/W) disagree, `potential_reversal_flag` fires. Weighted by frequency importance (A=5, Q=4, M=3, W=2, D=1).
+
 ---
 
-## Layer 5 Grand Total
+## Layer 5 UPDATED Grand Total
 
 | Module | Result Fields | Type |
 |--------|--------------|------|
@@ -237,11 +250,13 @@ For each `ResampledCache`, the runner executes:
 
 ## Running Total Across All 5 Layers
 
-| Layer | Cache Columns | Result Fields |
-|-------|--------------|---------------|
-| Layer 1: Features | ~311 | ~9 |
-| Layer 2: Analysis | ~61 | ~71 |
-| Layer 3: Temporal | ~17 | ~121 |
-| Layer 4: Hedge Fund | 0 | ~107 |
-| Layer 5: Multi-Frequency | 0 | ~13 top-level + nested |
-| **Total** | **~389** | **~321+** |
+| Layer | Cache Columns | Result Fields | Status |
+|-------|--------------|---------------|--------|
+| Layer 1: Features | ~428 | ~9 | Updated v3 |
+| Layer 2: Analysis | ~71 | ~77 | Updated v2 |
+| Layer 3: Temporal | ~17 | ~121 | |
+| Layer 4: Hedge Fund | 0 | ~122 | Updated v2 |
+| Layer 5: Multi-Frequency | 0 | **~17 top-level** (was ~13) + nested | **Updated v2** |
+| **Total** | **~516** | **~346+** | |
+
+**PR delta:** +4 new top-level result fields (cross_freq_momentum_score, cross_freq_direction_agreement, potential_reversal_flag, regime_vote_weights) vs v1.

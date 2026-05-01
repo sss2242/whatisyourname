@@ -135,6 +135,57 @@ def _filter_substages(
 # Public API
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Infrastructure: graceful degradation, timeout, validation
+# ---------------------------------------------------------------------------
+
+# Critical sub-stages that MUST succeed -- pipeline aborts if they fail.
+# Non-critical sub-stages log a warning and continue if they fail.
+_CRITICAL_SUBSTAGES: set[str] = {
+    "3.1",   # regime detection (regime_label needed by everything)
+    "4.1",   # forecasting (predictions needed for aggregation)
+    "5.1",   # forward pass (model states, PID, calibrator)
+    "5.4",   # Monte Carlo (survival probability is core output)
+    "6.5",   # prediction aggregation (final ensemble)
+    "7.5",   # hedge fund (parallel track but core for profile)
+}
+
+# Per-sub-stage timeout in seconds. Prevents hanging models from blocking pipeline.
+_SUBSTAGE_TIMEOUTS: dict[str, int] = {
+    "4.1": 300,   # forecasting: 5 min (LSTM + tree cascade)
+    "5.4": 300,   # Monte Carlo: 5 min (10K paths)
+    "6.1": 180,   # transformer: 3 min
+    "6.9": 120,   # genetic optimizer: 2 min
+    "7.4.1": 180, # MF annual: 3 min
+    "7.4.2": 180, # MF quarterly: 3 min
+    "7.4.3": 120, # MF monthly: 2 min
+    "7.5": 300,   # hedge fund: 5 min
+}
+_DEFAULT_TIMEOUT: int = 120  # 2 min for everything else
+
+# Required state fields per sub-stage. Validated before dispatch.
+_SUBSTAGE_REQUIREMENTS: dict[str, list[str]] = {
+    "3.1": ["cache"],
+    "4.1": ["cache", "extra_vars"],
+    "5.1": ["cache", "forecast_result", "weights"],
+    "5.4": ["cache"],
+    "6.3": ["cache", "forward_pass_result"],
+    "6.5": ["cache", "forecast_result"],
+    "7.5": ["cache", "income_df", "balance_df", "cashflow_df"],
+}
+
+
+def _validate_state_for_substage(state: "PipelineState", sub_id: str) -> None:
+    """Check that required fields are populated before running a sub-stage."""
+    required = _SUBSTAGE_REQUIREMENTS.get(sub_id, [])
+    missing = [f for f in required if getattr(state, f, None) is None]
+    if missing:
+        raise ValueError(
+            f"Sub-stage {sub_id} requires state fields {missing} "
+            f"but they are None. Run prior stages first."
+        )
+
+
 def run_stages(
     state: "PipelineState",
     stage_spec: str = "all",
@@ -172,19 +223,60 @@ def run_stages(
         state.load_checkpoint(prev)
 
     total = len(substages)
+    skipped: list[str] = []
+
     for i, (sub_id, func) in enumerate(substages, 1):
         logger.info("=" * 60)
         logger.info("[%d/%d] Running sub-stage %s", i, total, sub_id)
         logger.info("=" * 60)
 
-        t0 = time.time()
+        # Pre-flight validation: check required state fields exist
         try:
-            func(state)
+            _validate_state_for_substage(state, sub_id)
+        except ValueError as val_exc:
+            if sub_id in _CRITICAL_SUBSTAGES:
+                logger.error("CRITICAL validation failed for %s: %s", sub_id, val_exc)
+                raise
+            logger.warning("Validation failed for %s (non-critical, skipping): %s", sub_id, val_exc)
+            skipped.append(sub_id)
+            continue
+
+        t0 = time.time()
+        timeout = _SUBSTAGE_TIMEOUTS.get(sub_id, _DEFAULT_TIMEOUT)
+
+        try:
+            # Run with timeout via concurrent.futures
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(func, state)
+                future.result(timeout=timeout)
+        except FuturesTimeout:
+            elapsed = time.time() - t0
+            msg = f"Sub-stage {sub_id} timed out after {timeout}s (elapsed: {elapsed:.1f}s)"
+            if sub_id in _CRITICAL_SUBSTAGES:
+                logger.error("CRITICAL timeout: %s", msg)
+                if save_checkpoints:
+                    state.save(f"{sub_id}_failed")
+                raise TimeoutError(msg)
+            logger.warning("Non-critical timeout: %s (continuing)", msg)
+            skipped.append(sub_id)
+            continue
         except Exception as exc:
-            logger.error("Sub-stage %s FAILED: %s", sub_id, exc)
+            elapsed = time.time() - t0
+            # Graceful degradation: non-critical sub-stages can fail
+            if sub_id not in _CRITICAL_SUBSTAGES:
+                logger.warning(
+                    "Non-critical sub-stage %s failed after %.1fs (continuing): %s",
+                    sub_id, elapsed, exc,
+                )
+                skipped.append(sub_id)
+                if save_checkpoints:
+                    state.save(f"{sub_id}_skipped")
+                continue
+            # Critical failure: abort pipeline
+            logger.error("CRITICAL sub-stage %s FAILED after %.1fs: %s", sub_id, elapsed, exc)
             import traceback
             traceback.print_exc()
-            # Save what we have so far
             if save_checkpoints:
                 state.save(f"{sub_id}_failed")
             raise
@@ -194,6 +286,9 @@ def run_stages(
 
         if save_checkpoints:
             state.save(sub_id)
+
+    if skipped:
+        logger.info("Pipeline completed with %d skipped sub-stages: %s", len(skipped), skipped)
 
 
 def get_available_stages() -> list[str]:

@@ -1,6 +1,8 @@
-# Layer 6: Staged Pipeline Architecture -- Complete Variable Chart
+# Layer 6: Staged Pipeline Architecture -- Complete Variable Chart (v2)
 
 Every variable and sub-stage in the 6 Layer 6 modules. This layer decomposes the monolithic pipeline into per-model sub-stages with checkpoint save/resume via `PipelineState`. It produces no new analytical variables -- it orchestrates execution of Layers 1-5 and persists their state to disk.
+
+**v2 update (2026-05-01):** Added 3 infrastructure enhancements to the stage runner: graceful degradation for non-critical sub-stages, per-sub-stage timeout management, and pre-flight state validation.
 
 ---
 
@@ -152,8 +154,8 @@ Every variable and sub-stage in the 6 Layer 6 modules. This layer decomposes the
 
 ## 6.2 Stage Runner
 
-**File:** `operator1/stages/runner.py` (281 lines)
-**Purpose:** Dispatches sub-stages in dependency order with checkpoint save/resume.
+**File:** `operator1/stages/runner.py` (~350 lines)
+**Purpose:** Dispatches sub-stages in dependency order with checkpoint save/resume, graceful degradation, timeout management, and pre-flight validation.
 
 ### Stage Spec Syntax
 
@@ -169,8 +171,20 @@ Every variable and sub-stage in the 6 Layer 6 modules. This layer decomposes the
 1. Build registry from all 5 stage modules
 2. Parse stage spec into start/end IDs
 3. Filter registry to matching sub-stages
-4. For each sub-stage: load previous checkpoint if resuming, execute, save checkpoint
-5. Each sub-stage wrapped in try/except with failed checkpoint save
+4. For each sub-stage:
+   a. **Pre-flight validation** (NEW): check required state fields via `_SUBSTAGE_REQUIREMENTS`
+   b. **Timeout-wrapped execution** (NEW): `concurrent.futures` with per-sub-stage timeout via `_SUBSTAGE_TIMEOUTS`
+   c. Save checkpoint on success
+   d. **Graceful degradation** (NEW): non-critical failures log warning and continue; critical failures (`_CRITICAL_SUBSTAGES`) abort
+5. Log skipped sub-stages count at pipeline completion
+
+### Infrastructure Enhancements (NEW v2)
+
+| Enhancement | Config | Description |
+|-------------|--------|-------------|
+| **Graceful Degradation** | `_CRITICAL_SUBSTAGES` set (6 entries: 3.1, 4.1, 5.1, 5.4, 6.5, 7.5) | Non-critical sub-stages can fail without aborting. Skipped stages saved as `{id}_skipped` checkpoint. |
+| **Timeout Management** | `_SUBSTAGE_TIMEOUTS` dict (default: 120s, MC/HF: 300s, Transformer: 180s) | Prevents hanging models from blocking pipeline indefinitely. Uses `concurrent.futures.ThreadPoolExecutor`. |
+| **Pre-Flight Validation** | `_SUBSTAGE_REQUIREMENTS` dict (7 entries for key stages) | Validates required PipelineState fields before dispatch. Missing fields in non-critical stages skip; in critical stages abort. |
 
 ---
 
@@ -269,31 +283,33 @@ Every variable and sub-stage in the 6 Layer 6 modules. This layer decomposes the
 
 ---
 
-## Layer 6 Grand Total
+## Layer 6 UPDATED Grand Total
 
-| Module | Lines | Role |
-|--------|-------|------|
-| 6.1 Pipeline State | 404 | State serialization (83 fields) |
-| 6.2 Stage Runner | 281 | Dispatch + checkpoint |
-| 6.3 Stage 3 -- Temporal | 295 | 8 sub-stages |
-| 6.4 Stage 4 -- Forecasting | 54 | 1 sub-stage |
-| 6.5 Stage 5 -- Forward | 285 | 5 sub-stages |
-| 6.6 Stage 6 -- Ensemble | 455 | 10 sub-stages |
-| 6.7 Stage 7 -- Integration | 387 | 14 sub-stages |
-| **Total** | **~2,161** | **35 sub-stages + 83 state fields** |
+| Module | Lines | Role | Status |
+|--------|-------|------|--------|
+| 6.1 Pipeline State | 404 | State serialization (83 fields) | |
+| 6.2 Stage Runner | **~350** (was 281) | Dispatch + checkpoint + graceful degradation + timeout + validation | **ENHANCED v2** |
+| 6.3 Stage 3 -- Temporal | 295 | 8 sub-stages | |
+| 6.4 Stage 4 -- Forecasting | 54 | 1 sub-stage | |
+| 6.5 Stage 5 -- Forward | 285 | 5 sub-stages | |
+| 6.6 Stage 6 -- Ensemble | 455 | 10 sub-stages | |
+| 6.7 Stage 7 -- Integration | 387 | 14 sub-stages | |
+| **Total** | **~2,230** | **35 sub-stages + 83 state fields** | |
 
 **0 new cache columns. 0 new result fields.** Layer 6 is purely orchestration -- it dispatches existing Layer 1-5 modules and persists their outputs to disk via PipelineState.
+
+**v2 infrastructure additions:** 3 new config dicts (`_CRITICAL_SUBSTAGES`, `_SUBSTAGE_TIMEOUTS`, `_SUBSTAGE_REQUIREMENTS`), 1 new validation function, enhanced dispatch loop with graceful degradation + timeout.
 
 ---
 
 ## Running Total Across All 6 Layers
 
-| Layer | Cache Columns | Result Fields | Role |
-|-------|--------------|---------------|------|
-| Layer 1: Features | ~311 | ~9 | Raw cache -> enriched features |
-| Layer 2: Analysis | ~61 | ~71 | Survival, hierarchy, calibration |
-| Layer 3: Temporal | ~17 | ~121 | Regime, forecasting, uncertainty |
-| Layer 4: Hedge Fund | 0 | ~107 | Parallel investment analysis |
-| Layer 5: Multi-Frequency | 0 | ~13+ nested | 5-frequency pipeline + 13-method fusion |
-| Layer 6: Staged Pipeline | 0 | 0 | Orchestration + checkpoint/resume |
-| **Total** | **~389** | **~321+** | **~47K lines across 70 modules** |
+| Layer | Cache Columns | Result Fields | Role | Status |
+|-------|--------------|---------------|------|--------|
+| Layer 1: Features | ~428 | ~9 | Raw cache -> enriched features | Updated v3 |
+| Layer 2: Analysis | ~71 | ~77 | Survival, hierarchy, calibration | Updated v2 |
+| Layer 3: Temporal | ~17 | ~121 | Regime, forecasting, uncertainty | |
+| Layer 4: Hedge Fund | 0 | ~122 | Parallel investment analysis | Updated v2 |
+| Layer 5: Multi-Frequency | 0 | ~17+ nested | 5-frequency pipeline + fusion | Updated v2 |
+| Layer 6: Staged Pipeline | 0 | 0 | Orchestration + checkpoint/resume | **Updated v2** |
+| **Total** | **~516** | **~346+** | **~48K lines across 70 modules** | |
