@@ -171,6 +171,11 @@ class FrequencyFusionResult:
     # New v2 fields
     disagreement: DisagreementSignal = field(default_factory=DisagreementSignal)
     confirmed_breaks: list[BreakConfirmation] = field(default_factory=list)
+    # Layer 5 enhancement: cross-frequency momentum (Moskowitz et al. 2012)
+    cross_freq_momentum_score: float = 0.0     # -1 (all down) to +1 (all up)
+    cross_freq_direction_agreement: float = 0.0  # 0 (disagree) to 1 (all agree)
+    potential_reversal_flag: bool = False        # long-term vs short-term disagree
+    regime_vote_weights: dict[str, float] = field(default_factory=dict)  # per-freq voting weight
     excluded_frequencies: list[str] = field(default_factory=list)
     meta_learner_weights: dict[str, float] = field(default_factory=dict)
     cointegrated: bool = False
@@ -924,6 +929,50 @@ def _m12_cointegration_anchor(results: dict[str, Any]) -> tuple[bool, float]:
 # REGIME CONSENSUS (enhanced from v1)
 # ===================================================================
 
+def _compute_cross_frequency_momentum(
+    results: dict[str, Any],
+) -> tuple[float, float, bool]:
+    """Cross-frequency momentum signal (Moskowitz, Ooi & Pedersen 2012).
+
+    When ALL frequencies agree on direction (annual up, quarterly up, etc.),
+    it's a much stronger signal than any single frequency. Disagreement
+    between long-term and short-term = potential reversal.
+
+    Returns (momentum_score, direction_agreement, potential_reversal).
+    """
+    freq_weights = {"A": 5, "Q": 4, "M": 3, "W": 2, "D": 1}
+    signs: dict[str, int] = {}
+
+    for freq, result in results.items():
+        td = getattr(result, "trend_direction", None)
+        if td == "up":
+            signs[freq] = 1
+        elif td == "down":
+            signs[freq] = -1
+        else:
+            signs[freq] = 0
+
+    if not signs:
+        return 0.0, 0.0, False
+
+    # Weighted momentum score
+    total_w = sum(freq_weights.get(f, 1) for f in signs)
+    score = sum(signs[f] * freq_weights.get(f, 1) for f in signs) / max(total_w, 1)
+    score = max(-1.0, min(1.0, score))
+
+    # Direction agreement: fraction with same sign as majority
+    majority_sign = 1 if score > 0 else (-1 if score < 0 else 0)
+    n_agree = sum(1 for s in signs.values() if s == majority_sign) if majority_sign != 0 else len(signs)
+    agreement = n_agree / max(len(signs), 1)
+
+    # Potential reversal: long-term and short-term disagree
+    long_term = signs.get("A", signs.get("Q", 0))
+    short_term = signs.get("D", signs.get("W", 0))
+    reversal = long_term != 0 and short_term != 0 and long_term != short_term
+
+    return score, agreement, reversal
+
+
 def compute_regime_consensus(
     frequency_results: dict[str, Any],
     cascade_directions: dict[str, str] | None = None,
@@ -1163,6 +1212,12 @@ def fuse_multi_frequency_results(
     disagreement = _m8_disagreement_signal(results)
     methods_applied.append(f"M8:{disagreement.shape}")
 
+    # Cross-frequency momentum (Moskowitz, Ooi & Pedersen 2012)
+    _cfm_score, _cfm_agreement, _cfm_reversal = _compute_cross_frequency_momentum(results)
+    methods_applied.append(f"CFM:score={_cfm_score:.2f}")
+    if _cfm_reversal:
+        logger.info("Cross-frequency reversal detected: long-term and short-term trends disagree")
+
     # M13: Meta-learner stacking
     meta_weights = _m13_meta_learner(freq_forecasts, freq_errors)
     if meta_weights:
@@ -1279,4 +1334,8 @@ def fuse_multi_frequency_results(
         cointegrated=cointegrated,
         cointegration_ect=ect,
         methods_applied=methods_applied,
+        # Layer 5 enhancement: cross-frequency momentum
+        cross_freq_momentum_score=_cfm_score,
+        cross_freq_direction_agreement=_cfm_agreement,
+        potential_reversal_flag=_cfm_reversal,
     )
