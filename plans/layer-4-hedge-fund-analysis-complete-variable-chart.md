@@ -1,6 +1,8 @@
-# Layer 4: Hedge Fund Analysis -- Complete Variable Chart
+# Layer 4: Hedge Fund Analysis -- Complete Variable Chart (v2)
 
 Every variable produced by the 20 Layer 4 modules in `operator1/hedge_fund/`. This is a parallel analytical track that answers "Can I make money on this, when, and how much?" Primary data source: raw quarterly statement DataFrames (8-24 rows), NOT the 504-row daily cache. All outputs are result objects stored in `profile["hedge_fund"]` -- no cache columns.
+
+**v2 update (2026-05-01):** Added expert-method enhancements from PR: 5-factor DuPont decomposition (Palepu, Healy & Peek 2019), regime-conditional momentum, market-implied growth + RIV valuation fields, Kelly criterion position sizing (Kelly 1956).
 
 ---
 
@@ -68,6 +70,11 @@ Every variable produced by the 20 Layer 4 modules in `operator1/hedge_fund/`. Th
 | 2 | `roic` | `NOPAT / Invested_Capital` (accounting return) | Float | `hedge_fund.return_spread.roic` |
 | 3 | `spread_bps` | `(CROA - ROIC) * 10000` | Integer (bps) | `hedge_fund.return_spread.spread_bps` |
 | 4 | `quality_label` | high_quality / neutral / accrual_inflation | Categorical | `hedge_fund.return_spread.quality_label` |
+| 5 | `dupont_tax_burden` | `NI / EBT` -- tax efficiency (Palepu, Healy & Peek 2019) | Float | `hedge_fund.return_spread.dupont_tax_burden` | **NEW** |
+| 6 | `dupont_interest_burden` | `EBT / EBIT` -- debt cost efficiency | Float | `hedge_fund.return_spread.dupont_interest_burden` | **NEW** |
+| 7 | `dupont_asset_turnover` | `Revenue / Total_Assets` -- asset utilization | Float | `hedge_fund.return_spread.dupont_asset_turnover` | **NEW** |
+| 8 | `dupont_equity_multiplier` | `Total_Assets / Equity` -- leverage | Float | `hedge_fund.return_spread.dupont_equity_multiplier` | **NEW** |
+| 9 | `dupont_quality_driver` | Which factor dominates ROE: margin / leverage / turnover | Categorical | `hedge_fund.return_spread.dupont_quality_driver` | **NEW** |
 
 ---
 
@@ -132,6 +139,8 @@ Every variable produced by the 20 Layer 4 modules in `operator1/hedge_fund/`. Th
 | 2 | `inflection_detected` | True when 2nd derivative of revenue/margins turns positive | Boolean | `hedge_fund.momentum.inflection_detected` |
 | 3 | `revenue_acceleration` | 2nd derivative (change in growth rate) | Float | Component |
 | 4 | `price_momentum_divergence` | Fundamental momentum vs 63-day price momentum | Float | Component |
+| 5 | `regime_adjusted_momentum` | Momentum score with regime-conditional weights: revenue_accel 70% in survival, margin_slope 40% in normal | 0-100 | `hedge_fund.momentum.regime_adjusted_momentum` | **NEW** |
+| 6 | `momentum_regime_bias` | Which component drives the score in the current regime | Categorical | `hedge_fund.momentum.momentum_regime_bias` | **NEW** |
 
 ---
 
@@ -174,6 +183,11 @@ Every variable produced by the 20 Layer 4 modules in `operator1/hedge_fund/`. Th
 | 6 | `upside_pct` | `(p50 - current_price) / current_price` | Float (%) | `hedge_fund.dcf.upside_pct` |
 | 7 | `risk_reward_ratio` | `upside / downside` | Float | `hedge_fund.dcf.risk_reward_ratio` |
 | 8 | `current_price` | Latest close from cache | Float ($) | `hedge_fund.dcf.current_price` |
+| 9 | `growth_gap` | `implied_growth_rate - actual_growth_rate` -- positive = priced for more growth than delivered | Float (%) | `hedge_fund.dcf.growth_gap` | **NEW** |
+| 10 | `priced_for_perfection_flag` | True when growth_gap > 2x actual growth | Boolean | `hedge_fund.dcf.priced_for_perfection_flag` | **NEW** |
+| 11 | `riv_intrinsic` | Residual Income Valuation (Ohlson 1995): `BV + sum(RI_t/(1+r)^t)` | Float ($) | `hedge_fund.dcf.riv_intrinsic` | **NEW** |
+| 12 | `riv_excess_return` | `(NI - r*BV) / BV` -- is the company creating value above cost of equity? | Float | `hedge_fund.dcf.riv_excess_return` | **NEW** |
+| 13 | `riv_vs_dcf_divergence` | `riv_intrinsic - intrinsic_p50` -- large divergence = model uncertainty | Float ($) | `hedge_fund.dcf.riv_vs_dcf_divergence` | **NEW** |
 
 ---
 
@@ -230,6 +244,9 @@ Every variable produced by the 20 Layer 4 modules in `operator1/hedge_fund/`. Th
 | 5 | `stop_price` | Stop-loss level | Float ($) | `hedge_fund.position.stop_price` |
 | 6 | `target_price` | 63-day resistance level | Float ($) | `hedge_fund.position.target_price` |
 | 7 | `survival_sizing` | Normal=1.0x, Modified=0.5x, Company_Survival=0.0x, Extreme=-0.5x, Recovery=1.5x | Float | Component |
+| 8 | `kelly_fraction` | Full Kelly optimal bet size: `(p*b - q) / b` where p=P(win from MC), b=avg_win/avg_loss (Kelly 1956) | Float (-1 to +1) | `hedge_fund.position.kelly_fraction` | **NEW** |
+| 9 | `half_kelly_size` | Conservative half-Kelly: `kelly_fraction / 2`, capped at [-0.5, 0.5] | Float | `hedge_fund.position.half_kelly_size` | **NEW** |
+| 10 | `kelly_edge` | `p*b - q` -- positive = there is a mathematical edge, negative = no edge | Float | `hedge_fund.position.kelly_edge` | **NEW** |
 
 ---
 
@@ -320,42 +337,44 @@ Runs all 15 base metrics + scorecard + position signal in dependency order. Sing
 
 ---
 
-## Layer 4 Grand Total
+## Layer 4 UPDATED Grand Total
 
-| Module | Variables | Type |
-|--------|----------|------|
-| 4.1 FCF Quality | 4 | Result |
-| 4.2 Accruals Forensics | 4 | Result |
-| 4.3 Earnings Smoothing | 4 | Result |
-| 4.4 Dividend Burn | 3 | Result |
-| 4.5 CROA vs ROIC | 4 | Result |
-| 4.6 Operating Leverage | 4 | Result |
-| 4.7 OBS Risk | 3 | Result |
-| 4.8 Asset Quality | 4 | Result |
-| 4.9 Leverage Stress | 4 | Result |
-| 4.10 Momentum | 4 | Result |
-| 4.11 Growth Quality | 3 | Result |
-| 4.12 Earnings Surprise | 4 | Result |
-| 4.13 DCF Valuation | 8 | Result |
-| 4.14 Valuation-Quality | 3 | Result |
-| 4.15 PEG Composite | 3 | Result |
-| 4.16 Scorecard | 7 | Result |
-| 4.17 Position Signal | 7 | Result |
-| 4.18 Orchestrator | 0 (wrapper) | -- |
-| 4.19 Advanced Methods | 19 (P1: 10, P2: 5, P3: 4) | Result |
-| 4.20 Fusion | 16 | Result |
-| **Total** | **~107** | **All result objects** |
+| Module | Variables | Type | Status |
+|--------|----------|------|--------|
+| 4.1 FCF Quality | 4 | Result | |
+| 4.2 Accruals Forensics | 4 | Result | |
+| 4.3 Earnings Smoothing | 4 | Result | |
+| 4.4 Dividend Burn | 3 | Result | |
+| 4.5 CROA vs ROIC + DuPont | **9** (was 4) | Result | **ENHANCED** (+5 DuPont decomposition) |
+| 4.6 Operating Leverage | 4 | Result | |
+| 4.7 OBS Risk | 3 | Result | |
+| 4.8 Asset Quality | 4 | Result | |
+| 4.9 Leverage Stress | 4 | Result | |
+| 4.10 Momentum | **6** (was 4) | Result | **ENHANCED** (+2 regime-conditional) |
+| 4.11 Growth Quality | 3 | Result | |
+| 4.12 Earnings Surprise | 4 | Result | |
+| 4.13 DCF Valuation | **13** (was 8) | Result | **ENHANCED** (+5 growth gap, RIV) |
+| 4.14 Valuation-Quality | 3 | Result | |
+| 4.15 PEG Composite | 3 | Result | |
+| 4.16 Scorecard | 7 | Result | |
+| 4.17 Position Signal | **10** (was 7) | Result | **ENHANCED** (+3 Kelly criterion) |
+| 4.18 Orchestrator | 0 (wrapper) | -- | |
+| 4.19 Advanced Methods | 19 (P1: 10, P2: 5, P3: 4) | Result | |
+| 4.20 Fusion | 16 | Result | |
+| **Total** | **~122** | **All result objects** | |
 
-**0 cache columns, ~107 result fields** stored in `profile["hedge_fund"]`.
+**0 cache columns, ~122 result fields** (was ~107) stored in `profile["hedge_fund"]`.
+
+**PR delta:** +15 new result fields (+5 DuPont + 2 regime momentum + 5 growth/RIV + 3 Kelly) vs v1.
 
 ---
 
 ## Running Total Across All 4 Layers
 
-| Layer | Cache Columns | Result Fields |
-|-------|--------------|---------------|
-| Layer 1: Features | ~311 | ~9 |
-| Layer 2: Analysis | ~61 | ~71 |
-| Layer 3: Temporal | ~17 | ~121 |
-| Layer 4: Hedge Fund | 0 | ~107 |
-| **Total** | **~389** | **~308** |
+| Layer | Cache Columns | Result Fields | Status |
+|-------|--------------|---------------|--------|
+| Layer 1: Features | ~428 | ~9 | Updated v3 |
+| Layer 2: Analysis | ~71 | ~77 | Updated v2 |
+| Layer 3: Temporal | ~17 | ~121 | |
+| Layer 4: Hedge Fund | 0 | **~122** (was ~107) | **Updated v2** |
+| **Total** | **~516** | **~329** | |
