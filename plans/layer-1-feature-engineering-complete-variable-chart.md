@@ -1,16 +1,16 @@
-# Layer 1: Feature Engineering -- Complete Variable Chart (v2)
+# Layer 1: Feature Engineering -- Complete Variable Chart (v3)
 
-Every variable produced by the 18 Layer 1 modules (14 from analysis-models-map + 4 additional feature modules found in source code), with formula, input dependencies, tier classification, and downstream consumers.
+Every variable produced by the 21 Layer 1 modules (14 from analysis-models-map + 4 additional feature modules found in source code + 3 new modules from PR #1), with formula, input dependencies, tier classification, and downstream consumers.
 
-**Note:** The analysis-models-map listed 14 modules but there are actually 18 modules in `operator1/features/` that inject cache columns. The 4 unlisted modules are: Institutional Flow, Cross-Asset Signals, Options Signals, and Event Calendar.
+**Note:** The analysis-models-map listed 14 modules but there are actually 21 modules in `operator1/features/` that inject cache columns. The 4 previously unlisted modules are: Institutional Flow, Cross-Asset Signals, Options Signals, and Event Calendar. The 3 new modules added in PR #1 (2026-05-01) are: Behavioral Signals, Complexity Signals, and Feature Normalization.
 
 ---
 
 ## 1.1 Derived Variables
 
-**File:** `operator1/features/derived_variables.py` (1,042 lines)
+**File:** `operator1/features/derived_variables.py` (~1,468 lines)
 **Pipeline step:** Step 5
-**Entry point:** `compute_derived_variables(df)` -- runs 17 computation stages sequentially
+**Entry point:** `compute_derived_variables(df)` -- runs 22 computation stages sequentially
 
 ### Stage 1: Returns and Risk (`_compute_returns_and_risk`)
 
@@ -164,7 +164,61 @@ Every variable produced by the 18 Layer 1 modules (14 from analysis-models-map +
 | 66 | `merton_dd` | `(log(V/D) + (-0.5*sigma_V^2)*T) / (sigma_V*sqrt(T))` (Merton 1974) | `close`, `volatility_21d`, `total_debt`/`total_debt_asof`, `market_cap`/`shares_outstanding` | Credit | T2 | HF Merton default, MC survival anchor |
 | 67 | `merton_dd_change_21d` | `merton_dd - merton_dd.shift(21)` | `merton_dd` | Change | T2 | Extra vars |
 
-**Companion flags for all 67 variables:** `is_missing_{var}` (67 flags) + `invalid_math_{var}` (~20 for ratio variables) = **~154 total columns**
+### Stage 18: Market Microstructure Signals (`_compute_microstructure_signals`) -- NEW PR #1
+
+| # | Variable | Formula | Inputs | Type | Tier | Consumers |
+|---|----------|---------|--------|------|------|-----------|
+| 68 | `corwin_schultz_spread` | `2*(exp(alpha)-1)/(1+exp(alpha))` where alpha from rolling H/L beta+gamma (Corwin & Schultz 2012) | `high`, `low` | Spread (0-1) | T2 | Survival trigger (illiquidity), MC liquidation, ownership contagion, signal IC |
+| 69 | `kyle_lambda` | Rolling 21d OLS slope of `return_1d` on `signed_volume` * 1M (Kyle 1985) | `return_1d`, `volume` | Price impact | T2 | Graph risk contagion speed, HF position sizing |
+| 70 | `parkinson_vol_21d` | `sqrt(sum(log(H/L)^2, 21) / (4*21*ln(2)))` (Parkinson 1980) | `high`, `low` | Volatility | T3 | Regime detector alt input, OHLC predictor H/L |
+| 71 | `yang_zhang_vol_21d` | `sqrt(oc_var + k*co_var + (1-k)*RS_var)` where k=0.34/(1.34+(n+1)/(n-1)) (Yang & Zhang 2000) | `open`, `high`, `low`, `close` | Volatility | T3 | Adaptive model params (Garman-Klass supplement), GARCH init |
+| 72 | `volume_clock_intensity` | `(volume - volume_avg_21d) / volume_std_21d` (AFML daily proxy) | `volume`, `volume_avg_21d` | Z-score | T3 | News sentiment amplifier, event impact confirmation |
+
+### Stage 19: Stationarity & Time-Series Structure (`_compute_stationarity_features`) -- NEW PR #1
+
+| # | Variable | Formula | Inputs | Type | Tier | Consumers |
+|---|----------|---------|--------|------|------|-----------|
+| 73 | `close_frac_diff` | Fractional differentiation of close (d=0.4, fixed-window convolution, Lopez de Prado AFML Ch.5) | `close` | Stationary price | T3 | Forecasting (all models), transformer (better input than raw close) |
+| 74 | `hurst_exponent_rolling` | Rolling 63d R/S analysis Hurst exponent (Mandelbrot 1971) | `return_1d` | H (0-1) | T3 | Forecasting model selection (H>0.5=trend, H<0.5=mean-reversion), DTW analog weighting, prediction aggregator confidence |
+| 75 | `autocorr_lag1` | `return_1d.rolling(63).apply(autocorr, lag=1)` (Lo & MacKinlay 1988) | `return_1d` | Correlation (-1 to +1) | T3 | Short-term predictability signal for VAR/AR models |
+| 76 | `autocorr_lag5` | `return_1d.rolling(63).apply(autocorr, lag=5)` (weekly reversal) | `return_1d` | Correlation (-1 to +1) | T3 | Weekly reversal pattern detection |
+| 77 | `momentum_12_1` | `(close/close.shift(252) - 1) - (close/close.shift(21) - 1)` (Jegadeesh & Titman 1993; Novy-Marx 2012) | `close` | Return | T3 | Prediction aggregator canonical momentum factor |
+| 78 | `idiosyncratic_vol_63d` | `(return_1d - beta_252d * benchmark_return_1d).rolling(63).std()` (Ang et al. 2006) | `return_1d`, `beta_252d`, `benchmark_return_1d` | Volatility | T5 | HF position sizing, lottery characteristics input |
+| 79 | `earnings_revision_proxy` | `(eps_calc - eps_calc.shift(63)) / abs(eps_calc.shift(63))` (Chan, Jegadeesh & Lakonishok 1996) | `eps_calc` or `net_income_ttm_asof` | Signal | T4 | HF earnings momentum (stronger than price momentum) |
+
+### Stage 20: Credit Risk & Distress Signals (`_compute_credit_signals`) -- NEW PR #1
+
+| # | Variable | Formula | Inputs | Type | Tier | Consumers |
+|---|----------|---------|--------|------|------|-----------|
+| 80 | `cash_burn_rate_monthly` | `max(0, -operating_cash_flow) / 30` | `operating_cash_flow` | Cash flow | T1 | Financial health runway, scenario engine cash runway |
+| 81 | `debt_maturity_pressure` | `short_term_debt / total_debt_asof` | `short_term_debt`, `total_debt_asof` | Ratio (0-1) | T2 | HF leverage stress severity, MC refinancing risk |
+| 82 | `dso` | `receivables / (revenue/90)` (Days Sales Outstanding) | `receivables`, `revenue` | Days | T4 | Cash conversion cycle component |
+| 83 | `dio` | `inventory / (COGS/90)` (Days Inventory Outstanding) | `inventory`, `cost_of_revenue`/`gross_profit` | Days | T4 | Cash conversion cycle component |
+| 84 | `dpo` | `payables / (COGS/90)` (Days Payable Outstanding) | `payables`, `cost_of_revenue`/`gross_profit` | Days | T4 | Cash conversion cycle component |
+| 85 | `cash_conversion_cycle` | `DSO + DIO - DPO` (Richards & Laughlin 1980) | `dso`, `dio`, `dpo` | Days | T1 | HF asset quality, prediction aggregator ops signal |
+| 86 | `altman_z_momentum_63d` | `fh_altman_z_score - fh_altman_z_score.shift(63)` | `fh_altman_z_score` | Change | T2 | Survival early warning (declining Z before threshold), USS |
+| 87 | `covenant_proximity_score` | `max(normalized_distance_to_each_survival_trigger)` clipped (0-1), thresholds from `scoring_weights.yml` | `current_ratio`, `debt_to_equity_abs`, `fcf_yield`, `drawdown_252d` | Score (0-1) | T2 | USS graduated early warning, MC survival calibration |
+
+### Stage 22: Tail Risk & Higher-Moment Features (`_compute_tail_risk_features`) -- NEW PR #1
+
+| # | Variable | Formula | Inputs | Type | Tier | Consumers |
+|---|----------|---------|--------|------|------|-----------|
+| 88 | `skewness_63d` | `return_1d.rolling(63).skew()` (Harvey & Siddique 2000) | `return_1d` | Higher moment | T3 | MC non-Gaussian path generation, conformal asymmetric widening |
+| 89 | `kurtosis_63d` | `return_1d.rolling(63).kurt()` (Dittmar 2002) | `return_1d` | Higher moment | T3 | MC fat-tail path generation, conformal heavy-tail widening |
+| 90 | `tail_ratio_63d` | `abs(P95 / P5)` of return distribution (empyrical convention) | `return_1d` | Ratio | T3 | Prediction aggregator downside/upside asymmetry |
+| 91 | `max_daily_loss_63d` | `return_1d.rolling(63).min()` | `return_1d` | Return | T3 | MC worst-case scenario anchor |
+| 92 | `vol_of_vol_21d` | `volatility_21d.rolling(21).std()` (Cont & da Fonseca 2002) | `volatility_21d` | Volatility | T3 | GARCH fit quality proxy |
+
+### Stage 24: Forensic Accounting Signals (`_compute_forensic_signals`) -- NEW PR #1
+
+| # | Variable | Formula | Inputs | Type | Tier | Consumers |
+|---|----------|---------|--------|------|------|-----------|
+| 93 | `revenue_receivables_divergence` | `revenue.pct_change(252) - receivables.pct_change(252)` (Lev & Thiagarajan 1993) | `revenue`, `receivables` | Signal | T4 | HF accruals forensics channel stuffing detection |
+| 94 | `capex_depreciation_ratio` | `abs(capex) / (ebitda - ebit)` (Sloan 1996) | `capex`, `ebitda`, `ebit`/`operating_income` | Ratio | T4 | HF investment quality signal |
+| 95 | `soft_asset_ratio` | `(total_assets - cash) / total_assets` (Barton & Simko 2002) | `total_assets`, `cash_and_equivalents` | Ratio (0-1) | T4 | HF manipulation risk proxy |
+| 96 | `ocf_ratio` | `operating_cash_flow / net_income` (Dechow & Dichev 2002) | `operating_cash_flow`, `net_income` | Ratio | T4 | HF FCF quality daily cash conversion tracking |
+
+**Companion flags for all 96 variables:** `is_missing_{var}` (96 flags) + `invalid_math_{var}` (~30 for ratio variables) = **~222 total columns**
 
 ---
 
@@ -364,10 +418,13 @@ Variables ranked: close, return_1d, volatility_21d, revenue, net_income, total_d
 
 ---
 
-## 1.13 Product Metrics
+## 1.13 Product Metrics + Operational Efficiency
 
-**File:** `operator1/features/product_metrics.py` (289 lines)
-**Pipeline step:** Step 5i.6
+**File:** `operator1/features/product_metrics.py` (~361 lines)
+**Pipeline step:** Step 5i.6 (segments) + Step 5i.6b (operational efficiency)
+**Entry points:** `compute_product_metrics(cache, segment_data)`, `compute_operational_efficiency(cache)`
+
+### Segment Metrics (from `compute_product_metrics`)
 
 | # | Variable | Formula | Consumers |
 |---|----------|---------|-----------|
@@ -381,7 +438,17 @@ Variables ranked: close, return_1d, volatility_21d, revenue, net_income, total_d
 | 8 | `dominant_segment_growth` | YoY growth of largest segment | Extra vars |
 | 9 | `net_new_revenue_pct` | Revenue from new segments / total | Extra vars |
 
-**9 columns**
+### Operational Efficiency Features (from `compute_operational_efficiency`) -- NEW PR #1
+
+| # | Variable | Formula | Consumers |
+|---|----------|---------|-----------|
+| 10 | `inventory_turnover` | `revenue / inventory` | HF asset quality, extra vars |
+| 11 | `receivables_turnover` | `revenue / receivables` | HF revenue quality, extra vars |
+| 12 | `payables_turnover` | `COGS / payables` (COGS fallback: `revenue - gross_profit`) | HF supplier power, extra vars |
+| 13 | `sga_efficiency` | `revenue / sga_expenses` | Vanity SGA bloat detection, extra vars |
+| 14 | `capex_intensity` | `abs(capex) / revenue` | HF capital cycle classification, extra vars |
+
+**14 columns**
 
 ---
 
@@ -469,28 +536,97 @@ No cache variables (transparent PDF fallback). **0 columns**
 
 ---
 
-## Layer 1 CORRECTED Grand Total
+## 1.19 Behavioral Signals -- NEW PR #1
 
-| Module | Primary Variables | Companion Flags | Total Columns |
-|--------|-------------------|-----------------|---------------|
-| 1.1 Derived Variables | 67 | ~87 | ~154 |
-| 1.2 Conflict Risk | 9 | 0 | 9 |
-| 1.3 Filing Calendar | 1 cache + 9 result | 0 | 1 |
-| 1.4 Linked Aggregates | ~33 | 0 | ~33 |
-| 1.5 Macro Alignment | 7 | 7 | 14 |
-| 1.6 Macro Quadrant | 2 | 0 | 2 |
-| 1.7 News Sentiment | **7** | 0 | **7** |
-| 1.8 Peer Ranking | 12 | 0 | 12 |
-| 1.9 Private Company Proxies | 5 | 5 | 10 |
-| 1.10 Market Buying Power | **4** | 0 | **4** |
-| 1.11 SIX Derived Proxies | 26 | 0 | 26 |
-| 1.12 Product Catalysts | 4 | 0 | 4 |
-| 1.13 Product Metrics | 9 | 0 | 9 |
-| 1.14 OCR Pipeline | 0 | 0 | 0 |
-| **1.15 Institutional Flow** | **9** | **0** | **9** |
-| **1.16 Cross-Asset Signals** | **6** | **0** | **6** |
-| **1.17 Options Signals** | **6** | **0** | **6** |
-| **1.18 Event Calendar** | **5** | **0** | **5** |
-| **Total** | **~212** | **~99** | **~311** |
+**File:** `operator1/features/behavioral_signals.py` (121 lines)
+**Pipeline step:** Step 5i.7 (after product_catalysts, before complexity_signals)
+**Entry point:** `compute_behavioral_signals(cache)`
 
-All ~311 columns flow into the daily cache DataFrame consumed by Layer 2 (Analysis) and Layer 3 (Temporal Models).
+| # | Variable | Formula | Type | Consumers |
+|---|----------|---------|------|-----------|
+| 1 | `anchoring_52w_high` | `close / close.rolling(252).max()` (George & Hwang 2004, JF) | Continuous (0-1) | Prediction aggregator momentum/reversal signal, HF position context, signal IC |
+| 2 | `anchoring_52w_low` | `close / close.rolling(252).min()` | Continuous (1+) | Extra vars |
+| 3 | `disposition_effect_proxy` | `return_1d.rolling(63).corr(inst_flow_momentum)` (Shefrin & Statman 1985; Frazzini 2006) | Continuous (-1 to +1) | Institutional flow quality assessment, extra vars |
+| 4 | `attention_spike` | `1 if volume_zscore > 2.0` where z = `(volume - volume_avg_21d) / volume_std_21d` (Barber & Odean 2008, RFS) | Binary (0/1) | News sentiment amplifier, extra vars |
+| 5 | `lottery_characteristics` | `(idio_vol_pctrank + skew_pctrank + low_price_flag) / 3` (Bali, Cakici & Whitelaw 2011, JFE) | Continuous (0-1) | HF risk classification, position sizing, extra vars |
+
+**Dependencies:** `inst_flow_momentum` (from Step 5.inst), `beta_252d` + `benchmark_return_1d` (from derived_variables Stage 14). This is why behavioral signals must run as a separate module AFTER institutional flow, not inside derived_variables.
+
+**5 columns**
+
+---
+
+## 1.20 Complexity Signals -- NEW PR #1
+
+**File:** `operator1/features/complexity_signals.py` (254 lines)
+**Pipeline step:** Step 5i.8 (after behavioral_signals, before feature_normalization)
+**Entry point:** `compute_complexity_signals(cache, window=63, price_window=126)`
+
+Inlined entropy implementations from `raphaelvallat/antropy` (367 stars) and `blue-yonder/tsfresh` (9,183 stars) -- zero added dependencies.
+
+| # | Variable | Formula | Type | Consumers |
+|---|----------|---------|------|-----------|
+| 1 | `sample_entropy_21d` | Rolling sample entropy (Richman & Moorman 2000): count template matches within `r=0.2*std` tolerance, order=2 | Continuous | Conformal band widening (high entropy = low predictability), model diagnostics |
+| 2 | `perm_entropy_21d` | Permutation entropy (Bandt & Pompe 2002): ordinal pattern frequency, order=3, normalized | Continuous (0-1) | Forecasting model trust signal, extra vars |
+| 3 | `lz_complexity` | Lempel-Ziv 1976 complexity on binarized returns (>0 = "1", <=0 = "0"), normalized by `n/log2(n)` | Continuous (0-1) | Prediction aggregator confidence (near 1.0 = random walk = widen bands) |
+| 4 | `approx_entropy_price` | Approximate entropy on PRICE series, not returns (Pincus 1991, PNAS): captures price-level predictability | Continuous | Regime detector (entropy drops precede regime shifts), extra vars |
+
+**4 columns**
+
+---
+
+## 1.21 Feature Normalization -- NEW PR #1
+
+**File:** `operator1/features/feature_normalization.py` (130 lines)
+**Pipeline step:** Step 5i.9 (MUST run LAST in feature pipeline, before temporal models)
+**Entry point:** `compute_feature_normalization(cache)`
+**Critical dependency:** Requires `survival_regime` column from `hierarchy_weights.py` (Step 5) for regime-conditional z-scores.
+
+For 10 key variables (`current_ratio`, `debt_to_equity_abs`, `fcf_yield`, `gross_margin`, `volatility_21d`, `pe_ratio_calc`, `revenue_growth_yoy`, `sentiment_score`, `merton_dd`, `fh_composite_score`):
+
+| # | Pattern | Formula | Type | Consumers |
+|---|---------|---------|------|-----------|
+| 1-10 | `{var}_zscore_63d` | `(value - rolling_mean_63d) / rolling_std_63d` | Z-score | Forecasting (tree models), normalized ML features |
+| 11-20 | `{var}_percentile_252d` | `value.rolling(252).rank(pct=True)` | Percentile (0-1) | Prediction aggregator historical context signal |
+| 21-30 | `{var}_change_21d` | `value.diff(21)` | Level change | Forecasting (tree models), trend/gradient detection |
+
+For 5 survival-critical variables (`current_ratio`, `debt_to_equity_abs`, `fcf_yield`, `drawdown_252d`, `volatility_21d`):
+
+| # | Pattern | Formula | Type | Consumers |
+|---|---------|---------|------|-----------|
+| 31-35 | `{var}_regime_zscore` | Per-regime expanding z-score: `(value - regime_mean) / regime_std` | Z-score | USS controller ("is this unusual FOR THIS REGIME?"), extra vars |
+
+**~35 columns** (10 x 3 standard normalizations + 5 regime z-scores)
+
+---
+
+## Layer 1 UPDATED Grand Total
+
+| Module | Primary Variables | Companion Flags | Total Columns | Status |
+|--------|-------------------|-----------------|---------------|--------|
+| 1.1 Derived Variables | **96** (was 67) | **~126** (was ~87) | **~222** (was ~154) | **ENHANCED PR #1** (+29 vars in 5 new stages) |
+| 1.2 Conflict Risk | 9 | 0 | 9 | |
+| 1.3 Filing Calendar | 1 cache + 9 result | 0 | 1 | |
+| 1.4 Linked Aggregates | ~33 | 0 | ~33 | |
+| 1.5 Macro Alignment | 7 | 7 | 14 | |
+| 1.6 Macro Quadrant | 2 | 0 | 2 | |
+| 1.7 News Sentiment | 7 | 0 | 7 | |
+| 1.8 Peer Ranking | 12 | 0 | 12 | |
+| 1.9 Private Company Proxies | 5 | 5 | 10 | |
+| 1.10 Market Buying Power | 4 | 0 | 4 | |
+| 1.11 SIX Derived Proxies | 26 | 0 | 26 | |
+| 1.12 Product Catalysts | 4 | 0 | 4 | |
+| 1.13 Product Metrics + Ops Efficiency | **14** (was 9) | 0 | **14** (was 9) | **ENHANCED PR #1** (+5 operational efficiency) |
+| 1.14 OCR Pipeline | 0 | 0 | 0 | |
+| 1.15 Institutional Flow | 9 | 0 | 9 | |
+| 1.16 Cross-Asset Signals | 6 | 0 | 6 | |
+| 1.17 Options Signals | 6 | 0 | 6 | |
+| 1.18 Event Calendar | 5 | 0 | 5 | |
+| **1.19 Behavioral Signals** | **5** | **0** | **5** | **NEW PR #1** |
+| **1.20 Complexity Signals** | **4** | **0** | **4** | **NEW PR #1** |
+| **1.21 Feature Normalization** | **~35** | **0** | **~35** | **NEW PR #1** |
+| **Total** | **~290** | **~138** | **~428** | |
+
+All ~428 columns flow into the daily cache DataFrame consumed by Layer 2 (Analysis) and Layer 3 (Temporal Models).
+
+**PR #1 delta:** +73 new primary variables (+5 operational efficiency, +29 derived variable stages, +5 behavioral, +4 complexity, +~35 normalization), ~39 new companion flags, **+117 total new columns** vs v2.
