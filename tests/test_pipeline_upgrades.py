@@ -32,6 +32,9 @@ class TestProfileSchema:
 
         profile = {key: {"available": True} for key in REQUIRED_PROFILE_KEYS}
         profile["meta"] = {"generated_at": "2025-01-01"}
+        # Schema also checks 'available' flag on these optional sections
+        for opt_key in ("predicted_regime_shifts", "model_diagnostics", "supply_chain_stress"):
+            profile[opt_key] = {"available": False}
 
         issues = validate_profile(profile)
         assert len(issues) == 0

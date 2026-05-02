@@ -528,7 +528,7 @@ class TestEvolveVariables(unittest.TestCase):
 
         result = evolve_variables(paths, initial)
 
-        # Terminal values should be above initial.
+        # Terminal values should be above initial (positive returns + positive beta).
         terminal = result["current_ratio"][:, -1]
         self.assertTrue(np.all(terminal > 1.5))
 
@@ -912,7 +912,8 @@ class TestRunMonteCarlo(unittest.TestCase):
             DEFAULT_HORIZONS,
         )
 
-        cache = _make_mc_cache(200)
+        # Use 500 rows (>= 400 threshold) so DEFAULT_HORIZONS keys are used
+        cache = _make_mc_cache(500)
         result = run_monte_carlo(cache, n_paths=100, n_bootstrap=50)
 
         # Should have probabilities for all default horizons.
@@ -928,7 +929,8 @@ class TestRunMonteCarlo(unittest.TestCase):
             DEFAULT_HORIZONS,
         )
 
-        cache = _make_mc_cache(200)
+        # Use 500 rows (>= 400 threshold) so DEFAULT_HORIZONS keys are used
+        cache = _make_mc_cache(500)
         result = run_monte_carlo(cache, n_paths=100, n_bootstrap=50)
 
         for h_label in DEFAULT_HORIZONS:

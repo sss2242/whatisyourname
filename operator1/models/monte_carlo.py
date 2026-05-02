@@ -725,21 +725,27 @@ def evolve_variables(
         elif filing_interval > 1:
             # Frequency-aware evolution: update only at filing intervals.
             # Between filings, hold the last reported value constant.
+            # Cap filing_interval to n_steps so short simulations still
+            # produce meaningful terminal values (not flat lines).
+            effective_interval = min(filing_interval, max(1, n_steps - 1))
             scale = max(abs(init_val), 1e-6)
             evolved = np.full((n_paths, n_steps), init_val)
-            for t in range(n_steps):
-                if t > 0 and t % filing_interval == 0:
+            last_filing_t = 0
+            for t in range(1, n_steps):
+                if t % effective_interval == 0:
                     # Filing day: update based on cumulative returns since
                     # last filing.
-                    prev_filing_t = t - filing_interval
-                    if prev_filing_t >= 0:
-                        cum_since_filing = cum_returns[:, t] - cum_returns[:, prev_filing_t]
-                    else:
-                        cum_since_filing = cum_returns[:, t]
-                    evolved[:, t] = evolved[:, max(0, t - 1)] + beta * cum_since_filing * scale
-                elif t > 0:
+                    cum_since_filing = cum_returns[:, t] - cum_returns[:, last_filing_t]
+                    evolved[:, t] = evolved[:, t - 1] + beta * cum_since_filing * scale
+                    last_filing_t = t
+                else:
                     # Non-filing day: carry forward previous value.
                     evolved[:, t] = evolved[:, t - 1]
+            # Always apply a final-step update if the last step wasn't a
+            # filing day, so terminal values reflect cumulative returns.
+            if (n_steps - 1) % effective_interval != 0 and n_steps > 1:
+                cum_since_filing = cum_returns[:, -1] - cum_returns[:, last_filing_t]
+                evolved[:, -1] = evolved[:, -2] + beta * cum_since_filing * scale
             result[var_name] = evolved
         else:
             # Daily evolution: original linear sensitivity model.
