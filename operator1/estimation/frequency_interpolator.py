@@ -211,7 +211,11 @@ def _distribute_flow(
             if len(sorted_dates) >= 2:
                 gap = (sorted_dates[1] - sorted_dates[0]).days
             else:
-                gap = 90  # default quarterly
+                # Infer gap from global filing dates when the column
+                # has only 1 non-NaN value (F5 bug fix).
+                gap = _infer_period_gap_from_global_dates(
+                    period_end, filing_dates,
+                )
             period_start = period_end - pd.Timedelta(days=gap)
         else:
             period_start = sorted_dates[i - 1] + pd.Timedelta(days=1)
@@ -241,7 +245,9 @@ def _distribute_flow(
     if len(sorted_dates) >= 2:
         gap = (sorted_dates[1] - sorted_dates[0]).days
     else:
-        gap = 90
+        gap = _infer_period_gap_from_global_dates(
+            first_period_start, filing_dates,
+        )
     estimated_start = first_period_start - pd.Timedelta(days=gap)
     before_mask = (daily_index <= estimated_start) & result.isna()
     if before_mask.any() and result.notna().any():
@@ -303,6 +309,37 @@ def _interpolate_stock_to_index(
     return combined
 
 
+def _infer_period_gap_from_global_dates(
+    period_end: pd.Timestamp,
+    filing_dates: list[pd.Timestamp],
+) -> int:
+    """Infer the filing period gap for a sparse column using global dates.
+
+    When a flow column has only 1 non-NaN value but the statement has
+    multiple filing dates, the column likely covers a longer period
+    than the statement's native frequency.  For example, annual
+    gross_profit in a quarterly income statement covers 4 quarters.
+
+    Returns estimated gap in calendar days.
+    """
+    if not filing_dates or len(filing_dates) < 2:
+        return 90  # genuine single-filing fallback
+
+    sorted_global = sorted(filing_dates)
+    gaps = [(sorted_global[i + 1] - sorted_global[i]).days
+            for i in range(len(sorted_global) - 1)]
+    median_gap = int(np.median(gaps))
+
+    # Count how many global filing dates precede period_end where
+    # this column was NaN (i.e., the column skipped those periods).
+    preceding = [d for d in sorted_global if d < period_end]
+    n_covered_periods = len(preceding) + 1
+    inferred_gap = median_gap * n_covered_periods
+
+    # Cap at 730 days (2 years max) to avoid runaway estimates
+    return min(inferred_gap, 730)
+
+
 def _distribute_flow_to_index(
     filing_values: pd.Series,
     filing_dates: list[pd.Timestamp],
@@ -347,7 +384,12 @@ def _distribute_flow_to_index(
             if len(sorted_dates) >= 2:
                 gap = (sorted_dates[1] - sorted_dates[0]).days
             else:
-                gap = 90
+                # Infer gap from global filing dates when the column
+                # has only 1 non-NaN value.  Prevents distributing an
+                # annual total over a quarterly window (F5 bug fix).
+                gap = _infer_period_gap_from_global_dates(
+                    period_end, filing_dates,
+                )
             period_start = period_end - pd.Timedelta(days=gap)
         else:
             period_start = sorted_dates[i - 1] + pd.Timedelta(days=1)
@@ -375,7 +417,9 @@ def _distribute_flow_to_index(
     if len(sorted_dates) >= 2:
         gap = (sorted_dates[1] - sorted_dates[0]).days
     else:
-        gap = 90
+        gap = _infer_period_gap_from_global_dates(
+            first_end, filing_dates,
+        )
     estimated_start = first_end - pd.Timedelta(days=gap)
     before_mask = (target_index <= estimated_start) & result.isna()
     if before_mask.any() and result.notna().any():

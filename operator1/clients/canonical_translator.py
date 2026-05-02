@@ -947,13 +947,34 @@ def pivot_to_canonical_wide(
     if valid.empty:
         return pd.DataFrame()
 
-    # For duplicates within same period+concept, keep the latest filing
-    if "filing_date" in valid.columns:
-        valid = valid.sort_values("filing_date", ascending=False)
-        valid = valid.drop_duplicates(
-            subset=[date_col, "canonical_name"],
-            keep="first",
+    # For duplicates within same period+concept, prefer quarterly over
+    # annual (flow variables should not mix period scales -- F5 fix).
+    # Within same period_type, keep the latest filing_date.
+    _sort_cols = []
+    if "period_type" in valid.columns:
+        # Priority: quarterly=0, semiannual=1, annual=2 (lower = preferred)
+        _pt_priority = {"quarterly": 0, "10-q": 0, "q": 0,
+                        "semiannual": 1, "semi-annual": 1, "h": 1,
+                        "annual": 2, "10-k": 2, "a": 2, "fy": 2}
+        valid["_pt_sort"] = (
+            valid["period_type"].astype(str).str.lower().str.strip()
+            .map(_pt_priority).fillna(2)
         )
+        _sort_cols.append("_pt_sort")  # ascending: quarterly first
+    if "filing_date" in valid.columns:
+        _sort_cols.append("filing_date")
+
+    if _sort_cols:
+        ascending = [True] * len(_sort_cols)
+        if "filing_date" in _sort_cols:
+            ascending[_sort_cols.index("filing_date")] = False
+        valid = valid.sort_values(_sort_cols, ascending=ascending)
+    valid = valid.drop_duplicates(
+        subset=[date_col, "canonical_name"],
+        keep="first",
+    )
+    if "_pt_sort" in valid.columns:
+        valid = valid.drop(columns=["_pt_sort"])
 
     # Pivot
     try:

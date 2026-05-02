@@ -332,6 +332,27 @@ def _compute_profitability(df: pd.DataFrame) -> pd.DataFrame:
     result, ism, inv = safe_ratio(net_income, equity, "roe")
     _set_ratio_columns(df, "roe", result, ism, inv)
 
+    # F5 guard: reject economically impossible margins caused by statement
+    # frequency mismatch (e.g., annual gross_profit / quarterly revenue).
+    # Margins beyond these thresholds are set to NaN with flags.
+    _MARGIN_CAPS = {
+        "gross_margin": 1.5,       # 150% max (some software companies near 100%)
+        "operating_margin": 1.0,   # 100% max
+        "net_margin": 1.0,         # 100% max
+    }
+    for _m_name, _m_cap in _MARGIN_CAPS.items():
+        if _m_name in df.columns:
+            _impossible = df[_m_name].abs() > _m_cap
+            if _impossible.any():
+                logger.warning(
+                    "F5 plausibility: %d/%d days of %s exceed +/-%.0f%% "
+                    "(likely statement frequency mismatch), setting to NaN",
+                    int(_impossible.sum()), len(df), _m_name, _m_cap * 100,
+                )
+                df.loc[_impossible, _m_name] = np.nan
+                df.loc[_impossible, f"is_missing_{_m_name}"] = 1
+                df.loc[_impossible, f"invalid_math_{_m_name}"] = 1
+
     # EBITDA approximation: EBITDA is not a reported line item in most
     # GAAP/IFRS filings.  Best available proxy is operating_income (EBIT)
     # since depreciation/amortization are rarely available as separate items.
