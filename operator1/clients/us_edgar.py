@@ -41,45 +41,74 @@ _CACHE_DIR = Path("cache/us_sec_edgar")
 _USGAAP_INCOME_CONCEPTS: dict[str, str] = {
     "Revenues": "revenue",
     "RevenueFromContractWithCustomerExcludingAssessedTax": "revenue",
+    "SalesRevenueNet": "revenue",
     "CostOfGoodsAndServicesSold": "cost_of_revenue",
     "CostOfRevenue": "cost_of_revenue",
     "GrossProfit": "gross_profit",
     "OperatingIncomeLoss": "operating_income",
+    "OperatingExpenses": "operating_expenses",
     "NetIncomeLoss": "net_income",
+    "NetIncomeLossAvailableToCommonStockholdersBasic": "net_income",
     "EarningsPerShareBasic": "eps_basic",
     "EarningsPerShareDiluted": "eps_diluted",
+    "WeightedAverageNumberOfShareOutstandingBasicAndDiluted": "shares_outstanding",
+    "WeightedAverageNumberOfDilutedSharesOutstanding": "shares_outstanding",
     "InterestExpense": "interest_expense",
     "IncomeTaxExpenseBenefit": "taxes",
     "SellingGeneralAndAdministrativeExpense": "sga_expense",
     "ResearchAndDevelopmentExpense": "research_and_development",
+    "DepreciationAndAmortization": "depreciation_amortization",
 }
 
 _USGAAP_BALANCE_CONCEPTS: dict[str, str] = {
     "Assets": "total_assets",
     "Liabilities": "total_liabilities",
     "StockholdersEquity": "total_equity",
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest": "total_equity",
     "AssetsCurrent": "current_assets",
     "LiabilitiesCurrent": "current_liabilities",
     "CashAndCashEquivalentsAtCarryingValue": "cash_and_equivalents",
+    "CashCashEquivalentsAndShortTermInvestments": "cash_and_equivalents",
     "ShortTermBorrowings": "short_term_debt",
+    "ShortTermDebtCurrent": "short_term_debt",
+    "DebtCurrent": "short_term_debt",
+    "CommercialPaper": "short_term_debt",
     "LongTermDebt": "long_term_debt",
     "LongTermDebtNoncurrent": "long_term_debt",
+    "LongTermDebtAndCapitalLeaseObligations": "long_term_debt",
     "RetainedEarningsAccumulatedDeficit": "retained_earnings",
     "Goodwill": "goodwill",
     "IntangibleAssetsNetExcludingGoodwill": "intangible_assets",
+    "IntangibleAssetsNetIncludingGoodwill": "intangible_assets",
     "AccountsReceivableNetCurrent": "receivables",
     "InventoryNet": "inventory",
     "AccountsPayableCurrent": "payables",
+    "CommonStockSharesOutstanding": "shares_outstanding",
+    "WeightedAverageNumberOfShareOutstandingBasicAndDiluted": "shares_outstanding",
+    "PropertyPlantAndEquipmentNet": "ppe_net",
+}
+
+# DEI (Document and Entity Information) concepts -- separate namespace in
+# the companyfacts JSON, accessed via facts["dei"] instead of facts["us-gaap"].
+# EntityCommonStockSharesOutstanding is the most reliable shares_outstanding
+# source for many companies (reported every 10-K/10-Q cover page).
+_DEI_CONCEPTS: dict[str, str] = {
+    "EntityCommonStockSharesOutstanding": "shares_outstanding",
 }
 
 _USGAAP_CASHFLOW_CONCEPTS: dict[str, str] = {
     "NetCashProvidedByUsedInOperatingActivities": "operating_cash_flow",
+    "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations": "operating_cash_flow",
     "PaymentsToAcquirePropertyPlantAndEquipment": "capex",
     "NetCashProvidedByUsedInInvestingActivities": "investing_cf",
+    "NetCashProvidedByUsedInInvestingActivitiesContinuingOperations": "investing_cf",
     "NetCashProvidedByUsedInFinancingActivities": "financing_cf",
+    "NetCashProvidedByUsedInFinancingActivitiesContinuingOperations": "financing_cf",
     "PaymentsOfDividends": "dividends_paid",
     "PaymentsOfDividendsCommonStock": "dividends_paid",
     "PaymentsForRepurchaseOfCommonStock": "buybacks",
+    "DepreciationDepletionAndAmortization": "depreciation_amortization",
+    "ShareBasedCompensation": "stock_based_comp",
 }
 
 
@@ -1909,6 +1938,38 @@ class USEdgarClient:
                         "unit": unit_key,
                         "period_type": "annual" if form == "10-K" else "quarterly",
                     })
+
+        # Also check the DEI namespace for balance sheet fields like
+        # EntityCommonStockSharesOutstanding (reported on 10-K/10-Q cover
+        # pages -- the most reliable shares_outstanding source for many
+        # companies that don't report CommonStockSharesOutstanding under
+        # us-gaap).
+        if statement_type == "balance":
+            dei = facts.get("facts", {}).get("dei", {})
+            for concept_name, canonical_name in _DEI_CONCEPTS.items():
+                # Skip if we already have this canonical field from us-gaap
+                if any(r["concept"] == canonical_name for r in rows):
+                    continue
+                concept_data = dei.get(concept_name, {})
+                units = concept_data.get("units", {})
+                for unit_key in ("shares",):
+                    entries = units.get(unit_key, [])
+                    for entry in entries:
+                        form = entry.get("form", "")
+                        if form not in ("10-K", "10-Q", "20-F"):
+                            continue
+                        rows.append({
+                            "concept": canonical_name,
+                            "value": entry.get("val"),
+                            "filing_date": entry.get("filed", ""),
+                            "report_date": entry.get("end", ""),
+                            "period_start": entry.get("start", ""),
+                            "form": form,
+                            "fiscal_year": entry.get("fy"),
+                            "fiscal_period": entry.get("fp", ""),
+                            "unit": unit_key,
+                            "period_type": "annual" if form == "10-K" else "quarterly",
+                        })
 
         if not rows:
             return pd.DataFrame()
