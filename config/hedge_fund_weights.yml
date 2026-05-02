@@ -68,10 +68,13 @@ balance_sheet:
 # ---------------------------------------------------------------------------
 inflection:
   momentum:
-    revenue_accel_weight: 0.40
-    margin_trend_weight: 0.30
-    fcf_conversion_weight: 0.20
-    roic_trajectory_weight: 0.10
+    revenue_accel_weight: 0.30
+    margin_trend_weight: 0.25
+    fcf_conversion_weight: 0.15
+    roic_trajectory_weight: 0.05
+    price_momentum_weight: 0.25      # price return component (Jegadeesh & Titman 1993)
+    price_momentum_lookback_days: 63  # trading days for price return computation
+    price_normalization_scale: 200    # maps +/-25% return to 0-100 score range
   growth_quality:
     organic_fraction_weight: 0.50
     margin_adjusted_weight: 0.25
@@ -118,6 +121,14 @@ position_sizing:
     extreme_survival: -0.5
   recovery_multiplier: 1.5
   support_resistance_lookback_days: 63
+  # Momentum clamp: prevent fighting strong price trends
+  momentum_clamp:
+    enabled: true
+    lookback_days: 63              # trading days for trend detection
+    uptrend_threshold: 0.08        # 63d return above this floors sell signal
+    downtrend_threshold: -0.15     # 63d return below this caps buy signal
+    clamp_floor: -0.1             # minimum signal when uptrend clamp fires (weak hold)
+    clamp_ceiling: 0.1            # maximum signal when downtrend clamp fires (weak hold)
 
 # ---------------------------------------------------------------------------
 # Thesis Scorecard

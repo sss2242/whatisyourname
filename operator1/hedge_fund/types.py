@@ -236,6 +236,10 @@ class MomentumCompositeResult:
     fcf_conversion_trend: float | None = None
     roic_trajectory: float | None = None
     price_momentum_divergence: float | None = None  # fundamental vs price
+    price_momentum_63d: float | None = None          # 63-day price return
+    price_momentum_252d: float | None = None         # 252-day price return
+    price_fundamental_divergence: bool = False        # True when price and fundamentals disagree
+    divergence_direction: str = ""                    # "price_leading" or "fundamentals_leading"
     inflection_detected: bool = False
     # Layer 4 enhancement: regime-conditional momentum (4.10A)
     regime_adjusted_momentum: float | None = None
@@ -384,6 +388,9 @@ class PositionSignalResult:
     stop_price: float | None = None
     target_price: float | None = None
     risk_reward_ratio: float | None = None
+    # Momentum clamp: prevents fighting strong price trends
+    momentum_override: bool = False
+    momentum_override_reason: str = ""
     # Layer 4 enhancement: Kelly criterion sizing (4.17A)
     kelly_fraction: float | None = None       # full Kelly optimal bet size
     half_kelly_size: float | None = None      # conservative half-Kelly

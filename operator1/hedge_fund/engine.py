@@ -491,6 +491,19 @@ def _compute_momentum(
         # ROIC trajectory (simplified)
         roic_slope = None  # would need invested capital computation
 
+        # Price momentum from cache (Jegadeesh & Titman 1993)
+        price_mom_score = 50.0  # neutral default
+        if cache is not None and "close" in cache.columns:
+            closes = cache["close"].dropna()
+            _pm_lookback = int(w.get("price_momentum_lookback_days", 63))
+            _pm_scale = float(w.get("price_normalization_scale", 200))
+            if len(closes) >= _pm_lookback:
+                ret_63d = float(closes.iloc[-1] / closes.iloc[-_pm_lookback] - 1)
+                result.price_momentum_63d = ret_63d
+                if len(closes) >= 252:
+                    result.price_momentum_252d = float(closes.iloc[-1] / closes.iloc[-252] - 1)
+                price_mom_score = normalize_score(50 + ret_63d * _pm_scale, 0, 100)
+
         # Score components (normalize to 0-100)
         def _norm(val: float | None, scale: float = 100.0) -> float:
             if val is None:
@@ -498,10 +511,11 @@ def _compute_momentum(
             return normalize_score(50 + val * scale, 0, 100)
 
         score = (
-            w.get("revenue_accel_weight", 0.4) * _norm(rev_accel, 500)
-            + w.get("margin_trend_weight", 0.3) * _norm(margin_slope, 5000)
-            + w.get("fcf_conversion_weight", 0.2) * _norm(fcf_conv_slope, 5000)
-            + w.get("roic_trajectory_weight", 0.1) * 50
+            w.get("revenue_accel_weight", 0.30) * _norm(rev_accel, 500)
+            + w.get("margin_trend_weight", 0.25) * _norm(margin_slope, 5000)
+            + w.get("fcf_conversion_weight", 0.15) * _norm(fcf_conv_slope, 5000)
+            + w.get("roic_trajectory_weight", 0.05) * 50
+            + w.get("price_momentum_weight", 0.25) * price_mom_score
         )
         result.score = normalize_score(score)
         result.label = _score_label(result.score)
@@ -509,6 +523,20 @@ def _compute_momentum(
             rev_accel is not None and rev_accel < -0.01
             and (margin_slope is not None and margin_slope < 0)
         )
+
+        # Price-fundamental divergence detection
+        _fund_score = (
+            w.get("revenue_accel_weight", 0.30) * _norm(rev_accel, 500)
+            + w.get("margin_trend_weight", 0.25) * _norm(margin_slope, 5000)
+            + w.get("fcf_conversion_weight", 0.15) * _norm(fcf_conv_slope, 5000)
+            + w.get("roic_trajectory_weight", 0.05) * 50
+        ) / max(1 - w.get("price_momentum_weight", 0.25), 0.01)
+        if price_mom_score > 65 and _fund_score < 40:
+            result.price_fundamental_divergence = True
+            result.divergence_direction = "price_leading"
+        elif price_mom_score < 35 and _fund_score > 60:
+            result.price_fundamental_divergence = True
+            result.divergence_direction = "fundamentals_leading"
         result.available = True
     except Exception as exc:
         logger.debug("Momentum composite failed: %s", exc)
@@ -1107,6 +1135,33 @@ def _compute_position_signal(
         result.alpha_base = alpha
         raw = alpha * q_mult * s_mult * d_mult * conviction * 100
         result.signal = max(-1.0, min(1.0, raw))
+
+        # Momentum clamp: prevent fighting strong price trends (config-driven)
+        _clamp_cfg = get_hf_weight("position_sizing.momentum_clamp", {})
+        if _clamp_cfg.get("enabled", True) and cache is not None and "close" in cache.columns:
+            closes = cache["close"].dropna()
+            _clamp_lookback = int(_clamp_cfg.get("lookback_days", 63))
+            if len(closes) >= _clamp_lookback:
+                _ret = float(closes.iloc[-1] / closes.iloc[-_clamp_lookback] - 1)
+                _up_thresh = float(_clamp_cfg.get("uptrend_threshold", 0.08))
+                _down_thresh = float(_clamp_cfg.get("downtrend_threshold", -0.15))
+                _floor = float(_clamp_cfg.get("clamp_floor", -0.1))
+                _ceiling = float(_clamp_cfg.get("clamp_ceiling", 0.1))
+
+                if _ret > _up_thresh and result.signal < _floor:
+                    result.momentum_override = True
+                    result.momentum_override_reason = (
+                        f"Signal clamped from {result.signal:.2f} to {_floor:.2f}: "
+                        f"{_clamp_lookback}d return +{_ret*100:.1f}% overrides quality-driven sell"
+                    )
+                    result.signal = _floor
+                elif _ret < _down_thresh and result.signal > _ceiling:
+                    result.momentum_override = True
+                    result.momentum_override_reason = (
+                        f"Signal clamped from {result.signal:.2f} to {_ceiling:.2f}: "
+                        f"{_clamp_lookback}d return {_ret*100:.1f}% overrides quality-driven buy"
+                    )
+                    result.signal = _ceiling
 
         # Label
         if result.signal > 0.5: result.label = "strong_buy"
