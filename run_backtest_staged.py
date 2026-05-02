@@ -30,7 +30,10 @@ from pathlib import Path
 ALL_STAGES = [
     # Backtest Stage 1: Data fetch + cache build + features
     ("1", "Data Fetch + Cache Build + Features"),
-    # Backtest Stage 2: Temporal models (36 sub-stages via staged runner)
+    # Backtest Stage 2: Data preprocessing (frequency separation + reconciliation)
+    ("2.1", "Frequency Separation (Bayesian + Chow-Lin/Denton)"),
+    ("2.2", "Data Reconciliation (identity checks + dedup)"),
+    # Backtest Stage 3+: Temporal models (36 sub-stages via staged runner)
     ("3.1", "Regime Detection (HMM/GMM/PELT/BCP/ChangeFinder)"),
     ("3.2", "Dual Regime Mixer"),
     ("3.3", "Granger Causality (PCMCI)"),

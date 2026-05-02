@@ -33,6 +33,7 @@ def _build_registry() -> list[tuple[str, callable]]:
     Imports are deferred to avoid circular imports and to only load
     stage modules when they are actually needed.
     """
+    from operator1.stages.stage2_preprocessing import STAGE_2_SUBSTAGES
     from operator1.stages.stage3_temporal import STAGE_3_SUBSTAGES
     from operator1.stages.stage4_forecasting import STAGE_4_SUBSTAGES
     from operator1.stages.stage5_forward import STAGE_5_SUBSTAGES
@@ -40,7 +41,8 @@ def _build_registry() -> list[tuple[str, callable]]:
     from operator1.stages.stage7_integration import STAGE_7_SUBSTAGES
 
     return (
-        STAGE_3_SUBSTAGES
+        STAGE_2_SUBSTAGES
+        + STAGE_3_SUBSTAGES
         + STAGE_4_SUBSTAGES
         + STAGE_5_SUBSTAGES
         + STAGE_6_SUBSTAGES
@@ -165,6 +167,7 @@ _DEFAULT_TIMEOUT: int = 120  # 2 min for everything else
 
 # Required state fields per sub-stage. Validated before dispatch.
 _SUBSTAGE_REQUIREMENTS: dict[str, list[str]] = {
+    "2.1": ["income_df"],  # needs at least one raw statement DF
     "3.1": ["cache"],
     "4.1": ["cache", "extra_vars"],
     "5.1": ["cache", "forecast_result", "weights"],
