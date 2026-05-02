@@ -93,6 +93,7 @@ class ClaudeClient(LLMClient):
         *,
         max_output_tokens: int = 8192,
         temperature: float = 0.7,
+        system_prompt: str = "",
     ) -> dict[str, Any]:
         """Build Claude API request arguments.
 
@@ -101,8 +102,8 @@ class ClaudeClient(LLMClient):
         Gemini, the key is never in the URL). The ``anthropic-version``
         header is required and specifies the API version.
 
-        The payload uses the ``messages`` array with ``role`` and
-        ``content`` fields, following the chat format.
+        When ``system_prompt`` is provided, it is sent via the
+        ``system`` top-level parameter in the Messages API payload.
         """
         url = f"{self._base_url}/messages"
         headers = {
@@ -110,7 +111,7 @@ class ClaudeClient(LLMClient):
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-        payload = {
+        payload: dict[str, Any] = {
             "model": self._model,
             "max_tokens": max_output_tokens,
             "temperature": temperature,
@@ -118,6 +119,8 @@ class ClaudeClient(LLMClient):
                 {"role": "user", "content": prompt},
             ],
         }
+        if system_prompt:
+            payload["system"] = system_prompt
         return {"url": url, "json": payload, "headers": headers}
 
     def _parse_response(self, data: dict[str, Any]) -> str:
