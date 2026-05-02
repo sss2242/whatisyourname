@@ -2023,7 +2023,7 @@ Examples:
     _STAGE_DEPS = {
         "1": None,
         "2": "1",   # temporal models depend on Stage 1 (data fetch)
-        "3": "2",   # profile build depends on Stage 2 (temporal models)
+        "3": None,  # profile build loads latest checkpoint dynamically
     }
 
     # Handle sub-stage routing: "2:3.1" means "load latest checkpoint, run sub-stage 3.1"
@@ -2039,6 +2039,12 @@ Examples:
 
     for stage_key in stages:
         dep = _STAGE_DEPS[stage_key]
+        # Stage 3 (profile build) needs the latest temporal checkpoint
+        if dep is None and stage_key == "3":
+            _latest = _find_latest_checkpoint(state.output_dir, "3")
+            if _latest:
+                logger.info("Stage 3: loading latest checkpoint '%s'", _latest)
+                state.load_checkpoint(_latest)
         if dep is not None:
             # Load state from the dependency stage, with fallback chain
             dep_key = str(dep)

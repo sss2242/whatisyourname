@@ -190,8 +190,33 @@ class PipelineState:
             try:
                 pickle.dumps(v)
                 state_dict[k] = v
-            except (pickle.PicklingError, TypeError, AttributeError):
-                logger.debug("Skipping non-picklable key: %s", k)
+            except (pickle.PicklingError, TypeError, AttributeError) as exc:
+                # Try to salvage the result by stripping non-picklable sub-fields
+                # (e.g., ForwardPassResult.model_states contains fitted sklearn/torch models)
+                _salvaged = False
+                if hasattr(v, "__dict__"):
+                    try:
+                        _cleaned = type(v).__new__(type(v))
+                        for attr_name, attr_val in v.__dict__.items():
+                            try:
+                                pickle.dumps(attr_val)
+                                setattr(_cleaned, attr_name, attr_val)
+                            except (pickle.PicklingError, TypeError, AttributeError):
+                                setattr(_cleaned, attr_name, None)
+                                logger.debug(
+                                    "Stripped non-picklable sub-field %s.%s",
+                                    k, attr_name,
+                                )
+                        pickle.dumps(_cleaned)
+                        state_dict[k] = _cleaned
+                        _salvaged = True
+                        logger.info(
+                            "Salvaged %s by stripping non-picklable sub-fields", k,
+                        )
+                    except Exception:
+                        pass
+                if not _salvaged:
+                    logger.warning("Skipping non-picklable key: %s (%s)", k, exc)
 
         # Save raw statement DFs separately (they can be large)
         for df_name in ("income_df", "balance_df", "cashflow_df", "quotes_df"):
