@@ -2356,7 +2356,7 @@ def _build_advanced_insights(profile: dict[str, Any]) -> str:
             lines.append("")
             sorted_feats = sorted(feat_imp.items(), key=lambda x: x[1] or 0, reverse=True)
             for feat, imp in sorted_feats[:5]:
-                lines.append(f"- {feat}: attention weight {_fmt(imp, '.4f')}")
+                lines.append(f"- {_humanize_var(feat)}: attention weight {_fmt(imp, '.4f')}")
         lines.append("")
 
     # Granger causality
@@ -3663,7 +3663,7 @@ def _build_multi_frequency_section(profile: dict[str, Any]) -> str:
         lines.append("| Variable | Horizon | Forecast | Confidence | Frequencies |")
         lines.append("|----------|---------|----------|------------|-------------|")
         for p in preds[:15]:
-            var = p.get("variable", "")
+            var = _humanize_var(p.get("variable", ""))
             horizon = p.get("horizon", "")
             pf = p.get("point_forecast")
             pf_str = f"{pf:.4f}" if pf is not None else "N/A"
