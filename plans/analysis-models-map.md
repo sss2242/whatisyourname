@@ -1,24 +1,24 @@
-# Analysis Models Map (2026-04-17)
+# Analysis Models Map (2026-05-02)
 
-Comprehensive reference for all 62 analytical modules in Operator 1. Each module documented with purpose, mathematical basis, inputs, outputs, pipeline wiring, profile/report integration, dependencies, and current status.
+Comprehensive reference for all 78 analytical modules in Operator 1. Each module documented with purpose, mathematical basis, inputs, outputs, pipeline wiring, profile/report integration, dependencies, and current status.
 
-Total: ~49,900 lines of analytical code across 6 layers.
+Total: ~56,000 lines of analytical code across 6 layers.
 
 ---
 
 ## Layer 1: Feature Engineering
 
-12 modules in `operator1/features/` that transform the raw daily cache into model-ready features. These run in Steps 4-5 of main.py before any temporal modeling.
+21 modules in `operator1/features/` that transform the raw daily cache into model-ready features. These run in Steps 4-5 of main.py before any temporal modeling. **Updated 2026-05-01:** expanded from 14 to 21 modules with 7 new feature modules (options signals, cross-asset signals, event calendar, behavioral signals, complexity signals, feature normalization, operational efficiency).
 
 ---
 
 ### 1.1 Derived Variables
 
-**File:** `operator1/features/derived_variables.py` (818 lines)
+**File:** `operator1/features/derived_variables.py` (~1,468 lines)
 **Pipeline step:** Step 5
 **Profile key:** `current_state` (latest values of all derived columns)
 
-**Purpose:** Computes ~50 derived financial and technical columns from the raw cache. This is the primary feature engineering module -- every downstream model consumes its output.
+**Purpose:** Computes ~96 derived financial and technical columns across 24 computation stages from the raw cache. This is the primary feature engineering module -- every downstream model consumes its output. **Expanded 2026-05-01** from ~50 to ~96 variables with 5 new computation stages: microstructure signals (Corwin-Schultz spread, Kyle lambda, Parkinson/Yang-Zhang vol), stationarity features (fractional differentiation, Hurst exponent, autocorrelation, momentum 12-1), credit risk (cash burn rate, debt maturity pressure, CCC, covenant proximity), tail risk (skewness, kurtosis, tail ratio, vol-of-vol), forensic accounting (revenue-receivables divergence, capex-depreciation ratio, soft asset ratio, OCF ratio).
 
 **Mathematical operations:**
 
@@ -346,19 +346,130 @@ conflict_intensity = 0.40 * event_score + 0.20 * fatality_score + 0.25 * flag_sc
 
 ---
 
+### 1.15 Institutional Flow (previously unlisted)
+
+**File:** `operator1/features/institutional_flow.py` (372 lines)
+**Pipeline step:** Step 5.inst
+**Profile key:** `institutional_ownership_analysis.flow`
+
+**Purpose:** Computes institutional ownership flow signals from holder data. Detects accumulation/distribution patterns, crowding risk, smart money divergence, and insider trading signals.
+
+**9 output variables:** `inst_flow_momentum` (EMA-smoothed QoQ change, survival trigger at <-0.15), `inst_flow_momentum_label`, `inst_crowding_risk` (concentration x ownership level), `inst_crowding_risk_label`, `inst_smart_money_signal` (top-5 divergence), `inst_smart_money_label`, `inst_insider_signal` (net insider buying/selling), `inst_insider_label`, `inst_amihud_illiquidity` (Amihud 2002 ratio).
+
+**Input:** Cache, insider_transactions list
+**Output:** Cache + 9 inst_* columns
+
+---
+
+### 1.16 Options Signals (NEW -- 2026-04-18)
+
+**File:** `operator1/features/options_signals.py` (~530 lines)
+**Pipeline step:** Step 4a.7
+**Profile key:** `options_signals`
+
+**Purpose:** Fetches full options surface and computes 6 forward-looking features that move before price (institutional positioning visible in options first).
+
+**6 output variables:** `put_call_ratio` (total put OI / call OI), `risk_reversal_25d` (25-delta put IV - call IV), `iv_skew` (OTM put IV / ATM IV), `vix_term_structure` (VIX / VIX3M ratio), `skew_index` (CBOE SKEW level), `variance_risk_premium` (IV30 - RV21).
+
+**Input:** Cache, ticker, market_id
+**Output:** Cache + 6 options columns, `OptionsSignalResult`
+**Dependencies:** `yfinance` (for options chain data)
+
+---
+
+### 1.17 Cross-Asset Signals (NEW -- 2026-04-18)
+
+**File:** `operator1/features/cross_asset_signals.py` (~420 lines)
+**Pipeline step:** Step 4a.8
+**Profile key:** `cross_asset_signals`
+
+**Purpose:** Tracks 11 sector ETFs + Treasury yields + USD + gold to detect institutional capital rotation before it hits individual stocks.
+
+**6 output variables:** `sector_relative_strength` (target sector ETF / SPY, 12-month), `sector_rank_12m` (rank among 11 sectors, 1=best), `sector_dispersion` (cross-sector return std), `yield_curve_10y2y` (10Y-2Y Treasury spread), `usd_momentum_21d` (DXY 21-day momentum), `cross_asset_stress` (composite stress index from treasury/gold/VIX/USD).
+
+**Input:** Cache, sector string
+**Output:** Cache + 6 cross-asset columns, `CrossAssetResult`
+
+---
+
+### 1.18 Event Calendar (NEW -- 2026-04-18)
+
+**File:** `operator1/features/event_calendar.py` (~340 lines)
+**Pipeline step:** Step 4c.1
+**Profile key:** `event_calendar_signals`
+
+**Purpose:** Tracks known upcoming events (FOMC meetings, estimated earnings, political dates from `config/event_calendar.json`) and computes proximity features that adjust prediction confidence.
+
+**5 output variables:** `days_to_next_event`, `event_uncertainty_premium` (0-1 multiplier), `fomc_proximity` (days to nearest FOMC), `earnings_proximity` (days to estimated next earnings), `event_density_30d` (count of events in next 30 days).
+
+**Downstream consumers:** Conformal prediction (interval widening near events), PEAD (drift decay), prediction aggregator (confidence adjustment).
+
+**Input:** Cache, ticker, filing_calendar_result, reference_date
+**Output:** Cache + 5 event columns, `EventCalendarResult`
+
+---
+
+### 1.19 Behavioral Signals (NEW -- 2026-05-01)
+
+**File:** `operator1/features/behavioral_signals.py` (121 lines)
+**Pipeline step:** Step 5i.7
+
+**Purpose:** 5 behavioral finance signals that capture investor psychology biases exploitable for prediction.
+
+**5 output variables:** `anchoring_52w_high` (close / 52-week high, George & Hwang 2004), `anchoring_52w_low` (close / 52-week low), `disposition_effect_proxy` (return-flow correlation, Shefrin & Statman 1985), `attention_spike` (volume z-score > 2.0, Barber & Odean 2008), `lottery_characteristics` (idio vol + skew + low price composite, Bali, Cakici & Whitelaw 2011).
+
+**Critical dependency:** Must run AFTER institutional flow (requires `inst_flow_momentum`).
+
+**Input:** Cache with inst_flow_momentum, beta_252d, benchmark_return_1d
+**Output:** Cache + 5 behavioral columns
+
+---
+
+### 1.20 Complexity Signals (NEW -- 2026-05-01)
+
+**File:** `operator1/features/complexity_signals.py` (254 lines)
+**Pipeline step:** Step 5i.8
+
+**Purpose:** 4 information-theoretic complexity measures. High complexity = low predictability = wider conformal bands.
+
+**4 output variables:** `sample_entropy_21d` (Richman & Moorman 2000, template matching within tolerance), `perm_entropy_21d` (Bandt & Pompe 2002, ordinal pattern frequency), `lz_complexity` (Lempel-Ziv 1976, binarized return compression ratio), `approx_entropy_price` (Pincus 1991, price-level predictability).
+
+**Implementation:** Inlined from `antropy` and `tsfresh` -- zero added dependencies.
+
+**Input:** Cache with return_1d, close
+**Output:** Cache + 4 complexity columns
+
+---
+
+### 1.21 Feature Normalization (NEW -- 2026-05-01)
+
+**File:** `operator1/features/feature_normalization.py` (130 lines)
+**Pipeline step:** Step 5i.9 (MUST run LAST before temporal models)
+
+**Purpose:** Produces normalized versions of key features for ML model consumption and regime-conditional z-scores for USS controller.
+
+**~35 output variables:** For 10 key variables: `{var}_zscore_63d`, `{var}_percentile_252d`, `{var}_change_21d`. For 5 survival-critical variables: `{var}_regime_zscore` (per-regime expanding z-score for "is this unusual FOR THIS REGIME?" detection).
+
+**Critical dependency:** Requires `survival_regime` column from hierarchy_weights (Step 5).
+
+**Input:** Cache with survival_regime column
+**Output:** Cache + ~35 normalized columns
+
+---
+
 ## Layer 2: Analysis Modules
 
-10 modules in `operator1/analysis/` that produce survival flags, regime classifications, protection assessments, and adaptive parameter calibration. These provide the interpretive framework that temporal models operate within.
+10 modules in `operator1/analysis/` that produce survival flags, regime classifications, protection assessments, and adaptive parameter calibration. These provide the interpretive framework that temporal models operate within. **Updated 2026-05-01:** survival mode expanded with gradient velocity early warning (Duffie et al. 2007), bootstrap uncertainty bands, semi-Markov duration modeling; financial health expanded with ensemble distress prediction (Altman Z + Ohlson O + Zmijewski + Merton PD) and CVaR-weighted composite; hierarchy weights enhanced with entropy-based blending; USS controller enhanced with soft regime transitions; scenario engine enhanced with reverse stress testing (Basel III).
 
 ---
 
 ### 2.1 Survival Mode Detection
 
-**File:** `operator1/analysis/survival_mode.py` (600 lines)
+**File:** `operator1/analysis/survival_mode.py` (~822 lines)
 **Pipeline step:** Step 5
 **Profile key:** `survival`
 
-**Purpose:** The core binary classification that determines whether a company is in financial distress. Produces three daily flags that control the entire pipeline's behavior via hierarchy weights.
+**Purpose:** The core binary classification that determines whether a company is in financial distress. Produces three daily flags that control the entire pipeline's behavior via hierarchy weights. **Enhanced 2026-05-01:** added gradient velocity early warning (`compute_survival_velocity`, Duffie, Saita & Wang 2007), bootstrap uncertainty bands (`compute_survival_uncertainty`, P10/P90), and cash adequacy floor (suppresses liquidity triggers when cash/market_cap > 5%).
 
 **Company survival flag** -- triggered when ANY condition is true:
 ```
@@ -686,7 +797,7 @@ Each scenario produces: cash runway (days), survival probability at 90d and 252d
 
 ## Layer 3: Temporal Models
 
-24 modules in `operator1/models/` that consume the enriched daily cache. Statistical and ML models for regime detection, forecasting, uncertainty quantification, and prediction aggregation.
+26 modules in `operator1/models/` that consume the enriched daily cache. Statistical and ML models for regime detection, forecasting, uncertainty quantification, and prediction aggregation. **Updated 2026-05-01:** added Boruta + PIMP + mRMR feature selector (replacing Granger pruning), recursive day-by-day prediction aggregation, jump-diffusion Monte Carlo with antithetic variates, temporal model feature integration (parallel tree, GARCH-X, residual regression).
 
 ---
 
@@ -750,7 +861,7 @@ Each scenario produces: cash runway (days), survival probability at 90d and 252d
 
 **Method 2 -- Pairwise Granger F-tests** (fallback): Standard `statsmodels.tsa.stattools.grangercausalitytests` at multiple lags (1, 2, 5, 10).
 
-**Feature pruning:** `prune_features_by_causality()` removes variables from `_extra_vars` that have no significant causal relationship with any prediction target. `always_keep` parameter protects core variables.
+**Feature pruning:** `prune_features_by_causality()` **REMOVED (2026-04-19)** -- replaced by Boruta + PIMP + mRMR 3-layer feature selection (see 3.5b below). Granger result kept for informational purposes (profile, report, model synergies unified causal network).
 
 **Time-varying Granger** (`compute_time_varying_granger`): Rolling-window causal analysis that detects emerging and disappearing causal relationships over time.
 
@@ -802,9 +913,30 @@ Where H is conditional entropy estimated via k-nearest-neighbor density estimati
 
 ---
 
+### 3.5b Feature Selector (NEW -- 2026-04-19)
+
+**File:** `operator1/models/feature_selector.py` (~500 lines)
+**Pipeline step:** Step 6c (sub-stage 3.8, after Granger)
+**Profile key:** `feature_selection`
+
+**Purpose:** 3-layer feature selection that replaced Granger-based pruning. Selects the optimal feature subset for temporal models using three complementary methods.
+
+**Method 1 -- Boruta** (Kursa & Rudnicki 2010): Creates shadow features (random permutations of each real feature), trains random forest, compares real vs shadow feature importance. Features consistently more important than shadows are "confirmed"; borderline features are "tentative".
+
+**Method 2 -- PIMP** (Altmann et al. 2010): Permutation Importance with P-values. Per-regime feature ranking -- computes permutation importance within each survival regime separately, so features important during distress may differ from features important during normal operations.
+
+**Method 3 -- mRMR** (Peng, Long & Ding 2005): Minimum Redundancy Maximum Relevance. Selects features that are maximally relevant to the target while minimally redundant with each other. Uses mutual information estimation.
+
+**Final selection:** Union of all three methods retained. Typically reduces ~300 extra_vars to ~50-80 informative features.
+
+**Input:** Cache, extra_variables list, regime_labels
+**Output:** `FeatureSelectionResult` with boruta_confirmed, boruta_tentative, regime_selected, mrmr_selected, method_contributions
+
+---
+
 ### 3.6 Forecasting
 
-**File:** `operator1/models/forecasting.py` (4,074 lines)
+**File:** `operator1/models/forecasting.py` (~4,588 lines)
 **Pipeline step:** Step 6h
 **Profile key:** `model_metrics`, `predictions`
 
@@ -915,6 +1047,7 @@ For t in [warmup_end ... cache_end]:
 3. Simulate 10,000 paths with regime switching (sample regime at each step via transition matrix)
 4. Apply importance sampling for tail events (tilt distribution toward crisis scenarios)
 5. Compute survival probability = fraction of paths not triggering any survival threshold
+6. **NEW (2026-05-01):** Jump-diffusion model (Merton 1976): `dS/S = (mu - lambda*k)dt + sigma*dW + J*dN` where N is Poisson process with intensity lambda and J is log-normal jump size. Jump parameters (lambda, mu_j, sigma_j) estimated from return distribution tail analysis. Antithetic variates for variance reduction (generates mirrored paths to halve MC standard error). Jump parameters passed to importance sampling paths (jumps are real events, not sampling artifacts).
 
 **Frequency-aware evolution:** Quarterly/annual variables (current_ratio, fcf_yield) update only at estimated filing intervals (~63 days for quarterly), holding constant between filings.
 
@@ -1343,6 +1476,30 @@ DSRI, GMI, AQI, SGI, DEPI, SGAI, LVGI, TATA. M > -2.22 = likely manipulator.
 
 **Input:** Cache, linked_caches, entity_groups, walk_forward_result, forecast_result, sobol_result, target_profile
 **Output:** `RetroCalibrationResult` with calibrated group weights and parameter adjustments
+
+---
+
+### 3.28b Recursive Day-by-Day Predictions (NEW -- 2026-04-24)
+
+**File:** `operator1/models/recursive_aggregator.py` (~350 lines)
+**Pipeline step:** Sub-stage 6.11
+**Profile key:** `extended_models.recursive_predictions`
+
+**Purpose:** Autoregressive chaining of day-by-day predictions. Instead of predicting each horizon independently, predicts day t+1, injects predicted values as inputs for day t+2 prediction, and repeats for 5-21 days forward. Handles uncertainty propagation -- confidence bands widen at each step.
+
+**Algorithm:**
+1. Initialize from latest actual cache values
+2. For each forward day d in [1..N]:
+   - Build feature vector from actuals (d < today) + predicted values (d >= today)
+   - Run prediction aggregation for day d
+   - Store prediction + confidence
+   - Inject predicted values into the feature vector for day d+1
+3. Track per-step model weights, confidence decay, regime transitions
+
+**Output:** `RecursiveResult` with per-day predictions (point + bands), cumulative confidence decay, regime tracking, total days predicted, method used.
+
+**Input:** Cache, forecast_result, mc_result, pred_result, regime_labels, conformal_result
+**Output:** `RecursiveResult` stored in profile via `result.to_dict()`
 
 ---
 
@@ -1918,6 +2075,11 @@ Step 5g:   linked_aggregates
 Step 5h:   peer_ranking
 Step 5i:   news_sentiment
 Step 5i.5: product_catalysts
+Step 5i.6: product_metrics (segment_hhi, cannibalization, etc.) + geographic_metrics (geo_hhi, china_pct)
+Step 5i.6b: operational_efficiency (inventory/receivables/payables turnover, SGA efficiency, capex intensity)
+Step 5i.7: behavioral_signals (anchoring, disposition, attention, lottery)
+Step 5i.8: complexity_signals (sample entropy, permutation entropy, LZ complexity, approx entropy)
+Step 5i.9: feature_normalization (z-scores, percentiles, changes, regime z-scores) -- MUST RUN LAST
 Step 5j:   adaptive_thresholds -> recalibrate survival
 Step 5.5:  regime_detector (early) -> survival_timeline (enriched)
 Step 5k:   adaptive_model_params
@@ -1925,7 +2087,8 @@ Step 5k.2: adaptive_windows
 Step 6:    [TEMPORAL MODELS -- skip if --skip-models]
   6a: regime_detector (if not already run)
   6b: regime_mixer
-  6c: granger_causality -> prune features
+  6c: granger_causality (informational, no pruning)
+  6c.1: feature_selector (Boruta + PIMP + mRMR -> prune extra_vars)
   6d: transfer_entropy
   6e: cycle_decomposition
   6f: pattern_detector
@@ -1948,7 +2111,8 @@ Step 6:    [TEMPORAL MODELS -- skip if --skip-models]
   6u: genetic_optimizer
   6v: ohlc_predictor
   6v.1: detect_patterns_on_predicted_ohlc (predicted OHLC patterns)
-Step 6-USS: forecast bounding + scenario engine
+  6w: recursive_aggregator (day-by-day autoregressive chaining, sub-stage 6.11)
+Step 6-USS: forecast bounding + scenario engine + reverse stress test (Basel III)
 Step 6.5:  retroactive_calibration
 Step 6.6:  model_diagnostics (expected path vs actual path)
 Step 6.7:  multi_frequency_runner -> frequency_fusion
@@ -1980,14 +2144,14 @@ Step 8:    report_generator + triage_card (USS)
 
 | Layer | Modules | Lines | Description |
 |-------|---------|-------|-------------|
-| Features | 14 | ~11,500 | Raw cache -> enriched features (includes product_metrics + OCR) |
-| Analysis | 10 | ~6,300 | Survival flags, hierarchy, protection, adaptive calibration, USS |
-| Temporal | 25 | ~18,500 | Regime, forecasting (ETS replaced AutoARIMA), MC, uncertainty, aggregation |
-| USS | 2 | ~1,040 | Unified Survival System (controller + scenario engine) |
+| Features | **21** | **~14,500** | Raw cache -> enriched features (96 derived vars + options + cross-asset + events + behavioral + complexity + normalization + product_metrics + OCR) |
+| Analysis | 10 | **~7,200** | Survival flags (+ velocity + uncertainty + ensemble distress), hierarchy (+ entropy blend), protection, adaptive calibration, USS (+ soft transition + reverse stress) |
+| Temporal | **27** | **~20,500** | Regime, feature selection (Boruta/PIMP/mRMR), forecasting (ETS, GARCH-X, parallel tree), MC (+ jump-diffusion + antithetic), recursive aggregator, uncertainty, aggregation |
+| USS | 2 | **~1,300** | Unified Survival System (controller + scenario engine + reverse stress test) |
 | Monitoring/Diagnostics | 1 | ~875 | Model expected path vs actual path diagnostics |
-| **Hedge Fund** | **9** | **~5,100** | **15 base metrics + 15 advanced methods (Piotroski, Altman Z''', etc.) + 8-method fusion + scorecard + position signal** |
-| **Multi-Frequency** | **3** | **~1,800** | **5-frequency pipeline (A/Q/M/W/D) with per-frequency sub-stages + cross-frequency fusion** |
-| **Staged Pipeline** | **6** | **~1,865** | **PipelineState + runner + 5 stage modules (30 sub-stages with checkpoint save/resume)** |
-| **Total** | **70** | **~46,980** | |
+| **Hedge Fund** | **9** | **~5,500** | **15 base metrics + 19 advanced methods (Piotroski, DuPont, Kelly, Altman Z''', etc.) + 8-method fusion + scorecard + position signal** |
+| **Multi-Frequency** | **3** | **~2,600** | **5-frequency pipeline (A/Q/M/W/D) with 13-method fusion + cross-frequency momentum (Moskowitz et al.)** |
+| **Staged Pipeline** | **6** | **~2,230** | **PipelineState + runner (graceful degradation + timeout + validation) + 5 stage modules (35 sub-stages with checkpoint save/resume)** |
+| **Total** | **~78** | **~54,700** | |
 
-All 70 modules wired in main.py (or via staged runner). All results stored in profile_builder. HF results in `profile["hedge_fund"]`. Multi-frequency results in `profile["multi_frequency"]`. Staged pipeline accessible via `--stage 3-6 --run-dir cache/AAPL`.
+All ~78 modules wired in main.py (or via staged runner). All results stored in profile_builder. HF results in `profile["hedge_fund"]`. Multi-frequency results in `profile["multi_frequency"]`. Staged pipeline accessible via `--stage 3-6 --run-dir cache/AAPL`. Staged backtest compiler available via `python run_backtest_staged.py`.

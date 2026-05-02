@@ -1,6 +1,6 @@
 # Complete Data Flow and Model Contract Map
 
-*Last updated: 2026-04-17*
+*Last updated: 2026-05-02*
 
 Every model in the Operator 1 pipeline, from raw cache construction through
 report generation, with expected vs actual inputs, outputs, and operations.
@@ -76,8 +76,8 @@ report generation, with expected vs actual inputs, outputs, and operations.
 | | Expected | Actual | Status |
 |---|----------|--------|--------|
 | **Input** | cache DataFrame with `close`, financial statement columns | Same | OK |
-| **Output** | cache + ~50 derived columns: `return_1d`, `log_return_1d`, `volatility_21d`, `drawdown_252d`, `current_ratio`, `debt_to_equity_abs`, `fcf_yield`, `cash_ratio`, `gross_margin`, `pe_ratio_calc`, `beta_252d`, `debt_service_coverage`, etc. + `is_missing_*` and `invalid_math_*` flags | Same | OK |
-| **Operation** | 1. Returns and risk from close price. 2. Solvency ratios (debt_to_equity, net_debt, debt_service_coverage). 3. Liquidity ratios (current_ratio, cash_ratio). 4. Profitability (margins). 5. TTM computations. 6. **Technical indicators via `ta` library: ADX, OBV, BB width, MACD histogram**. 7. **Beta vs market benchmark** (`beta_252d` from `config/market_benchmarks.yml`, per-market index). All use `safe_ratio()` to handle division by zero. | Same | **ENHANCED** |
+| **Output** | cache + **~96 derived columns** across 24 computation stages + `is_missing_*` and `invalid_math_*` flags (~222 total columns) | Same | **ENHANCED (2026-05-01)** |
+| **Operation** | 24 stages: 1. Returns/risk. 2. Solvency. 3. Liquidity. 4. Interest coverage. 5. Cash reality. 6. Profitability. 7. ROA. 8. Valuation. 9. TTM/growth. 10. Volume. 11. Per-share. 12. Technical indicators (ADX, OBV, BB, MACD via `ta`). 13. Recovery time. 14. Beta vs benchmark. 15. Earnings quality (Sloan accruals, SUE, PEAD). 16. Realized vol decomposition (bipower variation, jump detection). 17. Merton distance-to-default. **NEW stages (2026-05-01):** 18. Market microstructure (Corwin-Schultz spread, Kyle lambda, Parkinson/Yang-Zhang vol, volume clock). 19. Stationarity (fractional differentiation, Hurst exponent, autocorrelation, momentum 12-1, idiosyncratic vol, earnings revision proxy). 20. Credit risk (cash burn rate, debt maturity pressure, CCC=DSO+DIO-DPO, Altman Z momentum, covenant proximity). 22. Tail risk (skewness, kurtosis, tail ratio, max daily loss, vol-of-vol). 24. Forensic accounting (revenue-receivables divergence, capex-depreciation ratio, soft asset ratio, OCF ratio). All use `safe_ratio()`. | Same | **ENHANCED** |
 
 ### C2. Survival Mode -- `compute_company_survival_flag()` + `compute_cox_survival_score()`
 
@@ -188,6 +188,81 @@ report generation, with expected vs actual inputs, outputs, and operations.
 | **Operation** | When the PIT filing API does not provide price data (most don't -- SEC EDGAR, DART, etc.), fetch OHLCV from a free-tier source: yfinance (global fallback), or per-region wrappers (pykrx for Korea, baostock for China, twstock for Taiwan, nselib for India). | Same | OK |
 | **Note** | OHLCV source is tracked separately in `profile["meta"]["ohlcv_source"]` | Same | OK |
 
+### C15. Options Signals -- `compute_options_signals()` (NEW -- 2026-04-18)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache, `ticker`, `market_id` | Same | OK |
+| **Output** | cache + `put_call_ratio`, `risk_reversal_25d`, `iv_skew`, `vix_term_structure`, `skew_index`, `variance_risk_premium`; `options_signal_result` | Same | OK |
+| **Operation** | Fetches full options surface via yfinance. Computes 6 forward-looking features: put/call OI ratio, 25-delta risk reversal, OTM/ATM IV skew, VIX/VIX3M term structure, CBOE SKEW index, variance risk premium (IV30 - RV21). These are leading indicators -- institutional positioning visible in options before price moves. | Same | OK |
+| **Location** | `operator1/features/options_signals.py` (~530 lines) | | |
+| **Profile** | Stored in `profile["options_signals"]` via `result.to_profile_dict()` | Same | OK |
+
+### C16. Cross-Asset Sector Rotation Signals -- `compute_cross_asset_signals()` (NEW -- 2026-04-18)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache, `sector` string | Same | OK |
+| **Output** | cache + `sector_relative_strength`, `sector_rank_12m`, `sector_dispersion`, `yield_curve_10y2y`, `usd_momentum_21d`, `cross_asset_stress`; `cross_asset_result` | Same | OK |
+| **Operation** | Tracks 11 sector ETFs + Treasury yields + USD + gold via yfinance to detect institutional capital rotation before it hits individual stocks. Computes relative strength, rank, dispersion, yield curve slope, USD momentum, composite stress index. | Same | OK |
+| **Location** | `operator1/features/cross_asset_signals.py` (~420 lines) | | |
+| **Profile** | Stored in `profile["cross_asset_signals"]` via `result.to_profile_dict()` | Same | OK |
+
+### C17. Event Calendar Features -- `compute_event_calendar_features()` (NEW -- 2026-04-18)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache, `ticker`, `filing_calendar_result`, `reference_date` | Same | OK |
+| **Output** | cache + `days_to_next_event`, `event_uncertainty_premium`, `fomc_proximity`, `earnings_proximity`, `event_density_30d`; `event_calendar_result` | Same | OK |
+| **Operation** | Tracks known upcoming events (FOMC meetings, estimated earnings, political dates from `config/event_calendar.json`) and computes proximity features that adjust prediction confidence. Used by conformal for interval widening near events and by PEAD for drift decay. | Same | OK |
+| **Location** | `operator1/features/event_calendar.py` (~340 lines) | | |
+| **Profile** | Stored in `profile["event_calendar_signals"]` via `result.to_profile_dict()` | Same | OK |
+
+### C18. Behavioral Signals -- `compute_behavioral_signals()` (NEW -- 2026-05-01)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache (requires `inst_flow_momentum` from Step 5.inst, `beta_252d` from derived_variables) | Same | OK |
+| **Output** | cache + `anchoring_52w_high`, `anchoring_52w_low`, `disposition_effect_proxy`, `attention_spike`, `lottery_characteristics` | Same | OK |
+| **Operation** | 5 behavioral finance signals: 52-week high/low anchoring (George & Hwang 2004), disposition effect proxy (Shefrin & Statman 1985), attention spike (Barber & Odean 2008), lottery characteristics composite (Bali, Cakici & Whitelaw 2011). Must run AFTER institutional flow (requires `inst_flow_momentum`). | Same | OK |
+| **Location** | `operator1/features/behavioral_signals.py` (121 lines) | | |
+
+### C19. Complexity Signals -- `compute_complexity_signals()` (NEW -- 2026-05-01)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache with `return_1d`, `close` | Same | OK |
+| **Output** | cache + `sample_entropy_21d`, `perm_entropy_21d`, `lz_complexity`, `approx_entropy_price` | Same | OK |
+| **Operation** | 4 information-theoretic complexity measures: sample entropy (Richman & Moorman 2000), permutation entropy (Bandt & Pompe 2002), Lempel-Ziv complexity (1976), approximate entropy on price (Pincus 1991). Inlined from `antropy`/`tsfresh` -- zero added dependencies. High complexity signals low predictability (conformal band widening). | Same | OK |
+| **Location** | `operator1/features/complexity_signals.py` (254 lines) | | |
+
+### C20. Feature Normalization -- `compute_feature_normalization()` (NEW -- 2026-05-01)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache with `survival_regime` column (from hierarchy_weights) | Same | OK |
+| **Output** | cache + ~35 columns: `{var}_zscore_63d`, `{var}_percentile_252d`, `{var}_change_21d` for 10 key variables + `{var}_regime_zscore` for 5 survival-critical variables | Same | OK |
+| **Operation** | MUST run LAST in feature pipeline before temporal models. Rolling z-scores (63d), percentile ranks (252d), and level changes (21d) for 10 key variables. Regime-conditional expanding z-scores for 5 survival variables using per-regime mean/std. Enables "is this unusual FOR THIS REGIME?" detection. | Same | OK |
+| **Location** | `operator1/features/feature_normalization.py` (130 lines) | | |
+
+### C21. Geographic Supply Chain Risk -- `compute_geographic_metrics()` (NEW -- 2026-04-18)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache, `geo_segments` dict, `subsidiaries` list (from GLEIF) | Same | OK |
+| **Output** | cache + `geo_hhi`, `china_revenue_pct`, `supply_chain_geo_hhi`, `trade_policy_uncertainty`, `tariff_exposure_score` | Same | OK |
+| **Operation** | Computes geographic concentration (Herfindahl from revenue geo segments), China revenue exposure, supply chain geographic spread, trade policy uncertainty proxy, tariff exposure scoring. Consumed by conformal (geo_hhi widens intervals) and MC (stress triggers). | Same | OK |
+| **Location** | `operator1/features/product_metrics.py` (within `compute_geographic_metrics`) | | |
+
+### C22. Operational Efficiency -- `compute_operational_efficiency()` (NEW -- 2026-05-01)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache with financial statement columns | Same | OK |
+| **Output** | cache + `inventory_turnover`, `receivables_turnover`, `payables_turnover`, `sga_efficiency`, `capex_intensity` | Same | OK |
+| **Operation** | 5 operational efficiency metrics from financial statements. Inventory/receivables/payables turnover ratios, SGA efficiency (revenue/SGA), capex intensity (capex/revenue). Consumed by HF asset quality and vanity modules. | Same | OK |
+| **Location** | `operator1/features/product_metrics.py` (within `compute_operational_efficiency`) | | |
+
 ---
 
 ## Phase D: Estimation Engine
@@ -284,8 +359,8 @@ Three modules that replace fixed constants across the pipeline with data-derived
 |---|----------|--------|--------|
 | **Input** | cache, `variables` list (up to 25 float columns with >50 non-NaN obs) | Same | OK |
 | **Output** | `granger_result` with `causality_matrix`, `significant_pairs`, `retained_variables`, `pruned_variables`, `network_density` | Same | OK |
-| **Operation** | **PCMCI via tigramite** (preferred, handles autocorrelation and confounders) or pairwise Granger F-tests (fallback). Prune variables with no causal links. **NEW: `compute_time_varying_granger()` for rolling-window temporal causal graph.** Result used to prune `_extra_vars` list fed to temporal models. | Same | **ENHANCED** |
-| **Downstream** | `prune_features_by_causality()` removes non-causal variables from `_extra_vars` | Same | OK |
+| **Operation** | **PCMCI via tigramite** (preferred, handles autocorrelation and confounders) or pairwise Granger F-tests (fallback). **NOTE (2026-04-19):** Granger-based feature pruning REMOVED -- replaced by Boruta + PIMP + mRMR 3-layer selection (see F7.5). Granger result kept for informational purposes (profile, report, synergies). **`compute_time_varying_granger()` for rolling-window temporal causal graph.** | Same | **ENHANCED** |
+| **Downstream** | Informational only -- pruning now handled by Feature Selector (sub-stage 3.8) | Pruning removed (2026-04-19) | **CHANGED** |
 
 ### F4. Transfer Entropy -- `compute_transfer_entropy()`
 
@@ -319,6 +394,16 @@ Three modules that replace fixed constants across the pipeline with data-derived
 | **Input** | cache, `cycle_result`, `granger_result`, `transfer_entropy_result`, `linked_caches`, `extra_variables`, `economic_plane` | Same | OK |
 | **Output** | cache (+ synergy features), `_extra_vars` (updated), `_synergy_meta` dict | Same | OK |
 | **Operation** | 1. Inject cycle phase features (Synergy B). 2. Build unified causal network from Granger + TE (Synergy D). 3. Compute peer-adjusted survival thresholds (Synergy G). 4. Apply plane-aware model weights. | Same | OK |
+
+### F7.5. Feature Selection -- Boruta + PIMP + mRMR (NEW -- 2026-04-19)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache, `extra_variables` list, `regime_labels` | Same | OK |
+| **Output** | `FeatureSelectionResult` with `boruta_confirmed`, `boruta_tentative`, `regime_selected` (per-regime), `mrmr_selected`, `method_contributions`, `n_input`, `n_output` | Same | OK |
+| **Operation** | 3-layer feature selection replacing Granger-based pruning: (1) **Boruta** (Kursa & Rudnicki 2010) -- shadow-feature importance test via random forest, identifies confirmed/tentative/rejected features. (2) **PIMP** (Altmann 2010) -- Permutation Importance with P-values, per-regime feature ranking. (3) **mRMR** (Peng, Long & Ding 2005) -- minimum Redundancy Maximum Relevance, selects complementary feature set. Union of all three methods retained. | Same | OK |
+| **Location** | `operator1/models/feature_selector.py` (~500 lines) | | |
+| **Profile** | Stored in `profile["feature_selection"]` | Same | OK |
 
 ### F8. Forecasting -- `run_forecasting()`
 
@@ -359,7 +444,7 @@ Three modules that replace fixed constants across the pipeline with data-derived
 |---|----------|--------|--------|
 | **Input** | cache (needs `return_1d`, `regime_label`) | Same | OK |
 | **Output** | `MonteCarloResult` with `survival_probability` per horizon, `regime_distributions`, `transition_matrix`, `terminal_values` | Same | OK |
-| **Operation** | 1. Estimate per-regime return distributions. 2. Build regime transition matrix. 3. Simulate 10,000 paths with regime switching. 4. Apply importance sampling for tail events. 5. Compute survival probability (fraction of paths not triggering survival thresholds). **NEW**: `run_multivariate_monte_carlo()` jointly simulates (return, delta_current_ratio, delta_fcf_yield, delta_debt_to_equity) using copula correlation structure, checking survival triggers on simulated ratios directly. | Same | **ENHANCED** |
+| **Operation** | 1. Estimate per-regime return distributions. 2. Build regime transition matrix. 3. Simulate 10,000 paths with regime switching. 4. Apply importance sampling for tail events. 5. Compute survival probability (fraction of paths not triggering survival thresholds). **NEW (2026-05-01):** Jump-diffusion model (Merton 1976) with Poisson jumps + antithetic variates for variance reduction. Jump parameters passed to importance sampling paths. **`run_multivariate_monte_carlo()`** jointly simulates (return, delta_current_ratio, delta_fcf_yield, delta_debt_to_equity) using copula correlation structure, checking survival triggers on simulated ratios directly. | Same | **ENHANCED** |
 
 ### F13. Copula -- `run_copula_analysis()`
 
@@ -441,6 +526,16 @@ Three modules that replace fixed constants across the pipeline with data-derived
 | **Input** | cache, `forecast_result`, `mc_result`, `pattern_drift_multiplier` | Same | OK |
 | **Output** | `OHLCResult` with next-day OHLC predictions | Same | OK |
 | **Operation** | Combine forecast + Monte Carlo + pattern drift to predict next-day Open, High, Low, Close | Same | OK |
+
+### F22.5. Recursive Day-by-Day Predictions -- `run_recursive_aggregation()` (NEW -- 2026-04-24)
+
+| | Expected | Actual | Status |
+|---|----------|--------|--------|
+| **Input** | cache, `forecast_result`, `mc_result`, `pred_result`, `regime_labels`, `conformal_result` | Same | OK |
+| **Output** | `RecursiveResult` with per-day predictions for next 5-21 trading days, each day using the previous day's predicted values as inputs (autoregressive chaining) | Same | OK |
+| **Operation** | Day-by-day recursive prediction: predict day t+1, inject predicted values as "actuals" for day t+2 prediction, repeat. Handles uncertainty propagation (bands widen each step). Stores per-step model weights, confidence decay, and regime transition tracking. | Same | OK |
+| **Location** | `operator1/models/recursive_aggregator.py` | | |
+| **Profile** | Stored in `profile["extended_models"]["recursive_predictions"]` via `result.to_dict()` | Same | OK |
 
 ### F23. Regime Shift Predictor -- `predict_regime_shifts()`
 
@@ -690,6 +785,7 @@ Three modules that replace fixed constants across the pipeline with data-derived
 | Cycle Decomposition | 3.5 | `stage3_temporal.py` | CEEMDAN / FFT |
 | Pattern Detection | 3.6 | `stage3_temporal.py` | Candlestick + Matrix Profile |
 | Pre-Forecast Synergies | 3.7 | `stage3_temporal.py` | Economic planes + causal pruning |
+| Feature Selection | 3.8 | `stage3_temporal.py` | Boruta + PIMP + mRMR 3-layer selection |
 | Forecasting | 4.1 | `stage4_forecasting.py` | Kalman, GARCH, VAR, LSTM, Tree, ETS |
 | Forward Pass | 5.1 | `stage5_forward.py` | PID-controlled walk |
 | Burn-Out | 5.2 | `stage5_forward.py` | Exponential gradient calibration |
@@ -707,7 +803,8 @@ Three modules that replace fixed constants across the pipeline with data-derived
 | TV Granger | 6.8 | `stage6_ensemble.py` | Rolling-window causal |
 | MV Monte Carlo | 6.9 | `stage6_ensemble.py` | Copula joint simulation |
 | Genetic Optimizer | 6.10 | `stage6_ensemble.py` | Optuna TPE / GA |
-| OHLC Predictor | 6.11 | `stage6_ensemble.py` | Forecast + MC + pattern drift |
+| OHLC Predictor | 6.10 | `stage6_ensemble.py` | Forecast + MC + pattern drift |
+| Recursive Predictions | 6.11 | `stage6_ensemble.py` | Day-by-day autoregressive chaining |
 | USS + Scenario | 7.1 | `stage7_integration.py` | Forecast bounding + 3-scenario MC |
 | Retro Calibration | 7.2 | `stage7_integration.py` | Empirical Bayes |
 | Model Diagnostics | 7.3 | `stage7_integration.py` | Expected vs actual path |
@@ -842,3 +939,13 @@ Three modules that replace fixed constants across the pipeline with data-derived
 | S22 | multi_frequency_runner.py | MF pipeline ran sequentially in main.py, no sub-stage checkpoints | **FIXED (2026-04-16)** -- Split into per-frequency sub-stages with disk serialization. Post-fusion HF runs once (not per-frequency). ResampledCache constructor fixed with 3 missing fields. |
 | S23 | backtest_runner.py | 13 parity bugs vs main.py (HMM look-ahead, missing kwargs, profile gaps) | **FIXED (2026-04-15)** -- HMM look-ahead bias fixed, missing kwargs added, profile gap fields populated. |
 | S24 | scoring_weights.py | 7 analytical modules using hardcoded constants instead of config | **FIXED (2026-04-04)** -- Wired conflict_weights, vanity_weights, frequency_fusion, uss_model_switching, and others to `config/scoring_weights.yml`. |
+| S25 | granger_causality.py | Granger-based feature pruning too aggressive, removes useful features | **FIXED (2026-04-19)** -- Replaced with Boruta + PIMP + mRMR 3-layer feature selection (sub-stage 3.8). Granger result kept for informational purposes. |
+| S26 | monte_carlo.py | Geometric Brownian motion ignores fat-tail jumps | **FIXED (2026-05-01)** -- Added Merton jump-diffusion model with Poisson jumps + antithetic variates for variance reduction. Jump parameters passed to importance sampling paths. |
+| S27 | us_edgar.py | Missing critical balance/income fields after edgartools XBRL extraction (SEC 429 rate limiting) | **FIXED (2026-04-19)** -- CompanyFacts API fallback fills missing fields from SEC `api/xbrl/companyfacts/CIK{cik}.json`. Auto-discovery of company-specific XBRL concepts via keyword matching. |
+| S28 | prediction_aggregator.py | No recursive day-by-day predictions (only single-step forecasts) | **FIXED (2026-04-24)** -- Added `recursive_aggregator.py` (sub-stage 6.11) with autoregressive chaining for 5-21 day ahead predictions. |
+| S29 | run_backtest_staged.py | No orchestrator for running 35+ sub-stages as separate processes | **FIXED (2026-04-30)** -- Added staged backtest compiler that runs each sub-stage via `subprocess.run()` with progress tracking, failure resume, and per-stage timing. |
+| S30 | main.py / stages/ | Gap features (options, cross-asset, event calendar, geographic) not wired into MC/conformal/extra_vars | **FIXED (2026-04-18)** -- Options/cross-asset/event/geographic features wired into MC stress triggers, conformal interval widening, extra_vars list, and per-frequency MF state. |
+| S31 | derived_variables.py | Only ~50 features, missing microstructure, stationarity, credit, tail risk, forensic signals | **FIXED (2026-05-01)** -- Expanded to 96 features across 24 computation stages. Added Corwin-Schultz spread, Kyle lambda, Hurst exponent, fractional differentiation, CCC, covenant proximity, skewness/kurtosis, forensic accounting signals. |
+| S32 | survival_mode.py | No gradient early warning or uncertainty bands on survival probability | **FIXED (2026-05-01)** -- Added `compute_survival_velocity()` (Duffie et al. 2007) for deterioration rate tracking + `compute_survival_uncertainty()` bootstrap P10/P90 bands. |
+| S33 | financial_health.py | No multi-model ensemble for distress prediction | **FIXED (2026-05-01)** -- Added `fh_ensemble_distress_prob` stacking Altman Z + Ohlson O + Zmijewski + Merton PD. Added CVaR-weighted composite (Rockafellar & Uryasev 2000). |
+| S34 | report_generator.py | New L2/L4/L5 profile keys not rendered in reports | **FIXED (2026-05-01)** -- Added rendering for ensemble distress, CVaR composite, DuPont decomposition, Kelly sizing, cross-frequency momentum in report sections. |
