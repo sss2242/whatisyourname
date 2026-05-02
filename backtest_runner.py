@@ -1974,6 +1974,26 @@ Examples:
     state.years = args.years
     state.output_dir = args.run_dir
 
+    def _find_latest_checkpoint(run_dir: str, target_sub: str) -> str | None:
+        """Find the most recent checkpoint before the target sub-stage.
+
+        Scans all state_*.pkl files in run_dir, sorts by modification time,
+        and returns the latest one that is NOT the target sub-stage itself.
+        This ensures sub-stage 5.1 loads from 4.1 (not from 1).
+        """
+        rd = Path(run_dir)
+        if not rd.exists():
+            return None
+        candidates = []
+        for pkl in rd.glob("state_*.pkl"):
+            sub = pkl.stem.replace("state_", "")
+            if sub != target_sub:
+                candidates.append((pkl.stat().st_mtime, sub))
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+
     # Validation mode
     if args.validate:
         state.load_checkpoint("3")
@@ -2006,12 +2026,15 @@ Examples:
         "3": "2",   # profile build depends on Stage 2 (temporal models)
     }
 
-    # Handle sub-stage routing: "2:3.1" means "load Stage 1 state, run sub-stage 3.1"
+    # Handle sub-stage routing: "2:3.1" means "load latest checkpoint, run sub-stage 3.1"
     for i, stage_key in enumerate(stages):
         if ":" in stage_key:
             parent, sub_spec = stage_key.split(":", 1)
             _STAGE_FUNCS[stage_key] = lambda s, spec=sub_spec: run_stage2(s, spec)
-            _STAGE_DEPS[stage_key] = "1"  # sub-stages depend on Stage 1
+            # Find the best dependency: look for the previous sub-stage checkpoint
+            # (e.g., 5.1 should load from 4.1, not from Stage 1)
+            _best_dep = _find_latest_checkpoint(state.output_dir, sub_spec)
+            _STAGE_DEPS[stage_key] = _best_dep or "1"
             stages[i] = stage_key
 
     for stage_key in stages:
