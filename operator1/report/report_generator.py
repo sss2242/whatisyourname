@@ -40,6 +40,87 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Variable name humanizer -- converts code names to plain finance language
+# ---------------------------------------------------------------------------
+
+_VARIABLE_DISPLAY_NAMES: dict[str, str] = {
+    "close": "Close Price",
+    "return_1d": "Daily Return",
+    "return_5d": "5-Day Return",
+    "return_21d": "21-Day Return",
+    "volatility_21d": "21-Day Volatility",
+    "volatility_63d": "63-Day Volatility",
+    "volatility_garch_midas": "GARCH Volatility",
+    "drawdown_252d": "Max Drawdown (1Y)",
+    "current_ratio": "Current Ratio",
+    "debt_to_equity_abs": "Debt-to-Equity",
+    "fcf_yield": "Free Cash Flow Yield",
+    "cash_ratio": "Cash Ratio",
+    "gross_margin": "Gross Margin",
+    "operating_margin": "Operating Margin",
+    "net_margin": "Net Margin",
+    "pe_ratio_calc": "P/E Ratio",
+    "ev_to_ebitda": "EV/EBITDA",
+    "revenue": "Revenue",
+    "net_income": "Net Income",
+    "total_assets": "Total Assets",
+    "total_debt": "Total Debt",
+    "cash_and_equivalents": "Cash & Equivalents",
+    "free_cash_flow": "Free Cash Flow",
+    "operating_cash_flow": "Operating Cash Flow",
+    "interest_coverage": "Interest Coverage",
+    "net_debt_to_ebitda": "Net Debt / EBITDA",
+    "revenue_growth_yoy": "Revenue Growth (YoY)",
+    "earnings_growth_yoy": "Earnings Growth (YoY)",
+    "beta_252d": "Market Beta",
+    "rsi_14": "RSI (14)",
+    "macd_histogram": "MACD Histogram",
+    "adx": "ADX (Trend Strength)",
+    "bb_width": "Bollinger Band Width",
+    "sentiment_score": "Sentiment Score",
+    "merton_dd": "Merton Distance-to-Default",
+    "fh_composite_score": "Financial Health Score",
+    "fh_liquidity_score": "Liquidity Score",
+    "fh_solvency_score": "Solvency Score",
+    "fh_stability_score": "Stability Score",
+    "fh_profitability_score": "Profitability Score",
+    "fh_growth_score": "Growth Score",
+    "survival_probability": "Survival Probability",
+    "kurtosis_63d": "Return Kurtosis (63d)",
+    "skewness_63d": "Return Skewness (63d)",
+    "tail_ratio_63d": "Tail Ratio (63d)",
+    "vol_of_vol_21d": "Volatility of Volatility",
+    "cross_asset_stress": "Cross-Asset Stress Index",
+    "vix_term_structure": "VIX Term Structure",
+    "put_call_ratio": "Put/Call Ratio",
+    "risk_reversal_25d": "Risk Reversal (25-Delta)",
+    "iv_skew": "IV Skew",
+    "sector_relative_strength": "Sector Relative Strength",
+    "sample_entropy_21d": "Sample Entropy (21d)",
+    "perm_entropy_21d": "Permutation Entropy (21d)",
+    "lz_complexity": "Lempel-Ziv Complexity",
+    "anchoring_52w_high": "52-Week High Anchoring",
+    "corwin_schultz_spread": "Bid-Ask Spread (Corwin-Schultz)",
+    "kyle_lambda": "Price Impact (Kyle Lambda)",
+    "hurst_exponent_rolling": "Hurst Exponent",
+}
+
+
+def _humanize_var(name: str) -> str:
+    """Convert a snake_case variable name to a human-readable label."""
+    if name in _VARIABLE_DISPLAY_NAMES:
+        return _VARIABLE_DISPLAY_NAMES[name]
+    # Generic fallback: replace underscores, title case, handle common suffixes
+    human = name.replace("_", " ").replace("  ", " ").strip()
+    # Remove trailing dimension markers
+    for suffix in ("1d", "5d", "21d", "63d", "252d"):
+        if human.endswith(f" {suffix}"):
+            human = human[: -len(suffix) - 1] + f" ({suffix})"
+    return human.title()
+
+
+
+# ---------------------------------------------------------------------------
 # Report tiers
 # ---------------------------------------------------------------------------
 
@@ -800,14 +881,14 @@ def _build_regime_analysis(profile: dict[str, Any]) -> str:
                         pf = _fmt(p.get("point_forecast"))
                         ci_lo = _fmt(p.get("lower_ci"))
                         ci_hi = _fmt(p.get("upper_ci"))
-                        lines.append(f"- {var}: {pf} [{ci_lo}, {ci_hi}]")
+                        lines.append(f"- {_humanize_var(var)}: {pf} [{ci_lo}, {ci_hi}]")
                 elif isinstance(h_preds, dict):
                     for var, vals in list(h_preds.items())[:5]:
                         if isinstance(vals, dict):
                             pf = _fmt(vals.get("point") or vals.get("point_forecast"))
                             ci_lo = _fmt(vals.get("lower") or vals.get("lower_ci"))
                             ci_hi = _fmt(vals.get("upper") or vals.get("upper_ci"))
-                            lines.append(f"- {var}: {pf} [{ci_lo}, {ci_hi}]")
+                            lines.append(f"- {_humanize_var(var)}: {pf} [{ci_lo}, {ci_hi}]")
                 lines.append("")
     else:
         lines.append("Forecast data unavailable.")
@@ -1244,7 +1325,7 @@ def _build_predictions_forecasts(profile: dict[str, Any]) -> str:
             pt = h_data["point_forecast"]
             if isinstance(pt, dict):
                 for var, val in list(pt.items())[:10]:
-                    lines.append(f"- **{var}:** {_fmt(val)}")
+                    lines.append(f"- **{_humanize_var(var)}:** {_fmt(val)}")
             else:
                 lines.append(f"- Point forecast: {_fmt(pt)}")
 
@@ -1282,7 +1363,7 @@ def _build_predictions_forecasts(profile: dict[str, Any]) -> str:
                 for h, interval in intervals.items():
                     if isinstance(interval, dict):
                         lines.append(
-                            f"- **{var}** ({h}): "
+                            f"- **{_humanize_var(var)}** ({h}): "
                             f"[{_fmt(interval.get('lower'))}, {_fmt(interval.get('upper'))}] "
                             f"(width: {_fmt(interval.get('interval_width'))})"
                         )
@@ -1300,7 +1381,7 @@ def _build_predictions_forecasts(profile: dict[str, Any]) -> str:
         for var, exp in list(per_var.items())[:8]:
             narrative = exp.get("narrative", "")
             if narrative:
-                lines.append(f"- **{var}:** {narrative}")
+                lines.append(f"- **{_humanize_var(var)}:** {narrative}")
             else:
                 drivers = exp.get("top_drivers", [])
                 parts = []
@@ -4434,13 +4515,13 @@ def _build_feature_selection_section(profile: dict[str, Any]) -> str:
     lines.append(f"3-layer feature selection reduced **{n_in}** candidate features to **{n_out}** informative features.\n")
     boruta = fs.get("boruta_confirmed", [])
     if boruta:
-        lines.append(f"**Boruta Confirmed ({len(boruta)}):** {', '.join(boruta[:15])}" + (f" (+{len(boruta)-15} more)" if len(boruta) > 15 else ""))
+        lines.append(f"**Boruta Confirmed ({len(boruta)}):** {', '.join(_humanize_var(v) for v in boruta[:15])}" + (f" (+{len(boruta)-15} more)" if len(boruta) > 15 else ""))
     tentative = fs.get("boruta_tentative", [])
     if tentative:
-        lines.append(f"\n**Boruta Tentative ({len(tentative)}):** {', '.join(tentative[:10])}")
+        lines.append(f"\n**Boruta Tentative ({len(tentative)}):** {', '.join(_humanize_var(v) for v in tentative[:10])}")
     mrmr = fs.get("mrmr_selected", [])
     if mrmr:
-        lines.append(f"\n**mRMR Selected ({len(mrmr)}):** {', '.join(mrmr[:15])}")
+        lines.append(f"\n**mRMR Selected ({len(mrmr)}):** {', '.join(_humanize_var(v) for v in mrmr[:15])}")
     mc = fs.get("method_contributions", {})
     if mc:
         lines.append("\n**Method Contributions:**\n")
