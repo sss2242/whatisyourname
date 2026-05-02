@@ -220,19 +220,23 @@ class TestCompanySurvivalFlag(unittest.TestCase):
 
     def test_low_current_ratio_triggers(self):
         from operator1.analysis.survival_mode import compute_company_survival_flag
-        df = _make_feature_df(10, current_ratio=np.full(10, 0.8))
+        # cash_and_equivalents=0 disables cash adequacy floor (P6) so trigger fires
+        df = _make_feature_df(10, current_ratio=np.full(10, 0.8),
+                              cash_and_equivalents=np.full(10, 0.0))
         flag = compute_company_survival_flag(df)
         self.assertTrue((flag == 1).all())
 
     def test_high_debt_equity_triggers(self):
         from operator1.analysis.survival_mode import compute_company_survival_flag
-        df = _make_feature_df(10, debt_to_equity_abs=np.full(10, 4.0))
+        df = _make_feature_df(10, debt_to_equity_abs=np.full(10, 4.0),
+                              cash_and_equivalents=np.full(10, 0.0))
         flag = compute_company_survival_flag(df)
         self.assertTrue((flag == 1).all())
 
     def test_negative_fcf_yield_triggers(self):
         from operator1.analysis.survival_mode import compute_company_survival_flag
-        df = _make_feature_df(10, fcf_yield=np.full(10, -0.05))
+        df = _make_feature_df(10, fcf_yield=np.full(10, -0.05),
+                              cash_and_equivalents=np.full(10, 0.0))
         flag = compute_company_survival_flag(df)
         self.assertTrue((flag == 1).all())
 

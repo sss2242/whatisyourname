@@ -714,6 +714,9 @@ def _compute_recovery_time(df: pd.DataFrame) -> pd.DataFrame:
         df["recovery_time_avg"] = np.nan
         df["recovery_time_max"] = np.nan
         df["n_recovery_episodes"] = 0
+        df["is_missing_recovery_time_avg"] = 1
+        df["is_missing_recovery_time_max"] = 1
+        df["is_missing_n_recovery_episodes"] = 0
         return df
 
     close_clean = close.dropna()
@@ -721,6 +724,9 @@ def _compute_recovery_time(df: pd.DataFrame) -> pd.DataFrame:
         df["recovery_time_avg"] = np.nan
         df["recovery_time_max"] = np.nan
         df["n_recovery_episodes"] = 0
+        df["is_missing_recovery_time_avg"] = 1
+        df["is_missing_recovery_time_max"] = 1
+        df["is_missing_n_recovery_episodes"] = 0
         return df
 
     # Track drawdown episodes: peak -> trough -> recovery
@@ -756,8 +762,11 @@ def _compute_recovery_time(df: pd.DataFrame) -> pd.DataFrame:
 
     # Store as scalar columns (same value for all days -- summary metric)
     df["recovery_time_avg"] = avg_recovery
+    df["is_missing_recovery_time_avg"] = int(pd.isna(avg_recovery))
     df["recovery_time_max"] = max_recovery
+    df["is_missing_recovery_time_max"] = int(pd.isna(max_recovery))
     df["n_recovery_episodes"] = n_episodes
+    df["is_missing_n_recovery_episodes"] = 0
 
     return df
 
@@ -1480,6 +1489,26 @@ def compute_derived_variables(df: pd.DataFrame) -> pd.DataFrame:
         n_dupes = result.columns.duplicated().sum()
         result = result.loc[:, ~result.columns.duplicated()]
         logger.debug("Removed %d duplicate columns", n_dupes)
+
+    # Ensure every var in DERIVED_VARIABLES exists and has an is_missing_*
+    # companion.  Some stages require more data than available (e.g.,
+    # momentum_12_1 needs 252 days) and may not create the column at all.
+    # Newer stages (15-24) use direct assignment without companion flags.
+    _n_vars_added = 0
+    _n_flags_added = 0
+    for _var in DERIVED_VARIABLES:
+        if _var not in result.columns:
+            result[_var] = np.nan
+            _n_vars_added += 1
+        _flag = f"is_missing_{_var}"
+        if _flag not in result.columns:
+            result[_flag] = result[_var].isna().astype(int)
+            _n_flags_added += 1
+    if _n_vars_added > 0 or _n_flags_added > 0:
+        logger.debug(
+            "Sweep: added %d missing var columns + %d is_missing_* flags",
+            _n_vars_added, _n_flags_added,
+        )
 
     logger.info(
         "Derived variables computed: %d new columns",

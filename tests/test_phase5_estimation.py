@@ -419,8 +419,8 @@ class TestTierMembership(unittest.TestCase):
         # gross_margin should be in tier 4
         self.assertEqual(membership.get("gross_margin"), 4)
 
-        # pe_ratio should be in tier 5
-        self.assertEqual(membership.get("pe_ratio"), 5)
+        # pe_ratio_calc should be in tier 5 (canonical computed name from derived_variables)
+        self.assertEqual(membership.get("pe_ratio_calc"), 5)
 
 
 # ===========================================================================
