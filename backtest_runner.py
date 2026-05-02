@@ -236,7 +236,7 @@ def run_stage1(state: PipelineState) -> None:
             stmt = locals()[stmt_ref]
             if stmt.empty:
                 continue
-            freq_groups = separate_by_period_type(stmt)
+            freq_groups = separate_by_period_type(stmt, market_id=state.market_id)
             if len(freq_groups) > 1:
                 logger.info(
                     "Mixed-frequency %s: %s",

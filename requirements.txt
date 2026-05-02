@@ -44,6 +44,7 @@ optuna>=4.0               # TPE hyperparameter optimization
 statsforecast>=2.0        # Fast AutoARIMA
 vaderSentiment>=3.3       # VADER rule-based sentiment
 EMD-signal>=1.6           # CEEMDAN cycle decomposition
+tempdisagg>=0.2.13        # Chow-Lin/Denton temporal disaggregation
 
 # --- Stage 3: Deep Learning + Bayesian ---
 torch==2.10.0             # ~2 GB download -- skip if bandwidth is limited

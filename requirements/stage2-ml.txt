@@ -24,3 +24,4 @@ optuna>=4.0                 # TPE hyperparameter optimization
 statsforecast>=2.0          # Fast AutoARIMA (100x faster than pmdarima)
 vaderSentiment>=3.3         # Rule-based sentiment analysis (VADER)
 EMD-signal>=1.6             # CEEMDAN cycle decomposition
+tempdisagg>=0.2.13          # Chow-Lin/Denton temporal disaggregation (frequency separator)

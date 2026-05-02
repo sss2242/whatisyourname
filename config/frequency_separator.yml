@@ -1,0 +1,163 @@
+# Frequency Separator Configuration
+# Controls how mixed-frequency financial statements are separated and disaggregated.
+
+# ---------------------------------------------------------------------------
+# Fiscal calendar registry -- market-specific filing patterns
+# ---------------------------------------------------------------------------
+fiscal_calendars:
+  us_sec_edgar:
+    exchange: XNYS
+    common_fy_ends: ["12-31", "09-30", "06-30", "03-31"]
+    default_freq: quarterly
+    freq_prior: {quarterly: 0.80, semiannual: 0.05, annual: 0.15}
+    typical_filing_lag_days: 40
+  uk_companies_house:
+    exchange: XLON
+    common_fy_ends: ["12-31", "03-31", "06-30"]
+    default_freq: semiannual
+    freq_prior: {quarterly: 0.10, semiannual: 0.50, annual: 0.40}
+    typical_filing_lag_days: 120
+  eu_esef:
+    exchange: XAMS
+    common_fy_ends: ["12-31", "06-30"]
+    default_freq: annual
+    freq_prior: {quarterly: 0.20, semiannual: 0.30, annual: 0.50}
+    typical_filing_lag_days: 90
+  fr_esef:
+    exchange: XPAR
+    common_fy_ends: ["12-31", "06-30"]
+    default_freq: semiannual
+    freq_prior: {quarterly: 0.15, semiannual: 0.40, annual: 0.45}
+    typical_filing_lag_days: 90
+  de_esef:
+    exchange: XFRA
+    common_fy_ends: ["12-31", "09-30"]
+    default_freq: annual
+    freq_prior: {quarterly: 0.15, semiannual: 0.25, annual: 0.60}
+    typical_filing_lag_days: 90
+  jp_jquants:
+    exchange: XTKS
+    common_fy_ends: ["03-31"]
+    default_freq: quarterly
+    freq_prior: {quarterly: 0.90, semiannual: 0.05, annual: 0.05}
+    typical_filing_lag_days: 45
+  kr_dart:
+    exchange: XKRX
+    common_fy_ends: ["12-31"]
+    default_freq: quarterly
+    freq_prior: {quarterly: 0.85, semiannual: 0.05, annual: 0.10}
+    typical_filing_lag_days: 45
+  tw_mops:
+    exchange: XTAI
+    common_fy_ends: ["12-31"]
+    default_freq: quarterly
+    freq_prior: {quarterly: 0.85, semiannual: 0.05, annual: 0.10}
+    typical_filing_lag_days: 30
+  br_cvm:
+    exchange: BVMF
+    common_fy_ends: ["12-31"]
+    default_freq: quarterly
+    freq_prior: {quarterly: 0.80, semiannual: 0.05, annual: 0.15}
+    typical_filing_lag_days: 60
+  cl_cmf:
+    exchange: XSGO
+    common_fy_ends: ["12-31"]
+    default_freq: quarterly
+    freq_prior: {quarterly: 0.60, semiannual: 0.10, annual: 0.30}
+    typical_filing_lag_days: 60
+  in_bse:
+    exchange: XBOM
+    common_fy_ends: ["03-31"]
+    default_freq: quarterly
+    freq_prior: {quarterly: 0.85, semiannual: 0.05, annual: 0.10}
+    typical_filing_lag_days: 45
+  cn_sse:
+    exchange: XSHG
+    common_fy_ends: ["12-31"]
+    default_freq: quarterly
+    freq_prior: {quarterly: 0.80, semiannual: 0.10, annual: 0.10}
+    typical_filing_lag_days: 30
+  hk_hkex:
+    exchange: XHKG
+    common_fy_ends: ["12-31", "03-31"]
+    default_freq: semiannual
+    freq_prior: {quarterly: 0.10, semiannual: 0.60, annual: 0.30}
+    typical_filing_lag_days: 60
+  sg_sgx:
+    exchange: XSES
+    common_fy_ends: ["12-31", "03-31"]
+    default_freq: semiannual
+    freq_prior: {quarterly: 0.30, semiannual: 0.40, annual: 0.30}
+    typical_filing_lag_days: 60
+  ca_sedar:
+    exchange: XTSE
+    common_fy_ends: ["12-31", "10-31"]
+    default_freq: quarterly
+    freq_prior: {quarterly: 0.80, semiannual: 0.05, annual: 0.15}
+    typical_filing_lag_days: 45
+  au_asx:
+    exchange: XASX
+    common_fy_ends: ["06-30", "12-31"]
+    default_freq: semiannual
+    freq_prior: {quarterly: 0.10, semiannual: 0.50, annual: 0.40}
+    typical_filing_lag_days: 60
+  sa_tadawul:
+    exchange: XSAU
+    common_fy_ends: ["12-31"]
+    default_freq: quarterly
+    freq_prior: {quarterly: 0.70, semiannual: 0.10, annual: 0.20}
+    typical_filing_lag_days: 45
+  ch_six:
+    exchange: XSWX
+    common_fy_ends: ["12-31"]
+    default_freq: annual
+    freq_prior: {quarterly: 0.05, semiannual: 0.25, annual: 0.70}
+    typical_filing_lag_days: 90
+  za_jse:
+    exchange: XJSE
+    common_fy_ends: ["12-31", "06-30"]
+    default_freq: semiannual
+    freq_prior: {quarterly: 0.10, semiannual: 0.50, annual: 0.40}
+    typical_filing_lag_days: 90
+  mx_bmv:
+    exchange: XMEX
+    common_fy_ends: ["12-31"]
+    default_freq: quarterly
+    freq_prior: {quarterly: 0.75, semiannual: 0.10, annual: 0.15}
+    typical_filing_lag_days: 45
+  ae_dfm:
+    exchange: XDFM
+    common_fy_ends: ["12-31"]
+    default_freq: quarterly
+    freq_prior: {quarterly: 0.60, semiannual: 0.20, annual: 0.20}
+    typical_filing_lag_days: 60
+
+# Default priors for unknown markets
+default_freq_prior: {quarterly: 0.50, semiannual: 0.20, annual: 0.30}
+
+# ---------------------------------------------------------------------------
+# Bayesian frequency detection parameters
+# ---------------------------------------------------------------------------
+bayesian_detection:
+  gap_mean_quarterly: 90        # expected calendar days between quarterly filings
+  gap_std_quarterly: 15         # std dev (accounts for fiscal calendar variation)
+  gap_mean_semiannual: 180
+  gap_std_semiannual: 25
+  gap_mean_annual: 365
+  gap_std_annual: 40
+
+# ---------------------------------------------------------------------------
+# Temporal disaggregation method selection
+# ---------------------------------------------------------------------------
+disaggregation:
+  flow_method: chow-lin-opt     # tempdisagg method for flow variables (revenue, net_income, etc.)
+  stock_method: denton-cholette  # tempdisagg method for stock variables (total_assets, etc.)
+  fallback_method: fast          # when primary tempdisagg method fails
+
+# ---------------------------------------------------------------------------
+# Post-disaggregation reconciliation
+# ---------------------------------------------------------------------------
+reconciliation:
+  sum_tolerance: 0.05           # max 5% deviation: sum(Q1..Q4) vs annual
+  identity_tolerance: 0.01      # max 1% for accounting identity checks
+  restatement_threshold: 0.10   # 10% change between original and amended filing = material restatement flag

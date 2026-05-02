@@ -846,7 +846,7 @@ Non-interactive examples:
             if stmt.empty:
                 continue
 
-            freq_groups = separate_by_period_type(stmt)
+            freq_groups = separate_by_period_type(stmt, market_id=market_id)
             if len(freq_groups) > 1:
                 logger.info(
                     "Mixed-frequency %s detected: %s -- separating and reconciling",
