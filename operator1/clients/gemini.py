@@ -91,6 +91,7 @@ class GeminiClient(LLMClient):
         *,
         max_output_tokens: int = 8192,
         temperature: float = 0.7,
+        system_prompt: str = "",
     ) -> dict[str, Any]:
         """Build Gemini API request arguments.
 
@@ -98,18 +99,25 @@ class GeminiClient(LLMClient):
         query parameter. The payload uses the ``contents`` array with
         ``parts`` containing the prompt text. Generation config is
         passed via ``generationConfig``.
+
+        When ``system_prompt`` is provided, it is sent via the
+        ``systemInstruction`` top-level field (Gemini v1beta API).
         """
         url = (
             f"{self._base_url}/models/{self._model}:generateContent"
             f"?key={self._api_key}"
         )
-        payload = {
+        payload: dict[str, Any] = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": max_output_tokens,
             },
         }
+        if system_prompt:
+            payload["systemInstruction"] = {
+                "parts": [{"text": system_prompt}],
+            }
         return {"url": url, "json": payload}
 
     def _parse_response(self, data: dict[str, Any]) -> str:

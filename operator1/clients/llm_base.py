@@ -57,6 +57,50 @@ _LLM_HOST_RATE_LIMITS: dict[str, float] = {
 from operator1.http_utils import _extract_host, _sanitise_url  # shared utilities
 
 
+# ---------------------------------------------------------------------------
+# System prompt loading (from config/llm_system_prompts.yml)
+# ---------------------------------------------------------------------------
+
+_system_prompt_cache: dict[str, Any] | None = None
+
+
+def _load_system_prompts() -> dict[str, Any]:
+    """Load and cache system prompts from config/llm_system_prompts.yml."""
+    global _system_prompt_cache
+    if _system_prompt_cache is not None:
+        return _system_prompt_cache
+
+    try:
+        from operator1.config_loader import load_config
+        _system_prompt_cache = load_config("llm_system_prompts")
+    except Exception as exc:
+        logger.debug("System prompts config not found: %s (using defaults)", exc)
+        _system_prompt_cache = {}
+    return _system_prompt_cache
+
+
+def get_system_prompt(task_type: str = "") -> str:
+    """Build a system prompt for the given task type.
+
+    Composes: base_system_prompt + task-specific overlay.
+    Returns empty string if config is not available (graceful fallback).
+    """
+    config = _load_system_prompts()
+    base = config.get("base_system_prompt", "")
+    overlay = config.get(task_type, "") if task_type else ""
+    parts = [p for p in (base, overlay) if p]
+    return "\n\n".join(parts)
+
+
+def get_task_temperature(task_type: str = "") -> float | None:
+    """Get the enforced temperature for a task type, or None for default."""
+    config = _load_system_prompts()
+    defaults = config.get("temperature_defaults", {})
+    if task_type and task_type in defaults:
+        return float(defaults[task_type])
+    return None
+
+
 def _rate_limit_sleep(host: str, calls_per_second: float | None = None) -> None:
     """Per-host rate limiter: sleep if requests are too fast."""
     effective_rate = calls_per_second or _LLM_HOST_RATE_LIMITS.get(host, 1.0)
@@ -232,11 +276,19 @@ class LLMClient(ABC):
         *,
         max_output_tokens: int = 8192,
         temperature: float = 0.7,
+        system_prompt: str = "",
     ) -> dict[str, Any]:
         """Build the request kwargs for requests.post().
 
         Must return a dict with keys: url, json, headers (optional),
         and any other kwargs for requests.post().
+
+        Parameters
+        ----------
+        system_prompt:
+            System-level instructions loaded from config/llm_system_prompts.yml.
+            Provider-specific: Gemini uses ``systemInstruction``, Claude uses
+            ``system``, OpenRouter uses a system role message.
         """
 
     @abstractmethod
@@ -269,15 +321,26 @@ class LLMClient(ABC):
         max_output_tokens: int = 8192,
         temperature: float = 0.7,
         timeout: int = 60,
+        task_type: str = "",
     ) -> str:
         """Execute an LLM request with retry logic and rate limiting.
 
         This is the core execution method that handles:
+        - System prompt composition (base + task overlay)
+        - Per-task temperature enforcement
         - Per-host rate limiting
         - Exponential backoff on 429/5xx errors
         - Retry-After header respect
         - Request logging
         """
+        # Compose system prompt from config (base + task overlay)
+        system_prompt = get_system_prompt(task_type)
+
+        # Enforce per-task temperature from config (overrides caller)
+        task_temp = get_task_temperature(task_type)
+        if task_temp is not None:
+            temperature = task_temp
+
         cfg = get_global_config()
         max_retries: int = cfg.get("max_retries", 5)
         backoff: float = cfg.get("backoff_factor", 2.0)
@@ -287,6 +350,7 @@ class LLMClient(ABC):
             prompt,
             max_output_tokens=max_output_tokens,
             temperature=temperature,
+            system_prompt=system_prompt,
         )
         url = req_args.pop("url")
         host = _extract_host(url)
@@ -376,20 +440,29 @@ class LLMClient(ABC):
     # High-level generate methods (use _execute_request internally)
     # ------------------------------------------------------------------
 
-    def generate(self, prompt: str) -> str:
+    def generate(self, prompt: str, *, task_type: str = "") -> str:
         """Send a prompt and return the raw text response.
 
         This is the public interface used by ``run.py`` for LLM-based
         market routing and by ``PooledLLMClient`` for key rotation.
+
+        Parameters
+        ----------
+        task_type:
+            Task identifier for system prompt selection and temperature
+            enforcement.  Valid values: ``"report_generation"``,
+            ``"entity_discovery"``, ``"sentiment_scoring"``,
+            ``"data_extraction"``, ``"filing_extraction"``,
+            ``"macro_mapping"``.  Empty string uses base prompt only.
         """
         cfg = get_global_config()
         timeout = cfg.get("timeout_s", 30)
-        return self._execute_request(prompt, timeout=timeout)
+        return self._execute_request(prompt, timeout=timeout, task_type=task_type)
 
     # Keep private alias for backward compatibility with internal callers
-    def _generate(self, prompt: str) -> str:
+    def _generate(self, prompt: str, *, task_type: str = "") -> str:
         """Send a prompt and return the raw text response."""
-        return self.generate(prompt)
+        return self.generate(prompt, task_type=task_type)
 
     def _generate_with_config(
         self,
@@ -398,6 +471,7 @@ class LLMClient(ABC):
         max_output_tokens: int = 8192,
         temperature: float = 0.7,
         timeout: int = 60,
+        task_type: str = "",
     ) -> str:
         """Send a prompt with generation config and return the raw text."""
         return self._execute_request(
@@ -405,6 +479,7 @@ class LLMClient(ABC):
             max_output_tokens=max_output_tokens,
             temperature=temperature,
             timeout=timeout,
+            task_type=task_type,
         )
 
     # ------------------------------------------------------------------
@@ -518,7 +593,7 @@ Return valid JSON only, no markdown.
                 profile_json=json.dumps(target_profile, indent=2),
                 sector_hints=sector_hints or "none",
             )
-            text = self._generate(prompt)
+            text = self._generate(prompt, task_type="entity_discovery")
             parsed = self._parse_json_response(text)
             if isinstance(parsed, dict):
                 # Handle both new format (list of objects) and old format (list of strings)
@@ -688,7 +763,7 @@ Return valid JSON only, no markdown.
                 profile_json=profile_json,
                 country=country,
             )
-            text1 = self._generate(prompt1)
+            text1 = self._generate(prompt1, task_type="entity_discovery")
             parsed1 = self._parse_json_response(text1)
             if isinstance(parsed1, dict):
                 is_intl = parsed1.get("is_international", False)
@@ -713,7 +788,7 @@ Return valid JSON only, no markdown.
                 country=country,
                 already_found=already_found,
             )
-            text2 = self._generate(prompt2)
+            text2 = self._generate(prompt2, task_type="entity_discovery")
             parsed2 = self._parse_json_response(text2)
             if isinstance(parsed2, dict):
                 _merge_results(parsed2)
@@ -752,7 +827,7 @@ Return valid JSON only, no markdown.
                     found_summary=found_summary or "  (none found)",
                     thin_groups="\n".join(f"  - {tg}" for tg in thin_groups),
                 )
-                text3 = self._generate(prompt3)
+                text3 = self._generate(prompt3, task_type="entity_discovery")
                 parsed3 = self._parse_json_response(text3)
                 if isinstance(parsed3, dict):
                     before = sum(len(v) for v in all_entities.values())
@@ -825,7 +900,7 @@ Return valid JSON only, no markdown.
                 country=country,
                 sector=sector or "general",
             )
-            text = self._generate(prompt)
+            text = self._generate(prompt, task_type="macro_mapping")
             parsed = self._parse_json_response(text)
             if isinstance(parsed, dict):
                 return {k: str(v) for k, v in parsed.items()}
@@ -839,7 +914,10 @@ Return valid JSON only, no markdown.
     # ------------------------------------------------------------------
 
     _REPORT_PROMPT = """\
-You are a Bloomberg-style financial analyst specializing in comprehensive equity research.
+You are generating a data-grounded equity research report. Your role is to \
+synthesize the quantitative pipeline outputs below into clear, actionable \
+analysis. Every claim must cite data from the profile. Do not speculate \
+beyond what the models produced.
 
 You have been provided with a complete company profile that includes:
 - 2 years of historical financial and market data
@@ -867,9 +945,11 @@ this information into actionable insights for sophisticated investors.
 REPORT STRUCTURE (MUST INCLUDE ALL 14 SECTIONS):
 
 1. EXECUTIVE SUMMARY
-   - 3 bullet points summarizing key findings
-   - Clear investment recommendation: BUY / HOLD / SELL with confidence level (High/Medium/Low)
-   - 12-month target price with rationale
+   - 3 bullet points summarizing key findings (cite specific metrics from the profile)
+   - Investment recommendation derived from pipeline signals:
+     Use hedge_fund.position.signal if available (>0.3=BUY, -0.3 to 0.3=HOLD, <-0.3=SELL).
+     State confidence level based on model_diagnostics.overall_robustness.
+   - 12-month price range from the pipeline's conformal prediction intervals (NOT your own estimate)
 
 2. COMPANY OVERVIEW
    - Company identity and classification
@@ -990,13 +1070,15 @@ missingness summary, any modules that failed and how the report compensated. \
 Must be easy for a non-technical client to understand.
 
 13. INVESTMENT RECOMMENDATION
-    **Recommendation:** [BUY / HOLD / SELL]
-    **Confidence Level:** [High / Medium / Low]
-    **12-Month Target Price:** with rationale
-    **Key Catalysts to Watch:** events or metrics that would change the recommendation
-    **Entry Strategy:** recommended entry price or conditions
-    **Exit Strategy:** price targets for profits and stop-loss levels
-    **Position Sizing:** suggested portfolio allocation based on risk profile
+    **Recommendation:** Derived from hedge_fund.position.signal (>0.3=BUY, -0.3..0.3=HOLD, <-0.3=SELL).
+    If position signal is not available, derive from survival_probability and financial_health composite.
+    Do NOT generate your own recommendation independent of the pipeline signals.
+    **Confidence Level:** Based on model_diagnostics.overall_robustness (>0.7=High, 0.5-0.7=Medium, <0.5=Low).
+    **12-Month Price Range:** From pipeline conformal intervals at 252d horizon. State point estimate + 90% CI.
+    **Key Catalysts to Watch:** from event_calendar and filing_calendar data in the profile.
+    **Risk Factors:** from survival_probability, conflict_risk, scenario_analysis data.
+    **IMPORTANT:** If survival_probability < 0.85, lead with "ELEVATED RISK" warning.
+    If scorecard grade is D or F, the tone must reflect distress.
 
 14. APPENDIX
     - Methodology summary: all 23+ temporal modules used:
@@ -1093,6 +1175,7 @@ Generate the complete Bloomberg-style investment report now.
                 max_output_tokens=effective_tokens,
                 temperature=temperature,
                 timeout=timeout,
+                task_type="report_generation",
             )
 
         except Exception as exc:
@@ -1153,7 +1236,7 @@ Generate the complete Bloomberg-style investment report now.
             )
 
             try:
-                text = self._generate(prompt)
+                text = self._generate(prompt, task_type="sentiment_scoring")
                 scores = self._parse_json_response(text)
 
                 if isinstance(scores, list) and len(scores) == len(batch):

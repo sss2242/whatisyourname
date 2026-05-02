@@ -152,16 +152,24 @@ class OpenRouterClient(LLMClient):
         *,
         max_output_tokens: int = 8192,
         temperature: float = 0.7,
+        system_prompt: str = "",
     ) -> dict[str, Any]:
         """Build OpenRouter API request arguments.
 
         OpenRouter uses the OpenAI-compatible chat completions endpoint.
         Auth is via Bearer token in the Authorization header.
+
+        When ``system_prompt`` is provided, it is prepended as a system
+        role message in the messages array (OpenAI-compatible format).
         """
         url = f"{self._base_url}/chat/completions"
+        messages: list[dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
         payload = {
             "model": self._model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "max_tokens": min(max_output_tokens, self._max_output_tokens),
             "temperature": temperature,
         }
