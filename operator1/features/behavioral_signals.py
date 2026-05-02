@@ -19,8 +19,14 @@ import numpy as np
 import pandas as pd
 
 from operator1.constants import EPSILON
+from operator1.scoring_weights import get_weight
 
 logger = logging.getLogger(__name__)
+
+# Load tweakable constants from config (fallback to hardcoded defaults)
+_ATTENTION_SPIKE_THRESHOLD = float(get_weight("behavioral_signals.attention_spike_threshold", 2.0))
+_DISPOSITION_WINDOW = int(get_weight("behavioral_signals.disposition_window", 63))
+_LOTTERY_LOW_PRICE = float(get_weight("behavioral_signals.lottery_low_price_threshold", 5.0))
 
 
 def compute_behavioral_signals(cache: pd.DataFrame) -> pd.DataFrame:

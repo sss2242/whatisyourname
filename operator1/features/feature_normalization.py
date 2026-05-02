@@ -24,6 +24,8 @@ import logging
 import numpy as np
 import pandas as pd
 
+from operator1.scoring_weights import get_weight
+
 from operator1.constants import EPSILON
 
 logger = logging.getLogger(__name__)

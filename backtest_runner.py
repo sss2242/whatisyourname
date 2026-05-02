@@ -1430,6 +1430,41 @@ def run_stage3(state: PipelineState) -> None:
         else:
             profile["product_catalysts"] = {"available": False}
 
+        # 11b. behavioral signals
+        try:
+            _beh_cols = [c for c in cache.columns if c.startswith("anchoring_") or c.startswith("disposition_") or c.startswith("attention_") or c.startswith("lottery_")]
+            if _beh_cols:
+                _latest = cache.iloc[-1]
+                profile["behavioral_signals"] = {
+                    "available": True,
+                    "anchoring_52w_high": float(_latest.get("anchoring_52w_high", 0) or 0),
+                    "anchoring_52w_low": float(_latest.get("anchoring_52w_low", 0) or 0),
+                    "disposition_effect_proxy": float(_latest.get("disposition_effect_proxy", 0) or 0),
+                    "attention_spike": int(_latest.get("attention_spike", 0) or 0),
+                    "lottery_characteristics": float(_latest.get("lottery_characteristics", 0) or 0),
+                }
+            else:
+                profile["behavioral_signals"] = {"available": False}
+        except Exception:
+            profile["behavioral_signals"] = {"available": False}
+
+        # 11c. complexity signals
+        try:
+            _cpx_cols = [c for c in cache.columns if c.startswith("sample_entropy") or c.startswith("perm_entropy") or c.startswith("lz_") or c.startswith("approx_entropy")]
+            if _cpx_cols:
+                _latest = cache.iloc[-1]
+                profile["complexity_signals"] = {
+                    "available": True,
+                    "sample_entropy_21d": float(_latest.get("sample_entropy_21d", 0) or 0),
+                    "perm_entropy_21d": float(_latest.get("perm_entropy_21d", 0) or 0),
+                    "lz_complexity": float(_latest.get("lz_complexity", 0) or 0),
+                    "approx_entropy_price": float(_latest.get("approx_entropy_price", 0) or 0),
+                }
+            else:
+                profile["complexity_signals"] = {"available": False}
+        except Exception:
+            profile["complexity_signals"] = {"available": False}
+
         # 12. product_segments
         _seg = state.seg_result
         if _seg and _seg.get("n_segments", 0) >= 2:
@@ -1974,6 +2009,26 @@ Examples:
     state.years = args.years
     state.output_dir = args.run_dir
 
+    def _find_latest_checkpoint(run_dir: str, target_sub: str) -> str | None:
+        """Find the most recent checkpoint before the target sub-stage.
+
+        Scans all state_*.pkl files in run_dir, sorts by modification time,
+        and returns the latest one that is NOT the target sub-stage itself.
+        This ensures sub-stage 5.1 loads from 4.1 (not from 1).
+        """
+        rd = Path(run_dir)
+        if not rd.exists():
+            return None
+        candidates = []
+        for pkl in rd.glob("state_*.pkl"):
+            sub = pkl.stem.replace("state_", "")
+            if sub != target_sub:
+                candidates.append((pkl.stat().st_mtime, sub))
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+
     # Validation mode
     if args.validate:
         state.load_checkpoint("3")
@@ -2003,19 +2058,28 @@ Examples:
     _STAGE_DEPS = {
         "1": None,
         "2": "1",   # temporal models depend on Stage 1 (data fetch)
-        "3": "2",   # profile build depends on Stage 2 (temporal models)
+        "3": None,  # profile build loads latest checkpoint dynamically
     }
 
-    # Handle sub-stage routing: "2:3.1" means "load Stage 1 state, run sub-stage 3.1"
+    # Handle sub-stage routing: "2:3.1" means "load latest checkpoint, run sub-stage 3.1"
     for i, stage_key in enumerate(stages):
         if ":" in stage_key:
             parent, sub_spec = stage_key.split(":", 1)
             _STAGE_FUNCS[stage_key] = lambda s, spec=sub_spec: run_stage2(s, spec)
-            _STAGE_DEPS[stage_key] = "1"  # sub-stages depend on Stage 1
+            # Find the best dependency: look for the previous sub-stage checkpoint
+            # (e.g., 5.1 should load from 4.1, not from Stage 1)
+            _best_dep = _find_latest_checkpoint(state.output_dir, sub_spec)
+            _STAGE_DEPS[stage_key] = _best_dep or "1"
             stages[i] = stage_key
 
     for stage_key in stages:
         dep = _STAGE_DEPS[stage_key]
+        # Stage 3 (profile build) needs the latest temporal checkpoint
+        if dep is None and stage_key == "3":
+            _latest = _find_latest_checkpoint(state.output_dir, "3")
+            if _latest:
+                logger.info("Stage 3: loading latest checkpoint '%s'", _latest)
+                state.load_checkpoint(_latest)
         if dep is not None:
             # Load state from the dependency stage, with fallback chain
             dep_key = str(dep)

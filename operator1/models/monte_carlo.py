@@ -768,6 +768,9 @@ def run_simulation(
     importance_tilt: float = DEFAULT_IS_TILT,
     survival_thresholds: dict[str, tuple[str, float]] | None = None,
     variable_sensitivities: dict[str, float] | None = None,
+    jump_lambda: float = 0.0,
+    jump_mean: float = 0.0,
+    jump_std: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Run Monte Carlo simulation for a single horizon.
 
@@ -798,6 +801,12 @@ def run_simulation(
         Override survival trigger thresholds.
     variable_sensitivities:
         Variable sensitivity to returns.
+    jump_lambda:
+        Jump-diffusion Poisson intensity (annualized).
+    jump_mean:
+        Mean of log-normal jump size.
+    jump_std:
+        Std of log-normal jump size.
 
     Returns
     -------
@@ -1498,6 +1507,9 @@ def run_monte_carlo(
             importance_tilt=_horizon_tilt,
             survival_thresholds=survival_thresholds,
             variable_sensitivities=variable_sensitivities,
+            jump_lambda=jump_lambda,
+            jump_mean=jump_mean,
+            jump_std=jump_std,
         )
 
         # Weighted survival probability (clip to [0, 1] for float safety).

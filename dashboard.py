@@ -487,6 +487,49 @@ def render_home():
                 with ui.row().classes("gap-4"):
                     _card("On Track", f"{diag.get('n_models_on_track', 0)}/{diag.get('n_models_assessed', 0)}", diag.get("overall_robustness", ""), "verified")
 
+            # Ensemble Distress + CVaR (from financial_health)
+            _fh = profile.get("financial_health", {})
+            _ens_prob = _fh.get("ensemble_distress_prob")
+            _ens_label = _fh.get("ensemble_distress_label")
+            _cvar = _fh.get("cvar_composite")
+            if _ens_prob is not None or _cvar is not None:
+                ui.separator()
+                ui.label("Advanced Health Metrics").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    if _ens_prob is not None:
+                        _card("Ensemble Distress", f"{_ens_prob:.0%}", _ens_label or "", "warning")
+                    if _cvar is not None:
+                        _card("CVaR Composite", f"{_cvar:.1f}/100", "Worst-30% tier avg", "assessment")
+
+            # DuPont + Kelly (from hedge_fund)
+            _hf = profile.get("hedge_fund", {})
+            _rs = _hf.get("return_spread", {})
+            _pos = _hf.get("position", {})
+            _dupont = _rs.get("dupont_quality_driver")
+            _kelly = _pos.get("kelly_fraction")
+            if _dupont or _kelly is not None:
+                ui.separator()
+                ui.label("HF Advanced Metrics").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    if _dupont:
+                        _card("DuPont Driver", str(_dupont), "ROE decomposition", "analytics")
+                    if _kelly is not None:
+                        _half_kelly = _pos.get("half_kelly_size", _kelly / 2)
+                        _card("Kelly Size", f"{_half_kelly:.1%}", f"Full Kelly: {_kelly:.1%}", "speed")
+
+            # Cross-Frequency Momentum (from multi_frequency)
+            _mf = profile.get("multi_frequency", {})
+            _cfm = _mf.get("cross_freq_momentum_score")
+            _cfd = _mf.get("cross_freq_direction_agreement")
+            _rev = _mf.get("potential_reversal_flag")
+            if _cfm is not None:
+                ui.separator()
+                ui.label("Cross-Frequency Momentum").classes("text-lg font-bold mt-3")
+                with ui.row().classes("gap-4"):
+                    _card("MF Momentum", f"{_cfm:+.2f}", f"Agreement: {_cfd:.0%}" if _cfd else "", "sync")
+                    if _rev:
+                        _card("Reversal Signal", "ACTIVE", "Long/short term disagree", "swap_horiz")
+
             # Filing Calendar
             fc = profile.get("filing_calendar", {})
             if fc.get("available"):

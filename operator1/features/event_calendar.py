@@ -42,6 +42,8 @@ from typing import Any
 
 import pandas as pd
 
+from operator1.scoring_weights import get_weight
+
 logger = logging.getLogger(__name__)
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "event_calendar.json"

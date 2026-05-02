@@ -36,6 +36,8 @@ from typing import Any
 
 import pandas as pd
 
+from operator1.scoring_weights import get_weight
+
 logger = logging.getLogger(__name__)
 
 
