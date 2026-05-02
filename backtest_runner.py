@@ -224,6 +224,35 @@ def run_stage1(state: PipelineState) -> None:
     except Exception as exc:
         logger.warning("Pivot failed: %s", exc)
 
+    # Frequency separation: resolve mixed annual+quarterly statement data.
+    # Mirrors main.py Step 3d -- prevents annual totals from being
+    # distributed over quarterly windows (F5 bug).
+    try:
+        from operator1.clients.frequency_separator import (
+            separate_by_period_type,
+            build_highest_frequency_statement,
+        )
+        for label, stmt_ref in [("income", "income_df"), ("balance", "balance_df"), ("cashflow", "cashflow_df")]:
+            stmt = locals()[stmt_ref]
+            if stmt.empty:
+                continue
+            freq_groups = separate_by_period_type(stmt)
+            if len(freq_groups) > 1:
+                logger.info(
+                    "Mixed-frequency %s: %s",
+                    label, {k: len(v) for k, v in freq_groups.items()},
+                )
+                reconciled = build_highest_frequency_statement(freq_groups)
+                if not reconciled.empty:
+                    if label == "income":
+                        income_df = reconciled
+                    elif label == "balance":
+                        balance_df = reconciled
+                    else:
+                        cashflow_df = reconciled
+    except Exception as exc:
+        logger.warning("Frequency separation failed: %s", exc)
+
     # Save raw statement DataFrames for multi-frequency Q/A direct construction
     state.income_df = income_df
     state.balance_df = balance_df

@@ -829,6 +829,45 @@ Non-interactive examples:
     except Exception as exc:
         logger.warning("Long-to-wide pivot failed (continuing with raw format): %s", exc)
 
+    # Step 3d: Frequency separation -- resolve mixed-frequency statements.
+    # PIT clients may return both quarterly and annual rows in the same
+    # DataFrame. Naively merging these produces flow variable mismatches
+    # (annual totals in quarterly windows -> 319% gross margin).
+    # Separate by period_type, then use highest-frequency data with
+    # revenue-ratio-scaled backfill from lower frequencies.
+    try:
+        from operator1.clients.frequency_separator import (
+            separate_by_period_type,
+            build_highest_frequency_statement,
+        )
+
+        for label, stmt_ref in [("income", "income_df"), ("balance", "balance_df"), ("cashflow", "cashflow_df")]:
+            stmt = locals()[stmt_ref]
+            if stmt.empty:
+                continue
+
+            freq_groups = separate_by_period_type(stmt)
+            if len(freq_groups) > 1:
+                logger.info(
+                    "Mixed-frequency %s detected: %s -- separating and reconciling",
+                    label,
+                    {k: len(v) for k, v in freq_groups.items()},
+                )
+                reconciled = build_highest_frequency_statement(freq_groups)
+                if not reconciled.empty:
+                    if label == "income":
+                        income_df = reconciled
+                    elif label == "balance":
+                        balance_df = reconciled
+                    else:
+                        cashflow_df = reconciled
+                    logger.info(
+                        "Reconciled %s: %d rows x %d cols (highest freq + backfill)",
+                        label, len(reconciled), len(reconciled.columns),
+                    )
+    except Exception as exc:
+        logger.warning("Frequency separation failed (continuing with raw data): %s", exc)
+
     if quotes_df.empty and income_df.empty and balance_df.empty:
         logger.error(
             "No data retrieved for %s from %s. "
