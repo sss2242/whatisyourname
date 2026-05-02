@@ -322,3 +322,74 @@ feature_selection:
   pimp_significance: 0.05
   mrmr_max_features: 30
   min_regime_samples: 30
+
+# --- Behavioral signals ---
+behavioral_signals:
+  attention_spike_threshold: 2.0
+  disposition_window: 63
+  lottery_low_price_threshold: 5.0
+
+# --- Complexity signals ---
+complexity_signals:
+  entropy_window: 21
+  price_window: 126
+  lz_window: 252
+  sample_entropy_r: 0.2
+  perm_entropy_order: 3
+
+# --- Feature normalization ---
+feature_normalization:
+  zscore_window: 63
+  percentile_window: 252
+  change_window: 21
+  key_variables:
+    - current_ratio
+    - debt_to_equity_abs
+    - fcf_yield
+    - gross_margin
+    - volatility_21d
+    - pe_ratio_calc
+    - revenue_growth_yoy
+    - sentiment_score
+    - merton_dd
+    - fh_composite_score
+  regime_variables:
+    - current_ratio
+    - debt_to_equity_abs
+    - fcf_yield
+    - drawdown_252d
+    - volatility_21d
+
+# --- Options signals ---
+options_signals:
+  delta_threshold: 0.25
+  min_open_interest: 100
+  near_term_dte_max: 60
+  iv_window: 30
+
+# --- Cross-asset signals ---
+cross_asset_signals:
+  momentum_window: 21
+  stress_vix_weight: 0.3
+  stress_treasury_weight: 0.25
+  stress_gold_weight: 0.25
+  stress_usd_weight: 0.2
+
+# --- Event calendar ---
+event_calendar:
+  uncertainty_decay_rate: 0.1
+  max_event_premium: 0.5
+  fomc_impact_days: 3
+  earnings_impact_days: 5
+
+# --- Jump-diffusion Monte Carlo ---
+jump_diffusion:
+  max_lambda: 50.0
+  spike_threshold_percentile: 95
+  min_spike_count: 3
+
+# --- Recursive aggregator ---
+recursive_aggregator:
+  max_days_forward: 21
+  confidence_decay_rate: 0.05
+  regime_tracking: true

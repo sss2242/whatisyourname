@@ -515,6 +515,48 @@ def _compare_dtw(expected: dict, dtw_result: Any) -> dict[str, Any]:
     return result
 
 
+def _compare_simple_model(
+    model_name: str,
+    result: Any,
+    *,
+    check_fitted: bool = True,
+    expected_when: bool = True,
+) -> dict[str, Any]:
+    """Generic comparison for models that either ran or didn't.
+
+    Parameters
+    ----------
+    model_name:
+        Name for logging.
+    result:
+        Model result object (None if not run).
+    check_fitted:
+        If True, check for ``fitted`` attribute.
+    expected_when:
+        Whether the model was expected to run given data characteristics.
+    """
+    out: dict[str, Any] = {
+        "expected": {"should_run": expected_when},
+        "actual": {},
+        "deviation": 0.0,
+        "robustness": "unknown",
+    }
+    if result is None:
+        out["actual"]["status"] = "not_run"
+        out["robustness"] = "n/a" if not expected_when else "low"
+        return out
+
+    ran = True
+    if check_fitted:
+        ran = getattr(result, "fitted", None) is True or getattr(result, "available", None) is True
+    elif hasattr(result, "available"):
+        ran = result.available
+
+    out["actual"]["status"] = "ran" if ran else "failed"
+    out["robustness"] = "high" if ran else "low"
+    return out
+
+
 def _compare_conformal(expected: dict, conformal_result: Any) -> dict[str, Any]:
     """Compare expected conformal coverage against actual."""
     result = {**expected, "actual": {}, "deviation": 0.0, "robustness": "unknown"}
@@ -753,6 +795,9 @@ def compute_model_diagnostics(
     cycle_result: Any = None,
     dtw_result: Any = None,
     conformal_result: Any = None,
+    transformer_result: Any = None,
+    particle_filter_result: Any = None,
+    recursive_result: Any = None,
 ) -> ModelDiagnosticsResult:
     """Compute expected path vs actual path diagnostics for all models.
 
@@ -831,6 +876,21 @@ def compute_model_diagnostics(
             ),
             "conformal_prediction": _compare_conformal(
                 expectations["conformal_prediction"], conformal_result,
+            ),
+            "transformer": _compare_simple_model(
+                "transformer", transformer_result,
+                check_fitted=True,
+                expected_when=chars.get("n_observations", 0) > 100,
+            ),
+            "particle_filter": _compare_simple_model(
+                "particle_filter", particle_filter_result,
+                check_fitted=True,
+                expected_when=any(c in cache.columns for c in ["cash_ratio", "current_ratio"]),
+            ),
+            "recursive_aggregator": _compare_simple_model(
+                "recursive_aggregator", recursive_result,
+                check_fitted=False,
+                expected_when=forecast_result is not None,
             ),
         }
 

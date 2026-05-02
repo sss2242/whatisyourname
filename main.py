@@ -2951,6 +2951,41 @@ Non-interactive examples:
         else:
             profile["product_catalysts"] = {"available": False}
 
+        # Inject behavioral signals summary
+        try:
+            _beh_cols = [c for c in cache.columns if c.startswith("anchoring_") or c.startswith("disposition_") or c.startswith("attention_") or c.startswith("lottery_")]
+            if _beh_cols:
+                _latest = cache.iloc[-1]
+                profile["behavioral_signals"] = {
+                    "available": True,
+                    "anchoring_52w_high": _safe_float(_latest.get("anchoring_52w_high")),
+                    "anchoring_52w_low": _safe_float(_latest.get("anchoring_52w_low")),
+                    "disposition_effect_proxy": _safe_float(_latest.get("disposition_effect_proxy")),
+                    "attention_spike": int(_latest.get("attention_spike", 0)) if not pd.isna(_latest.get("attention_spike", 0)) else 0,
+                    "lottery_characteristics": _safe_float(_latest.get("lottery_characteristics")),
+                }
+            else:
+                profile["behavioral_signals"] = {"available": False}
+        except Exception:
+            profile["behavioral_signals"] = {"available": False}
+
+        # Inject complexity signals summary
+        try:
+            _cpx_cols = [c for c in cache.columns if c.startswith("sample_entropy") or c.startswith("perm_entropy") or c.startswith("lz_") or c.startswith("approx_entropy")]
+            if _cpx_cols:
+                _latest = cache.iloc[-1]
+                profile["complexity_signals"] = {
+                    "available": True,
+                    "sample_entropy_21d": _safe_float(_latest.get("sample_entropy_21d")),
+                    "perm_entropy_21d": _safe_float(_latest.get("perm_entropy_21d")),
+                    "lz_complexity": _safe_float(_latest.get("lz_complexity")),
+                    "approx_entropy_price": _safe_float(_latest.get("approx_entropy_price")),
+                }
+            else:
+                profile["complexity_signals"] = {"available": False}
+        except Exception:
+            profile["complexity_signals"] = {"available": False}
+
         # Inject event calendar signals (Gap 4)
         if event_calendar_result is not None and event_calendar_result.available:
             profile["event_calendar_signals"] = event_calendar_result.to_profile_dict()

@@ -88,8 +88,8 @@ class ReportMode(str, Enum):
 # template headings (1-22).
 TIER_SECTIONS: dict[ReportTier, set[int]] = {
     ReportTier.BASIC: {1, 2, 4, 6, 20, 2007},  # quick screening + position signal
-    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20, 2006, 2007, 2008, 2030, 2031, 2032, 2033},  # + options signals, cross-asset, event calendar
-    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2023, 2024, 2025, 2026, 2027, 2028, 2029, 2030, 2031, 2032, 2033, 2034},  # + options signals, cross-asset, event calendar, regime shifts
+    ReportTier.PRO: {1, 2, 3, 4, 5, 6, 65, 7, 75, 11, 14, 16, 17, 18, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 20, 2006, 2007, 2008, 2030, 2031, 2032, 2033, 2035},  # + behavioral signals
+    ReportTier.PREMIUM: set(range(1, 23)) | {65, 75, 195, 196, 197, 198, 199, 1995, 1996, 1997, 1998, 1999, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2023, 2024, 2025, 2026, 2027, 2028, 2029, 2030, 2031, 2032, 2033, 2034, 2035, 2036, 2037, 2038},  # + behavioral, complexity, feature selection, recursive
 }
 
 
@@ -4367,6 +4367,109 @@ def _build_predicted_regime_shifts_section(profile: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _build_behavioral_signals_section(profile: dict[str, Any]) -> str:
+    """Section 35: Behavioral Finance Signals."""
+    bs = profile.get("behavioral_signals", {})
+    if not bs.get("available"):
+        return "*Behavioral signal data not available.*\n"
+    lines: list[str] = []
+    lines.append("Behavioral finance signals capture investor psychology biases exploitable for prediction.\n")
+    lines.append("| Signal | Value | Interpretation |")
+    lines.append("|--------|-------|----------------|")
+    a52h = bs.get("anchoring_52w_high")
+    if a52h is not None:
+        interp = "Near 52-week high (momentum)" if a52h > 0.9 else "Far from high (reversal potential)" if a52h < 0.7 else "Mid-range"
+        lines.append(f"| 52-Week High Anchoring | {a52h:.2f} | {interp} |")
+    disp = bs.get("disposition_effect_proxy")
+    if disp is not None:
+        interp = "Strong disposition effect" if abs(disp) > 0.3 else "Weak disposition effect"
+        lines.append(f"| Disposition Effect | {disp:.3f} | {interp} |")
+    attn = bs.get("attention_spike")
+    lines.append(f"| Attention Spike | {'Yes' if attn else 'No'} | {'Unusual volume detected' if attn else 'Normal volume'} |")
+    lottery = bs.get("lottery_characteristics")
+    if lottery is not None:
+        interp = "Lottery stock characteristics" if lottery > 0.6 else "Institutional quality" if lottery < 0.3 else "Mixed"
+        lines.append(f"| Lottery Characteristics | {lottery:.2f} | {interp} |")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _build_complexity_signals_section(profile: dict[str, Any]) -> str:
+    """Section 36: Time-Series Complexity Analysis."""
+    cs = profile.get("complexity_signals", {})
+    if not cs.get("available"):
+        return "*Complexity signal data not available.*\n"
+    lines: list[str] = []
+    lines.append("Information-theoretic measures of time-series predictability. Higher complexity = lower predictability = wider confidence intervals.\n")
+    lines.append("| Metric | Value | Interpretation |")
+    lines.append("|--------|-------|----------------|")
+    se = cs.get("sample_entropy_21d")
+    if se is not None:
+        interp = "High regularity (predictable)" if se < 0.5 else "High complexity (unpredictable)" if se > 1.5 else "Moderate complexity"
+        lines.append(f"| Sample Entropy (21d) | {se:.3f} | {interp} |")
+    pe = cs.get("perm_entropy_21d")
+    if pe is not None:
+        interp = "Ordered (trending)" if pe < 0.6 else "Near-random" if pe > 0.9 else "Moderate structure"
+        lines.append(f"| Permutation Entropy (21d) | {pe:.3f} | {interp} |")
+    lz = cs.get("lz_complexity")
+    if lz is not None:
+        interp = "Compressible (patterned)" if lz < 0.5 else "Near-random walk" if lz > 0.8 else "Moderate complexity"
+        lines.append(f"| Lempel-Ziv Complexity | {lz:.3f} | {interp} |")
+    ae = cs.get("approx_entropy_price")
+    if ae is not None:
+        interp = "Price-level predictable" if ae < 0.3 else "Price-level chaotic" if ae > 0.7 else "Moderate"
+        lines.append(f"| Approximate Entropy (Price) | {ae:.3f} | {interp} |")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _build_feature_selection_section(profile: dict[str, Any]) -> str:
+    """Section 37: Feature Selection Results."""
+    fs = profile.get("feature_selection", {})
+    if not fs.get("available"):
+        return "*Feature selection data not available.*\n"
+    lines: list[str] = []
+    n_in = fs.get("n_input", 0)
+    n_out = fs.get("n_output", 0)
+    lines.append(f"3-layer feature selection reduced **{n_in}** candidate features to **{n_out}** informative features.\n")
+    boruta = fs.get("boruta_confirmed", [])
+    if boruta:
+        lines.append(f"**Boruta Confirmed ({len(boruta)}):** {', '.join(boruta[:15])}" + (f" (+{len(boruta)-15} more)" if len(boruta) > 15 else ""))
+    tentative = fs.get("boruta_tentative", [])
+    if tentative:
+        lines.append(f"\n**Boruta Tentative ({len(tentative)}):** {', '.join(tentative[:10])}")
+    mrmr = fs.get("mrmr_selected", [])
+    if mrmr:
+        lines.append(f"\n**mRMR Selected ({len(mrmr)}):** {', '.join(mrmr[:15])}")
+    mc = fs.get("method_contributions", {})
+    if mc:
+        lines.append("\n**Method Contributions:**\n")
+        lines.append("| Method | Features Selected |")
+        lines.append("|--------|-------------------|")
+        for method, count in mc.items():
+            lines.append(f"| {method} | {count} |")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _build_recursive_predictions_section(profile: dict[str, Any]) -> str:
+    """Section 38: Recursive Day-by-Day Predictions."""
+    ext = profile.get("extended_models", {})
+    rp = ext.get("recursive_predictions", {})
+    if not rp.get("available"):
+        return "*Recursive day-by-day prediction data not available.*\n"
+    lines: list[str] = []
+    lines.append("Autoregressive chaining: each day's prediction feeds as input to the next day's model.\n")
+    n_days = rp.get("n_days_predicted", 0)
+    method = rp.get("method", "recursive_chaining")
+    lines.append(f"**Days predicted:** {n_days}")
+    lines.append(f"**Method:** {method}\n")
+    if rp.get("confidence_decay"):
+        lines.append(f"**Confidence decay:** Bands widen by approximately {rp.get('confidence_decay_rate', 'N/A')} per step\n")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def _build_fallback_report(
     profile: dict[str, Any],
     tier: ReportTier = ReportTier.PREMIUM,
@@ -4442,6 +4545,10 @@ def _build_fallback_report(
         2032: ("32. Cross-Asset Sector Rotation Signals", _build_cross_asset_signals_section(profile)),
         2033: ("33. Upcoming Events & Uncertainty Calendar", _build_event_calendar_section(profile)),
         2034: ("34. Predicted Regime Shifts", _build_predicted_regime_shifts_section(profile)),
+        2035: ("35. Behavioral Finance Signals", _build_behavioral_signals_section(profile)),
+        2036: ("36. Time-Series Complexity Analysis", _build_complexity_signals_section(profile)),
+        2037: ("37. Feature Selection Results", _build_feature_selection_section(profile)),
+        2038: ("38. Recursive Day-by-Day Predictions", _build_recursive_predictions_section(profile)),
         22: ("22. Appendix & Methodology", _build_appendix(profile)),
     }
 

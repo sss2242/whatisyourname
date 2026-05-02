@@ -1430,6 +1430,41 @@ def run_stage3(state: PipelineState) -> None:
         else:
             profile["product_catalysts"] = {"available": False}
 
+        # 11b. behavioral signals
+        try:
+            _beh_cols = [c for c in cache.columns if c.startswith("anchoring_") or c.startswith("disposition_") or c.startswith("attention_") or c.startswith("lottery_")]
+            if _beh_cols:
+                _latest = cache.iloc[-1]
+                profile["behavioral_signals"] = {
+                    "available": True,
+                    "anchoring_52w_high": float(_latest.get("anchoring_52w_high", 0) or 0),
+                    "anchoring_52w_low": float(_latest.get("anchoring_52w_low", 0) or 0),
+                    "disposition_effect_proxy": float(_latest.get("disposition_effect_proxy", 0) or 0),
+                    "attention_spike": int(_latest.get("attention_spike", 0) or 0),
+                    "lottery_characteristics": float(_latest.get("lottery_characteristics", 0) or 0),
+                }
+            else:
+                profile["behavioral_signals"] = {"available": False}
+        except Exception:
+            profile["behavioral_signals"] = {"available": False}
+
+        # 11c. complexity signals
+        try:
+            _cpx_cols = [c for c in cache.columns if c.startswith("sample_entropy") or c.startswith("perm_entropy") or c.startswith("lz_") or c.startswith("approx_entropy")]
+            if _cpx_cols:
+                _latest = cache.iloc[-1]
+                profile["complexity_signals"] = {
+                    "available": True,
+                    "sample_entropy_21d": float(_latest.get("sample_entropy_21d", 0) or 0),
+                    "perm_entropy_21d": float(_latest.get("perm_entropy_21d", 0) or 0),
+                    "lz_complexity": float(_latest.get("lz_complexity", 0) or 0),
+                    "approx_entropy_price": float(_latest.get("approx_entropy_price", 0) or 0),
+                }
+            else:
+                profile["complexity_signals"] = {"available": False}
+        except Exception:
+            profile["complexity_signals"] = {"available": False}
+
         # 12. product_segments
         _seg = state.seg_result
         if _seg and _seg.get("n_segments", 0) >= 2:
