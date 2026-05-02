@@ -2654,16 +2654,26 @@ def run_prediction_aggregation(
                 var_name, h_label, conformal_result,
             )
             if used_conformal:
-                lower, upper = conf_lower, conf_upper
+                # Re-center conformal bounds on the ensemble point forecast.
+                # The conformal WIDTH is valid (calibrated from residuals),
+                # but the CENTER is stale -- it reflects the raw forward-pass
+                # forecast before B1/B2/B3/C2 ensemble adjustments shifted
+                # the point.  Preserving the half-width and moving the center
+                # ensures lower_ci <= point_forecast <= upper_ci always holds.
+                conf_half_width = (conf_upper - conf_lower) / 2.0
+                if not math.isnan(point):
+                    lower = point - conf_half_width
+                    upper = point + conf_half_width
+                else:
+                    lower, upper = conf_lower, conf_upper
                 interval_source = "conformal"
                 # Still apply survival widening on top of conformal.
                 if survival_adjusted:
                     surv_p = max(0.0, min(1.0, surv_prob))
                     risk_factor = 1.0 + (1.0 - surv_p) * survival_risk_multiplier
-                    mid = (lower + upper) / 2.0
-                    half_width = (upper - lower) / 2.0
-                    lower = mid - half_width * risk_factor
-                    upper = mid + half_width * risk_factor
+                    half_width = conf_half_width * risk_factor
+                    lower = point - half_width
+                    upper = point + half_width
             else:
                 # Fallback to RMSE-based bands.
                 lower, upper = compute_uncertainty_bands(
