@@ -91,6 +91,9 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
 
     from operator1.secrets_loader import load_secrets
     state._secrets = load_secrets()
+
+    # Parse end date
+    end_dt = datetime.strptime(state.end_date, "%Y-%m-%d").date()
     start_dt = end_dt - timedelta(days=int(state.years * 365))
     logger.info("Window: %s to %s (%.1f years)", start_dt, end_dt, state.years)
 
