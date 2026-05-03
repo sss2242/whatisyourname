@@ -3693,6 +3693,10 @@ class ForwardPassResult:
     n_break_resets: int = 0  # structural break model resets (Synergy 2)
     pid_summary: dict[str, Any] = field(default_factory=dict)  # PID controller state
     conformal_calibrator: Any = None  # Trained ConformalCalibrator from the forward pass
+    # Inline feature importance extracted while model objects are still alive.
+    # Survives pickle serialization (plain dict of dicts).
+    # {variable: {"top_drivers": [{"feature": str, "importance": float, "direction": str}], "method": str}}
+    shap_inline: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _init_model_wrappers(
@@ -4118,6 +4122,65 @@ def run_forward_pass(
         logger.info(
             "Forward pass: %d structural break model resets performed",
             _n_break_resets,
+        )
+
+    # ---- SHAP inline: extract feature importance while models are alive ----
+    # These survive pickle serialization (plain dicts), unlike model objects.
+    _shap_inline: dict[str, dict[str, Any]] = {}
+    for var_name, wrappers in model_bank.items():
+        wrapper = wrappers[0] if wrappers else None
+        if wrapper is None:
+            continue
+        try:
+            if isinstance(wrapper, TreeWrapper) and wrapper._fitted and wrapper._model_obj is not None:
+                model_obj = wrapper._model_obj
+                feat_cols = wrapper._feature_cols
+                if hasattr(model_obj, "feature_importances_") and feat_cols:
+                    importances = model_obj.feature_importances_
+                    pairs = sorted(
+                        zip(feat_cols, importances),
+                        key=lambda x: -abs(x[1]),
+                    )[:10]
+                    _shap_inline[var_name] = {
+                        "top_drivers": [
+                            {
+                                "feature": f,
+                                "importance": round(float(imp), 6),
+                                "direction": "positive" if imp > 0 else "mixed",
+                            }
+                            for f, imp in pairs
+                            if imp > 0
+                        ],
+                        "method": "tree_feature_importances",
+                        "model_type": getattr(model_obj, "__class__", type(model_obj)).__name__,
+                    }
+                elif hasattr(model_obj, "coef_"):
+                    coefs = model_obj.coef_
+                    if hasattr(coefs, "__len__") and feat_cols:
+                        pairs = sorted(
+                            zip(feat_cols, coefs),
+                            key=lambda x: -abs(x[1]),
+                        )[:10]
+                        _shap_inline[var_name] = {
+                            "top_drivers": [
+                                {
+                                    "feature": f,
+                                    "importance": round(float(abs(c)), 6),
+                                    "direction": "positive" if c > 0 else "negative",
+                                }
+                                for f, c in pairs
+                                if abs(c) > 1e-10
+                            ],
+                            "method": "linear_coefficients",
+                            "model_type": type(model_obj).__name__,
+                        }
+        except Exception:
+            pass  # Best-effort extraction -- don't break the forward pass
+    if _shap_inline:
+        result.shap_inline = _shap_inline
+        logger.info(
+            "SHAP inline: extracted feature importance for %d/%d variables",
+            len(_shap_inline), len(model_bank),
         )
 
     # Summary

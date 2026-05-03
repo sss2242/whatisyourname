@@ -572,3 +572,204 @@ def run_recursive_predictions(
     )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Forecast-based fallback (Fix 10: works without fitted model objects)
+# ---------------------------------------------------------------------------
+
+
+def _interpolate_horizon(
+    forecasts_for_var: dict[str, float],
+    day: int,
+) -> float | None:
+    """Interpolate a point prediction for an arbitrary day from known horizons.
+
+    Uses linear interpolation between the two nearest horizon anchors.
+    Known horizons: 1d, 5d, 21d, 63d, 252d.
+    """
+    # Build sorted list of (horizon_days, value) from available horizons
+    horizon_map = {"1d": 1, "5d": 5, "21d": 21, "63d": 63, "252d": 252}
+    points: list[tuple[int, float]] = []
+    for label, h_days in horizon_map.items():
+        val = forecasts_for_var.get(label)
+        if val is not None:
+            try:
+                points.append((h_days, float(val)))
+            except (TypeError, ValueError):
+                pass
+
+    if not points:
+        return None
+
+    points.sort(key=lambda x: x[0])
+
+    # Clamp to nearest endpoint if day is outside range
+    if day <= points[0][0]:
+        return points[0][1]
+    if day >= points[-1][0]:
+        return points[-1][1]
+
+    # Find bracketing pair and interpolate
+    for i in range(len(points) - 1):
+        d0, v0 = points[i]
+        d1, v1 = points[i + 1]
+        if d0 <= day <= d1:
+            w = (day - d0) / (d1 - d0)
+            return v0 * (1 - w) + v1 * w
+
+    return points[-1][1]
+
+
+def run_recursive_from_forecasts(
+    cache: pd.DataFrame,
+    forecasts: dict[str, dict[str, float]],
+    *,
+    horizon_days: int = 252,
+    snapshot_days: dict[str, int] | None = None,
+    transition_matrix: np.ndarray | None = None,
+    regime_order: list[str] | None = None,
+    random_state: int = 42,
+) -> RecursivePredictionResult:
+    """Forecast-based recursive predictions (no fitted model objects needed).
+
+    Interpolates between known forecast horizons (1d/5d/21d/63d/252d) and
+    applies sqrt(t) confidence decay + MC regime drift. Produces the same
+    RecursivePredictionResult shape as the model-based path.
+
+    This is the fallback for staged pipeline mode where model_states are
+    lost to pickle serialization between sub-stages (Fix 10).
+
+    Parameters
+    ----------
+    cache:
+        Daily cache up to reference date.
+    forecasts:
+        ``{variable: {horizon_label: value}}`` from ForecastResult.
+    horizon_days:
+        Maximum number of days to project.
+    snapshot_days:
+        Which days to extract as horizon snapshots.
+    transition_matrix:
+        HMM transition matrix from Monte Carlo.
+    regime_order:
+        Ordered regime labels matching transition_matrix rows.
+    random_state:
+        Random seed for regime sampling.
+    """
+    if cache is None or cache.empty or not forecasts:
+        return RecursivePredictionResult(available=False)
+
+    if snapshot_days is None:
+        snapshot_days = dict(DEFAULT_SNAPSHOT_DAYS)
+
+    max_snap = max(snapshot_days.values()) if snapshot_days else 252
+    horizon_days = min(horizon_days, max_snap)
+
+    rng = np.random.default_rng(random_state)
+
+    # Identify variables with at least one horizon forecast
+    predictable_vars = [v for v in forecasts if forecasts[v]]
+    if not predictable_vars:
+        return RecursivePredictionResult(available=False)
+
+    # Current regime
+    current_regime = "unknown"
+    if "regime_label" in cache.columns and cache["regime_label"].notna().any():
+        current_regime = str(cache["regime_label"].dropna().iloc[-1])
+
+    # Estimate 1d conformal width from recent returns
+    conformal_width_1d = 1.0
+    if "close" in cache.columns:
+        close_vals = cache["close"].dropna().values
+        if len(close_vals) >= 30:
+            recent_returns = np.diff(close_vals[-30:]) / close_vals[-30:-1]
+            conformal_width_1d = float(np.std(recent_returns) * abs(close_vals[-1]))
+        elif len(close_vals) > 0:
+            conformal_width_1d = abs(float(close_vals[-1])) * 0.015
+
+    # Generate future dates
+    last_date = cache.index[-1]
+    next_date = pd.Timestamp(last_date) + pd.offsets.BDay(1)
+    future_dates = pd.bdate_range(start=next_date, periods=horizon_days)
+
+    # Trajectory storage
+    trajectory: dict[str, list[float]] = {v: [] for v in predictable_vars}
+    trajectory_dates: list[str] = []
+
+    # Snapshot collection
+    snapshots: dict[str, RecursiveSnapshot] = {}
+
+    # Per-step confidence decay: halves in ~60 steps
+    decay_rate = 0.012
+
+    for step in range(1, horizon_days + 1):
+        current_date = future_dates[step - 1]
+        step_date = current_date.strftime("%Y-%m-%d")
+
+        # Interpolate predictions for this day from known horizons
+        predicted: dict[str, float] = {}
+        for var in predictable_vars:
+            val = _interpolate_horizon(forecasts[var], step)
+            if val is not None:
+                predicted[var] = val
+
+        if not predicted:
+            break
+
+        # Evolve regime
+        current_regime = _evolve_regime(
+            current_regime, transition_matrix, regime_order, rng,
+        )
+
+        # Store trajectory
+        trajectory_dates.append(step_date)
+        for var in predictable_vars:
+            trajectory[var].append(predicted.get(var, float("nan")))
+
+        # Snapshot if this step matches a horizon
+        step_confidence = math.exp(-decay_rate * step)
+        for label, snap_day in snapshot_days.items():
+            if step == snap_day:
+                uncertainty: dict[str, tuple[float, float]] = {}
+                for var in predictable_vars:
+                    val = predicted.get(var, 0.0)
+                    if var == "close" and conformal_width_1d > 0:
+                        half_w = conformal_width_1d * math.sqrt(step)
+                        uncertainty[var] = (val - half_w, val + half_w)
+                    elif val != 0:
+                        rel_unc = 0.02 * math.sqrt(step)
+                        half_w = abs(val) * rel_unc
+                        uncertainty[var] = (val - half_w, val + half_w)
+                    else:
+                        uncertainty[var] = (0.0, 0.0)
+
+                snapshots[label] = RecursiveSnapshot(
+                    day=step,
+                    date=step_date,
+                    predictions=dict(predicted),
+                    uncertainty=uncertainty,
+                    regime=current_regime,
+                    cumulative_confidence=step_confidence,
+                )
+                logger.info(
+                    "Forecast-recursive snapshot '%s' (day %d): confidence=%.3f",
+                    label, step, step_confidence,
+                )
+
+    result = RecursivePredictionResult(
+        snapshots=snapshots,
+        full_trajectory=trajectory,
+        trajectory_dates=trajectory_dates,
+        method="forecast_interpolation",
+        total_steps=len(trajectory_dates),
+        confidence_decay_rate=decay_rate,
+        available=len(snapshots) > 0,
+    )
+
+    logger.info(
+        "Forecast-recursive predictions: %d steps, %d snapshots",
+        result.total_steps, len(result.snapshots),
+    )
+
+    return result
