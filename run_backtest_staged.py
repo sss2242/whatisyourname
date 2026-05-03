@@ -147,6 +147,16 @@ def find_resume_point(run_dir: str) -> str | None:
     if not rd.exists():
         return None
 
+    # First check our own progress file
+    progress = _load_progress(run_dir)
+    last_idx = progress.get("last_completed_idx")
+    if last_idx is not None and isinstance(last_idx, int):
+        next_idx = last_idx + 1
+        if next_idx < len(ALL_STAGES):
+            return ALL_STAGES[next_idx][0]
+        return None  # all done
+
+    # Fallback: check PipelineState checkpoints
     checkpoints = []
     for pkl in rd.glob("state_*.pkl"):
         sub = pkl.stem.replace("state_", "")
@@ -157,6 +167,78 @@ def find_resume_point(run_dir: str) -> str | None:
 
     checkpoints.sort(reverse=True)
     return checkpoints[0][1]
+
+
+# ---------------------------------------------------------------------------
+# Progress persistence (for self-restart pattern)
+# ---------------------------------------------------------------------------
+
+_PROGRESS_FILENAME = "staged_progress.json"
+
+
+def _load_progress(run_dir: str) -> dict:
+    """Load accumulated progress from prior self-restart invocations."""
+    path = Path(run_dir) / _PROGRESS_FILENAME
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_progress(run_dir: str, progress: dict) -> None:
+    """Persist progress to disk between self-restart invocations."""
+    rd = Path(run_dir)
+    rd.mkdir(parents=True, exist_ok=True)
+    progress["timestamp"] = datetime.now().isoformat()
+    with open(rd / _PROGRESS_FILENAME, "w") as f:
+        json.dump(progress, f, indent=2)
+
+
+def _print_summary(run_dir: str) -> None:
+    """Print accumulated results from all prior invocations."""
+    progress = _load_progress(run_dir)
+    stages = progress.get("stages", [])
+    total_elapsed = progress.get("total_elapsed", 0)
+    total = len(ALL_STAGES)
+    completed = sum(1 for s in stages if s["status"] == "done")
+    failed = [s for s in stages if s["status"] == "failed"]
+
+    print(_bold("  " + "=" * 60))
+    print(_bold("  BACKTEST SUMMARY"))
+    print(_bold("  " + "=" * 60))
+    print(f"  Stages completed: {completed}/{total}")
+    print(f"  Total time: {total_elapsed:.0f}s ({total_elapsed / 60:.1f} min)")
+    if failed:
+        print(f"  {_red('Failed at')}: {failed[-1]['stage']}")
+    elif completed >= total:
+        print(f"  {_green('Status')}: All stages complete")
+    else:
+        print(f"  {_yellow('Status')}: In progress ({total - completed} remaining)")
+    print()
+
+    if stages:
+        print(_bold("  Per-stage timing:"))
+        for r in stages:
+            icon = _green("+") if r["status"] == "done" else _red("X")
+            print(f"    {icon} {r['stage']:>8} | {r['elapsed']:>6.1f}s | {r['name']}")
+
+    # Also save the compiler results JSON
+    results_path = Path(run_dir) / "staged_compiler_results.json"
+    with open(results_path, "w") as f:
+        json.dump({
+            "market": progress.get("market", ""),
+            "company": progress.get("company", ""),
+            "end_date": progress.get("end_date", ""),
+            "total_stages": total,
+            "completed": completed,
+            "total_time_s": round(total_elapsed, 1),
+            "failed_stage": failed[-1]["stage"] if failed else None,
+            "stages": stages,
+            "timestamp": datetime.now().isoformat(),
+        }, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -218,105 +300,110 @@ Examples:
             return 1
         print(_yellow(f"  Starting from: {args.start_from}"))
 
-    # Run stages
+    # ------------------------------------------------------------------
+    # Self-restart architecture: run ONE sub-stage, save progress,
+    # then os.execv() to restart at the next sub-stage.
+    # This gives each sub-stage a fresh process timeout window.
+    # ------------------------------------------------------------------
+
     total = len(ALL_STAGES)
-    completed = start_idx
-    failed_stage = None
-    total_time = 0.0
 
-    results: list[dict] = []
+    if start_idx >= total:
+        print(_green("  All stages already completed."))
+        _print_summary(run_dir)
+        return 0
 
-    for i in range(start_idx, total):
-        stage_id, stage_name = ALL_STAGES[i]
+    # Load accumulated results from prior sub-stages
+    progress = _load_progress(run_dir)
 
-        # Status display
-        print()
-        print(_bold(f"  [{i + 1}/{total}] {_progress_bar(i, total)}"))
-        print(f"  {_cyan('RUNNING')} {_bold(stage_id)}: {stage_name}")
-        print(_dim(f"  Started: {datetime.now().strftime('%H:%M:%S')}"))
+    # Run ONE sub-stage
+    i = start_idx
+    stage_id, stage_name = ALL_STAGES[i]
 
-        success, elapsed = run_single_stage(
-            stage_id=stage_id,
-            stage_name=stage_name,
-            run_dir=run_dir,
-            market=args.market,
-            company=args.company,
-            end_date=args.end_date,
-            years=args.years,
-        )
-
-        total_time += elapsed
-
-        if success:
-            completed += 1
-            status = _green("DONE")
-            results.append({
-                "stage": stage_id,
-                "name": stage_name,
-                "status": "done",
-                "elapsed": round(elapsed, 1),
-            })
-        else:
-            status = _red("FAILED")
-            failed_stage = stage_id
-            results.append({
-                "stage": stage_id,
-                "name": stage_name,
-                "status": "failed",
-                "elapsed": round(elapsed, 1),
-            })
-
-        print(f"  {status} {stage_id}: {stage_name} ({elapsed:.1f}s)")
-
-        if not success:
-            print()
-            print(_red(f"  Stage {stage_id} failed after {elapsed:.1f}s"))
-            print(_yellow(f"  Resume with: python run_backtest_staged.py --resume --run-dir {run_dir}"))
-            break
-
-    # Summary
     print()
-    print(_bold("  " + "=" * 60))
-    print(_bold("  BACKTEST SUMMARY"))
-    print(_bold("  " + "=" * 60))
-    print(f"  Stages completed: {completed}/{total}")
-    print(f"  Total time: {total_time:.0f}s ({total_time / 60:.1f} min)")
-    if failed_stage:
-        print(f"  {_red('Failed at')}: {failed_stage}")
+    print(_bold(f"  [{i + 1}/{total}] {_progress_bar(i, total)}"))
+    print(f"  {_cyan('RUNNING')} {_bold(stage_id)}: {stage_name}")
+    print(_dim(f"  Started: {datetime.now().strftime('%H:%M:%S')}"))
+
+    success, elapsed = run_single_stage(
+        stage_id=stage_id,
+        stage_name=stage_name,
+        run_dir=run_dir,
+        market=args.market,
+        company=args.company,
+        end_date=args.end_date,
+        years=args.years,
+    )
+
+    # Save progress
+    stage_result = {
+        "stage": stage_id,
+        "name": stage_name,
+        "status": "done" if success else "failed",
+        "elapsed": round(elapsed, 1),
+    }
+    progress.setdefault("stages", []).append(stage_result)
+    progress["last_completed_idx"] = i if success else i - 1
+    progress["last_completed_id"] = stage_id if success else (ALL_STAGES[i - 1][0] if i > 0 else None)
+    progress["total_elapsed"] = round(
+        sum(s["elapsed"] for s in progress["stages"]), 1,
+    )
+    progress["market"] = args.market
+    progress["company"] = args.company
+    progress["end_date"] = args.end_date
+    progress["validate"] = args.validate
+    _save_progress(run_dir, progress)
+
+    if success:
+        print(f"  {_green('DONE')} {stage_id}: {stage_name} ({elapsed:.1f}s)")
     else:
-        print(f"  {_green('Status')}: All stages complete")
-    print()
-
-    # Show per-stage timing
-    print(_bold("  Per-stage timing:"))
-    for r in results:
-        icon = _green("+") if r["status"] == "done" else _red("X")
-        print(f"    {icon} {r['stage']:>8} | {r['elapsed']:>6.1f}s | {r['name']}")
-
-    # Save results
-    results_path = Path(run_dir) / "staged_compiler_results.json"
-    results_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(results_path, "w") as f:
-        json.dump({
-            "market": args.market,
-            "company": args.company,
-            "end_date": args.end_date,
-            "total_stages": total,
-            "completed": completed,
-            "total_time_s": round(total_time, 1),
-            "failed_stage": failed_stage,
-            "stages": results,
-            "timestamp": datetime.now().isoformat(),
-        }, f, indent=2)
-
-    # Validate if requested
-    if args.validate and not failed_stage:
+        print(f"  {_red('FAILED')} {stage_id}: {stage_name} ({elapsed:.1f}s)")
         print()
-        print(_bold("  Running validation..."))
-        cmd = [sys.executable, "backtest_runner.py", "--validate", "--run-dir", run_dir]
-        subprocess.run(cmd)
+        print(_red(f"  Stage {stage_id} failed after {elapsed:.1f}s"))
+        print(_yellow(f"  Resume: python run_backtest_staged.py --resume --run-dir {run_dir}"))
+        _print_summary(run_dir)
+        return 1
 
-    return 0 if not failed_stage else 1
+    # If there are more sub-stages, self-restart at the next one
+    next_idx = i + 1
+    if next_idx < total:
+        next_id = ALL_STAGES[next_idx][0]
+        print(_dim(f"  Self-restarting at sub-stage {next_id}..."))
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+        # Build command to re-execute ourselves at the next sub-stage
+        cmd = [
+            sys.executable, __file__,
+            "--market", args.market,
+            "--company", args.company,
+            "--end-date", args.end_date,
+            "--years", str(args.years),
+            "--run-dir", run_dir,
+            "--start-from", next_id,
+        ]
+        if args.validate:
+            cmd.append("--validate")
+
+        # Replace this process with a fresh invocation
+        os.execv(sys.executable, cmd)
+
+        # Fallback if os.execv returns (shouldn't happen on Linux)
+        result = subprocess.run(cmd)
+        return result.returncode
+    else:
+        # All stages done
+        print()
+        _print_summary(run_dir)
+
+        # Validate if requested
+        if args.validate:
+            print()
+            print(_bold("  Running validation..."))
+            cmd = [sys.executable, "backtest_runner.py", "--validate", "--run-dir", run_dir]
+            subprocess.run(cmd)
+
+        return 0
 
 
 if __name__ == "__main__":
