@@ -304,13 +304,20 @@ def run_6_5_aggregation(state: PipelineState) -> None:
 
 
 def run_6_6_shap(state: PipelineState) -> None:
-    """6.6: SHAP explainability (TreeExplainer / KernelExplainer)."""
+    """6.6: SHAP explainability (inline importance preferred, library fallback)."""
     logger.info("Sub-stage 6.6: SHAP explainability")
-    try:
-        from operator1.models.explainability import compute_shap_explanations
-        if state.pred_result is not None:
+
+    # Path A (preferred): Use inline feature importance from forward pass.
+    # This data was extracted while model objects were alive (before pickle)
+    # and stored as a plain dict on ForwardPassResult.shap_inline.
+    if (
+        state.forward_pass_result is not None
+        and getattr(state.forward_pass_result, "shap_inline", None)
+    ):
+        try:
+            from operator1.models.explainability import from_inline_importance
             _preds: dict[str, float] = {}
-            if hasattr(state.pred_result, "predictions"):
+            if state.pred_result is not None and hasattr(state.pred_result, "predictions"):
                 for var, hd in state.pred_result.predictions.items():
                     if isinstance(hd, dict):
                         hp = hd.get("1d")
@@ -318,6 +325,32 @@ def run_6_6_shap(state: PipelineState) -> None:
                             pf = getattr(hp, "point_forecast", None)
                             if pf is not None:
                                 _preds[var] = pf
+            state.shap_result = from_inline_importance(
+                state.forward_pass_result.shap_inline,
+                predictions=_preds,
+            )
+            if state.shap_result and state.shap_result.available:
+                logger.info(
+                    "SHAP from inline importance: %d variables",
+                    len(state.shap_result.explanations),
+                )
+                return
+        except Exception as exc:
+            logger.debug("Inline SHAP fallback failed: %s", exc)
+
+    # Path B (original): Use SHAP library with live model objects.
+    try:
+        from operator1.models.explainability import compute_shap_explanations
+        if state.pred_result is not None:
+            _preds_b: dict[str, float] = {}
+            if hasattr(state.pred_result, "predictions"):
+                for var, hd in state.pred_result.predictions.items():
+                    if isinstance(hd, dict):
+                        hp = hd.get("1d")
+                        if hp is not None:
+                            pf = getattr(hp, "point_forecast", None)
+                            if pf is not None:
+                                _preds_b[var] = pf
             _predict_fns: dict[str, Any] = {}
             if state.forward_pass_result is not None and hasattr(state.forward_pass_result, "model_states"):
                 for var, wrapper in state.forward_pass_result.model_states.items():
@@ -325,10 +358,10 @@ def run_6_6_shap(state: PipelineState) -> None:
                         _predict_fns[var] = wrapper.predict
             state.shap_result = compute_shap_explanations(
                 state.cache,
-                predictions=_preds,
+                predictions=_preds_b,
                 predict_fns=_predict_fns if _predict_fns else None,
             )
-            logger.info("SHAP explanations computed")
+            logger.info("SHAP explanations computed (library path)")
     except Exception as exc:
         logger.warning("SHAP failed: %s", exc)
 
@@ -443,41 +476,64 @@ def run_6_10_ohlc(state: PipelineState) -> None:
 def run_6_11_recursive_predictions(state: PipelineState) -> None:
     """6.11: Recursive day-by-day predictions.
 
-    Chains 1d predictions recursively to build multi-horizon forecasts.
-    Uses fitted model states from the forward pass and evolves regime
-    labels via the MC transition matrix.
+    Path A: Uses fitted model states from the forward pass (when alive).
+    Path B: Interpolates between forecast horizons (when model_states
+            are lost to pickle serialization in staged mode).
     """
     logger.info("Sub-stage 6.11: Recursive day-by-day predictions")
     cache = state.cache
+
+    # Extract transition matrix and regime order from MC result
+    transition_matrix = None
+    regime_order = None
+    if state.mc_result is not None:
+        transition_matrix = getattr(state.mc_result, "transition_matrix", None)
+        regime_order = getattr(state.mc_result, "regime_order", None)
+
     fp = state.forward_pass_result
-    if fp is None or not getattr(fp, "model_states", None):
-        logger.info("Skipping recursive predictions: no forward pass model states")
-        return
+    has_model_states = fp is not None and getattr(fp, "model_states", None)
 
-    try:
-        from operator1.models.recursive_aggregator import run_recursive_predictions
-
-        # Extract transition matrix and regime order from MC result
-        transition_matrix = None
-        regime_order = None
-        if state.mc_result is not None:
-            transition_matrix = getattr(state.mc_result, "transition_matrix", None)
-            regime_order = getattr(state.mc_result, "regime_order", None)
-
-        state.recursive_result = run_recursive_predictions(
-            cache=cache,
-            model_states=fp.model_states,
-            transition_matrix=transition_matrix,
-            regime_order=regime_order,
-        )
-        if state.recursive_result and state.recursive_result.available:
-            logger.info(
-                "Recursive predictions complete: %d steps, %d snapshots",
-                state.recursive_result.total_steps,
-                len(state.recursive_result.snapshots),
+    # Path A: model_states available (in-process or non-staged mode)
+    if has_model_states:
+        try:
+            from operator1.models.recursive_aggregator import run_recursive_predictions
+            state.recursive_result = run_recursive_predictions(
+                cache=cache,
+                model_states=fp.model_states,
+                transition_matrix=transition_matrix,
+                regime_order=regime_order,
             )
-    except Exception as exc:
-        logger.warning("Recursive predictions failed: %s", exc)
+            if state.recursive_result and state.recursive_result.available:
+                logger.info(
+                    "Recursive predictions complete: %d steps, %d snapshots",
+                    state.recursive_result.total_steps,
+                    len(state.recursive_result.snapshots),
+                )
+                return
+        except Exception as exc:
+            logger.warning("Recursive predictions (model path) failed: %s", exc)
+
+    # Path B: forecast-based interpolation (staged mode, model_states lost)
+    if state.forecast_result is not None and hasattr(state.forecast_result, "forecasts"):
+        try:
+            from operator1.models.recursive_aggregator import run_recursive_from_forecasts
+            state.recursive_result = run_recursive_from_forecasts(
+                cache=cache,
+                forecasts=state.forecast_result.forecasts,
+                transition_matrix=transition_matrix,
+                regime_order=regime_order,
+            )
+            if state.recursive_result and state.recursive_result.available:
+                logger.info(
+                    "Recursive predictions (forecast interpolation): %d steps, %d snapshots",
+                    state.recursive_result.total_steps,
+                    len(state.recursive_result.snapshots),
+                )
+                return
+        except Exception as exc:
+            logger.warning("Recursive predictions (forecast path) failed: %s", exc)
+
+    logger.info("Skipping recursive predictions: no model states or forecasts available")
 
 
 # Registry

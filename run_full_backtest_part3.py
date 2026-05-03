@@ -42,7 +42,10 @@ try:
     from operator1.models.copula import run_copula_analysis
     cop = run_copula_analysis(cache)
     results["copula"] = cop
-    logger.info("2/6 Copula: best=%s, tail=%.4f", getattr(cop,"best_copula","?"), getattr(cop,"lower_tail_dependence",0) if getattr(cop,"available",False) else 0)
+    _avg_td = 0.0
+    if getattr(cop, "available", False) and getattr(cop, "tail_dependence", None):
+        _avg_td = sum(cop.tail_dependence.values()) / max(len(cop.tail_dependence), 1)
+    logger.info("2/6 Copula: best=%s, avg_tail=%.4f", getattr(cop,"best_copula","?"), _avg_td)
 except Exception as e: logger.warning("Copula: %s", e)
 
 # ── 3. Conformal prediction ──

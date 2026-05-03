@@ -135,6 +135,120 @@ def _try_sobol(
         return None
 
 
+def _try_morris(
+    X: np.ndarray,
+    y: np.ndarray,
+    variable_names: list[str],
+    n_trajectories: int = 15,
+) -> tuple[dict[str, float], dict[str, float]] | None:
+    """Morris screening method (Morris 1991, Campolongo et al. 2007).
+
+    Needs only r*(p+1) samples where r=trajectories, p=parameters.
+    For 30 features with r=15: 15*31 = 465 samples (fits 502 rows).
+    Compare to Saltelli: N*(2D+2) = 512*(62) = 31,744 (way too many).
+
+    Returns (first_order_proxy, total_order_proxy) using mu_star and sigma.
+    mu_star (mean absolute elementary effect) is a ranking-equivalent
+    substitute for Sobol S1 indices -- sufficient for hierarchy nudging.
+    """
+    try:
+        from SALib.sample import morris as morris_sample
+        from SALib.analyze import morris as morris_analyze
+        from sklearn.ensemble import GradientBoostingRegressor
+    except ImportError:
+        logger.info("SALib.sample.morris not available")
+        return None
+
+    n_vars = X.shape[1]
+    if n_vars < 2 or len(y) < 50:
+        return None
+
+    # Cap trajectories to fit available data: r*(p+1) <= n_samples
+    max_r = max(4, len(y) // (n_vars + 1))
+    n_trajectories = min(n_trajectories, max_r)
+
+    if n_trajectories < 4:
+        return None
+
+    problem = {
+        "num_vars": n_vars,
+        "names": variable_names,
+        "bounds": [
+            [float(X[:, i].min()), float(X[:, i].max())]
+            for i in range(n_vars)
+        ],
+    }
+
+    # Sanitise bounds
+    for i, (lb, ub) in enumerate(problem["bounds"]):
+        if lb >= ub:
+            problem["bounds"][i] = [lb - 1.0, ub + 1.0]
+
+    try:
+        # Train a surrogate model (same as Sobol path)
+        model = GradientBoostingRegressor(
+            n_estimators=50, max_depth=4, random_state=42,
+        )
+        model.fit(X, y)
+
+        # Generate Morris samples
+        X_morris = morris_sample.sample(
+            problem, N=n_trajectories, num_levels=4,
+        )
+
+        # Clip to training bounds
+        for i in range(n_vars):
+            X_morris[:, i] = np.clip(
+                X_morris[:, i],
+                problem["bounds"][i][0],
+                problem["bounds"][i][1],
+            )
+
+        # Evaluate surrogate on Morris samples
+        Y_morris = model.predict(X_morris)
+
+        # Analyse using Morris method
+        Si = morris_analyze.analyze(problem, X_morris, Y_morris)
+
+        # mu_star = mean absolute elementary effect (proxy for S1)
+        # sigma = std of elementary effects (proxy for ST / interaction)
+        mu_star = Si.get("mu_star", Si.get("mu_star_conf", None))
+        sigma = Si.get("sigma", None)
+
+        if mu_star is None:
+            return None
+
+        # Normalize mu_star to sum to 1 (like Sobol S1)
+        total_mu = float(np.sum(np.abs(mu_star)))
+        if total_mu <= 0:
+            return None
+
+        first_order = {
+            name: max(0.0, float(mu_star[i]) / total_mu)
+            for i, name in enumerate(variable_names)
+        }
+
+        if sigma is not None:
+            total_sigma = float(np.sum(np.abs(sigma)))
+            total_order = {
+                name: max(0.0, float(sigma[i]) / total_sigma) if total_sigma > 0 else first_order[name]
+                for i, name in enumerate(variable_names)
+            }
+        else:
+            total_order = dict(first_order)
+
+        logger.info(
+            "Morris screening: %d trajectories, %d variables, %d surrogate samples",
+            n_trajectories, n_vars, len(X_morris),
+        )
+
+        return first_order, total_order
+
+    except Exception as exc:
+        logger.warning("Morris screening failed: %s", exc)
+        return None
+
+
 def _permutation_importance(
     X: np.ndarray,
     y: np.ndarray,
@@ -226,17 +340,33 @@ def _run_sensitivity_impl(
     X = df[feature_variables].values
     y = df[target_variable].values
 
-    # Try Sobol first, fall back to permutation
-    sobol_result = _try_sobol(X, y, feature_variables)
+    # Cascade: Morris (cheap, fits small samples) -> Sobol (exact but data-hungry)
+    #          -> permutation importance (always works)
+    first_order = None
+    total_order = None
+    method = ""
 
-    if sobol_result is not None:
-        first_order, total_order = sobol_result
-        method = "sobol"
+    # Step 1: Try Morris screening (needs r*(p+1) samples, typically 300-500)
+    morris_result = _try_morris(X, y, feature_variables)
+    if morris_result is not None:
+        first_order, total_order = morris_result
+        method = "morris_screening"
+        logger.info("Sensitivity: Morris screening succeeded")
     else:
+        # Step 2: Try Sobol (needs N*(2D+2) samples, typically 1000+)
+        sobol_result = _try_sobol(X, y, feature_variables)
+        if sobol_result is not None:
+            first_order, total_order = sobol_result
+            method = "sobol"
+            logger.info("Sensitivity: Sobol analysis succeeded")
+
+    # Step 3: Permutation importance fallback (always works)
+    if first_order is None:
         perm_imp = _permutation_importance(X, y, feature_variables)
         first_order = perm_imp
         total_order = perm_imp
         method = "permutation_fallback"
+        logger.info("Sensitivity: using permutation importance fallback")
 
     # Aggregate by tier
     tier_importance: dict[str, float] = {}

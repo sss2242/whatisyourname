@@ -343,7 +343,7 @@ def generate_copula_correlated_samples(
     """
     rng = np.random.default_rng(random_seed)
 
-    if copula_result is None or not getattr(copula_result, "fitted", False):
+    if copula_result is None or not getattr(copula_result, "available", False):
         # Fallback: independent uniform samples
         return rng.random((n_samples, n_variables))
 

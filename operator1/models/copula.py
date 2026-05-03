@@ -300,6 +300,83 @@ def _estimate_joint_crisis_prob(
     return float(np.mean(all_below))
 
 
+def _fit_empirical_copula(
+    data: np.ndarray,
+    variable_names: list[str],
+) -> CopulaResult:
+    """Empirical copula using rank-based pseudo-observations + Kendall's tau.
+
+    Non-parametric fallback that works with any sample size >= 10.
+    Uses rank correlation (Kendall's tau) for dependence structure and
+    empirical quantile exceedance for lower tail dependence estimation.
+
+    References:
+        Genest & Favre (2007), Kendall tau inversion for copula parameters.
+        OpenTURNS uncertainty quantification (tau -> Clayton theta mapping).
+    """
+    n, d = data.shape
+
+    # Compute pairwise Kendall tau correlation
+    from scipy.stats import kendalltau
+
+    tau_matrix: dict[str, dict[str, float]] = {}
+    for i, vi in enumerate(variable_names):
+        tau_matrix[vi] = {}
+        for j, vj in enumerate(variable_names):
+            if i == j:
+                tau_matrix[vi][vj] = 1.0
+            elif j > i:
+                tau_val, _ = kendalltau(data[:, i], data[:, j])
+                tau_matrix[vi][vj] = round(float(tau_val) if np.isfinite(tau_val) else 0.0, 4)
+            else:
+                tau_matrix[vi][vj] = tau_matrix[vj][vi]
+
+    # Empirical lower tail dependence from quantile co-exceedance
+    q = 0.10
+    tail_dep: dict[str, float] = {}
+    for i in range(d):
+        for j in range(i + 1, d):
+            qi = np.quantile(data[:, i], q)
+            qj = np.quantile(data[:, j], q)
+            both_below = np.sum((data[:, i] <= qi) & (data[:, j] <= qj))
+            i_below = np.sum(data[:, i] <= qi)
+            dep = both_below / max(i_below, 1)
+            key = f"{variable_names[i]}|{variable_names[j]}"
+            tail_dep[key] = round(float(dep), 4)
+
+    # Joint crisis probability
+    joint_crisis = _estimate_joint_crisis_prob(data, variable_names)
+
+    # Infer best copula type from tau distribution
+    mean_tau = np.mean([
+        tau_matrix[vi][vj]
+        for i, vi in enumerate(variable_names)
+        for j, vj in enumerate(variable_names)
+        if i < j
+    ]) if d > 1 else 0.0
+
+    # If mean tau is negative (lower tail clustering), Clayton is implied
+    if mean_tau > 0:
+        # Convert tau to Clayton theta: theta = 2*tau/(1-tau)
+        clayton_theta = max(0.01, 2 * mean_tau / (1 - mean_tau)) if mean_tau < 1.0 else 10.0
+        best_type = f"empirical_clayton_implied(theta={clayton_theta:.2f})"
+    else:
+        best_type = "empirical_kendall"
+
+    logger.info(
+        "Empirical copula: %d variables, %d observations, mean_tau=%.3f, type=%s",
+        d, n, mean_tau, best_type,
+    )
+
+    return CopulaResult(
+        copula_correlation=tau_matrix,
+        tail_dependence=tail_dep,
+        joint_crisis_probability=round(joint_crisis, 4),
+        best_copula=best_type,
+        aic_scores={"empirical": 0.0},
+    )
+
+
 def run_copula_analysis(
     cache: pd.DataFrame,
     variables: list[str] | None = None,
@@ -375,43 +452,60 @@ def _run_copula_impl(
     except Exception:
         df = cache[variables].dropna()
 
-    if len(df) < 30:
-        return CopulaResult(available=False, error="Insufficient data for copula fitting")
+    if len(df) < 10:
+        return CopulaResult(available=False, error="Insufficient data for copula fitting (<10 rows)")
 
     data = df.values
     var_names = list(variables)
 
-    # Step 1: Transform to uniform marginals
-    uniform = _to_uniform_marginals(data)
+    # Sparse data path (10-30 rows): use empirical copula directly
+    if len(df) < 30:
+        logger.info(
+            "Copula: %d overlapping rows (<30), using empirical Kendall tau fallback",
+            len(df),
+        )
+        return _fit_empirical_copula(data, var_names)
 
-    # Step 2: Fit Gaussian copula (always available as baseline)
-    gaussian_corr = _fit_gaussian_copula(uniform)
+    # Full data path (>= 30 rows): try parametric first, empirical fallback
+    try:
+        # Step 1: Transform to uniform marginals
+        uniform = _to_uniform_marginals(data)
 
-    # Step 3: Model selection -- fit Student-t and Clayton, pick best by AIC
-    best_type, best_corr, aic_scores = _select_best_copula(uniform, gaussian_corr)
+        # Step 2: Fit Gaussian copula (always available as baseline)
+        gaussian_corr = _fit_gaussian_copula(uniform)
 
-    # Step 4: Estimate tail dependence
-    tail_dep = _estimate_tail_dependence(data, var_names)
+        # Step 3: Model selection -- fit Student-t and Clayton, pick best by AIC
+        best_type, best_corr, aic_scores = _select_best_copula(uniform, gaussian_corr)
 
-    # Step 5: Joint crisis probability
-    joint_crisis = _estimate_joint_crisis_prob(data, var_names)
+        # Step 4: Estimate tail dependence
+        tail_dep = _estimate_tail_dependence(data, var_names)
 
-    # Format correlation as nested dict
-    corr_dict: dict[str, dict[str, float]] = {}
-    for i, vi in enumerate(var_names):
-        corr_dict[vi] = {}
-        for j, vj in enumerate(var_names):
-            corr_dict[vi][vj] = round(float(best_corr[i, j]), 4)
+        # Step 5: Joint crisis probability
+        joint_crisis = _estimate_joint_crisis_prob(data, var_names)
 
-    logger.info(
-        "Copula analysis: %d variables, best=%s, joint crisis prob = %.4f",
-        len(var_names), best_type, joint_crisis,
-    )
+        # Format correlation as nested dict
+        corr_dict: dict[str, dict[str, float]] = {}
+        for i, vi in enumerate(var_names):
+            corr_dict[vi] = {}
+            for j, vj in enumerate(var_names):
+                corr_dict[vi][vj] = round(float(best_corr[i, j]), 4)
 
-    return CopulaResult(
-        copula_correlation=corr_dict,
-        tail_dependence=tail_dep,
-        joint_crisis_probability=round(joint_crisis, 4),
-        best_copula=best_type,
-        aic_scores=aic_scores,
-    )
+        logger.info(
+            "Copula analysis: %d variables, best=%s, joint crisis prob = %.4f",
+            len(var_names), best_type, joint_crisis,
+        )
+
+        return CopulaResult(
+            copula_correlation=corr_dict,
+            tail_dependence=tail_dep,
+            joint_crisis_probability=round(joint_crisis, 4),
+            best_copula=best_type,
+            aic_scores=aic_scores,
+        )
+    except Exception as exc:
+        # Parametric copula failed -- fall back to empirical
+        logger.warning(
+            "Parametric copula failed (%s), falling back to empirical Kendall tau",
+            exc,
+        )
+        return _fit_empirical_copula(data, var_names)

@@ -101,7 +101,108 @@ class SHAPResult:
 
 
 # ---------------------------------------------------------------------------
-# SHAP computation
+# Inline importance fallback (Fix 9: works without fitted model objects)
+# ---------------------------------------------------------------------------
+
+
+def from_inline_importance(
+    inline_data: dict[str, dict[str, Any]],
+    predictions: dict[str, float] | None = None,
+) -> "SHAPResult":
+    """Build a SHAPResult from forward-pass inline feature importance.
+
+    This is the primary path when running in staged mode where model
+    objects do not survive pickle serialization between sub-stages.
+    The forward pass extracts ``feature_importances_`` / ``coef_`` from
+    fitted models while they are still alive and stores them as a plain
+    dict on ``ForwardPassResult.shap_inline``.
+
+    Parameters
+    ----------
+    inline_data:
+        ``{variable: {"top_drivers": [{"feature", "importance", "direction"}], "method": str}}``
+    predictions:
+        Optional ``{variable: predicted_value}`` for richer explanations.
+
+    Returns
+    -------
+    SHAPResult with per-variable explanations and global importance.
+    """
+    result = SHAPResult()
+
+    if not inline_data:
+        result.error = "No inline importance data available"
+        return result
+
+    global_shap_sum: dict[str, float] = {}
+    global_shap_count: dict[str, int] = {}
+
+    for var, var_data in inline_data.items():
+        drivers = var_data.get("top_drivers", [])
+        method = var_data.get("method", "inline")
+        if not drivers:
+            continue
+
+        total_magnitude = sum(d.get("importance", 0.0) for d in drivers)
+
+        top_features: list[FeatureAttribution] = []
+        for d in drivers[:MAX_TOP_FEATURES]:
+            imp = d.get("importance", 0.0)
+            pct = (imp / total_magnitude * 100) if total_magnitude > 0 else 0.0
+            top_features.append(FeatureAttribution(
+                feature_name=d.get("feature", ""),
+                shap_value=imp,
+                feature_value=0.0,
+                direction=d.get("direction", "positive"),
+                contribution_pct=pct,
+            ))
+
+        # Build narrative from top 5 drivers
+        narrative_parts = []
+        for fa in top_features[:5]:
+            narrative_parts.append(f"{fa.shap_value:.4f} from {fa.feature_name}")
+        narrative = f"Prediction driven by: {'; '.join(narrative_parts)}" if narrative_parts else ""
+
+        predicted_value = predictions.get(var, 0.0) if predictions else 0.0
+
+        result.explanations[var] = PredictionExplanation(
+            variable=var,
+            predicted_value=predicted_value,
+            base_value=0.0,
+            top_features=top_features,
+            total_shap_magnitude=total_magnitude,
+            explainer_type=method,
+            n_features_used=len(drivers),
+            narrative=narrative,
+        )
+
+        # Accumulate global importance
+        for fa in top_features:
+            global_shap_sum[fa.feature_name] = global_shap_sum.get(fa.feature_name, 0.0) + fa.shap_value
+            global_shap_count[fa.feature_name] = global_shap_count.get(fa.feature_name, 0) + 1
+
+    # Compute mean importance for global ranking
+    for feat in global_shap_sum:
+        count = global_shap_count.get(feat, 1)
+        result.global_importance[feat] = global_shap_sum[feat] / count
+
+    result.global_importance = dict(
+        sorted(result.global_importance.items(), key=lambda x: -x[1])
+    )
+
+    result.available = len(result.explanations) > 0
+
+    logger.info(
+        "SHAP from inline importance: %d variables explained, method=%s",
+        len(result.explanations),
+        next(iter(inline_data.values()), {}).get("method", "unknown") if inline_data else "none",
+    )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# SHAP computation (original library-based path)
 # ---------------------------------------------------------------------------
 
 
