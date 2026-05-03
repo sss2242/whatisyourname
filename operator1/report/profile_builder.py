@@ -1281,6 +1281,33 @@ def build_company_profile(
     if ext.get("genetic_optimizer"):
         profile.setdefault("genetic_optimizer", ext["genetic_optimizer"])
 
+    # ------------------------------------------------------------------
+    # Default keys: ensure all keys read by report_generator exist.
+    # These sections are normally injected by main.py / backtest_runner
+    # AFTER build_company_profile() returns, but if that post-injection
+    # step is skipped, the report should show "unavailable" not KeyError.
+    # ------------------------------------------------------------------
+    _DEFAULT_SECTIONS = [
+        "behavioral_signals", "complexity_signals", "conflict_risk",
+        "copula", "corporate_structure", "cross_asset_signals",
+        "cycle_decomposition", "economic_plane", "enriched_survival_timeline",
+        "event_calendar_signals", "extended_models", "feature_selection",
+        "filing_calendar", "fuzzy_protection", "game_theory",
+        "granger_causality", "graph_risk", "hedge_fund",
+        "historical_analogs", "institutional_holders",
+        "institutional_ownership_analysis", "linked_conflict",
+        "macro_indicators", "market_buying_power", "model_diagnostics",
+        "multi_frequency", "ohlc_predictions", "options_signals",
+        "patterns", "pid_controller", "position_signal",
+        "predicted_regime_shifts", "prediction_log", "product_catalysts",
+        "product_segments", "scenario_analysis", "shap_explanations",
+        "signal_ic", "supply_chain_stress", "survival_episodes",
+        "synergies_applied", "technical_patterns", "transfer_entropy",
+        "unified_survival_system",
+    ]
+    for _key in _DEFAULT_SECTIONS:
+        profile.setdefault(_key, {"available": False})
+
     # Make JSON-safe
     profile = _json_serialisable(profile)
 

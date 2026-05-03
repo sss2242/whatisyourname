@@ -1,23 +1,20 @@
-"""T6.1 (cont.) -- Causality analysis and variable pruning.
+"""T6.1 (cont.) -- Causality analysis: Transfer Entropy.
 
-Provides Granger-causality testing and relationship pruning that
-feed into the forecasting models (T6.2).
+This module provides ``compute_transfer_entropy()`` for non-linear
+causal information flow measurement between variable pairs.
 
-**Granger Causality:**
-  Tests whether the past values of variable X improve the prediction
-  of variable Y beyond what Y's own past provides.  The result is a
-  pairwise causality matrix indicating statistically significant
-  (p < 0.05) causal links.
+.. deprecated::
+    ``compute_granger_causality()`` in this file is **dead code** --
+    the pipeline imports the active implementation from
+    ``operator1.models.granger_causality`` instead. The duplicate
+    here is retained only for backward compatibility with any
+    external callers. New code should use
+    ``from operator1.models.granger_causality import compute_granger_causality``.
 
-**Variable Pruning:**
-  Removes weakly connected variables from the modelling set to reduce
-  overfitting and speed up downstream VAR/LSTM fitting.  The pruning
-  threshold is configurable.
-
-**Tier-Aware Pruning (Sec 10.4):**
-  Variables belonging to Tier 1-2 (liquidity, solvency) are never
-  pruned regardless of their Granger score, because survival mode
-  logic depends on them unconditionally.
+**Transfer Entropy:**
+  Measures directed information flow using Shannon entropy.
+  Complementary to Granger causality -- captures non-linear
+  relationships that linear Granger F-tests miss.
 
 Output:
   - ``causality_matrix``: DataFrame of shape (n_vars, n_vars) where

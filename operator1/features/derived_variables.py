@@ -308,11 +308,13 @@ def _compute_profitability(df: pd.DataFrame) -> pd.DataFrame:
     """
     revenue = df.get("revenue", pd.Series(np.nan, index=df.index))
     gross_profit = df.get("gross_profit", pd.Series(np.nan, index=df.index))
-    # Prefer ebit; fall back to operating_income (canonical name used by
-    # many international data sources via canonical_translator).
-    ebit = df.get("ebit", pd.Series(np.nan, index=df.index))
+    # For margin calculations, prefer operating_income (which goes through
+    # the same frequency interpolation path as revenue) over ebit (which
+    # may be on a different scale -- e.g. raw quarterly vs daily-interpolated).
+    # Fall back to ebit only if operating_income is unavailable.
+    ebit = df.get("operating_income", pd.Series(np.nan, index=df.index))
     if ebit.isna().all():
-        ebit = df.get("operating_income", pd.Series(np.nan, index=df.index))
+        ebit = df.get("ebit", pd.Series(np.nan, index=df.index))
     net_income = df.get("net_income", pd.Series(np.nan, index=df.index))
     equity = df.get("total_equity", pd.Series(np.nan, index=df.index))
 

@@ -3694,6 +3694,25 @@ class ForwardPassResult:
     pid_summary: dict[str, Any] = field(default_factory=dict)  # PID controller state
     conformal_calibrator: Any = None  # Trained ConformalCalibrator from the forward pass
 
+    def __getstate__(self):
+        """Custom pickle: strip non-picklable model_states and calibrator."""
+        state = self.__dict__.copy()
+        state["model_states"] = {}  # Fitted sklearn/torch models are not picklable
+        state["conformal_calibrator"] = None  # May hold thread-local refs
+        # Preserve conformal residuals so downstream can rebuild the calibrator.
+        # ConformalPIDCalibrator stores scores in ._scores (private dict of lists),
+        # not .scores. Flatten all Mondrian buckets into a single list.
+        cal = self.__dict__.get("conformal_calibrator")
+        if cal is not None and hasattr(cal, "_scores"):
+            state["_conformal_residuals"] = [
+                s for bucket in cal._scores.values() for s in bucket
+            ]
+        return state
+
+    def __setstate__(self, state):
+        """Custom unpickle: restore with empty model_states."""
+        self.__dict__.update(state)
+
 
 def _init_model_wrappers(
     cache: pd.DataFrame,
@@ -4021,7 +4040,7 @@ def run_forward_pass(
 
             weighted_error = _loss * (tier_weight / 20.0) * obs_weight * sample_w
 
-            result.errors_by_tier[tier_num].append(weighted_error)
+            result.errors_by_tier.setdefault(tier_num, []).append(weighted_error)
             if regime_t not in result.errors_by_regime:
                 result.errors_by_regime[regime_t] = []
             result.errors_by_regime[regime_t].append(weighted_error)
