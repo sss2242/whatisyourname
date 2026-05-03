@@ -4036,7 +4036,7 @@ def run_forward_pass(
 
             weighted_error = _loss * (tier_weight / 20.0) * obs_weight * sample_w
 
-            result.errors_by_tier[tier_num].append(weighted_error)
+            result.errors_by_tier.setdefault(tier_num, []).append(weighted_error)
             if regime_t not in result.errors_by_regime:
                 result.errors_by_regime[regime_t] = []
             result.errors_by_regime[regime_t].append(weighted_error)
