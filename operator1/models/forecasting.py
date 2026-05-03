@@ -3699,10 +3699,14 @@ class ForwardPassResult:
         state = self.__dict__.copy()
         state["model_states"] = {}  # Fitted sklearn/torch models are not picklable
         state["conformal_calibrator"] = None  # May hold thread-local refs
-        # Preserve conformal residuals so downstream can rebuild the calibrator
+        # Preserve conformal residuals so downstream can rebuild the calibrator.
+        # ConformalPIDCalibrator stores scores in ._scores (private dict of lists),
+        # not .scores. Flatten all Mondrian buckets into a single list.
         cal = self.__dict__.get("conformal_calibrator")
-        if cal is not None and hasattr(cal, "scores"):
-            state["_conformal_residuals"] = list(cal.scores)
+        if cal is not None and hasattr(cal, "_scores"):
+            state["_conformal_residuals"] = [
+                s for bucket in cal._scores.values() for s in bucket
+            ]
         return state
 
     def __setstate__(self, state):
