@@ -182,8 +182,11 @@ if "survival_probability" in cache.columns:
 # Copula
 cop = results.get("copula")
 if cop:
-    logger.info("\nCopula: best=%s, lower_tail=%.4f, joint_crisis=%.4f",
-                getattr(cop,"best_copula","?"), getattr(cop,"lower_tail_dependence",0),
+    _avg_td4 = 0.0
+    if getattr(cop, "tail_dependence", None):
+        _avg_td4 = sum(cop.tail_dependence.values()) / max(len(cop.tail_dependence), 1)
+    logger.info("\nCopula: best=%s, avg_tail=%.4f, joint_crisis=%.4f",
+                getattr(cop,"best_copula","?"), _avg_td4,
                 getattr(cop,"joint_crisis_probability",0))
 
 # DTW

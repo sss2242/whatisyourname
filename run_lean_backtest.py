@@ -114,10 +114,13 @@ copula_result = None
 try:
     from operator1.models.copula import run_copula_analysis
     copula_result = run_copula_analysis(cache)
-    if copula_result and copula_result.fitted:
-        logger.info("Copula: best=%s, tail_dep=%.4f, joint_crisis=%.4f",
+    if copula_result and copula_result.available:
+        _avg_tail = 0.0
+        if copula_result.tail_dependence:
+            _avg_tail = sum(copula_result.tail_dependence.values()) / len(copula_result.tail_dependence)
+        logger.info("Copula: best=%s, avg_tail_dep=%.4f, joint_crisis=%.4f",
                      copula_result.best_copula,
-                     copula_result.lower_tail_dependence,
+                     _avg_tail,
                      copula_result.joint_crisis_probability)
 except Exception as e:
     logger.warning("Copula failed: %s", e)
