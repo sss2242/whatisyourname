@@ -521,18 +521,10 @@ class USEdgarClient:
     def get_income_statement(self, identifier: str) -> pd.DataFrame:
         """Fetch income statements with filing_date and report_date columns.
 
-        Primary: CompanyFacts API (fast, single HTTP call, always available).
-        Fallback: edgartools XBRL parsing (richer but can hang on large filings).
+        Primary: edgartools Company.income_statement() with filing metadata.
+        Fallback: sec-edgar-api raw XBRL companyfacts extraction.
         """
-        # Try CompanyFacts first (fast, reliable)
-        try:
-            df = self._fetch_statement_fallback(identifier, "income")
-            if not df.empty:
-                return df
-        except Exception as exc:
-            logger.warning("CompanyFacts income failed for %s: %s", identifier, exc)
-
-        # Fallback to edgartools XBRL parsing
+        # Try edgartools first
         try:
             df = self._fetch_statement_edgartools(identifier, "income")
             if df is not None and not df.empty:
@@ -540,17 +532,11 @@ class USEdgarClient:
         except Exception as exc:
             logger.warning("edgartools income_statement failed for %s: %s", identifier, exc)
 
-        return pd.DataFrame()
+        # Fallback to raw XBRL
+        return self._fetch_statement_fallback(identifier, "income")
 
     def get_balance_sheet(self, identifier: str) -> pd.DataFrame:
         """Fetch balance sheets with filing_date and report_date columns."""
-        try:
-            df = self._fetch_statement_fallback(identifier, "balance")
-            if not df.empty:
-                return df
-        except Exception as exc:
-            logger.warning("CompanyFacts balance failed for %s: %s", identifier, exc)
-
         try:
             df = self._fetch_statement_edgartools(identifier, "balance")
             if df is not None and not df.empty:
@@ -558,17 +544,10 @@ class USEdgarClient:
         except Exception as exc:
             logger.warning("edgartools balance_sheet failed for %s: %s", identifier, exc)
 
-        return pd.DataFrame()
+        return self._fetch_statement_fallback(identifier, "balance")
 
     def get_cashflow_statement(self, identifier: str) -> pd.DataFrame:
         """Fetch cash flow statements with filing_date and report_date columns."""
-        try:
-            df = self._fetch_statement_fallback(identifier, "cashflow")
-            if not df.empty:
-                return df
-        except Exception as exc:
-            logger.warning("CompanyFacts cashflow failed for %s: %s", identifier, exc)
-
         try:
             df = self._fetch_statement_edgartools(identifier, "cashflow")
             if df is not None and not df.empty:
@@ -576,7 +555,7 @@ class USEdgarClient:
         except Exception as exc:
             logger.warning("edgartools cashflow_statement failed for %s: %s", identifier, exc)
 
-        return pd.DataFrame()
+        return self._fetch_statement_fallback(identifier, "cashflow")
 
     # -- Segment / product data extraction -----------------------------------
 
