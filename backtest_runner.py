@@ -70,17 +70,27 @@ BacktestState = PipelineState  # backward compat alias
 # Stage 1: Data fetch + cache build + features
 # ---------------------------------------------------------------------------
 
-def run_stage1(state: PipelineState) -> None:
-    """Fetch data, build cache, compute features, survival, linked entities."""
+def run_stage1(state: PipelineState, substage: str = "all") -> None:
+    """Fetch data, build cache, compute features, survival, linked entities.
+
+    When substage is "all", runs everything (original behavior).
+    When substage is "1.1" through "1.6", runs only that portion and saves
+    a checkpoint so the next sub-stage can resume from disk.
+
+    Sub-stages:
+        1.1 -- Data fetch (PIT client, profile, holders, statements, OHLCV)
+        1.2 -- Reconciliation + pivot + frequency separation + cache build
+        1.3 -- Macro + conflict + estimation + derived variables
+        1.4 -- Survival mode + hierarchy + fuzzy protection + FH
+        1.5 -- Entity discovery + graph risk + sentiment + catalysts
+        1.6 -- Adaptive calibration + enriched timeline + finalization
+    """
     logger.info("=" * 60)
-    logger.info("STAGE 1: Data Fetch + Cache Build + Features")
+    logger.info("STAGE 1: Data Fetch + Cache Build + Features (substage=%s)", substage)
     logger.info("=" * 60)
 
     from operator1.secrets_loader import load_secrets
     state._secrets = load_secrets()
-
-    # Parse end date
-    end_dt = datetime.strptime(state.end_date, "%Y-%m-%d").date()
     start_dt = end_dt - timedelta(days=int(state.years * 365))
     logger.info("Window: %s to %s (%.1f years)", start_dt, end_dt, state.years)
 
@@ -258,6 +268,12 @@ def run_stage1(state: PipelineState) -> None:
     state.balance_df = balance_df
     state.cashflow_df = cashflow_df
     state.quotes_df = quotes_df
+
+    # -- CHECKPOINT 1.1: Data fetch complete --
+    state.save("1.1")
+    logger.info("Checkpoint 1.1 saved (data fetch complete)")
+    if substage == "1.1":
+        return
 
     # Build cache
     if not quotes_df.empty:
@@ -584,6 +600,13 @@ def run_stage1(state: PipelineState) -> None:
     except Exception:
         pass
 
+    # -- CHECKPOINT 1.2: Cache built + macro + conflict --
+    state.cache = cache
+    state.save("1.2")
+    logger.info("Checkpoint 1.2 saved (cache built)")
+    if substage == "1.2":
+        return
+
     # Estimation
     # SIX proxy computation (Switzerland only -- must run BEFORE estimation)
     if state.market_id == "ch_six":
@@ -656,6 +679,13 @@ def run_stage1(state: PipelineState) -> None:
         cache = compute_institutional_flow(cache, insider_transactions=state.target_insiders)
     except Exception:
         pass
+
+    # -- CHECKPOINT 1.3: Estimation + features complete --
+    state.cache = cache
+    state.save("1.3")
+    logger.info("Checkpoint 1.3 saved (estimation + features)")
+    if substage == "1.3":
+        return
 
     # Survival mode
     from operator1.analysis.survival_mode import compute_company_survival_flag, compute_survival_probability
@@ -730,6 +760,13 @@ def run_stage1(state: PipelineState) -> None:
         cache = compute_vanity_score(cache)
     except Exception:
         pass
+
+    # -- CHECKPOINT 1.4: Survival + FH + vanity complete --
+    state.cache = cache
+    state.save("1.4")
+    logger.info("Checkpoint 1.4 saved (survival + health)")
+    if substage == "1.4":
+        return
 
     # LLM client for entity discovery
     from operator1.clients.llm_factory import create_llm_client
@@ -845,6 +882,13 @@ def run_stage1(state: PipelineState) -> None:
             }
         except Exception:
             pass
+
+    # -- CHECKPOINT 1.5: Entity discovery + sentiment complete --
+    state.cache = cache
+    state.save("1.5")
+    logger.info("Checkpoint 1.5 saved (entities + sentiment)")
+    if substage == "1.5":
+        return
 
     # Adaptive thresholds
     try:
@@ -1107,7 +1151,8 @@ def run_stage1(state: PipelineState) -> None:
         pass
 
     state.cache = cache
-    state.save("1")
+    state.save("1.6")
+    state.save("1")  # backward compat
     logger.info("STAGE 1 COMPLETE: %d rows x %d cols", len(cache), len(cache.columns))
 
 
@@ -2074,9 +2119,15 @@ Examples:
     # Stage 2: Temporal models via staged runner (stages 3-7, shared with main.py)
     #   Supports sub-stage specs: 3.1, 4.1, 5.4, 6.11, 7.4, etc.
     # Stage 3: Profile build + prediction extraction (backtest-specific)
+    # Stage 1 sub-stage IDs
+    _STAGE1_SUBSTAGES = {"1.1", "1.2", "1.3", "1.4", "1.5", "1.6"}
+
     if args.stage == "all":
         stages = ["1", "2", "3"]
     elif args.stage in ("1", "2", "3"):
+        stages = [args.stage]
+    elif args.stage in _STAGE1_SUBSTAGES:
+        # Stage 1 sub-stage: route to run_stage1 with substage param
         stages = [args.stage]
     else:
         # Sub-stage spec (e.g., "3.1", "4.1", "6.11", "3-6")
@@ -2084,13 +2135,25 @@ Examples:
         stages = [f"2:{args.stage}"]
 
     _STAGE_FUNCS = {
-        "1": lambda s: run_stage1(s),
+        "1": lambda s: run_stage1(s, substage="all"),
+        "1.1": lambda s: run_stage1(s, substage="1.1"),
+        "1.2": lambda s: run_stage1(s, substage="1.2"),
+        "1.3": lambda s: run_stage1(s, substage="1.3"),
+        "1.4": lambda s: run_stage1(s, substage="1.4"),
+        "1.5": lambda s: run_stage1(s, substage="1.5"),
+        "1.6": lambda s: run_stage1(s, substage="1.6"),
         "2": lambda s: run_stage2(s, "all"),
         "3": lambda s: run_stage3(s),
     }
     # Map stages to their dependency for state loading
     _STAGE_DEPS = {
         "1": None,
+        "1.1": None,
+        "1.2": "1.1",
+        "1.3": "1.2",
+        "1.4": "1.3",
+        "1.5": "1.4",
+        "1.6": "1.5",
         "2": "1",   # temporal models depend on Stage 1 (data fetch)
         "3": None,  # profile build loads latest checkpoint dynamically
     }
