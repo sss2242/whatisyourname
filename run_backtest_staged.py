@@ -28,13 +28,15 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 ALL_STAGES = [
-    # Backtest Stage 1: Data fetch + cache build + features (6 sub-stages)
-    ("1.1", "Data Fetch (PIT client, profile, holders, statements, OHLCV)"),
-    ("1.2", "Cache Build (reconciliation, pivot, merge, CompanyFacts, macro, conflict)"),
-    ("1.3", "Estimation + Features (SIX proxies, estimator, derived variables, institutional flow)"),
-    ("1.4", "Survival + Health (survival mode, hierarchy, fuzzy protection, FH, vanity)"),
-    ("1.5", "Entity Discovery + Sentiment (LLM entities, graph risk, game theory, sentiment, catalysts)"),
-    ("1.6", "Calibration + Finalization (adaptive params, enriched timeline, normalization)"),
+    # Backtest Stage 1: Data fetch + cache build + features (8 sub-stages)
+    ("1.1", "Profile + Company Search (PIT client, SEC EDGAR profile)"),
+    ("1.2", "Financial Statements (CompanyFacts API: income, balance, cashflow)"),
+    ("1.3", "OHLCV + Holders + Segments (yfinance, holders, product segments)"),
+    ("1.4", "Cache Build (reconciliation, pivot, merge, macro, conflict, estimation)"),
+    ("1.5", "Derived Variables + Survival (features, survival mode, hierarchy, FH)"),
+    ("1.6", "Entity Discovery + Sentiment (LLM entities, graph risk, sentiment)"),
+    ("1.7", "Adaptive Calibration (thresholds, model params, windows, signal IC)"),
+    ("1.8", "Enriched Timeline + Finalization (regime timeline, normalization)"),
     # Backtest Stage 2: Data preprocessing (frequency separation + reconciliation)
     ("2.1", "Frequency Separation (Bayesian + Chow-Lin/Denton)"),
     ("2.2", "Data Reconciliation (identity checks + dedup)"),

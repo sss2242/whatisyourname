@@ -148,29 +148,13 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     except Exception as exc:
         logger.debug("Supplement skipped: %s", exc)
 
-    # Holders
-    try:
-        if hasattr(pit_client, "get_holders"):
-            state.target_holders = pit_client.get_holders(identifier) or []
-    except Exception:
-        pass
-    try:
-        if hasattr(pit_client, "get_insider_transactions"):
-            state.target_insiders = pit_client.get_insider_transactions(identifier) or []
-    except Exception:
-        pass
+    # -- CHECKPOINT 1.1: Profile + company search complete --
+    state.save("1.1")
+    logger.info("Checkpoint 1.1 saved (profile + company search)")
+    if substage == "1.1":
+        return
 
-    # Product segment extraction (for product_metrics cache columns)
-    _seg_result: dict = {}
-    try:
-        if hasattr(pit_client, "extract_segment_data"):
-            _seg_result = pit_client.extract_segment_data(identifier) or {}
-            if _seg_result.get("n_segments", 0) >= 2:
-                logger.info("Segments: %d segments extracted", _seg_result["n_segments"])
-    except Exception as exc:
-        logger.debug("Segment extraction skipped: %s", exc)
-
-    # Fetch financial data (parallel)
+    # Fetch financial data (parallel) -- each download is a separate network call
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     income_df = balance_df = cashflow_df = quotes_df = pd.DataFrame()
@@ -193,18 +177,6 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
                 logger.info("%s: %d rows", lbl.capitalize(), len(r))
             except Exception as exc:
                 logger.warning("%s failed: %s", lbl, exc)
-
-    # OHLCV fallback
-    state.ohlcv_source_label = market_info.pit_api_name
-    if quotes_df.empty and ticker:
-        try:
-            from operator1.clients.ohlcv_provider import fetch_ohlcv
-            quotes_df = fetch_ohlcv(ticker, market_id=state.market_id)
-            if not quotes_df.empty:
-                state.ohlcv_source_label = "yfinance"
-                logger.info("OHLCV from yfinance: %d rows", len(quotes_df))
-        except Exception as exc:
-            logger.warning("OHLCV fallback failed: %s", exc)
 
     # Data reconciliation
     try:
@@ -272,10 +244,51 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     state.cashflow_df = cashflow_df
     state.quotes_df = quotes_df
 
-    # -- CHECKPOINT 1.1: Data fetch complete --
-    state.save("1.1")
-    logger.info("Checkpoint 1.1 saved (data fetch complete)")
-    if substage == "1.1":
+    # -- CHECKPOINT 1.2: Financial statements fetched --
+    state.save("1.2")
+    logger.info("Checkpoint 1.2 saved (financial statements)")
+    if substage == "1.2":
+        return
+
+    # OHLCV fallback + holders + segments
+    state.ohlcv_source_label = market_info.pit_api_name
+    if quotes_df.empty and ticker:
+        try:
+            from operator1.clients.ohlcv_provider import fetch_ohlcv
+            quotes_df = fetch_ohlcv(ticker, market_id=state.market_id)
+            if not quotes_df.empty:
+                state.ohlcv_source_label = "yfinance"
+                logger.info("OHLCV from yfinance: %d rows", len(quotes_df))
+        except Exception as exc:
+            logger.warning("OHLCV fallback failed: %s", exc)
+
+    # Holders
+    try:
+        if hasattr(pit_client, "get_holders"):
+            state.target_holders = pit_client.get_holders(identifier) or []
+    except Exception:
+        pass
+    try:
+        if hasattr(pit_client, "get_insider_transactions"):
+            state.target_insiders = pit_client.get_insider_transactions(identifier) or []
+    except Exception:
+        pass
+
+    # Product segment extraction
+    _seg_result: dict = {}
+    try:
+        if hasattr(pit_client, "extract_segment_data"):
+            _seg_result = pit_client.extract_segment_data(identifier) or {}
+            if _seg_result.get("n_segments", 0) >= 2:
+                logger.info("Segments: %d segments extracted", _seg_result["n_segments"])
+    except Exception as exc:
+        logger.debug("Segment extraction skipped: %s", exc)
+
+    # -- CHECKPOINT 1.3: OHLCV + holders + segments complete --
+    state.quotes_df = quotes_df
+    state.save("1.3")
+    logger.info("Checkpoint 1.3 saved (OHLCV + holders + segments)")
+    if substage == "1.3":
         return
 
     # Build cache
@@ -603,11 +616,11 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     except Exception:
         pass
 
-    # -- CHECKPOINT 1.2: Cache built + macro + conflict --
+    # -- CHECKPOINT 1.4: Cache built + macro + conflict --
     state.cache = cache
-    state.save("1.2")
-    logger.info("Checkpoint 1.2 saved (cache built)")
-    if substage == "1.2":
+    state.save("1.4")
+    logger.info("Checkpoint 1.4 saved (cache built)")
+    if substage == "1.4":
         return
 
     # Estimation
@@ -683,12 +696,7 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     except Exception:
         pass
 
-    # -- CHECKPOINT 1.3: Estimation + features complete --
-    state.cache = cache
-    state.save("1.3")
-    logger.info("Checkpoint 1.3 saved (estimation + features)")
-    if substage == "1.3":
-        return
+    # (Estimation + features done, continuing to survival...)
 
     # Survival mode
     from operator1.analysis.survival_mode import compute_company_survival_flag, compute_survival_probability
@@ -764,11 +772,11 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     except Exception:
         pass
 
-    # -- CHECKPOINT 1.4: Survival + FH + vanity complete --
+    # -- CHECKPOINT 1.5: Derived vars + survival + FH + vanity complete --
     state.cache = cache
-    state.save("1.4")
-    logger.info("Checkpoint 1.4 saved (survival + health)")
-    if substage == "1.4":
+    state.save("1.5")
+    logger.info("Checkpoint 1.5 saved (features + survival + health)")
+    if substage == "1.5":
         return
 
     # LLM client for entity discovery
@@ -886,11 +894,11 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         except Exception:
             pass
 
-    # -- CHECKPOINT 1.5: Entity discovery + sentiment complete --
+    # -- CHECKPOINT 1.6: Entity discovery + sentiment complete --
     state.cache = cache
-    state.save("1.5")
-    logger.info("Checkpoint 1.5 saved (entities + sentiment)")
-    if substage == "1.5":
+    state.save("1.6")
+    logger.info("Checkpoint 1.6 saved (entities + sentiment)")
+    if substage == "1.6":
         return
 
     # Adaptive thresholds
@@ -988,6 +996,13 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         )
     except Exception as exc:
         logger.debug("Prediction log fill skipped: %s", exc)
+
+    # -- CHECKPOINT 1.7: Adaptive calibration + Signal IC complete --
+    state.cache = cache
+    state.save("1.7")
+    logger.info("Checkpoint 1.7 saved (adaptive calibration)")
+    if substage == "1.7":
+        return
 
     # Enriched survival timeline
     try:
@@ -1154,7 +1169,7 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         pass
 
     state.cache = cache
-    state.save("1.6")
+    state.save("1.8")
     state.save("1")  # backward compat
     logger.info("STAGE 1 COMPLETE: %d rows x %d cols", len(cache), len(cache.columns))
 
@@ -2123,7 +2138,7 @@ Examples:
     #   Supports sub-stage specs: 3.1, 4.1, 5.4, 6.11, 7.4, etc.
     # Stage 3: Profile build + prediction extraction (backtest-specific)
     # Stage 1 sub-stage IDs
-    _STAGE1_SUBSTAGES = {"1.1", "1.2", "1.3", "1.4", "1.5", "1.6"}
+    _STAGE1_SUBSTAGES = {"1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8"}
 
     if args.stage == "all":
         stages = ["1", "2", "3"]
@@ -2145,6 +2160,8 @@ Examples:
         "1.4": lambda s: run_stage1(s, substage="1.4"),
         "1.5": lambda s: run_stage1(s, substage="1.5"),
         "1.6": lambda s: run_stage1(s, substage="1.6"),
+        "1.7": lambda s: run_stage1(s, substage="1.7"),
+        "1.8": lambda s: run_stage1(s, substage="1.8"),
         "2": lambda s: run_stage2(s, "all"),
         "3": lambda s: run_stage3(s),
     }
@@ -2157,6 +2174,8 @@ Examples:
         "1.4": "1.3",
         "1.5": "1.4",
         "1.6": "1.5",
+        "1.7": "1.6",
+        "1.8": "1.7",
         "2": "1",   # temporal models depend on Stage 1 (data fetch)
         "3": None,  # profile build loads latest checkpoint dynamically
     }
