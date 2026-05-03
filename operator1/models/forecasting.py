@@ -3694,6 +3694,21 @@ class ForwardPassResult:
     pid_summary: dict[str, Any] = field(default_factory=dict)  # PID controller state
     conformal_calibrator: Any = None  # Trained ConformalCalibrator from the forward pass
 
+    def __getstate__(self):
+        """Custom pickle: strip non-picklable model_states and calibrator."""
+        state = self.__dict__.copy()
+        state["model_states"] = {}  # Fitted sklearn/torch models are not picklable
+        state["conformal_calibrator"] = None  # May hold thread-local refs
+        # Preserve conformal residuals so downstream can rebuild the calibrator
+        cal = self.__dict__.get("conformal_calibrator")
+        if cal is not None and hasattr(cal, "scores"):
+            state["_conformal_residuals"] = list(cal.scores)
+        return state
+
+    def __setstate__(self, state):
+        """Custom unpickle: restore with empty model_states."""
+        self.__dict__.update(state)
+
 
 def _init_model_wrappers(
     cache: pd.DataFrame,

@@ -383,6 +383,7 @@ def run_stage1(state: PipelineState) -> None:
     # the SEC CompanyFacts API which provides ALL reported XBRL facts.
     _critical_balance_fields = {
         "current_assets": ["AssetsCurrent"],
+        "current_liabilities": ["LiabilitiesCurrent"],
         "cash_and_equivalents": [
             "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
             "CashAndCashEquivalentsAtCarryingValue",
@@ -390,6 +391,10 @@ def run_stage1(state: PipelineState) -> None:
         ],
         "total_liabilities": ["Liabilities"],
         "retained_earnings": ["RetainedEarningsAccumulatedDeficit"],
+        "short_term_debt": ["ShortTermBorrowings", "DebtCurrent", "CommercialPaper"],
+        "receivables": ["AccountsReceivableNetCurrent"],
+        "inventory": ["InventoryNet"],
+        "payables": ["AccountsPayableCurrent"],
     }
     # P2/P3/P9: Extend CompanyFacts fallback to income statement fields.
     # Missing net_income/EPS disables PE anchor, full Piotroski, and HF

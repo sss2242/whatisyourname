@@ -316,9 +316,9 @@ def compute_survival_probability(
     ]
 
     for col, threshold, direction in trigger_configs:
-        if col not in df.columns:
-            continue
-        s = df[col].fillna(threshold)  # neutral if missing
+        if col not in df.columns or df[col].isna().all():
+            continue  # Skip entirely -- don't contribute 0.5 for missing data
+        s = df[col].copy()  # Preserve NaN; per-row NaN handled by max aggregation
 
         # Distance from threshold (positive = in distress direction)
         if direction == "below":
