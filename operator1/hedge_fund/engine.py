@@ -1076,6 +1076,7 @@ def _compute_position_signal(
     survival_controller: Any = None,
     forecast_result: Any = None,
     filing_calendar_result: Any = None,
+    mc_result: Any = None,
 ) -> PositionSignalResult:
     """Compute actionable position signal from thesis scorecard."""
     result = PositionSignalResult()
@@ -1334,7 +1335,7 @@ def run_hedge_fund_analysis(
     hf.scorecard = _build_scorecard(hf)
     hf.position = _compute_position_signal(
         hf, cache, signal_ic_result, survival_controller,
-        forecast_result, filing_calendar_result,
+        forecast_result, filing_calendar_result, mc_result,
     )
 
     # --- Advanced Methods (15 additional techniques) ---

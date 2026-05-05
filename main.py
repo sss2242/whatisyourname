@@ -2721,6 +2721,7 @@ Non-interactive examples:
         weights = _ps.weights
         regime_detector = _ps.regime_detector
         _economic_plane = _ps.economic_plane
+        _extra_vars = _ps.extra_vars
         # Stage 7 results (USS, retro, diagnostics, MF, HF)
         scenario_result = _ps.scenario_result
         survival_controller = _ps.survival_controller or survival_controller
@@ -2916,6 +2917,7 @@ Non-interactive examples:
 
         # Inject economic plane classification
         try:
+            from operator1.analysis.economic_planes import classify_economic_plane
             plane_info = classify_economic_plane(
                 sector=target_profile.get("sector"),
                 industry=target_profile.get("industry"),
@@ -3142,7 +3144,7 @@ Non-interactive examples:
             profile["institutional_holders"] = {"available": False}
 
         # Inject institutional ownership deep analysis (contagion + flow)
-        _inst_analysis: dict[str, Any] = {"available": False}
+        _inst_analysis = {"available": False}
         try:
             _has_contagion = contagion_result is not None and contagion_result.available
             _has_flow = "inst_flow_momentum" in cache.columns and cache["inst_flow_momentum"].notna().any()
