@@ -195,6 +195,16 @@ def run_7_4_0_resample_prep(state: PipelineState) -> None:
     _has_raw = any(df is not None and not df.empty for df in [income_df, balance_df, cashflow_df])
     _is_annual_only = is_annual_only_market(market_id)
 
+    if not _has_raw:
+        logger.warning(
+            "MULTI-FREQUENCY DEGRADED: No raw financial statement data available "
+            "(income_df, balance_df, cashflow_df are all empty). "
+            "MF pipeline will resample the daily cache instead of using actual "
+            "filing data. Financial ratios at Q/A/M/W frequencies will be "
+            "forward-filled interpolated values, NOT actual periodic filings. "
+            "Results are OHLCV-only quality."
+        )
+
     frequencies = get_frequencies_slow_to_fast()
 
     # Detect semi-annual filings and adjust frequency list
@@ -214,6 +224,7 @@ def run_7_4_0_resample_prep(state: PipelineState) -> None:
     state.save_mf_frequencies(frequencies)
 
     # Build and save each ResampledCache
+    _degraded_freqs: list[str] = []
     for freq in frequencies:
         if freq in ("Q", "A", "W", "M", "S") and _has_raw:
             resampled = build_cache_from_raw_filings(
@@ -225,13 +236,21 @@ def run_7_4_0_resample_prep(state: PipelineState) -> None:
             resampled = resample_cache_to_frequency(
                 cache, frequency=freq, reference_date=ref_date,
             )
+            if freq != "D" and not _has_raw:
+                _degraded_freqs.append(freq)
+                logger.warning(
+                    "[%s] DEGRADED: Using resampled daily cache (no raw %s filings). "
+                    "Financial ratios are forward-filled interpolated values.",
+                    freq, resampled.label,
+                )
 
         if resampled.n_periods < 3:
             logger.info("[%s] Skipping -- only %d periods (need 3+)", freq, resampled.n_periods)
             continue
 
         state.save_mf_cache(freq, resampled)
-        logger.info("[%s] Resampled: %d periods, saved to disk", freq, resampled.n_periods)
+        logger.info("[%s] Resampled: %d periods, source=%s, saved to disk",
+                    freq, resampled.n_periods, resampled.data_source)
 
     logger.info("Resample prep complete: %d frequencies prepared", len(frequencies))
 

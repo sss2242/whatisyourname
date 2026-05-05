@@ -341,6 +341,7 @@ class PipelineState:
             "is_partial_last_period": resampled.is_partial_last_period,
             "original_daily_rows": resampled.original_daily_rows,
             "resampled_rows": resampled.resampled_rows,
+            "data_source": getattr(resampled, "data_source", "unknown"),
         }
         (d / f"{freq}_meta.json").write_text(_json.dumps(meta, indent=2))
 
@@ -364,6 +365,7 @@ class PipelineState:
             is_partial_last_period=meta.get("is_partial_last_period", False),
             original_daily_rows=meta.get("original_daily_rows", 0),
             resampled_rows=meta.get("resampled_rows", len(cache_df)),
+            data_source=meta.get("data_source", "unknown"),
         )
 
     def save_mf_result(self, freq: str, result) -> None:

@@ -81,6 +81,9 @@ class FrequencyResult:
     forecast_summary: dict[str, Any] = field(default_factory=dict)
     walk_forward_mae: float | None = None
 
+    # Data source tracking -- "raw_filings", "resampled_daily", or "daily_native"
+    data_source: str = "unknown"
+
     # Context to pass to next frequency
     context_for_next: FrequencyContext = field(default_factory=FrequencyContext)
 
@@ -185,10 +188,14 @@ def run_single_frequency_pipeline(
     freq = resampled.frequency
     freq_label = resampled.label
 
+    _data_source = getattr(resampled, "data_source", "unknown")
+    _is_degraded = _data_source == "resampled_daily" and freq != "D"
+
     if cache.empty:
         return FrequencyResult(
             frequency=freq, label=freq_label,
             n_periods=0, elapsed_seconds=0,
+            data_source=_data_source,
         )
 
     logger.info(
@@ -205,28 +212,39 @@ def run_single_frequency_pipeline(
         logger.warning("[%s] Derived variables failed: %s", freq, exc)
 
     # Step 2: Survival mode
+    # Skip financial-statement-dependent analysis on degraded caches.
+    # When data_source == "resampled_daily", financial ratios (current_ratio,
+    # debt_to_equity, fcf_yield) are forward-filled interpolated values from the
+    # daily cache, NOT actual periodic filings. Running survival mode on these
+    # produces fake survival flags that contaminate the MF fusion output.
     survival_prob = 1.0
     survival_regime = "normal"
-    try:
-        from operator1.analysis.survival_mode import (
-            compute_company_survival_flag,
-            compute_survival_probability,
+    if _is_degraded:
+        logger.info(
+            "[%s] Skipping survival mode (degraded: resampled daily cache, "
+            "financial ratios are interpolated, not actual filings)", freq,
         )
-        from operator1.analysis.hierarchy_weights import compute_hierarchy_weights
-        cache["company_survival_mode_flag"] = compute_company_survival_flag(cache)
-        cache["survival_probability"] = compute_survival_probability(cache)
-        cache = compute_hierarchy_weights(cache)
-        if "survival_probability" in cache.columns:
-            sp = cache["survival_probability"].dropna()
-            if len(sp) > 0:
-                survival_prob = float(sp.iloc[-1])
-        if "survival_regime" in cache.columns:
-            sr = cache["survival_regime"].dropna()
-            if len(sr) > 0:
-                survival_regime = str(sr.iloc[-1])
-        logger.info("[%s] Survival: prob=%.3f, regime=%s", freq, survival_prob, survival_regime)
-    except Exception as exc:
-        logger.warning("[%s] Survival mode failed: %s", freq, exc)
+    else:
+        try:
+            from operator1.analysis.survival_mode import (
+                compute_company_survival_flag,
+                compute_survival_probability,
+            )
+            from operator1.analysis.hierarchy_weights import compute_hierarchy_weights
+            cache["company_survival_mode_flag"] = compute_company_survival_flag(cache)
+            cache["survival_probability"] = compute_survival_probability(cache)
+            cache = compute_hierarchy_weights(cache)
+            if "survival_probability" in cache.columns:
+                sp = cache["survival_probability"].dropna()
+                if len(sp) > 0:
+                    survival_prob = float(sp.iloc[-1])
+            if "survival_regime" in cache.columns:
+                sr = cache["survival_regime"].dropna()
+                if len(sr) > 0:
+                    survival_regime = str(sr.iloc[-1])
+            logger.info("[%s] Survival: prob=%.3f, regime=%s", freq, survival_prob, survival_regime)
+        except Exception as exc:
+            logger.warning("[%s] Survival mode failed: %s", freq, exc)
 
     # Step 3: Regime detection (skip for annual -- too few points)
     regime_label = "unknown"
@@ -351,6 +369,7 @@ def run_single_frequency_pipeline(
         trend_direction=trend,
         forecast_summary=forecast_summary,
         walk_forward_mae=walk_forward_mae,
+        data_source=_data_source,
         context_for_next=context_for_next,
     )
 
