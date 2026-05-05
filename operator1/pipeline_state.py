@@ -97,6 +97,16 @@ class PipelineState:
         self.adaptive_tier3: Any = None
         self.mode_weights: Any = None
 
+        # ---- Per-frequency raw statement groups (from frequency separator) ----
+        # Keys: "quarterly", "semiannual", "annual"
+        # Values: DataFrames with actual filing data for that frequency only.
+        # Preserved from main.py Step 3d so Stage 7.4 MF pipeline can use
+        # frequency-appropriate source data instead of the reconciled
+        # highest-freq version.
+        self.income_freq_groups: dict[str, pd.DataFrame] = {}
+        self.balance_freq_groups: dict[str, pd.DataFrame] = {}
+        self.cashflow_freq_groups: dict[str, pd.DataFrame] = {}
+
         # ---- Stage 3: Temporal Analysis ----
         self.feature_selection_result: Any = None
         self.dual_regime_result: Any = None
@@ -182,6 +192,7 @@ class PipelineState:
             "cache", "linked_caches", "linked_agg_df",
             "_secrets", "_llm_client", "_pit_client",
             "income_df", "balance_df", "cashflow_df", "quotes_df",
+            "income_freq_groups", "balance_freq_groups", "cashflow_freq_groups",
         }
         state_dict = {}
         for k, v in self.__dict__.items():
@@ -223,6 +234,16 @@ class PipelineState:
             df = getattr(self, df_name, None)
             if df is not None and not df.empty:
                 df.to_parquet(run_dir / f"{df_name}.parquet")
+
+        # Save per-frequency statement groups (from frequency separator)
+        for grp_name in ("income_freq_groups", "balance_freq_groups", "cashflow_freq_groups"):
+            grp = getattr(self, grp_name, {})
+            if grp:
+                grp_dir = run_dir / "freq_groups" / grp_name
+                grp_dir.mkdir(parents=True, exist_ok=True)
+                for freq_label, df in grp.items():
+                    if df is not None and not df.empty:
+                        df.to_parquet(grp_dir / f"{freq_label}.parquet")
 
         with open(run_dir / f"state_{sub_stage}.pkl", "wb") as f:
             pickle.dump(state_dict, f)
@@ -298,6 +319,16 @@ class PipelineState:
             df_path = run_dir / f"{df_name}.parquet"
             if df_path.exists():
                 setattr(self, df_name, pd.read_parquet(df_path))
+
+        # Load per-frequency statement groups (from frequency separator)
+        for grp_name in ("income_freq_groups", "balance_freq_groups", "cashflow_freq_groups"):
+            grp_dir = run_dir / "freq_groups" / grp_name
+            if grp_dir.exists():
+                grp = {}
+                for pq in grp_dir.glob("*.parquet"):
+                    grp[pq.stem] = pd.read_parquet(pq)
+                if grp:
+                    setattr(self, grp_name, grp)
 
         # Find the state pickle -- try exact sub-stage, then fall back
         pkl_candidates = [
