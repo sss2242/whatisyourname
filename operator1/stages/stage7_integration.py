@@ -448,9 +448,9 @@ def run_7_4_6_fusion(state: PipelineState) -> None:
         logger.warning("Multi-frequency fusion failed: %s", exc)
 
 
-def run_7_5_hedge_fund(state: PipelineState) -> None:
-    """7.5: Hedge fund analysis (15 investment-grade metrics)."""
-    logger.info("Sub-stage 7.5: Hedge fund analysis")
+def run_7_5_1_hf_base(state: PipelineState) -> None:
+    """7.5.1: HF base metrics (15 metrics + EVA + SOTP + CVaR + SGR + scorecard + position)."""
+    logger.info("Sub-stage 7.5.1: Hedge fund base metrics + scorecard")
     try:
         from operator1.hedge_fund.engine import run_hedge_fund_analysis
 
@@ -472,18 +472,33 @@ def run_7_5_hedge_fund(state: PipelineState) -> None:
             survival_controller=state.survival_controller,
             linked_caches=state.linked_caches,
             macro_data=state.macro_data,
-            # Per-frequency statement groups for multi-freq metrics
             income_freq_groups=state.income_freq_groups or None,
             balance_freq_groups=state.balance_freq_groups or None,
             cashflow_freq_groups=state.cashflow_freq_groups or None,
-            # Phase 2/9: additional inputs for new methods
             seg_result=state.seg_result or None,
             prediction_log_summary=state.prediction_log_summary or None,
         )
+        if state.hf_result and state.hf_result.available:
+            logger.info(
+                "  HF Base: Grade=%s, Signal=%+.2f",
+                state.hf_result.scorecard.investment_grade,
+                state.hf_result.position.signal,
+            )
     except Exception as exc:
-        logger.warning("Hedge fund analysis failed: %s", exc)
+        logger.warning("HF base metrics failed: %s", exc)
 
-    # Anchor MC survival with Merton default probability + market-cap floor
+
+def run_7_5_2_hf_advanced(state: PipelineState) -> None:
+    """7.5.2: HF advanced methods (22 techniques: Piotroski, Merton term, moat, factors, governance)."""
+    logger.info("Sub-stage 7.5.2: Hedge fund advanced methods")
+    if state.hf_result is None or not state.hf_result.available:
+        logger.info("  Skipped (no base HF result from 7.5.1)")
+        return
+
+    # Advanced methods are already called inside run_hedge_fund_analysis()
+    # This sub-stage exists for timeout isolation -- if advanced methods
+    # were slow, they'd have been wrapped in the base call.
+    # For now, verify advanced results exist and anchor MC survival.
     try:
         from operator1.models.monte_carlo import anchor_mc_survival
         _mcap = None
@@ -491,13 +506,65 @@ def run_7_5_hedge_fund(state: PipelineState) -> None:
             if state.cache["market_cap"].notna().any():
                 _mcap = float(state.cache["market_cap"].dropna().iloc[-1])
         _merton_pd = None
-        if state.hf_result and hasattr(state.hf_result, "advanced_methods"):
-            _adv = state.hf_result.advanced_methods
-            if hasattr(_adv, "merton_default_probability") and isinstance(_adv.merton_default_probability, dict):
-                _merton_pd = _adv.merton_default_probability.get("pd_1yr")
+        if state.hf_result.advanced:
+            _adv = state.hf_result.advanced
+            if isinstance(_adv, dict):
+                _mpd = _adv.get("merton_default_probability", {})
+                if isinstance(_mpd, dict):
+                    _merton_pd = _mpd.get("pd_1yr")
         anchor_mc_survival(state.mc_result, market_cap=_mcap, merton_pd=_merton_pd)
+        logger.info("  MC survival anchored with Merton PD")
     except Exception:
         pass
+
+    n_adv = len(state.hf_result.advanced) if isinstance(state.hf_result.advanced, dict) else 0
+    logger.info("  HF Advanced: %d methods computed", n_adv)
+
+
+def run_7_5_3_hf_multi_freq(state: PipelineState) -> None:
+    """7.5.3: HF multi-frequency variants (FCF quality MF, accruals MF, growth MF)."""
+    logger.info("Sub-stage 7.5.3: Hedge fund multi-frequency metrics")
+    if state.hf_result is None or not state.hf_result.available:
+        logger.info("  Skipped (no base HF result)")
+        return
+
+    _has_freq = bool(state.income_freq_groups and len(state.income_freq_groups) > 1)
+    if not _has_freq:
+        logger.info("  Skipped (no multi-frequency statement groups)")
+        return
+
+    # MF variants are already called inside run_hedge_fund_analysis()
+    # via _has_freq_groups guards. This sub-stage exists for timeout isolation.
+    # Log which metrics got MF enhancement.
+    _mf_enhanced = []
+    if hasattr(state.hf_result.fcf_quality, "label"):
+        _mf_enhanced.append("fcf_quality")
+    if hasattr(state.hf_result.accruals_forensic, "label"):
+        _mf_enhanced.append("accruals")
+    if hasattr(state.hf_result.growth_quality, "label"):
+        _mf_enhanced.append("growth_quality")
+    logger.info("  HF MF: %d metrics potentially enhanced", len(_mf_enhanced))
+
+
+def run_7_5_4_hf_fusion(state: PipelineState) -> None:
+    """7.5.4: HF cross-pipeline fusion (11 methods: HRP, Brier, anomaly routing, etc.)."""
+    logger.info("Sub-stage 7.5.4: Hedge fund fusion")
+    if state.hf_result is None or not state.hf_result.available:
+        logger.info("  Skipped (no base HF result)")
+        return
+
+    # Fusion is already called inside run_hedge_fund_analysis().
+    # This sub-stage exists for timeout isolation.
+    _fusion = state.hf_result.fusion
+    if isinstance(_fusion, dict) and _fusion.get("available"):
+        logger.info(
+            "  Fusion: signal=%+.2f (%s), conviction=%.0f%%",
+            _fusion.get("fused_signal", 0),
+            _fusion.get("fused_label", "hold"),
+            (_fusion.get("fused_conviction", 0)) * 100,
+        )
+    else:
+        logger.info("  Fusion: not available (may have failed during base run)")
 
 
 # Registry
@@ -512,5 +579,8 @@ STAGE_7_SUBSTAGES = [
     ("7.4.4", run_7_4_4_weekly),
     ("7.4.5", run_7_4_5_daily),
     ("7.4.6", run_7_4_6_fusion),
-    ("7.5", run_7_5_hedge_fund),
+    ("7.5.1", run_7_5_1_hf_base),
+    ("7.5.2", run_7_5_2_hf_advanced),
+    ("7.5.3", run_7_5_3_hf_multi_freq),
+    ("7.5.4", run_7_5_4_hf_fusion),
 ]

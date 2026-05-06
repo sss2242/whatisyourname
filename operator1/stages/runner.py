@@ -149,7 +149,7 @@ _CRITICAL_SUBSTAGES: set[str] = {
     "5.1",   # forward pass (model states, PID, calibrator)
     "5.4",   # Monte Carlo (survival probability is core output)
     "6.5",   # prediction aggregation (final ensemble)
-    "7.5",   # hedge fund (parallel track but core for profile)
+    "7.5.1", # hedge fund base (scorecard + position signal core output)
 }
 
 # Per-sub-stage timeout in seconds. Prevents hanging models from blocking pipeline.
@@ -161,7 +161,10 @@ _SUBSTAGE_TIMEOUTS: dict[str, int] = {
     "7.4.1": 180, # MF annual: 3 min
     "7.4.2": 180, # MF quarterly: 3 min
     "7.4.3": 120, # MF monthly: 2 min
-    "7.5": 300,   # hedge fund: 5 min
+    "7.5.1": 180, # HF base metrics + scorecard: 3 min
+    "7.5.2": 120, # HF advanced methods: 2 min
+    "7.5.3": 180, # HF multi-freq variants: 3 min
+    "7.5.4": 60,  # HF fusion: 1 min
 }
 _DEFAULT_TIMEOUT: int = 120  # 2 min for everything else
 
@@ -174,7 +177,10 @@ _SUBSTAGE_REQUIREMENTS: dict[str, list[str]] = {
     "5.4": ["cache"],
     "6.3": ["cache", "forward_pass_result"],
     "6.5": ["cache", "forecast_result"],
-    "7.5": ["cache", "income_df", "balance_df", "cashflow_df"],
+    "7.5.1": ["cache", "income_df", "balance_df", "cashflow_df"],
+    "7.5.2": ["cache"],
+    "7.5.3": ["cache"],
+    "7.5.4": ["cache"],
 }
 
 
