@@ -1561,6 +1561,9 @@ def run_hedge_fund_analysis(
         readiness["n_tiers_ready"], readiness["min_periods"],
     )
 
+    # Multi-frequency availability flag (used across all tiers)
+    _has_freq_groups = bool(income_freq_groups and len(income_freq_groups) > 1)
+
     # --- Tier 1: Earnings Forensics ---
     from operator1.hedge_fund.fcf_quality import compute_fcf_quality
     from operator1.hedge_fund.accruals_forensics import compute_accruals_forensics
