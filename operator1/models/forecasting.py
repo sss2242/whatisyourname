@@ -2385,6 +2385,22 @@ def run_forecasting(
                                 )
                                 for _rl, _rh in HORIZONS.items():
                                     _rshift = _expected_daily * _rh
+                                    # Dampen regime shift near 52-week extremes
+                                    # and when Hurst exponent signals mean reversion
+                                    _regime_dampen = 1.0
+                                    if "anchoring_52w_high" in cache.columns:
+                                        _ath = cache["anchoring_52w_high"].dropna()
+                                        if len(_ath) > 0:
+                                            _ath_v = float(_ath.iloc[-1])
+                                            if _ath_v > 0.90 and _rshift > 0:
+                                                _regime_dampen = max(0.1, 1.0 - (_ath_v - 0.90) / 0.10)
+                                    if "hurst_exponent_rolling" in cache.columns:
+                                        _hurst = cache["hurst_exponent_rolling"].dropna()
+                                        if len(_hurst) > 0:
+                                            _h_v = float(_hurst.iloc[-1])
+                                            if _h_v < 0.45:
+                                                _regime_dampen *= max(0.3, _h_v / 0.45)
+                                    _rshift *= _regime_dampen
                                     _horizon_forecasts[_rl] *= (1 + _rshift)
                 except Exception:
                     pass
@@ -2400,13 +2416,41 @@ def run_forecasting(
                         _last_close = float(cache["close"].dropna().iloc[-1])
                         _mom_21d = float(_ret.iloc[-21:].mean())
                         _mom_5d = float(_ret.iloc[-5:].mean())
+
+                        # Adaptive momentum weight: dampen near 52-week
+                        # extremes where mean reversion is more probable
+                        # than momentum continuation.
+                        _base_mom_weight = 0.30
+                        _ath_score = 0.5  # neutral default
+                        if "anchoring_52w_high" in cache.columns:
+                            _ath_val = cache["anchoring_52w_high"].dropna()
+                            if len(_ath_val) > 0:
+                                _ath_score = float(_ath_val.iloc[-1])
+                        _atl_score = 2.0  # neutral default
+                        if "anchoring_52w_low" in cache.columns:
+                            _atl_val = cache["anchoring_52w_low"].dropna()
+                            if len(_atl_val) > 0:
+                                _atl_score = float(_atl_val.iloc[-1])
+
                         for _ml, _mh in HORIZONS.items():
                             # Use shorter-window momentum for short horizons
                             _mom = _mom_5d if _mh <= 5 else _mom_21d
                             _mom_pred = _last_close * (1 + _mom * _mh)
-                            # Blend: 70% model, 30% momentum
+
+                            # Dampen momentum near extremes:
+                            # At ATH (>0.85): momentum_weight 0.30 -> 0.05
+                            # At 52w low (<1.15): momentum_weight 0.30 -> 0.05
+                            # Mid-range: full 0.30
+                            if _ath_score > 0.85 and _mom > 0:
+                                _mom_weight = max(0.05, _base_mom_weight - ((_ath_score - 0.85) / 0.15) * 0.25)
+                            elif _atl_score < 1.15 and _mom < 0:
+                                _mom_weight = max(0.05, _base_mom_weight - ((1.15 - _atl_score) / 0.15) * 0.25)
+                            else:
+                                _mom_weight = _base_mom_weight
+
                             _horizon_forecasts[_ml] = (
-                                0.7 * _horizon_forecasts[_ml] + 0.3 * _mom_pred
+                                (1.0 - _mom_weight) * _horizon_forecasts[_ml]
+                                + _mom_weight * _mom_pred
                             )
                 except Exception:
                     pass

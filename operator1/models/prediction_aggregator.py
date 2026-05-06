@@ -963,7 +963,7 @@ def apply_technical_alpha_mask(
     ``TechnicalAlphaMask`` with open/high/close masked (None) and
     low set to an estimated value.
     """
-    mask = TechnicalAlphaMask(mask_applied=True)
+    mask = TechnicalAlphaMask(mask_applied=False)
 
     # Get last observed close.
     if "close" in cache.columns:
@@ -976,9 +976,8 @@ def apply_technical_alpha_mask(
         last_close = float("nan")
 
     if math.isnan(last_close):
-        # Cannot estimate -- return mask with NaN low.
         logger.warning(
-            "No close price available for Technical Alpha mask"
+            "No close price available for Technical Alpha estimation"
         )
         return mask
 
@@ -991,21 +990,35 @@ def apply_technical_alpha_mask(
             if not math.isnan(vol_val) and vol_val > 0:
                 vol = vol_val
 
-    # Estimate next-day low.
-    # Low is typically last_close minus some fraction of daily vol.
+    # Compute all OHLC estimates (unmasked).
+    # Masking is now report-only -- the calculation layer preserves
+    # all values for downstream models (OHLC predictor, recursive
+    # aggregator, HF position signal) that need full OHLC data.
     mask.next_day_low = last_close * (1.0 - vol * INTRADAY_LOW_FACTOR)
+    mask.next_day_high = last_close * (1.0 + vol * INTRADAY_LOW_FACTOR)
 
-    # Masked fields stay None.
-    mask.next_day_open = None
-    mask.next_day_high = None
-    mask.next_day_close = None
+    # Use close forecast from aggregated results if available
+    close_1d = forecasts.get("close", {}).get("1d")
+    if close_1d is not None and not math.isnan(close_1d):
+        mask.next_day_close = close_1d
+        # Open estimate: gap from last close toward forecast direction
+        gap_direction = 1.0 if close_1d >= last_close else -1.0
+        mask.next_day_open = last_close + gap_direction * vol * last_close * 0.3
+    else:
+        mask.next_day_close = last_close
+        mask.next_day_open = last_close
+
+    # mask_applied=False means the data layer has full OHLC values.
+    # The report generator applies display masking at render time.
+    mask.mask_applied = False
 
     logger.info(
-        "Technical Alpha mask: last_close=%.4f, vol=%.6f, "
-        "estimated_low=%.4f",
-        last_close,
-        vol,
+        "Technical Alpha OHLC: open=%.4f, high=%.4f, low=%.4f, close=%.4f "
+        "(masking deferred to report layer)",
+        mask.next_day_open,
+        mask.next_day_high,
         mask.next_day_low,
+        mask.next_day_close,
     )
 
     return mask
@@ -2685,6 +2698,31 @@ def run_prediction_aggregation(
                     z_score=z_score,
                 )
                 interval_source = "rmse"
+
+                # MC percentile override for long horizons (>= 21d).
+                # The RMSE * sqrt(h) scaling assumes independent daily
+                # errors, which underestimates uncertainty during trending
+                # markets.  MC path percentiles from 10K regime-switching
+                # simulations capture serial correlation and tail risk.
+                if (
+                    mc_result is not None
+                    and horizon_days >= 21
+                    and var_name == "close"
+                ):
+                    try:
+                        _mc_tv = getattr(mc_result, "terminal_values", {})
+                        _mc_paths = _mc_tv.get(horizon_days) or _mc_tv.get(f"{horizon_days}d")
+                        if _mc_paths is not None and len(_mc_paths) > 100:
+                            _mc_arr = np.array(_mc_paths)
+                            _mc_base = last_value if last_value and not math.isnan(last_value) else point
+                            _mc_p5 = float(np.percentile(_mc_arr, 5)) * _mc_base
+                            _mc_p95 = float(np.percentile(_mc_arr, 95)) * _mc_base
+                            if (_mc_p95 - _mc_p5) > (upper - lower):
+                                lower = _mc_p5
+                                upper = _mc_p95
+                                interval_source = "mc_percentile"
+                    except Exception:
+                        pass
 
             # ----------------------------------------------------------
             # Phase 2.5: Per-tier confidence multipliers (survival mode).
