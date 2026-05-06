@@ -2799,8 +2799,12 @@ def run_prediction_aggregation(
                         _last_px = last_value if last_value and not math.isnan(last_value) else point
                         _iv_hw = z_score * _last_px * _iv_daily * math.sqrt(max(horizon_days, 1))
                         _cur_hw = (upper - lower) / 2.0
-                        # Blend: 60% IV (forward), 40% model (backward)
-                        _blended_hw = 0.60 * _iv_hw + 0.40 * _cur_hw
+                        # Horizon-decaying IV blend: IV is best at short
+                        # horizons (market-priced event risk) but model
+                        # RMSE + MC percentiles dominate at longer horizons.
+                        _IV_BLEND = {1: 0.50, 5: 0.35, 21: 0.15, 252: 0.05}
+                        _iv_w = _IV_BLEND.get(horizon_days, 0.20)
+                        _blended_hw = _iv_w * _iv_hw + (1.0 - _iv_w) * _cur_hw
                         if _blended_hw > _cur_hw:
                             lower = point - _blended_hw
                             upper = point + _blended_hw
@@ -2842,6 +2846,39 @@ def run_prediction_aggregation(
                     _hw = max(abs(upper - lower) / 2.0, abs(point) * _MIN_HW_PCT)
                     lower = point - _hw
                     upper = point + _hw
+
+            # ----------------------------------------------------------
+            # Phase 3.10: Width cap -- prevent multiplicative blowup.
+            # MC P5/P95 range is the maximum reasonable uncertainty
+            # (already accounts for regime switching + tail risk).
+            # Absolute cap at 50% of price as final safety net.
+            # ----------------------------------------------------------
+            if mc_result is not None and var_name == "close" and not math.isnan(point):
+                try:
+                    _mc_tv = getattr(mc_result, "terminal_values", {})
+                    _mc_paths_cap = _mc_tv.get(horizon_days) or _mc_tv.get(f"{horizon_days}d")
+                    if _mc_paths_cap is not None and len(_mc_paths_cap) > 100:
+                        _mc_arr_cap = np.array(_mc_paths_cap)
+                        _mc_base_cap = last_value if last_value and not math.isnan(last_value) else point
+                        _mc_p5_cap = float(np.percentile(_mc_arr_cap, 5)) * _mc_base_cap
+                        _mc_p95_cap = float(np.percentile(_mc_arr_cap, 95)) * _mc_base_cap
+                        _mc_max_hw = (_mc_p95_cap - _mc_p5_cap) / 2.0
+                        _cur_hw_cap = (upper - lower) / 2.0
+                        if _mc_max_hw > 0 and _cur_hw_cap > _mc_max_hw:
+                            lower = point - _mc_max_hw
+                            upper = point + _mc_max_hw
+                            interval_source += "+mc_cap"
+                except Exception:
+                    pass
+
+            # Absolute cap: 50% of price at any horizon
+            if not math.isnan(point) and abs(point) > 0:
+                _abs_max_hw = abs(point) * 0.50
+                _cur_hw_abs = (upper - lower) / 2.0
+                if _cur_hw_abs > _abs_max_hw:
+                    lower = point - _abs_max_hw
+                    upper = point + _abs_max_hw
+                    interval_source += "+abs_cap"
 
             # ----------------------------------------------------------
             # Phase 4: DTW analog forecast.
