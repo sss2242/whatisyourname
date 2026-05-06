@@ -923,10 +923,9 @@ class USEdgarClient:
     ) -> list[str]:
         """Find peer companies matching a SIC code.
 
-        Three methods tried in order:
-        1. edgartools get_companies(sic=) -- uses cached data, no HTTP
-        2. EFTS full-text search -- modern SEC API with 1s rate limiting
-        3. Submissions endpoint -- one-by-one SIC lookup (slow, last resort)
+        Two methods tried in order:
+        1. EFTS full-text search -- modern SEC API with 1s rate limiting
+        2. CIK-to-ticker resolution from cached company list
 
         Returns a list of resolved ticker symbols (up to 10).
         """
@@ -935,36 +934,7 @@ class USEdgarClient:
         exclude = exclude or set()
         peers: list[str] = []
 
-        # Method 1: edgartools SIC filter (uses cached company data, no HTTP)
-        try:
-            self._init_edgartools()
-            if self._edgar_initialized:
-                from edgar import get_company_tickers
-                tickers_df = get_company_tickers()
-                if tickers_df is not None and hasattr(tickers_df, "iterrows"):
-                    for _, row in tickers_df.iterrows():
-                        row_sic = str(row.get("sic", "")).zfill(4) if row.get("sic") else ""
-                        if not row_sic:
-                            continue
-                        # Match: exact SIC for 4-digit, prefix for 2-digit
-                        if len(sic) == 4 and row_sic == sic:
-                            match = True
-                        elif len(sic) == 2 and row_sic.startswith(sic):
-                            match = True
-                        else:
-                            match = False
-                        if match:
-                            ticker = str(row.get("ticker", "")).upper()
-                            if ticker and ticker != target_ticker and ticker not in peers and ticker not in exclude:
-                                peers.append(ticker)
-                            if len(peers) >= 10:
-                                return peers
-                if peers:
-                    return peers
-        except Exception as exc:
-            logger.debug("edgartools SIC lookup failed: %s", exc)
-
-        # Method 2: EFTS full-text search API (rate-limited, 1s delay)
+        # Method 1: EFTS full-text search API (rate-limited, 1s delay)
         try:
             import requests
             _time.sleep(1)  # Respect SEC rate limits
