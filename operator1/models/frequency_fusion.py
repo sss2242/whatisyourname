@@ -177,6 +177,11 @@ class FrequencyFusionResult:
     potential_reversal_flag: bool = False        # long-term vs short-term disagree
     regime_vote_weights: dict[str, float] = field(default_factory=dict)  # per-freq voting weight
     excluded_frequencies: list[str] = field(default_factory=list)
+    degraded_frequencies: list[str] = field(default_factory=list)
+    # degraded_frequencies: frequencies that used resampled daily cache instead
+    # of actual filing data. Financial ratios at these frequencies are
+    # forward-filled interpolated values, not actual periodic filings.
+    # Survival mode and financial analysis were skipped for these.
     meta_learner_weights: dict[str, float] = field(default_factory=dict)
     cointegrated: bool = False
     cointegration_ect: float = 0.0
@@ -227,6 +232,7 @@ class FrequencyFusionResult:
             },
             "confirmed_breaks": len(self.confirmed_breaks),
             "excluded_frequencies": self.excluded_frequencies,
+            "degraded_frequencies": self.degraded_frequencies,
             "meta_learner_weights": {
                 k: round(v, 4) for k, v in self.meta_learner_weights.items()
             },
@@ -1302,10 +1308,12 @@ def fuse_multi_frequency_results(
         pass
 
     # ---------------------------------------------------------------
-    # Build frequency summary
+    # Build frequency summary + collect degraded frequencies
     # ---------------------------------------------------------------
     freq_summary = {}
+    _degraded_freqs: list[str] = []
     for freq, result in results.items():
+        _ds = getattr(result, "data_source", "unknown")
         freq_summary[freq] = {
             "label": result.label,
             "n_periods": result.n_periods,
@@ -1315,7 +1323,15 @@ def fuse_multi_frequency_results(
             "elapsed_seconds": round(result.elapsed_seconds, 1),
             "gating_weight": round(gating_weights.get(freq, 0.0), 4),
             "spectral_weight": round(spectral_weights.get(freq, 0.0), 4),
+            "data_source": _ds,
         }
+        if _ds == "resampled_daily" and freq != "D":
+            _degraded_freqs.append(freq)
+    if _degraded_freqs:
+        logger.warning(
+            "MF fusion: %d/%d frequencies are DEGRADED (resampled daily, no raw filings): %s",
+            len(_degraded_freqs), len(results), _degraded_freqs,
+        )
 
     logger.info("Fusion complete: %d methods applied, %d predictions",
                 len(methods_applied), len(predictions))
@@ -1330,6 +1346,7 @@ def fuse_multi_frequency_results(
         disagreement=disagreement,
         confirmed_breaks=confirmed_breaks,
         excluded_frequencies=excluded,
+        degraded_frequencies=_degraded_freqs,
         meta_learner_weights=meta_weights,
         cointegrated=cointegrated,
         cointegration_ect=ect,

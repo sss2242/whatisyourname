@@ -835,6 +835,10 @@ Non-interactive examples:
     # (annual totals in quarterly windows -> 319% gross margin).
     # Separate by period_type, then use highest-frequency data with
     # revenue-ratio-scaled backfill from lower frequencies.
+    # Per-frequency groups are PRESERVED for Stage 7.4 MF pipeline.
+    _income_freq_groups: dict = {}
+    _balance_freq_groups: dict = {}
+    _cashflow_freq_groups: dict = {}
     try:
         from operator1.clients.frequency_separator import (
             separate_by_period_type,
@@ -847,6 +851,15 @@ Non-interactive examples:
                 continue
 
             freq_groups = separate_by_period_type(stmt, market_id=market_id)
+            # Preserve per-frequency groups for Stage 7.4 MF pipeline.
+            # Each frequency pipeline will use its native filing data instead
+            # of the reconciled highest-freq version.
+            if label == "income":
+                _income_freq_groups = freq_groups
+            elif label == "balance":
+                _balance_freq_groups = freq_groups
+            else:
+                _cashflow_freq_groups = freq_groups
             if len(freq_groups) > 1:
                 logger.info(
                     "Mixed-frequency %s detected: %s -- separating and reconciling",
@@ -2666,6 +2679,9 @@ Non-interactive examples:
         _ps.cross_asset_result = locals().get("cross_asset_result")
         _ps.seg_result = locals().get("_seg_result", {})
         _ps.ohlcv_source_label = _ohlcv_source_label if "_ohlcv_source_label" in dir() else ""
+        _ps.income_freq_groups = _income_freq_groups
+        _ps.balance_freq_groups = _balance_freq_groups
+        _ps.cashflow_freq_groups = _cashflow_freq_groups
 
         if _save_checkpoints:
             _ps.save("2.9")
@@ -2705,6 +2721,7 @@ Non-interactive examples:
         weights = _ps.weights
         regime_detector = _ps.regime_detector
         _economic_plane = _ps.economic_plane
+        _extra_vars = _ps.extra_vars
         # Stage 7 results (USS, retro, diagnostics, MF, HF)
         scenario_result = _ps.scenario_result
         survival_controller = _ps.survival_controller or survival_controller
@@ -2900,6 +2917,7 @@ Non-interactive examples:
 
         # Inject economic plane classification
         try:
+            from operator1.analysis.economic_planes import classify_economic_plane
             plane_info = classify_economic_plane(
                 sector=target_profile.get("sector"),
                 industry=target_profile.get("industry"),
@@ -3126,7 +3144,7 @@ Non-interactive examples:
             profile["institutional_holders"] = {"available": False}
 
         # Inject institutional ownership deep analysis (contagion + flow)
-        _inst_analysis: dict[str, Any] = {"available": False}
+        _inst_analysis = {"available": False}
         try:
             _has_contagion = contagion_result is not None and contagion_result.available
             _has_flow = "inst_flow_momentum" in cache.columns and cache["inst_flow_momentum"].notna().any()

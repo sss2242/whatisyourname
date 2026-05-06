@@ -195,10 +195,48 @@ def run_7_4_0_resample_prep(state: PipelineState) -> None:
     _has_raw = any(df is not None and not df.empty for df in [income_df, balance_df, cashflow_df])
     _is_annual_only = is_annual_only_market(market_id)
 
+    # Per-frequency statement groups from frequency separator (Step 3d).
+    # These contain the ACTUAL filing data per frequency (quarterly, annual,
+    # semiannual) before Chow-Lin reconciliation merged them together.
+    _has_freq_groups = any(
+        bool(getattr(state, grp, {}))
+        for grp in ("income_freq_groups", "balance_freq_groups", "cashflow_freq_groups")
+    )
+    if _has_freq_groups:
+        logger.info(
+            "Per-frequency filing groups available: income=%s, balance=%s, cashflow=%s",
+            list(state.income_freq_groups.keys()),
+            list(state.balance_freq_groups.keys()),
+            list(state.cashflow_freq_groups.keys()),
+        )
+
+    if not _has_raw and not _has_freq_groups:
+        logger.warning(
+            "MULTI-FREQUENCY DEGRADED: No raw financial statement data available "
+            "(income_df, balance_df, cashflow_df are all empty, no freq_groups). "
+            "MF pipeline will resample the daily cache instead of using actual "
+            "filing data. Financial ratios at Q/A/M/W frequencies will be "
+            "forward-filled interpolated values, NOT actual periodic filings. "
+            "Results are OHLCV-only quality."
+        )
+
     frequencies = get_frequencies_slow_to_fast()
 
-    # Detect semi-annual filings and adjust frequency list
-    if _has_raw and "Q" in frequencies:
+    # Detect semi-annual filings and adjust frequency list.
+    # Check freq_groups first (more accurate), then fall back to raw DFs.
+    if _has_freq_groups:
+        _available_freq_labels = set()
+        for grp_name in ("income_freq_groups", "balance_freq_groups", "cashflow_freq_groups"):
+            _available_freq_labels.update(getattr(state, grp_name, {}).keys())
+        if "quarterly" in _available_freq_labels and "semiannual" in _available_freq_labels:
+            if "S" not in frequencies:
+                q_idx = frequencies.index("Q")
+                frequencies.insert(q_idx, "S")
+            logger.info("Both Q and S filings detected in freq_groups -- running both pipelines")
+        elif "semiannual" in _available_freq_labels and "quarterly" not in _available_freq_labels:
+            frequencies = [("S" if f == "Q" else f) for f in frequencies]
+            logger.info("Auto-switch: Q -> S (semi-annual filings only in freq_groups)")
+    elif _has_raw and "Q" in frequencies:
         _all_freqs = detect_all_filing_frequencies(income_df, balance_df, cashflow_df)
         _native = detect_native_filing_frequency(income_df, balance_df, cashflow_df)
         if "Q" in _all_freqs and "S" in _all_freqs:
@@ -213,25 +251,94 @@ def run_7_4_0_resample_prep(state: PipelineState) -> None:
     # Save frequency list for later sub-stages
     state.save_mf_frequencies(frequencies)
 
+    # Map pipeline freq code -> frequency separator label
+    _FREQ_CODE_TO_LABEL = {"Q": "quarterly", "S": "semiannual", "A": "annual"}
+
     # Build and save each ResampledCache
+    _degraded_freqs: list[str] = []
     for freq in frequencies:
-        if freq in ("Q", "A", "W", "M", "S") and _has_raw:
+        _sep_label = _FREQ_CODE_TO_LABEL.get(freq)
+
+        if _sep_label and _has_freq_groups:
+            # A/Q/S: Use frequency-specific raw filings (actual filing data
+            # for this frequency only, before Chow-Lin reconciliation).
+            _inc = state.income_freq_groups.get(_sep_label)
+            _bal = state.balance_freq_groups.get(_sep_label)
+            _cf = state.cashflow_freq_groups.get(_sep_label)
+            _any_freq_data = any(
+                df is not None and not df.empty
+                for df in [_inc, _bal, _cf]
+            )
+            if _any_freq_data:
+                resampled = build_cache_from_raw_filings(
+                    income_df=_inc, balance_df=_bal,
+                    cashflow_df=_cf, quotes_df=quotes_df,
+                    frequency=freq, reference_date=ref_date,
+                )
+                logger.info(
+                    "[%s] Built from native %s filings: inc=%d, bal=%d, cf=%d",
+                    freq, _sep_label,
+                    len(_inc) if _inc is not None and not _inc.empty else 0,
+                    len(_bal) if _bal is not None and not _bal.empty else 0,
+                    len(_cf) if _cf is not None and not _cf.empty else 0,
+                )
+            else:
+                # No native filings for this specific frequency -- fall back
+                # to reconciled DFs if available, otherwise daily cache.
+                if _has_raw:
+                    logger.info(
+                        "[%s] No native %s filings in freq_groups -- "
+                        "using reconciled DFs (interpolated from available frequencies)",
+                        freq, _sep_label,
+                    )
+                    resampled = build_cache_from_raw_filings(
+                        income_df=income_df, balance_df=balance_df,
+                        cashflow_df=cashflow_df, quotes_df=quotes_df,
+                        frequency=freq, reference_date=ref_date,
+                    )
+                else:
+                    logger.warning(
+                        "[%s] DEGRADED: No native %s filings and no raw DFs -- "
+                        "using resampled daily cache",
+                        freq, _sep_label,
+                    )
+                    resampled = resample_cache_to_frequency(
+                        cache, frequency=freq, reference_date=ref_date,
+                    )
+                    _degraded_freqs.append(freq)
+        elif freq in ("W", "M") and _has_raw:
+            # W/M: No native filings exist at these frequencies.
+            # Interpolate from reconciled (highest-freq) DFs.
             resampled = build_cache_from_raw_filings(
                 income_df=income_df, balance_df=balance_df,
                 cashflow_df=cashflow_df, quotes_df=quotes_df,
                 frequency=freq, reference_date=ref_date,
             )
-        else:
+        elif freq == "D":
+            # Daily: use daily cache as-is (always correct)
             resampled = resample_cache_to_frequency(
                 cache, frequency=freq, reference_date=ref_date,
             )
+        else:
+            # Fallback: resample daily cache (degraded)
+            resampled = resample_cache_to_frequency(
+                cache, frequency=freq, reference_date=ref_date,
+            )
+            if freq != "D":
+                _degraded_freqs.append(freq)
+                logger.warning(
+                    "[%s] DEGRADED: Using resampled daily cache (no raw %s filings). "
+                    "Financial ratios are forward-filled interpolated values.",
+                    freq, resampled.label,
+                )
 
         if resampled.n_periods < 3:
             logger.info("[%s] Skipping -- only %d periods (need 3+)", freq, resampled.n_periods)
             continue
 
         state.save_mf_cache(freq, resampled)
-        logger.info("[%s] Resampled: %d periods, saved to disk", freq, resampled.n_periods)
+        logger.info("[%s] Resampled: %d periods, source=%s, saved to disk",
+                    freq, resampled.n_periods, resampled.data_source)
 
     logger.info("Resample prep complete: %d frequencies prepared", len(frequencies))
 

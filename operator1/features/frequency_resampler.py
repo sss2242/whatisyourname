@@ -134,6 +134,13 @@ class ResampledCache:
     is_partial_last_period: bool
     original_daily_rows: int
     resampled_rows: int
+    data_source: str = "unknown"
+    # data_source values:
+    #   "raw_filings"     -- built from actual filing data (correct path)
+    #   "resampled_daily" -- resampled from the daily cache (degraded, no real
+    #                        filing-frequency data; financial ratios are
+    #                        forward-filled interpolated values, not actuals)
+    #   "daily_native"    -- daily frequency, uses the daily cache as-is (correct)
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +187,7 @@ def resample_cache_to_frequency(
             is_partial_last_period=False,
             original_daily_rows=0,
             resampled_rows=0,
+            data_source="resampled_daily",
         )
 
     if reference_date is None:
@@ -205,6 +213,7 @@ def resample_cache_to_frequency(
             is_partial_last_period=False,
             original_daily_rows=len(daily_cache),
             resampled_rows=0,
+            data_source="resampled_daily",
         )
 
     # Daily frequency: no resampling needed, just trim
@@ -218,6 +227,7 @@ def resample_cache_to_frequency(
             is_partial_last_period=False,
             original_daily_rows=len(daily_cache),
             resampled_rows=len(trimmed),
+            data_source="daily_native",
         )
 
     # Resample to target frequency
@@ -258,6 +268,7 @@ def resample_cache_to_frequency(
         is_partial_last_period=is_partial,
         original_daily_rows=len(daily_cache),
         resampled_rows=len(resampled),
+        data_source="resampled_daily",
     )
 
 
@@ -553,6 +564,7 @@ def build_cache_from_raw_filings(
             is_partial_last_period=False,
             original_daily_rows=0,
             resampled_rows=0,
+            data_source="raw_filings",
         )
 
     # Combine OHLCV + statements, aligning by date
@@ -604,6 +616,7 @@ def build_cache_from_raw_filings(
         is_partial_last_period=is_partial,
         original_daily_rows=n_daily,
         resampled_rows=len(combined),
+        data_source="raw_filings",
     )
 
 

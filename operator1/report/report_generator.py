@@ -742,39 +742,6 @@ def _build_linked_entities_section(profile: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _build_macro_section(profile: dict[str, Any]) -> str:
-    """Build macro environment section."""
-    # Macro data is embedded in the quality/estimation sections
-    estimation = profile.get("estimation", {})
-    quality = profile.get("data_quality", {})
-
-    lines = []
-    if estimation.get("available"):
-        lines.append("Macro data was aligned to daily frequency using as-of logic.")
-        lines.append("See the estimation coverage section for variable-level detail.")
-    else:
-        lines.append("Macro environment data was not available for this analysis.")
-
-    if quality.get("available"):
-        coverage = quality.get("variable_coverage", {})
-        macro_vars = [
-            k for k in coverage
-            if k.startswith(("inflation", "cpi", "unemployment", "gdp", "exchange"))
-        ]
-        if macro_vars:
-            lines.extend(["", "### Macro Variable Coverage", ""])
-            for var in sorted(macro_vars):
-                cov = coverage[var]
-                if isinstance(cov, dict):
-                    lines.append(
-                        f"- {var}: {_fmt(cov.get('coverage_pct'), '.1f')}% coverage"
-                    )
-                else:
-                    lines.append(f"- {var}: {_fmt(cov, '.1f')}% coverage")
-
-    return "\n".join(lines) if lines else "Macro environment data unavailable."
-
-
 def _build_regime_analysis(profile: dict[str, Any]) -> str:
     """Build regime analysis and forecasts section."""
     regimes = profile.get("regimes", {})

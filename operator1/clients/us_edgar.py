@@ -864,10 +864,16 @@ class USEdgarClient:
     def get_peers(self, identifier: str) -> list[str]:
         """Return peer companies based on SIC code matching.
 
-        Queries the SEC browse-edgar endpoint to find companies with the
-        same 4-digit SIC code, then maps CIKs back to tickers using the
-        company tickers list.  Returns up to 10 peer tickers.
+        Uses the ALREADY-CACHED company list from list_companies() and
+        edgartools' submissions data to find companies with the same SIC
+        code. No additional HTTP requests to company_tickers.json -- avoids
+        SEC 429 rate limiting that killed peer discovery.
+
+        Falls back to EFTS full-text search with 1s delay between calls
+        if the cached approach yields too few peers.
         """
+        import time as _time
+
         profile = self.get_profile(identifier)
         sic = profile.get("sic", "")
         target_ticker = profile.get("ticker", identifier).upper()
@@ -876,29 +882,24 @@ class USEdgarClient:
 
         sic_4 = str(sic).zfill(4)
 
-        # Step 1: Build a CIK -> ticker lookup from the company tickers list
-        try:
-            import requests
-            tickers_data = requests.get(
-                "https://www.sec.gov/files/company_tickers.json",
-                headers={"User-Agent": self._user_agent},
-                timeout=30,
-            ).json()
-            cik_to_ticker: dict[str, str] = {}
-            if isinstance(tickers_data, dict):
-                for entry in tickers_data.values():
-                    cik_str = str(entry.get("cik_str", "")).lstrip("0")
-                    ticker = str(entry.get("ticker", "")).upper()
-                    if cik_str and ticker:
-                        cik_to_ticker[cik_str] = ticker
-        except Exception:
-            return []
+        # Step 1: Use the cached company list (no new HTTP request).
+        # list_companies() caches to self._company_list_cache on first call.
+        # The SEC tickers JSON was already fetched during search_company().
+        companies = self.list_companies()
+        cik_to_ticker: dict[str, str] = {}
+        for c in companies:
+            cik_str = str(c.get("cik", "")).lstrip("0")
+            ticker = str(c.get("ticker", "")).upper()
+            if cik_str and ticker:
+                cik_to_ticker[cik_str] = ticker
 
-        # Step 2: Query SEC browse-edgar for companies with the same SIC
+        # Step 2: Find peers by SIC from edgartools submissions (cached per
+        # company, uses data.sec.gov which has higher rate limits than www.sec.gov)
         peers = self._query_peers_by_sic(sic_4, target_ticker, cik_to_ticker)
 
         # Fallback to 2-digit SIC (broad sector) if fewer than 5 exact peers
         if len(peers) < 5:
+            _time.sleep(1)  # Rate limit between SIC queries
             sic_2 = sic_4[:2]
             broad_peers = self._query_peers_by_sic(
                 sic_2, target_ticker, cik_to_ticker, exclude=set(peers),
@@ -922,21 +923,51 @@ class USEdgarClient:
     ) -> list[str]:
         """Find peer companies matching a SIC code.
 
-        Uses the SEC EFTS full-text search API (modern, reliable) instead
-        of the deprecated cgi-bin/browse-edgar endpoint which returns 503.
-
-        Falls back to filtering the company_tickers.json list by SIC prefix
-        if the EFTS query fails.
+        Three methods tried in order:
+        1. edgartools get_companies(sic=) -- uses cached data, no HTTP
+        2. EFTS full-text search -- modern SEC API with 1s rate limiting
+        3. Submissions endpoint -- one-by-one SIC lookup (slow, last resort)
 
         Returns a list of resolved ticker symbols (up to 10).
         """
-        import requests
+        import time as _time
 
         exclude = exclude or set()
         peers: list[str] = []
 
-        # Method 1: Use EFTS search API (modern, reliable)
+        # Method 1: edgartools SIC filter (uses cached company data, no HTTP)
         try:
+            self._init_edgartools()
+            if self._edgar_initialized:
+                from edgar import get_company_tickers
+                tickers_df = get_company_tickers()
+                if tickers_df is not None and hasattr(tickers_df, "iterrows"):
+                    for _, row in tickers_df.iterrows():
+                        row_sic = str(row.get("sic", "")).zfill(4) if row.get("sic") else ""
+                        if not row_sic:
+                            continue
+                        # Match: exact SIC for 4-digit, prefix for 2-digit
+                        if len(sic) == 4 and row_sic == sic:
+                            match = True
+                        elif len(sic) == 2 and row_sic.startswith(sic):
+                            match = True
+                        else:
+                            match = False
+                        if match:
+                            ticker = str(row.get("ticker", "")).upper()
+                            if ticker and ticker != target_ticker and ticker not in peers and ticker not in exclude:
+                                peers.append(ticker)
+                            if len(peers) >= 10:
+                                return peers
+                if peers:
+                    return peers
+        except Exception as exc:
+            logger.debug("edgartools SIC lookup failed: %s", exc)
+
+        # Method 2: EFTS full-text search API (rate-limited, 1s delay)
+        try:
+            import requests
+            _time.sleep(1)  # Respect SEC rate limits
             resp = requests.get(
                 "https://efts.sec.gov/LATEST/search-index",
                 params={
@@ -953,7 +984,6 @@ class USEdgarClient:
                 hits = data.get("hits", {}).get("hits", [])
                 for hit in hits:
                     source = hit.get("_source", {})
-                    entity_name = source.get("entity_name", "")
                     cik = str(source.get("entity_id", "")).lstrip("0")
                     ticker = cik_to_ticker.get(cik, "")
                     if ticker and ticker != target_ticker and ticker not in peers and ticker not in exclude:
@@ -962,24 +992,11 @@ class USEdgarClient:
                         return peers
                 if peers:
                     return peers
+            elif resp.status_code == 429:
+                logger.warning("EFTS rate limited (429) for SIC:%s -- waiting 5s", sic)
+                _time.sleep(5)
         except Exception as exc:
             logger.debug("EFTS SIC search failed: %s", exc)
-
-        # Method 2: Filter from already-loaded company tickers by SIC prefix
-        # The cik_to_ticker map was built from company_tickers.json which
-        # also contains SIC codes. Use edgartools if available.
-        try:
-            from edgar import get_companies
-            sic_matches = get_companies(sic=int(sic))
-            if sic_matches is not None:
-                for _, row in sic_matches.iterrows() if hasattr(sic_matches, "iterrows") else []:
-                    ticker = str(row.get("ticker", ""))
-                    if ticker and ticker != target_ticker and ticker not in peers and ticker not in exclude:
-                        peers.append(ticker)
-                    if len(peers) >= 10:
-                        break
-        except Exception as exc:
-            logger.debug("edgartools SIC lookup failed: %s", exc)
 
         return peers
 
