@@ -1064,7 +1064,7 @@ investors understand the *quality* of each prediction.
     - Scenarios that could invalidate predictions
     - Black swan events not captured by models
     11.1 LIMITATIONS (SHORT, REQUIRED):
-    Provide 5-10 bullets covering: data window, OHLCV source (FMP) caveats, \
+    Provide 5-10 bullets covering: data window, OHLCV source (yfinance/regional wrapper) caveats, \
 macro frequency reality (macro APIs provide monthly/quarterly data, aligned daily via as-of logic), \
 missingness summary, any modules that failed and how the report compensated. \
 Must be easy for a non-technical client to understand.

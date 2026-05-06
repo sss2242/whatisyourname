@@ -61,53 +61,53 @@ sub_industry:
   tier: null
 
 # ===========================================================================
-# Market data (Quotes / FMP -- direct, daily)
+# Market data (Quotes / OHLCV -- direct, daily)
 # ===========================================================================
 open:
   category: decision
-  source: fmp_ohlcv
+  source: ohlcv_provider
   mode: direct
   tier: null
 
 high:
   category: decision
-  source: fmp_ohlcv
+  source: ohlcv_provider
   mode: direct
   tier: null
 
 low:
   category: decision
-  source: fmp_ohlcv
+  source: ohlcv_provider
   mode: direct
   tier: null
 
 close:
   category: decision
-  source: fmp_ohlcv
+  source: ohlcv_provider
   mode: direct
   tier: null
 
 volume:
   category: decision
-  source: fmp_ohlcv
+  source: ohlcv_provider
   mode: direct
   tier: 3
 
 adjusted_close:
   category: decision
-  source: fmp_ohlcv
+  source: ohlcv_provider
   mode: direct
   tier: null
 
 market_cap:
   category: decision
-  source: fmp_ohlcv
+  source: ohlcv_provider
   mode: direct
   tier: null
 
 shares_outstanding:
   category: decision
-  source: fmp_ohlcv
+  source: ohlcv_provider
   mode: direct
   tier: null
 

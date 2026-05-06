@@ -131,7 +131,7 @@ def _rate_limit_sleep(calls_per_second: float, host: str = "") -> None:
 
     Enforces a minimum interval between API calls per host to respect
     each API's rate limits. Different APIs have very different limits
-    (SEC: 10/s, Alpha Vantage: 25/day).
+    (SEC: 10/s, OpenFIGI: 25/min).
     """
     if not host:
         host = "global"
