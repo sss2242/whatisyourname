@@ -294,3 +294,202 @@ def compute_leverage_stress_multi_freq(
         divergence * 100,
     )
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Frequency Coherence Test
+# ---------------------------------------------------------------------------
+
+def test_frequency_coherence(
+    freq_scores: dict[str, float],
+    threshold: float = 0.3,
+) -> tuple[float, str]:
+    """Test whether frequency results are coherent before merging.
+
+    Returns (coherence_score 0-1, action: merge/flag_disagreement/use_single_freq).
+    """
+    if len(freq_scores) < 2:
+        return 1.0, "use_single_freq"
+
+    values = list(freq_scores.values())
+    # Direction agreement: are all above or below 50?
+    directions = [1 if v > 50 else -1 for v in values]
+    direction_agreement = 1.0 if len(set(directions)) == 1 else 0.0
+
+    # Magnitude agreement: coefficient of variation
+    mean_v = np.mean(values)
+    std_v = np.std(values)
+    cv = std_v / max(abs(mean_v), 1e-6)
+    magnitude_agreement = max(0, 1.0 - cv)
+
+    coherence = 0.6 * direction_agreement + 0.4 * magnitude_agreement
+
+    if coherence >= 0.7:
+        action = "merge"
+    elif coherence >= threshold:
+        action = "flag_disagreement"
+    else:
+        action = "use_single_freq"
+
+    return round(coherence, 3), action
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: FCF Quality Multi-Frequency
+# ---------------------------------------------------------------------------
+
+def compute_fcf_quality_multi_freq(
+    income_freq_groups: dict[str, pd.DataFrame],
+    cashflow_freq_groups: dict[str, pd.DataFrame],
+    balance_freq_groups: dict[str, pd.DataFrame] | None = None,
+    cache: pd.DataFrame | None = None,
+) -> Any:
+    """Run FCF quality at each frequency, merge via weighted average."""
+    from operator1.hedge_fund.fcf_quality import compute_fcf_quality
+    from operator1.hedge_fund.types import FCFQualityResult
+
+    freq_weights = {"quarterly": 0.55, "annual": 0.45, "semiannual": 0.50}
+    freq_results: dict[str, FCFQualityResult] = {}
+
+    for freq_label, income_df in income_freq_groups.items():
+        if income_df is None or income_df.empty:
+            continue
+        cashflow_df = cashflow_freq_groups.get(freq_label, pd.DataFrame())
+        balance_df = (balance_freq_groups or {}).get(freq_label, pd.DataFrame())
+        try:
+            result = compute_fcf_quality(income_df, cashflow_df, balance_df, cache)
+            if result.available:
+                freq_results[freq_label] = result
+                logger.info("  FCF Quality @ %s: score=%.0f", freq_label, result.score)
+        except Exception as exc:
+            logger.debug("FCF Quality @ %s failed: %s", freq_label, exc)
+
+    if not freq_results:
+        return compute_fcf_quality(pd.DataFrame(), pd.DataFrame(), None, cache)
+
+    if len(freq_results) == 1:
+        return next(iter(freq_results.values()))
+
+    # Coherence test
+    scores = {k: v.score for k, v in freq_results.items()}
+    coherence, action = test_frequency_coherence(scores)
+
+    if action == "use_single_freq":
+        base = freq_results.get("quarterly", next(iter(freq_results.values())))
+        logger.info("  FCF Quality MF: incoherent (%.2f), using single freq", coherence)
+        return base
+
+    # Weighted merge
+    total_w = 0.0
+    weighted = 0.0
+    for freq_label, res in freq_results.items():
+        w = freq_weights.get(freq_label, 0.5)
+        weighted += w * res.score
+        total_w += w
+
+    fused_score = weighted / total_w if total_w > 0 else 50.0
+    base_freq = "quarterly" if "quarterly" in freq_results else next(iter(freq_results))
+    merged = freq_results[base_freq]
+    merged.score = fused_score
+    merged.label = "excellent" if fused_score >= 80 else "good" if fused_score >= 60 else "fair" if fused_score >= 40 else "weak" if fused_score >= 20 else "critical"
+
+    logger.info("  FCF Quality merged: score=%.0f (coherence=%.2f)", fused_score, coherence)
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Accruals Forensics Multi-Frequency
+# ---------------------------------------------------------------------------
+
+def compute_accruals_multi_freq(
+    income_freq_groups: dict[str, pd.DataFrame],
+    balance_freq_groups: dict[str, pd.DataFrame],
+    cashflow_freq_groups: dict[str, pd.DataFrame],
+    cache: pd.DataFrame | None = None,
+) -> Any:
+    """Jones model from annual (more power), Sloan/CCE from quarterly."""
+    from operator1.hedge_fund.accruals_forensics import compute_accruals_forensics
+    from operator1.hedge_fund.types import AccrualsForensicResult
+
+    freq_results: dict[str, AccrualsForensicResult] = {}
+
+    for freq_label, income_df in income_freq_groups.items():
+        if income_df is None or income_df.empty:
+            continue
+        balance_df = balance_freq_groups.get(freq_label, pd.DataFrame())
+        cashflow_df = cashflow_freq_groups.get(freq_label, pd.DataFrame())
+        try:
+            result = compute_accruals_forensics(income_df, balance_df, cashflow_df, cache)
+            if result.available:
+                freq_results[freq_label] = result
+                logger.info("  Accruals @ %s: red_flag=%.0f", freq_label, result.red_flag_score)
+        except Exception as exc:
+            logger.debug("Accruals @ %s failed: %s", freq_label, exc)
+
+    if not freq_results:
+        return compute_accruals_forensics(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), cache)
+
+    if len(freq_results) == 1:
+        return next(iter(freq_results.values()))
+
+    # For accruals: take Jones model from annual (more robust), rest from quarterly
+    base = freq_results.get("quarterly", next(iter(freq_results.values())))
+    annual = freq_results.get("annual")
+    if annual and annual.modified_jones_discretionary is not None:
+        base.modified_jones_discretionary = annual.modified_jones_discretionary
+
+    # Union of red flags: take worse score
+    base.red_flag_score = max(r.red_flag_score for r in freq_results.values())
+    base.label = "high_risk" if base.red_flag_score >= 70 else "elevated" if base.red_flag_score >= 40 else "moderate" if base.red_flag_score >= 20 else "low_risk"
+
+    logger.info("  Accruals merged: red_flag=%.0f", base.red_flag_score)
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Growth Quality Multi-Frequency
+# ---------------------------------------------------------------------------
+
+def compute_growth_quality_multi_freq(
+    income_freq_groups: dict[str, pd.DataFrame],
+    balance_freq_groups: dict[str, pd.DataFrame],
+) -> Any:
+    """Organic fraction from annual, incremental ROIC from quarterly."""
+    from operator1.hedge_fund.engine import _compute_growth_quality
+    from operator1.hedge_fund.types import GrowthQualityResult
+
+    freq_results: dict[str, GrowthQualityResult] = {}
+
+    for freq_label, income_df in income_freq_groups.items():
+        if income_df is None or income_df.empty:
+            continue
+        balance_df = balance_freq_groups.get(freq_label, pd.DataFrame())
+        try:
+            result = _compute_growth_quality(income_df, balance_df)
+            if result.available:
+                freq_results[freq_label] = result
+                logger.info("  GrowthQ @ %s: score=%.0f", freq_label, result.score)
+        except Exception as exc:
+            logger.debug("GrowthQ @ %s failed: %s", freq_label, exc)
+
+    if not freq_results:
+        return _compute_growth_quality(pd.DataFrame(), pd.DataFrame())
+
+    if len(freq_results) == 1:
+        return next(iter(freq_results.values()))
+
+    # Organic fraction from annual (structural), ROIC from quarterly (recent)
+    base = freq_results.get("quarterly", next(iter(freq_results.values())))
+    annual = freq_results.get("annual")
+    if annual and annual.organic_fraction is not None:
+        base.organic_fraction = annual.organic_fraction
+
+    # Weighted score
+    scores = {k: v.score for k, v in freq_results.items()}
+    weights = {"quarterly": 0.55, "annual": 0.45, "semiannual": 0.50}
+    total_w = sum(weights.get(k, 0.5) for k in scores)
+    fused = sum(scores[k] * weights.get(k, 0.5) for k in scores) / max(total_w, 1e-6)
+    base.score = fused
+
+    logger.info("  GrowthQ merged: score=%.0f", fused)
+    return base

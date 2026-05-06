@@ -964,6 +964,271 @@ def _compute_peg(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2: EVA Decomposition (Stern Stewart 1991)
+# ---------------------------------------------------------------------------
+
+def _compute_eva(
+    income_df: pd.DataFrame,
+    balance_df: pd.DataFrame,
+    cache: pd.DataFrame | None = None,
+) -> dict:
+    """Economic Value Added = NOPAT - WACC * Invested_Capital."""
+    try:
+        oi = extract_latest_value(income_df, "operating_income")
+        ni = extract_latest_value(income_df, "net_income")
+        taxes = extract_latest_value(income_df, "taxes")
+        ta = extract_latest_value(balance_df, "total_assets")
+        cl = extract_latest_value(balance_df, "current_liabilities")
+        te = extract_latest_value(balance_df, "total_equity")
+
+        if oi is None or ta is None:
+            return {"available": False}
+
+        # Tax rate estimation
+        tax_rate = 0.25
+        if taxes is not None and ni is not None and abs(ni + (taxes or 0)) > 1e-6:
+            tax_rate = max(0.0, min(0.5, abs(taxes) / abs(ni + taxes)))
+
+        nopat = oi * (1 - tax_rate)
+        ic = ta - (cl or 0)  # invested capital = total assets - current liabilities
+        if ic < 1e-6:
+            return {"available": False}
+
+        wacc = get_hf_weight("valuation.dcf.wacc_mean", 0.09)
+        eva = nopat - wacc * ic
+        roic = nopat / ic if ic > 1e-6 else 0.0
+        eva_spread = roic - wacc  # positive = creating value
+
+        # MVA: market value added
+        mva = None
+        if cache is not None and "market_cap" in cache.columns:
+            mc = cache["market_cap"].dropna()
+            if len(mc) > 0:
+                mva = float(mc.iloc[-1]) - ic
+
+        # Momentum: compare current EVA to 4Q ago
+        oi_s = extract_quarterly_series(income_df, "operating_income", 8)
+        eva_momentum = "stable"
+        if len(oi_s) >= 5:
+            prev_nopat = float(oi_s.iloc[-5]) * (1 - tax_rate)
+            prev_eva = prev_nopat - wacc * ic
+            if eva > prev_eva * 1.05:
+                eva_momentum = "improving"
+            elif eva < prev_eva * 0.95:
+                eva_momentum = "declining"
+
+        return {
+            "available": True,
+            "eva_latest": round(eva, 2),
+            "nopat": round(nopat, 2),
+            "invested_capital": round(ic, 2),
+            "roic": round(roic, 4),
+            "wacc": round(wacc, 4),
+            "eva_spread": round(eva_spread, 4),
+            "mva": round(mva, 2) if mva is not None else None,
+            "eva_momentum": eva_momentum,
+        }
+    except Exception as exc:
+        logger.debug("EVA computation failed: %s", exc)
+        return {"available": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: SOTP Valuation (Berger & Ofek 1995)
+# ---------------------------------------------------------------------------
+
+def _compute_sotp(
+    seg_result: dict | None,
+    cache: pd.DataFrame | None = None,
+) -> dict:
+    """Sum-of-parts valuation when 2+ segments exist."""
+    if not seg_result or seg_result.get("n_segments", 0) < 2:
+        return {"available": False}
+
+    try:
+        segments = seg_result.get("segments", {})
+        if not segments:
+            return {"available": False}
+
+        total_rev = sum(segments.values())
+        if total_rev <= 0:
+            return {"available": False}
+
+        # Sector EV/Revenue multiples (conservative defaults by industry keyword)
+        _SECTOR_MULTIPLES = {
+            "technology": 6.0, "software": 8.0, "cloud": 10.0,
+            "healthcare": 4.0, "pharma": 5.0,
+            "financial": 2.5, "banking": 1.5, "insurance": 1.8,
+            "consumer": 2.0, "retail": 1.5,
+            "industrial": 2.0, "manufacturing": 1.8,
+            "energy": 1.5, "oil": 1.2,
+            "telecom": 3.0, "media": 3.5,
+        }
+
+        segment_valuations = {}
+        for seg_name, seg_rev in segments.items():
+            # Match segment name to sector multiple
+            mult = 2.5  # default
+            name_lower = seg_name.lower()
+            for keyword, m in _SECTOR_MULTIPLES.items():
+                if keyword in name_lower:
+                    mult = m
+                    break
+            segment_valuations[seg_name] = {
+                "revenue": seg_rev,
+                "multiple": mult,
+                "ev": seg_rev * mult,
+            }
+
+        sotp_ev = sum(v["ev"] for v in segment_valuations.values())
+        overhead_pct = get_hf_weight("valuation_upgrade.sotp_corporate_overhead_pct", 0.05)
+        sotp_ev_net = sotp_ev * (1 - overhead_pct)
+
+        # Conglomerate discount
+        conglomerate_discount = None
+        current_price = None
+        if cache is not None and "market_cap" in cache.columns:
+            mc = cache["market_cap"].dropna()
+            if len(mc) > 0:
+                current_mc = float(mc.iloc[-1])
+                current_price = float(cache["close"].dropna().iloc[-1]) if "close" in cache.columns else None
+                conglomerate_discount = 1 - (current_mc / sotp_ev_net) if sotp_ev_net > 0 else None
+
+        # Most undervalued segment
+        most_undervalued = max(segment_valuations, key=lambda s: segment_valuations[s]["ev"] / max(segment_valuations[s]["revenue"], 1))
+
+        return {
+            "available": True,
+            "sotp_ev": round(sotp_ev_net, 2),
+            "segment_valuations": {k: {"revenue": v["revenue"], "multiple": v["multiple"], "ev": round(v["ev"], 2)}
+                                   for k, v in segment_valuations.items()},
+            "conglomerate_discount_pct": round(conglomerate_discount * 100, 1) if conglomerate_discount is not None else None,
+            "most_undervalued_segment": most_undervalued,
+            "n_segments": len(segments),
+        }
+    except Exception as exc:
+        logger.debug("SOTP computation failed: %s", exc)
+        return {"available": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Component CVaR (Boudt, Peterson & Croux 2008)
+# ---------------------------------------------------------------------------
+
+def _compute_component_cvar(
+    cache: pd.DataFrame | None = None,
+    alpha: float = 0.05,
+) -> dict:
+    """Decompose tail risk into contributions from individual risk factors."""
+    if cache is None or "return_1d" not in cache.columns:
+        return {"available": False}
+
+    try:
+        ret = cache["return_1d"].dropna()
+        if len(ret) < 63:
+            return {"available": False}
+
+        # Risk factor columns
+        factors = {}
+        _factor_cols = [
+            "revenue_growth_yoy", "gross_margin", "debt_to_equity_abs",
+            "volatility_21d", "conflict_intensity_score",
+        ]
+        for col in _factor_cols:
+            if col in cache.columns and cache[col].notna().sum() > 30:
+                factors[col] = cache[col].fillna(0).values[-len(ret):]
+
+        if not factors:
+            return {"available": False}
+
+        # Identify worst alpha% of days
+        cutoff = np.percentile(ret.values, alpha * 100)
+        tail_mask = ret.values <= cutoff
+        if tail_mask.sum() < 3:
+            return {"available": False}
+
+        # Component CVaR: average factor value on worst days vs all days
+        component_cvar = {}
+        for fname, fvals in factors.items():
+            fvals_aligned = fvals[-len(ret):]
+            if len(fvals_aligned) != len(ret):
+                continue
+            tail_mean = float(np.mean(fvals_aligned[tail_mask]))
+            full_mean = float(np.mean(fvals_aligned))
+            # Contribution = deviation from mean on tail days
+            component_cvar[fname] = round(abs(tail_mean - full_mean), 6)
+
+        total = sum(component_cvar.values()) or 1.0
+        contributions = {k: round(v / total * 100, 1) for k, v in component_cvar.items()}
+        dominant = max(contributions, key=contributions.get) if contributions else ""
+
+        return {
+            "available": True,
+            "component_contributions_pct": contributions,
+            "dominant_risk_factor": dominant,
+            "tail_days": int(tail_mask.sum()),
+            "cvar_alpha": alpha,
+        }
+    except Exception as exc:
+        logger.debug("Component CVaR failed: %s", exc)
+        return {"available": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Sustainable Growth Rate (Higgins 1977)
+# ---------------------------------------------------------------------------
+
+def _compute_sgr(
+    income_df: pd.DataFrame,
+    cashflow_df: pd.DataFrame,
+) -> dict:
+    """SGR = ROE * (1 - payout_ratio). Compare to actual growth."""
+    try:
+        ni = extract_latest_value(income_df, "net_income")
+        divs = extract_latest_value(cashflow_df, "dividends_paid")
+        te = extract_latest_value(income_df, "total_equity")
+        if te is None:
+            # Try from any source
+            from operator1.hedge_fund.helpers import extract_quarterly_series as _eqs
+            te_s = _eqs(income_df, "total_equity", 4)
+            if len(te_s) == 0:
+                return {}
+            te = float(te_s.iloc[-1])
+
+        if ni is None or te is None or abs(te) < 1e-6:
+            return {}
+
+        roe = ni / te
+        payout = abs(divs) / abs(ni) if divs is not None and abs(ni) > 1e-6 else 0.0
+        payout = min(payout, 1.0)
+        sgr = roe * (1 - payout)
+
+        # Actual growth for comparison
+        rev = extract_quarterly_series(income_df, "revenue", 8)
+        actual_growth = None
+        if len(rev) >= 5:
+            r_now = float(rev.iloc[-1])
+            r_prev = float(rev.iloc[-4]) if len(rev) >= 4 else float(rev.iloc[0])
+            if abs(r_prev) > 1e-6:
+                actual_growth = (r_now - r_prev) / abs(r_prev)
+
+        gap = (actual_growth - sgr) if actual_growth is not None else None
+        funding_flag = gap is not None and gap > 0.05
+
+        return {
+            "sgr": round(sgr, 4),
+            "roe": round(roe, 4),
+            "payout_ratio": round(payout, 4),
+            "actual_growth": round(actual_growth, 4) if actual_growth is not None else None,
+            "growth_gap_sgr": round(gap, 4) if gap is not None else None,
+            "funding_gap_flag": funding_flag,
+        }
+    except Exception as exc:
+        logger.debug("SGR computation failed: %s", exc)
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # Scorecard synthesis
 # ---------------------------------------------------------------------------
 
@@ -1384,6 +1649,43 @@ def run_hedge_fund_analysis(
         hf.valuation_quality.quadrant if hf.valuation_quality.available else "N/A",
         f"{hf.peg_composite.peg_adjusted:.1f}" if hf.peg_composite.peg_adjusted else "N/A",
     )
+
+    # --- Phase 2: EVA Decomposition ---
+    try:
+        hf.eva = _compute_eva(income_df, balance_df, cache)
+        if hf.eva.get("available"):
+            logger.info("  EVA: %.0f (spread=%+.1f%%)", hf.eva.get("eva_latest", 0), (hf.eva.get("eva_spread", 0)) * 100)
+    except Exception as _exc:
+        logger.debug("EVA failed: %s", _exc)
+
+    # --- Phase 2: SOTP Valuation ---
+    try:
+        _seg = locals().get("seg_result") or {}
+        hf.sotp = _compute_sotp(_seg, cache)
+        if hf.sotp.get("available"):
+            logger.info("  SOTP: EV=%.0f, discount=%s%%",
+                        hf.sotp.get("sotp_ev", 0),
+                        hf.sotp.get("conglomerate_discount_pct", "N/A"))
+    except Exception as _exc:
+        logger.debug("SOTP failed: %s", _exc)
+
+    # --- Phase 4: Component CVaR ---
+    try:
+        hf.risk_attribution = _compute_component_cvar(cache)
+        if hf.risk_attribution.get("available"):
+            logger.info("  CVaR: dominant=%s", hf.risk_attribution.get("dominant_risk_factor", "N/A"))
+    except Exception as _exc:
+        logger.debug("Component CVaR failed: %s", _exc)
+
+    # --- Phase 5: SGR (Sustainable Growth Rate) ---
+    try:
+        _sgr_result = _compute_sgr(income_df, cashflow_df)
+        if _sgr_result:
+            hf.growth_quality.sgr = _sgr_result.get("sgr")
+            hf.growth_quality.growth_gap_sgr = _sgr_result.get("growth_gap_sgr")
+            hf.growth_quality.funding_gap_flag = _sgr_result.get("funding_gap_flag", False)
+    except Exception as _exc:
+        logger.debug("SGR failed: %s", _exc)
 
     # --- Scorecard + Position Signal ---
     hf.scorecard = _build_scorecard(hf)

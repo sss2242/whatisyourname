@@ -957,8 +957,427 @@ def run_advanced_methods(
     result.cross_asset_regime = compute_cross_asset_regime(macro_data)
 
     # P3: Fama-French Alpha (stub -- needs external factor data)
-    # Would need Ken French CSV download. Setting to None for now.
     result.fama_french_alpha = None
+
+    # --- Phase 3: Merton Default Term Structure (KMV, Crosbie & Bohn 2003) ---
+    try:
+        result.merton_term_structure = _compute_merton_term_structure(cache)
+    except Exception:
+        pass
+
+    # --- Phase 3: Credit Migration Matrix (Jarrow, Lando & Turnbull 1997) ---
+    try:
+        result.credit_migration = _compute_credit_migration(cache)
+    except Exception:
+        pass
+
+    # --- Phase 5: Moat Quantification (Greenwald & Kahn 2005) ---
+    try:
+        result.moat = _compute_moat_score(income_df, cache, peer_ranking_result)
+    except Exception:
+        pass
+
+    # --- Phase 7: Factor Exposure (Ross 1976, Chen, Roll & Ross 1986) ---
+    try:
+        result.factor_exposure = _compute_factor_exposure(cache)
+    except Exception:
+        pass
+
+    # --- Phase 7: Equity Duration (Leibowitz 1998) ---
+    try:
+        result.equity_duration = _compute_equity_duration(cache)
+    except Exception:
+        pass
+
+    # --- Phase 8: Governance Score (Gompers, Ishii & Metrick 2003) ---
+    try:
+        result.governance = _compute_governance_score(cache)
+    except Exception:
+        pass
+
+    # --- Phase 8: Capital Allocation Quality (Jensen 1986) ---
+    try:
+        result.capital_allocation = _compute_capital_allocation_quality(cashflow_df, cache)
+    except Exception:
+        pass
 
     result.available = True
     return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Merton Default Term Structure (KMV)
+# ---------------------------------------------------------------------------
+
+def _compute_merton_term_structure(cache: pd.DataFrame | None) -> dict:
+    """Compute default probability at horizons T = 1, 2, 3, 5 years."""
+    from scipy.stats import norm as _norm
+
+    if cache is None:
+        return {}
+
+    close = cache.get("close")
+    vol = cache.get("volatility_21d")
+    debt_col = "total_debt_asof" if "total_debt_asof" in cache.columns else "total_debt"
+    debt = cache.get(debt_col)
+    shares = cache.get("shares_outstanding")
+
+    if close is None or vol is None or debt is None:
+        return {}
+
+    E = close.dropna().iloc[-1]  # equity value per share
+    sigma_E = vol.dropna().iloc[-1] * np.sqrt(252)  # annualized
+    D = debt.dropna().iloc[-1]
+    so = shares.dropna().iloc[-1] if shares is not None and shares.notna().any() else 1.0
+
+    if E <= 0 or sigma_E <= 0 or D <= 0 or so <= 0:
+        return {}
+
+    equity_value = E * so
+    # Initial estimate: V = E + D, sigma_V = sigma_E * E/V
+    V = equity_value + D
+    sigma_V = sigma_E * equity_value / V
+    r = 0.04  # risk-free proxy
+
+    term_structure = {}
+    for T in [1, 2, 3, 5]:
+        d1 = (np.log(V / D) + (r + 0.5 * sigma_V ** 2) * T) / (sigma_V * np.sqrt(T))
+        d2 = d1 - sigma_V * np.sqrt(T)
+        dd = d2  # distance to default
+        pd_val = float(_norm.cdf(-dd))
+        term_structure[f"{T}Y"] = {
+            "distance_to_default": round(float(dd), 4),
+            "default_probability": round(pd_val, 6),
+        }
+
+    return {"available": True, "horizons": term_structure}
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Credit Migration Matrix
+# ---------------------------------------------------------------------------
+
+def _compute_credit_migration(cache: pd.DataFrame | None) -> dict:
+    """Build 4x4 transition matrix from Altman Z-zone history."""
+    if cache is None or "fh_altman_z_zone" not in cache.columns:
+        return {}
+
+    zones = cache["fh_altman_z_zone"].dropna()
+    if len(zones) < 63:
+        return {}
+
+    # Resample to quarterly for transition counting
+    q_zones = zones.resample("QE").last().dropna()
+    if len(q_zones) < 3:
+        return {}
+
+    states = ["safe", "grey", "distress"]
+    n = len(states)
+    matrix = np.zeros((n, n))
+    smoothing = 0.01
+
+    for i in range(len(q_zones) - 1):
+        from_state = str(q_zones.iloc[i]).lower().strip()
+        to_state = str(q_zones.iloc[i + 1]).lower().strip()
+        if from_state in states and to_state in states:
+            fi = states.index(from_state)
+            ti = states.index(to_state)
+            matrix[fi, ti] += 1
+
+    # Add Laplace smoothing and normalize
+    matrix += smoothing
+    row_sums = matrix.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    matrix = matrix / row_sums
+
+    # Current state and migration momentum
+    current = str(q_zones.iloc[-1]).lower().strip()
+    momentum = "stable"
+    if len(q_zones) >= 4:
+        recent = [str(z).lower().strip() for z in q_zones.iloc[-4:]]
+        state_nums = [states.index(s) if s in states else 1 for s in recent]
+        if state_nums[-1] > state_nums[0]:
+            momentum = "downgrading"
+        elif state_nums[-1] < state_nums[0]:
+            momentum = "upgrading"
+
+    return {
+        "available": True,
+        "matrix": {states[i]: {states[j]: round(matrix[i, j], 4) for j in range(n)} for i in range(n)},
+        "current_state": current,
+        "migration_momentum": momentum,
+        "n_transitions": int(len(q_zones) - 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Competitive Moat (Greenwald & Kahn 2005)
+# ---------------------------------------------------------------------------
+
+def _compute_moat_score(
+    income_df: pd.DataFrame,
+    cache: pd.DataFrame | None = None,
+    peer_ranking_result: Any = None,
+) -> dict:
+    """Quantify economic moat from financial fundamentals."""
+    from operator1.hedge_fund.helpers import extract_quarterly_series
+
+    scores = {}
+
+    # Pricing power (30%): gross margin stability
+    gm = extract_quarterly_series(income_df, "gross_profit", 12)
+    rev = extract_quarterly_series(income_df, "revenue", 12)
+    if len(gm) >= 4 and len(rev) >= 4:
+        common = gm.index.intersection(rev.index)
+        if len(common) >= 4:
+            margins = gm.loc[common] / rev.loc[common].where(rev.loc[common].abs() > 1e-6)
+            margins = margins.dropna()
+            if len(margins) >= 4:
+                stability = 1.0 - min(float(margins.std()) * 10, 1.0)
+                scores["pricing_power"] = max(0, stability * 100)
+
+    # Cost advantage (25%): operating margin vs peers
+    if peer_ranking_result is not None:
+        vr = getattr(peer_ranking_result, "variable_ranks", None)
+        if isinstance(vr, dict) and "gross_margin" in vr:
+            scores["cost_advantage"] = float(vr["gross_margin"])
+
+    # Network effects (20%): revenue acceleration
+    if len(rev) >= 6:
+        growth = rev.pct_change().dropna()
+        if len(growth) >= 3:
+            accel = growth.diff().dropna()
+            mean_accel = float(accel.mean())
+            scores["network_effects"] = max(0, min(100, 50 + mean_accel * 2000))
+
+    # Switching costs (25%): revenue retention (low volatility = high switching costs)
+    if len(rev) >= 6:
+        cv = float(rev.std() / rev.mean()) if rev.mean() > 1e-6 else 1.0
+        scores["switching_costs"] = max(0, min(100, (1.0 - min(cv, 1.0)) * 100))
+
+    if not scores:
+        return {}
+
+    weights = {"pricing_power": 0.30, "cost_advantage": 0.25, "network_effects": 0.20, "switching_costs": 0.25}
+    composite = sum(scores.get(k, 50) * w for k, w in weights.items())
+    moat_type = max(scores, key=scores.get) if scores else "none"
+    trend = "stable"
+
+    return {
+        "available": True,
+        "moat_score": round(composite, 1),
+        "moat_type": moat_type,
+        "moat_trend": trend,
+        "components": {k: round(v, 1) for k, v in scores.items()},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: Multi-Factor Exposure (Ross 1976)
+# ---------------------------------------------------------------------------
+
+def _compute_factor_exposure(cache: pd.DataFrame | None) -> dict:
+    """Rolling OLS of stock returns on macro factors."""
+    if cache is None or "return_1d" not in cache.columns:
+        return {}
+
+    from sklearn.linear_model import LinearRegression
+
+    ret = cache["return_1d"].dropna()
+    if len(ret) < 126:
+        return {}
+
+    factors = {}
+    _factor_map = {
+        "yield_curve_10y2y": "rates",
+        "usd_momentum_21d": "usd",
+        "sector_relative_strength": "sector",
+        "benchmark_return_1d": "market",
+    }
+
+    for col, label in _factor_map.items():
+        if col in cache.columns and cache[col].notna().sum() > 60:
+            factors[label] = cache[col].fillna(0)
+
+    if len(factors) < 2:
+        return {}
+
+    # Align and run OLS on last 252 days
+    window = min(252, len(ret))
+    y = ret.iloc[-window:].values
+    X = np.column_stack([factors[k].iloc[-window:].values for k in factors])
+    mask = np.isfinite(y) & np.isfinite(X).all(axis=1)
+
+    if mask.sum() < 30:
+        return {}
+
+    lr = LinearRegression().fit(X[mask], y[mask])
+    r2 = lr.score(X[mask], y[mask])
+    betas = {label: round(float(b), 4) for label, b in zip(factors.keys(), lr.coef_)}
+    dominant = max(betas, key=lambda k: abs(betas[k]))
+    vulnerability = sum(abs(b) for b in betas.values())
+
+    return {
+        "available": True,
+        "factor_betas": betas,
+        "factor_r_squared": round(float(r2), 4),
+        "dominant_factor": dominant,
+        "macro_vulnerability_score": round(vulnerability, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: Equity Duration (Leibowitz 1998)
+# ---------------------------------------------------------------------------
+
+def _compute_equity_duration(cache: pd.DataFrame | None) -> dict:
+    """Empirical equity duration from returns vs yield changes."""
+    if cache is None or "return_1d" not in cache.columns:
+        return {}
+
+    yc_col = "yield_curve_10y2y"
+    if yc_col not in cache.columns or cache[yc_col].notna().sum() < 60:
+        return {}
+
+    ret = cache["return_1d"].dropna()
+    yc = cache[yc_col].diff().dropna()  # changes in yield
+
+    common = ret.index.intersection(yc.index)
+    if len(common) < 126:
+        return {}
+
+    ret_c = ret.loc[common].iloc[-252:]
+    yc_c = yc.loc[common].iloc[-252:]
+
+    var_yc = float(yc_c.var())
+    if var_yc < 1e-10:
+        return {}
+
+    cov_ry = float(ret_c.cov(yc_c))
+    duration_beta = -cov_ry / var_yc  # negative sign: positive duration = hurt by rate hikes
+
+    label = "high" if abs(duration_beta) > 5 else "moderate" if abs(duration_beta) > 2 else "low"
+    if duration_beta < -1:
+        label = "negative"  # benefits from rate hikes (e.g., banks)
+
+    return {
+        "available": True,
+        "equity_duration": round(duration_beta, 2),
+        "rate_sensitivity_label": label,
+        "rate_shock_impact_pct": round(duration_beta * 0.01 * 100, 2),  # per 100bps
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: Governance Quality Score (Gompers et al. 2003)
+# ---------------------------------------------------------------------------
+
+def _compute_governance_score(cache: pd.DataFrame | None) -> dict:
+    """Governance quality from available financial data proxies."""
+    if cache is None:
+        return {}
+
+    scores = {}
+
+    # Insider alignment (40%): from inst_insider_signal
+    if "inst_insider_signal" in cache.columns:
+        signal = cache["inst_insider_signal"].dropna()
+        if len(signal) > 0:
+            latest = float(signal.iloc[-1])
+            # Positive insider signal = aligned with shareholders
+            scores["insider_alignment"] = max(0, min(100, 50 + latest * 50))
+
+    # Ownership concentration risk (30%): from inst_crowding_risk (inverted)
+    if "inst_crowding_risk" in cache.columns:
+        cr = cache["inst_crowding_risk"].dropna()
+        if len(cr) > 0:
+            latest = float(cr.iloc[-1])
+            # Low crowding = better governance
+            scores["ownership_concentration"] = max(0, min(100, (1 - latest) * 100))
+
+    # Capital discipline (30%): from vanity_score (inverted)
+    if "vanity_score" in cache.columns:
+        vs = cache["vanity_score"].dropna()
+        if len(vs) > 0:
+            latest = float(vs.iloc[-1])
+            # Low vanity = good governance
+            scores["capital_discipline"] = max(0, min(100, 100 - latest))
+
+    if not scores:
+        return {}
+
+    weights = {"insider_alignment": 0.40, "ownership_concentration": 0.30, "capital_discipline": 0.30}
+    composite = sum(scores.get(k, 50) * w for k, w in weights.items())
+    label = "strong" if composite > 70 else "adequate" if composite > 50 else "weak" if composite > 30 else "poor"
+
+    return {
+        "available": True,
+        "governance_score": round(composite, 1),
+        "governance_label": label,
+        "components": {k: round(v, 1) for k, v in scores.items()},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: Capital Allocation Quality (Jensen 1986)
+# ---------------------------------------------------------------------------
+
+def _compute_capital_allocation_quality(
+    cashflow_df: pd.DataFrame,
+    cache: pd.DataFrame | None = None,
+) -> dict:
+    """Score how well management allocates capital."""
+    from operator1.hedge_fund.helpers import extract_quarterly_series
+
+    scores = {}
+
+    # Buyback timing: were buybacks done when stock was cheap?
+    buybacks = extract_quarterly_series(cashflow_df, "stock_buybacks", 8)
+    if len(buybacks) >= 4 and cache is not None and "pe_ratio_calc" in cache.columns:
+        pe = cache["pe_ratio_calc"].dropna()
+        if len(pe) > 0:
+            # Resample PE to quarterly
+            q_pe = pe.resample("QE").last().dropna()
+            common = buybacks.index.intersection(q_pe.index)
+            if len(common) >= 2:
+                bb_abs = buybacks.loc[common].abs()
+                pe_vals = q_pe.loc[common]
+                # Good timing: large buybacks when PE is low
+                # Correlation between buyback size and 1/PE
+                if pe_vals.std() > 0 and bb_abs.std() > 0:
+                    corr = float(bb_abs.corr(1 / pe_vals.where(pe_vals > 0)))
+                    if not np.isnan(corr):
+                        scores["buyback_timing"] = max(0, min(100, 50 + corr * 50))
+
+    # Dividend consistency
+    divs = extract_quarterly_series(cashflow_df, "dividends_paid", 8)
+    if len(divs) >= 4:
+        d_abs = divs.abs()
+        if d_abs.mean() > 1e-6:
+            cv = float(d_abs.std() / d_abs.mean())
+            scores["dividend_consistency"] = max(0, min(100, (1 - min(cv, 2) / 2) * 100))
+
+    # Reinvestment spread: ROIC - WACC
+    if cache is not None:
+        # Use EVA spread if available (computed earlier)
+        roic_val = None
+        for col in ["roa", "roe"]:
+            if col in cache.columns:
+                s = cache[col].dropna()
+                if len(s) > 0:
+                    roic_val = float(s.iloc[-1])
+                    break
+        if roic_val is not None:
+            wacc = 0.09  # default
+            spread = roic_val - wacc
+            scores["reinvestment_spread"] = max(0, min(100, 50 + spread * 500))
+
+    if not scores:
+        return {}
+
+    composite = sum(scores.values()) / len(scores)
+    return {
+        "available": True,
+        "capital_allocation_score": round(composite, 1),
+        "components": {k: round(v, 1) for k, v in scores.items()},
+    }
