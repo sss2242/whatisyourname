@@ -518,20 +518,35 @@ def _build_predictions_section(
 
     section["horizons"] = horizon_summaries
 
-    # Technical Alpha
+    # Technical Alpha -- store full unmasked OHLC values in the profile.
+    # Display masking is applied at report render time only, so downstream
+    # models (OHLC predictor, recursive aggregator, HF position signal)
+    # have access to all computed values.
     ta = prediction_result.get("technical_alpha")
     if ta:
         if isinstance(ta, dict):
             section["technical_alpha"] = {
+                "next_day_open": _safe_float(ta.get("next_day_open")),
+                "next_day_high": _safe_float(ta.get("next_day_high")),
                 "next_day_low": _safe_float(ta.get("next_day_low")),
-                "mask_applied": ta.get("mask_applied", True),
+                "next_day_close": _safe_float(ta.get("next_day_close")),
+                "mask_applied": ta.get("mask_applied", False),
             }
         else:
             section["technical_alpha"] = {
+                "next_day_open": _safe_float(
+                    getattr(ta, "next_day_open", None),
+                ),
+                "next_day_high": _safe_float(
+                    getattr(ta, "next_day_high", None),
+                ),
                 "next_day_low": _safe_float(
                     getattr(ta, "next_day_low", None),
                 ),
-                "mask_applied": getattr(ta, "mask_applied", True),
+                "next_day_close": _safe_float(
+                    getattr(ta, "next_day_close", None),
+                ),
+                "mask_applied": getattr(ta, "mask_applied", False),
             }
 
     # Ensemble weights

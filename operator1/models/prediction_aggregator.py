@@ -963,7 +963,7 @@ def apply_technical_alpha_mask(
     ``TechnicalAlphaMask`` with open/high/close masked (None) and
     low set to an estimated value.
     """
-    mask = TechnicalAlphaMask(mask_applied=True)
+    mask = TechnicalAlphaMask(mask_applied=False)
 
     # Get last observed close.
     if "close" in cache.columns:
@@ -976,9 +976,8 @@ def apply_technical_alpha_mask(
         last_close = float("nan")
 
     if math.isnan(last_close):
-        # Cannot estimate -- return mask with NaN low.
         logger.warning(
-            "No close price available for Technical Alpha mask"
+            "No close price available for Technical Alpha estimation"
         )
         return mask
 
@@ -991,21 +990,35 @@ def apply_technical_alpha_mask(
             if not math.isnan(vol_val) and vol_val > 0:
                 vol = vol_val
 
-    # Estimate next-day low.
-    # Low is typically last_close minus some fraction of daily vol.
+    # Compute all OHLC estimates (unmasked).
+    # Masking is now report-only -- the calculation layer preserves
+    # all values for downstream models (OHLC predictor, recursive
+    # aggregator, HF position signal) that need full OHLC data.
     mask.next_day_low = last_close * (1.0 - vol * INTRADAY_LOW_FACTOR)
+    mask.next_day_high = last_close * (1.0 + vol * INTRADAY_LOW_FACTOR)
 
-    # Masked fields stay None.
-    mask.next_day_open = None
-    mask.next_day_high = None
-    mask.next_day_close = None
+    # Use close forecast from aggregated results if available
+    close_1d = forecasts.get("close", {}).get("1d")
+    if close_1d is not None and not math.isnan(close_1d):
+        mask.next_day_close = close_1d
+        # Open estimate: gap from last close toward forecast direction
+        gap_direction = 1.0 if close_1d >= last_close else -1.0
+        mask.next_day_open = last_close + gap_direction * vol * last_close * 0.3
+    else:
+        mask.next_day_close = last_close
+        mask.next_day_open = last_close
+
+    # mask_applied=False means the data layer has full OHLC values.
+    # The report generator applies display masking at render time.
+    mask.mask_applied = False
 
     logger.info(
-        "Technical Alpha mask: last_close=%.4f, vol=%.6f, "
-        "estimated_low=%.4f",
-        last_close,
-        vol,
+        "Technical Alpha OHLC: open=%.4f, high=%.4f, low=%.4f, close=%.4f "
+        "(masking deferred to report layer)",
+        mask.next_day_open,
+        mask.next_day_high,
         mask.next_day_low,
+        mask.next_day_close,
     )
 
     return mask
@@ -2686,6 +2699,31 @@ def run_prediction_aggregation(
                 )
                 interval_source = "rmse"
 
+                # MC percentile override for long horizons (>= 21d).
+                # The RMSE * sqrt(h) scaling assumes independent daily
+                # errors, which underestimates uncertainty during trending
+                # markets.  MC path percentiles from 10K regime-switching
+                # simulations capture serial correlation and tail risk.
+                if (
+                    mc_result is not None
+                    and horizon_days >= 21
+                    and var_name == "close"
+                ):
+                    try:
+                        _mc_tv = getattr(mc_result, "terminal_values", {})
+                        _mc_paths = _mc_tv.get(horizon_days) or _mc_tv.get(f"{horizon_days}d")
+                        if _mc_paths is not None and len(_mc_paths) > 100:
+                            _mc_arr = np.array(_mc_paths)
+                            _mc_base = last_value if last_value and not math.isnan(last_value) else point
+                            _mc_p5 = float(np.percentile(_mc_arr, 5)) * _mc_base
+                            _mc_p95 = float(np.percentile(_mc_arr, 95)) * _mc_base
+                            if (_mc_p95 - _mc_p5) > (upper - lower):
+                                lower = _mc_p5
+                                upper = _mc_p95
+                                interval_source = "mc_percentile"
+                    except Exception:
+                        pass
+
             # ----------------------------------------------------------
             # Phase 2.5: Per-tier confidence multipliers (survival mode).
             # In survival mode, Tier 4/5 predictions are less reliable.
@@ -2713,6 +2751,134 @@ def run_prediction_aggregation(
                 mid = point if not math.isnan(point) else (lower + upper) / 2.0
                 lower = mid - (mid - lower) * copula_multiplier
                 upper = mid + (upper - mid) * copula_multiplier
+
+            # ----------------------------------------------------------
+            # Phase 3.5: Minimum half-width floor (Fix 1).
+            # A $0.45 band on a $250 stock is 0.18% -- absurdly narrow
+            # for 90% coverage.  Floor: 1% of price * sqrt(horizon).
+            # ----------------------------------------------------------
+            _MIN_HW_PCT = 0.01
+            if not math.isnan(point) and abs(point) > 0:
+                _min_hw = abs(point) * _MIN_HW_PCT * math.sqrt(max(horizon_days, 1))
+                _cur_hw = (upper - lower) / 2.0 if not (math.isnan(upper) or math.isnan(lower)) else 0.0
+                if _cur_hw < _min_hw:
+                    lower = point - _min_hw
+                    upper = point + _min_hw
+                    interval_source += "+floor"
+
+            # ----------------------------------------------------------
+            # Phase 3.6: Ensemble disagreement widening (Lakshminarayanan 2017).
+            # When models disagree, their disagreement IS the uncertainty.
+            # Use per-model RMSE spread as a proxy for forecast spread.
+            # ----------------------------------------------------------
+            if forecast_result is not None and hasattr(forecast_result, "metrics"):
+                _model_rmses = [
+                    m.rmse for m in forecast_result.metrics
+                    if m.variable == var_name and m.fitted and m.rmse > 0
+                ]
+                if len(_model_rmses) >= 2:
+                    _rmse_spread = max(_model_rmses) - min(_model_rmses)
+                    _disagree_hw = z_score * _rmse_spread * math.sqrt(max(horizon_days, 1))
+                    _cur_hw = (upper - lower) / 2.0 if not (math.isnan(upper) or math.isnan(lower)) else 0.0
+                    if _disagree_hw > _cur_hw:
+                        lower = point - _disagree_hw
+                        upper = point + _disagree_hw
+                        interval_source += "+disagreement"
+
+            # ----------------------------------------------------------
+            # Phase 3.7: IV-anchored interval blending (Hull 2018).
+            # Options-implied vol is the market's forward-looking consensus
+            # on uncertainty.  Blend with model-derived intervals.
+            # ----------------------------------------------------------
+            if "iv30" in cache.columns and var_name == "close":
+                _iv_series = cache["iv30"].dropna()
+                if len(_iv_series) > 0:
+                    _iv30_val = float(_iv_series.iloc[-1])
+                    if _iv30_val > 0 and not math.isnan(_iv30_val):
+                        _iv_daily = _iv30_val / math.sqrt(252)
+                        _last_px = last_value if last_value and not math.isnan(last_value) else point
+                        _iv_hw = z_score * _last_px * _iv_daily * math.sqrt(max(horizon_days, 1))
+                        _cur_hw = (upper - lower) / 2.0
+                        # Horizon-decaying IV blend: IV is best at short
+                        # horizons (market-priced event risk) but model
+                        # RMSE + MC percentiles dominate at longer horizons.
+                        _IV_BLEND = {1: 0.50, 5: 0.35, 21: 0.15, 252: 0.05}
+                        _iv_w = _IV_BLEND.get(horizon_days, 0.20)
+                        _blended_hw = _iv_w * _iv_hw + (1.0 - _iv_w) * _cur_hw
+                        if _blended_hw > _cur_hw:
+                            lower = point - _blended_hw
+                            upper = point + _blended_hw
+                            interval_source += "+iv"
+
+            # ----------------------------------------------------------
+            # Phase 3.8: ATH volatility scaling (Bouchaud 2002).
+            # Near all-time highs, realized vol underestimates future vol.
+            # Scale by vol-of-vol ratio.
+            # ----------------------------------------------------------
+            if "anchoring_52w_high" in cache.columns:
+                _ath_s = cache["anchoring_52w_high"].dropna()
+                if len(_ath_s) > 0:
+                    _ath_v = float(_ath_s.iloc[-1])
+                    if _ath_v > 0.90:
+                        _vov = 0.0
+                        _vol = 0.02
+                        if "vol_of_vol_21d" in cache.columns:
+                            _vov_s = cache["vol_of_vol_21d"].dropna()
+                            if len(_vov_s) > 0:
+                                _vov = float(_vov_s.iloc[-1])
+                        if "volatility_21d" in cache.columns:
+                            _vol_s = cache["volatility_21d"].dropna()
+                            if len(_vol_s) > 0:
+                                _vol = max(0.001, float(_vol_s.iloc[-1]))
+                        _vov_ratio = max(1.0, _vov / _vol) if _vov > 0 else 1.0
+                        _ath_scale = 1.0 + (_ath_v - 0.90) * _vov_ratio
+                        _cur_hw = (upper - lower) / 2.0
+                        lower = point - _cur_hw * _ath_scale
+                        upper = point + _cur_hw * _ath_scale
+                        interval_source += "+ath"
+
+            # ----------------------------------------------------------
+            # Phase 3.9: Invariant guard -- lower <= point <= upper.
+            # Must ALWAYS hold regardless of which interval path fired.
+            # ----------------------------------------------------------
+            if not math.isnan(point) and not math.isnan(lower) and not math.isnan(upper):
+                if lower > point or upper < point:
+                    _hw = max(abs(upper - lower) / 2.0, abs(point) * _MIN_HW_PCT)
+                    lower = point - _hw
+                    upper = point + _hw
+
+            # ----------------------------------------------------------
+            # Phase 3.10: Width cap -- prevent multiplicative blowup.
+            # MC P5/P95 range is the maximum reasonable uncertainty
+            # (already accounts for regime switching + tail risk).
+            # Absolute cap at 50% of price as final safety net.
+            # ----------------------------------------------------------
+            if mc_result is not None and var_name == "close" and not math.isnan(point):
+                try:
+                    _mc_tv = getattr(mc_result, "terminal_values", {})
+                    _mc_paths_cap = _mc_tv.get(horizon_days) or _mc_tv.get(f"{horizon_days}d")
+                    if _mc_paths_cap is not None and len(_mc_paths_cap) > 100:
+                        _mc_arr_cap = np.array(_mc_paths_cap)
+                        _mc_base_cap = last_value if last_value and not math.isnan(last_value) else point
+                        _mc_p5_cap = float(np.percentile(_mc_arr_cap, 5)) * _mc_base_cap
+                        _mc_p95_cap = float(np.percentile(_mc_arr_cap, 95)) * _mc_base_cap
+                        _mc_max_hw = (_mc_p95_cap - _mc_p5_cap) / 2.0
+                        _cur_hw_cap = (upper - lower) / 2.0
+                        if _mc_max_hw > 0 and _cur_hw_cap > _mc_max_hw:
+                            lower = point - _mc_max_hw
+                            upper = point + _mc_max_hw
+                            interval_source += "+mc_cap"
+                except Exception:
+                    pass
+
+            # Absolute cap: 50% of price at any horizon
+            if not math.isnan(point) and abs(point) > 0:
+                _abs_max_hw = abs(point) * 0.50
+                _cur_hw_abs = (upper - lower) / 2.0
+                if _cur_hw_abs > _abs_max_hw:
+                    lower = point - _abs_max_hw
+                    upper = point + _abs_max_hw
+                    interval_source += "+abs_cap"
 
             # ----------------------------------------------------------
             # Phase 4: DTW analog forecast.
