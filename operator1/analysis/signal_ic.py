@@ -259,23 +259,25 @@ def compute_signal_ic(
             if fr is None:
                 continue
 
-            # Align signal and forward return
-            aligned = pd.DataFrame({"signal": signal, "forward": fr}).dropna()
-            if len(aligned) < min_observations:
+            # Vectorized Spearman IC: rank transform + rolling Pearson
+            # Spearman correlation = Pearson correlation of ranks, so we
+            # pre-rank both series and use pandas rolling().corr() which
+            # runs in C. This eliminates the O(n_windows) Python loop
+            # that was calling scipy.stats.spearmanr() ~10,800 times.
+            both_valid = signal.notna() & fr.notna()
+            if both_valid.sum() < min_observations:
                 continue
 
-            # Rolling Spearman IC
-            rolling_ics = []
-            for start in range(0, len(aligned) - rolling_window + 1, rolling_window // 4):
-                window = aligned.iloc[start:start + rolling_window]
-                if len(window) >= min_observations // 2:
-                    ic, _ = stats.spearmanr(window["signal"], window["forward"])
-                    if not np.isnan(ic):
-                        rolling_ics.append(ic)
+            ranked_sig = signal[both_valid].rank()
+            ranked_fr = fr[both_valid].rank()
+            rolling_ic = ranked_sig.rolling(
+                rolling_window, min_periods=min_observations // 2,
+            ).corr(ranked_fr)
+            rolling_ic = rolling_ic.dropna()
 
-            if rolling_ics:
-                mean_ic = float(np.mean(rolling_ics))
-                std_ic = float(np.std(rolling_ics)) if len(rolling_ics) > 1 else 1.0
+            if len(rolling_ic) > 0:
+                mean_ic = float(rolling_ic.mean())
+                std_ic = float(rolling_ic.std()) if len(rolling_ic) > 1 else 1.0
                 icir = mean_ic / std_ic if std_ic > 1e-8 else 0.0
 
                 h_label = f"{h}d"

@@ -914,6 +914,7 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         return
 
     # Adaptive thresholds
+    _t_17a = time.time()
     try:
         from operator1.analysis.adaptive_thresholds import compute_adaptive_thresholds, threshold_set_to_survival_dict
         state.adaptive_thresholds = compute_adaptive_thresholds(
@@ -927,8 +928,10 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             cache = compute_hierarchy_weights(cache)
     except Exception:
         pass
+    logger.info("  1.7a adaptive_thresholds: %.1fs", time.time() - _t_17a)
 
     # Adaptive model parameters (Tier 2)
+    _t_17b = time.time()
     try:
         from operator1.analysis.adaptive_model_params import (
             compute_blend_weights, compute_regime_risk_multiplier,
@@ -958,8 +961,10 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         logger.info("Adaptive model params computed")
     except Exception as exc:
         logger.debug("Adaptive model params skipped: %s", exc)
+    logger.info("  1.7b adaptive_model_params: %.1fs", time.time() - _t_17b)
 
     # Adaptive windows (Tier 3)
+    _t_17c = time.time()
     try:
         from operator1.analysis.adaptive_windows import (
             compute_adaptive_windows, compute_nn_hyperparams,
@@ -985,8 +990,10 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         logger.info("Adaptive windows computed")
     except Exception as exc:
         logger.debug("Adaptive windows skipped: %s", exc)
+    logger.info("  1.7c adaptive_windows: %.1fs", time.time() - _t_17c)
 
     # Signal IC measurement
+    _t_17d = time.time()
     try:
         from operator1.analysis.signal_ic import compute_signal_ic, get_ic_weighted_signals
         state.signal_ic_result = compute_signal_ic(cache)
@@ -998,6 +1005,7 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             )
     except Exception as exc:
         logger.debug("Signal IC skipped: %s", exc)
+    logger.info("  1.7d signal_ic: %.1fs", time.time() - _t_17d)
 
     # Fill actuals from previous prediction log
     try:
