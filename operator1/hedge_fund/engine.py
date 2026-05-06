@@ -1065,6 +1065,18 @@ def _build_scorecard(hf: HedgeFundResult) -> ThesisScorecard:
             sc.investment_grade = "D"
             sc.conviction = min(sc.conviction, 2)
 
+    # Data sufficiency: count how many metrics computed from real data vs defaults
+    all_metrics = [
+        hf.fcf_quality, hf.accruals_forensic, hf.smoothing,
+        hf.dividend_burn, hf.return_spread, hf.operating_leverage,
+        hf.obs_risk, hf.asset_quality, hf.leverage_stress,
+        hf.momentum, hf.growth_quality, hf.earnings_surprise,
+        hf.dcf, hf.valuation_quality, hf.peg_composite,
+    ]
+    n_computed = sum(1 for m in all_metrics if getattr(m, "available", False))
+    sc.n_defaulted = len(all_metrics) - n_computed
+    sc.data_sufficiency = n_computed / len(all_metrics) if all_metrics else 0.0
+
     sc.available = True
     return sc
 
@@ -1258,11 +1270,24 @@ def run_hedge_fund_analysis(
     t0 = time.time()
     hf = HedgeFundResult()
 
-    if income_df is None or income_df.empty:
-        logger.info("HF Analysis skipped: no income statement data")
+    # Data readiness gate: refuse to score when critical data is missing
+    from operator1.hedge_fund.helpers import assess_hf_readiness
+    readiness = assess_hf_readiness(income_df, balance_df, cashflow_df)
+    hf.data_readiness = readiness
+
+    if not readiness["sufficient"]:
+        logger.warning(
+            "HF Analysis skipped: insufficient data (%d/5 tiers ready, %d periods). %s",
+            readiness["n_tiers_ready"],
+            readiness["min_periods"],
+            "; ".join(readiness["warnings"][:3]),
+        )
         return hf
 
-    logger.info("Running Hedge Fund Analysis (15 metrics + 15 advanced methods + scorecard)...")
+    logger.info(
+        "Running Hedge Fund Analysis (%d/5 tiers ready, %d periods, 15 metrics + 15 advanced + scorecard)...",
+        readiness["n_tiers_ready"], readiness["min_periods"],
+    )
 
     # --- Tier 1: Earnings Forensics ---
     from operator1.hedge_fund.fcf_quality import compute_fcf_quality

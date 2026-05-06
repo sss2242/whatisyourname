@@ -370,6 +370,8 @@ class ThesisScorecard:
     conviction: int = 5             # 0-10
     catalyst: str = ""              # next expected event
     risk_reward: str = "balanced"   # favorable, balanced, unfavorable
+    data_sufficiency: float = 1.0   # fraction of metrics computed from real data (0-1)
+    n_defaulted: int = 0            # number of metrics that hit defaults (score=50)
 
 
 @dataclass
@@ -443,6 +445,9 @@ class HedgeFundResult:
 
     # Cross-pipeline fusion (8 methods combining HF + multi-freq)
     fusion: dict[str, Any] = field(default_factory=dict)
+
+    # Data readiness assessment (computed before HF runs)
+    data_readiness: dict[str, Any] = field(default_factory=dict)
 
     def to_profile_dict(self) -> dict[str, Any]:
         """Convert to JSON-serializable dict for profile storage."""

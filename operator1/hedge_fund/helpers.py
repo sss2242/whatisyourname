@@ -205,6 +205,109 @@ def normalize_score(value: float, floor: float = 0.0, ceiling: float = 100.0) ->
     return max(floor, min(ceiling, value))
 
 
+# ---------------------------------------------------------------------------
+# HF data readiness assessment
+# ---------------------------------------------------------------------------
+
+# Minimum columns required per HF tier to produce meaningful (non-default) scores
+HF_REQUIRED_COLUMNS: dict[str, dict[str, list[str]]] = {
+    "tier1_earnings": {
+        "income": ["revenue", "net_income"],
+        "cashflow": ["operating_cash_flow"],
+        "balance": ["total_assets"],
+    },
+    "tier2_cashflow": {
+        "cashflow": ["operating_cash_flow", "capex"],
+        "income": ["interest_expense"],
+        "balance": ["total_debt", "total_equity"],
+    },
+    "tier3_balance_sheet": {
+        "balance": ["receivables", "inventory", "goodwill"],
+        "income": ["revenue", "cost_of_revenue"],
+    },
+    "tier4_inflection": {
+        "income": ["revenue", "net_income", "gross_profit"],
+    },
+    "tier5_valuation": {
+        "cashflow": ["operating_cash_flow", "capex"],
+        "balance": ["total_debt", "cash_and_equivalents"],
+    },
+}
+
+
+def assess_hf_readiness(
+    income_df: pd.DataFrame | None,
+    balance_df: pd.DataFrame | None,
+    cashflow_df: pd.DataFrame | None,
+) -> dict:
+    """Assess whether raw statement DFs have sufficient data for HF analysis.
+
+    Returns a dict with:
+    - ``sufficient``: True if minimum viable data is present
+    - ``tier_readiness``: per-tier breakdown (ready, present, missing)
+    - ``n_tiers_ready``: count of tiers with enough data (0-5)
+    - ``min_periods``: fewest rows across non-empty DFs
+    - ``warnings``: list of human-readable warnings
+    """
+    df_map = {
+        "income": income_df if income_df is not None else pd.DataFrame(),
+        "balance": balance_df if balance_df is not None else pd.DataFrame(),
+        "cashflow": cashflow_df if cashflow_df is not None else pd.DataFrame(),
+    }
+
+    tier_readiness: dict[str, dict] = {}
+    n_ready = 0
+
+    for tier_name, requirements in HF_REQUIRED_COLUMNS.items():
+        present: list[str] = []
+        missing: list[str] = []
+
+        for df_key, columns in requirements.items():
+            df = df_map[df_key]
+            for col in columns:
+                if not df.empty and col in df.columns and df[col].notna().any():
+                    present.append(f"{df_key}.{col}")
+                else:
+                    missing.append(f"{df_key}.{col}")
+
+        ready = len(missing) == 0
+        if ready:
+            n_ready += 1
+        tier_readiness[tier_name] = {
+            "ready": ready,
+            "present": present,
+            "missing": missing,
+        }
+
+    # Min periods across non-empty DFs
+    periods = []
+    for df in df_map.values():
+        if not df.empty:
+            periods.append(len(df))
+    min_periods = min(periods) if periods else 0
+
+    # Sufficient = tier1 ready AND at least 1 other tier AND min 2 periods
+    tier1_ready = tier_readiness["tier1_earnings"]["ready"]
+    sufficient = tier1_ready and n_ready >= 2 and min_periods >= 2
+
+    warnings: list[str] = []
+    if not tier1_ready:
+        warnings.append("Tier 1 (earnings) missing: need revenue + net_income + operating_cash_flow + total_assets")
+    if min_periods < 2:
+        warnings.append(f"Insufficient filing periods: {min_periods} (need >= 2 for trend analysis)")
+    for tier_name, info in tier_readiness.items():
+        if not info["ready"]:
+            warnings.append(f"{tier_name}: missing {', '.join(info['missing'])}")
+
+    return {
+        "sufficient": sufficient,
+        "tier_readiness": tier_readiness,
+        "n_tiers_ready": n_ready,
+        "min_periods": min_periods,
+        "warnings": warnings,
+    }
+
+
 def get_cache_latest(cache: pd.DataFrame, column: str) -> float | None:
     """Get the latest non-NaN value from the daily cache."""
     if cache is None or cache.empty or column not in cache.columns:
