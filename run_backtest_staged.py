@@ -371,15 +371,17 @@ Examples:
         _print_summary(run_dir)
         return 1
 
-    # If there are more sub-stages, self-restart at the next one
+    # If there are more sub-stages, spawn a fully detached process and exit.
+    # This gives a true terminal separation: the current process terminates
+    # completely, and a brand-new process with its own session starts for
+    # the next sub-stage. Platform timeouts reset because the old session
+    # is gone.
     next_idx = i + 1
     if next_idx < total:
         next_id = ALL_STAGES[next_idx][0]
-        print(_dim(f"  Self-restarting at sub-stage {next_id}..."))
-        sys.stdout.flush()
-        sys.stderr.flush()
+        next_name = ALL_STAGES[next_idx][1]
 
-        # Build command to re-execute ourselves at the next sub-stage
+        # Build command for the next sub-stage
         cmd = [
             sys.executable, __file__,
             "--market", args.market,
@@ -392,12 +394,34 @@ Examples:
         if args.validate:
             cmd.append("--validate")
 
-        # Replace this process with a fresh invocation
-        os.execv(sys.executable, cmd)
+        # Log file for the detached process
+        log_dir = Path(run_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"stage_{next_id.replace('.', '_')}.log"
 
-        # Fallback if os.execv returns (shouldn't happen on Linux)
-        result = subprocess.run(cmd)
-        return result.returncode
+        print()
+        print(_bold(f"  Spawning detached process for sub-stage {next_id}: {next_name}"))
+        print(_dim(f"  Log: {log_path}"))
+        print(_dim(f"  This terminal will now exit. Next sub-stage runs independently."))
+        print()
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+        # Spawn a fully detached process with its own session.
+        # start_new_session=True creates a new process group (setsid on Linux),
+        # so the child is not killed when this terminal/session closes.
+        with open(log_path, "w") as log_file:
+            subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+
+        # Exit this process -- the new one runs independently
+        print(_green(f"  Detached process spawned for {next_id}. Exiting current session."))
+        return 0
     else:
         # All stages done
         print()
