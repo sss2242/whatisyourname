@@ -7,8 +7,8 @@ backoff_factor: 2.0        # exponential backoff multiplier (2s, 4s, 8s, 16s, 32
 retry_on_status: [429, 500, 502, 503, 504]  # per spec Section D.4
 
 # Rate limiting (token-bucket style, per-host)
-# FMP free tier: 250 calls/day (~0.17/sec). Paid: 300/min (5/sec).
-# Set conservatively for free tier safety. Adjust up for paid plans.
+# Per-host limits are configured in http_utils.py (_HOST_RATE_LIMITS).
+# Default rate below applies to hosts without a specific limit.
 rate_limit_calls_per_second: 2.0   # max sustained request rate per host
 rate_limit_burst: 5                # max burst size before throttling
 

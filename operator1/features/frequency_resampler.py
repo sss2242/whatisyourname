@@ -187,7 +187,7 @@ def resample_cache_to_frequency(
             is_partial_last_period=False,
             original_daily_rows=0,
             resampled_rows=0,
-            data_source="resampled_daily",
+            data_source="daily_native" if frequency == "D" else "resampled_daily",
         )
 
     if reference_date is None:
@@ -213,7 +213,7 @@ def resample_cache_to_frequency(
             is_partial_last_period=False,
             original_daily_rows=len(daily_cache),
             resampled_rows=0,
-            data_source="resampled_daily",
+            data_source="daily_native" if frequency == "D" else "resampled_daily",
         )
 
     # Daily frequency: no resampling needed, just trim

@@ -96,6 +96,7 @@ class PipelineState:
         self.adaptive_model_params: Any = None
         self.adaptive_tier3: Any = None
         self.mode_weights: Any = None
+        self.hf_data_readiness: dict = {}  # HF data sufficiency assessment
 
         # ---- Per-frequency raw statement groups (from frequency separator) ----
         # Keys: "quarterly", "semiannual", "annual"
@@ -451,6 +452,63 @@ class PipelineState:
         if not p.exists():
             return []
         return _json.loads(p.read_text())
+
+    # ------------------------------------------------------------------
+    # Snapshots for inspection
+    # ------------------------------------------------------------------
+
+    def save_snapshot(self, sub_stage: str, prev_columns: list[str] | None = None) -> None:
+        """Copy current state files into a labeled snapshot directory for inspection.
+
+        Creates ``{output_dir}/snapshots/{sub_stage}/`` containing:
+        - ``cache.parquet`` -- copy of the cache at this point
+        - ``state.pkl`` -- copy of the state pickle
+        - ``manifest.json`` -- metadata (sub_id, timestamp, cache shape, columns added)
+
+        This is separate from ``save()`` which writes resume checkpoints.
+        Snapshots preserve the cache at each sub-stage boundary so you can
+        inspect how the data evolved without replaying from a pickle.
+        """
+        import shutil
+        from datetime import datetime as _dt
+
+        run_dir = Path(self.output_dir)
+        snap_dir = run_dir / "snapshots" / sub_stage.replace(".", "_")
+        snap_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy cache.parquet (already written by save())
+        cache_src = run_dir / "cache.parquet"
+        if cache_src.exists():
+            shutil.copy2(cache_src, snap_dir / "cache.parquet")
+
+        # Copy state pickle (already written by save())
+        pkl_src = run_dir / f"state_{sub_stage}.pkl"
+        if pkl_src.exists():
+            shutil.copy2(pkl_src, snap_dir / "state.pkl")
+
+        # Build manifest
+        current_columns = list(self.cache.columns) if self.cache is not None else []
+        columns_added = []
+        if prev_columns is not None:
+            prev_set = set(prev_columns)
+            columns_added = [c for c in current_columns if c not in prev_set]
+
+        manifest = {
+            "sub_stage": sub_stage,
+            "timestamp": _dt.now().isoformat(),
+            "cache_rows": len(self.cache) if self.cache is not None else 0,
+            "cache_cols": len(current_columns),
+            "columns_total": len(current_columns),
+            "columns_added": columns_added,
+            "columns_added_count": len(columns_added),
+        }
+        with open(snap_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        logger.info(
+            "Snapshot saved: %s (%d cols, +%d new)",
+            snap_dir, len(current_columns), len(columns_added),
+        )
 
     def find_latest_checkpoint(self) -> str | None:
         """Find the latest completed sub-stage checkpoint in run_dir."""

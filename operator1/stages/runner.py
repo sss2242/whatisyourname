@@ -194,6 +194,7 @@ def run_stages(
     stage_spec: str = "all",
     *,
     save_checkpoints: bool = True,
+    save_snapshots: bool = True,
 ) -> None:
     """Run sub-stages matching the spec, with optional checkpoint save.
 
@@ -227,6 +228,9 @@ def run_stages(
 
     total = len(substages)
     skipped: list[str] = []
+    _prev_columns: list[str] | None = (
+        list(state.cache.columns) if state.cache is not None else None
+    )
 
     for i, (sub_id, func) in enumerate(substages, 1):
         logger.info("=" * 60)
@@ -290,6 +294,16 @@ def run_stages(
         if save_checkpoints:
             state.save(sub_id)
 
+        # Snapshot for inspection (separate from resume checkpoints)
+        if save_snapshots:
+            try:
+                state.save_snapshot(sub_id, prev_columns=_prev_columns)
+                _prev_columns = (
+                    list(state.cache.columns) if state.cache is not None else None
+                )
+            except Exception as snap_exc:
+                logger.warning("Snapshot save failed for %s (continuing): %s", sub_id, snap_exc)
+
     if skipped:
         logger.info("Pipeline completed with %d skipped sub-stages: %s", len(skipped), skipped)
 
@@ -321,6 +335,10 @@ def main() -> int:
     parser.add_argument(
         "--no-save", action="store_true",
         help="Disable checkpoint saving (run in-memory only)",
+    )
+    parser.add_argument(
+        "--no-snapshots", action="store_true",
+        help="Disable per-sub-stage snapshot copies for inspection",
     )
     parser.add_argument(
         "--list", action="store_true", dest="list_stages",
@@ -366,7 +384,11 @@ def main() -> int:
             state.load_checkpoint(latest)
 
     try:
-        run_stages(state, args.stage, save_checkpoints=not args.no_save)
+        run_stages(
+            state, args.stage,
+            save_checkpoints=not args.no_save,
+            save_snapshots=not args.no_snapshots,
+        )
     except Exception:
         return 1
 

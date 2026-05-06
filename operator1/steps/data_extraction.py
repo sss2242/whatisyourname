@@ -263,7 +263,7 @@ def extract_all_data(
     # In the new architecture, OHLCV comes from the PIT client's
     # get_quotes() method.  If the PIT source doesn't provide price data
     # (e.g. SEC EDGAR, ESEF, EDINET, CVM, CMF), we fall back to the
-    # OHLCV supplement provider (Alpha Vantage, TWSE, etc.).
+    # OHLCV provider (yfinance, pykrx, baostock, twstock, etc.).
     result.target.ohlcv = result.target.quotes
     if result.target.ohlcv.empty:
         market_id = getattr(pit_client, "market_id", "")

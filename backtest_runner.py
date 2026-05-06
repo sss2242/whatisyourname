@@ -78,12 +78,16 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     a checkpoint so the next sub-stage can resume from disk.
 
     Sub-stages:
-        1.1 -- Data fetch (PIT client, profile, holders, statements, OHLCV)
-        1.2 -- Reconciliation + pivot + frequency separation + cache build
-        1.3 -- Macro + conflict + estimation + derived variables
-        1.4 -- Survival mode + hierarchy + fuzzy protection + FH
-        1.5 -- Entity discovery + graph risk + sentiment + catalysts
-        1.6 -- Adaptive calibration + enriched timeline + finalization
+        1.1  -- Data fetch (PIT client, profile, holders, statements, OHLCV)
+        1.2  -- Reconciliation + pivot + frequency separation + cache build
+        1.3  -- OHLCV fallback + holders + segments
+        1.4a -- Cache build (OHLCV spine, merge, benchmark, IV, cross-asset, options)
+        1.4b -- Macro + risk (macro fetch, quadrant, conflict, buying power, pre-ratios)
+        1.5  -- Estimation + SIX proxies + derived variables + survival + FH
+        1.6  -- Entity discovery + graph risk + sentiment + catalysts
+        1.7  -- Adaptive calibration (thresholds, model params, windows, signal IC)
+        1.8a -- Regime detection + enriched timeline (HMM/GMM/PELT/BCP/ChangeFinder)
+        1.8b -- Finalization (linked conflict, aggregates, peer ranking, behavioral, normalization)
     """
     logger.info("=" * 60)
     logger.info("STAGE 1: Data Fetch + Cache Build + Features (substage=%s)", substage)
@@ -558,6 +562,13 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     cache = cache[(cache.index >= bt_start) & (cache.index <= bt_end)]
     logger.info("Cache after backtest filter: %d rows x %d cols", len(cache), len(cache.columns))
 
+    # -- CHECKPOINT 1.4a: Cache built (OHLCV + statements merged) --
+    state.cache = cache
+    state.save("1.4a")
+    logger.info("Checkpoint 1.4a saved (cache built, pre-macro)")
+    if substage == "1.4a":
+        return
+
     # Macro data
     macro_api_info = get_macro_api_for_market(state.market_id)
     if macro_api_info:
@@ -616,11 +627,12 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     except Exception:
         pass
 
-    # -- CHECKPOINT 1.4: Cache built + macro + conflict --
+    # -- CHECKPOINT 1.4: Cache built + macro + conflict + pre-ratios --
     state.cache = cache
     state.save("1.4")
-    logger.info("Checkpoint 1.4 saved (cache built)")
-    if substage == "1.4":
+    state.save("1.4b")  # alias for clarity
+    logger.info("Checkpoint 1.4 saved (cache + macro + conflict)")
+    if substage in ("1.4", "1.4b"):
         return
 
     # Estimation
@@ -1037,6 +1049,13 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             pass
     except Exception as exc:
         logger.warning("Enriched timeline failed: %s", exc)
+
+    # -- CHECKPOINT 1.8a: Regime detection + enriched timeline --
+    state.cache = cache
+    state.save("1.8a")
+    logger.info("Checkpoint 1.8a saved (regime detection + enriched timeline)")
+    if substage == "1.8a":
+        return
 
     # Linked entity conflict propagation
     if state.conflict_result is not None and state.relationships:
