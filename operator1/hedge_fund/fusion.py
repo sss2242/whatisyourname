@@ -55,6 +55,14 @@ class FusionResult:
     freq_ic_attribution: dict = field(default_factory=dict)
     belief_network_posterior: float = 0.0  # 0-1 posterior probability of positive return
 
+    # Phase 9: HRP signal combination (Lopez de Prado 2016)
+    hrp_weights: dict = field(default_factory=dict)
+    signal_clustering: dict = field(default_factory=dict)
+    # Phase 9: Brier calibration (Brier 1950)
+    calibrated_conviction: float | None = None
+    overconfidence_flag: bool = False
+    calibration_reliability: float | None = None
+
     # Action summary
     action: str = ""                   # human-readable action sentence
     primary_risk: str = ""             # top risk factor

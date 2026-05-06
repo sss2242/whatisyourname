@@ -83,6 +83,19 @@ class AccrualsForensicResult:
     working_capital_anomaly: float | None = None
     cash_conversion_efficiency: float | None = None
     cce_trend: str = "stable"       # improving, stable, declining
+    # Phase 1: Dechow F-Score (Dechow et al. 2011)
+    dechow_f_score: float | None = None          # probit score
+    dechow_f_probability: float | None = None    # P(misstatement) 0-1
+    dechow_f_label: str = ""                     # clean / watch / flag
+    # Phase 1: Real activities manipulation (Roychowdhury 2006)
+    real_manipulation_score: float | None = None  # 0-100
+    abnormal_cfo: float | None = None
+    abnormal_production: float | None = None
+    abnormal_discretionary: float | None = None
+    manipulation_type: str = ""  # overproduction / cost_cutting / sales_pull_forward / clean
+    # Phase 8: Accounting conservatism (Basu 1997)
+    conservatism_index: float | None = None      # -1 to +1 (negative = aggressive)
+    conservatism_label: str = ""                 # conservative / neutral / aggressive
     narrative: str = ""
     error: str = ""
 
@@ -99,6 +112,10 @@ class SmoothingResult:
     benford_deviation: float | None = None
     sequential_surprise_pattern: float | None = None
     restatement_probability: float | None = None
+    # Phase 1: Beneish M5-Score (5-variable variant)
+    beneish_m5_score: float | None = None
+    beneish_m5_probability: float | None = None    # P(manipulator) 0-1
+    beneish_m5_m8_agreement: bool | None = None    # both flag or both clear
     narrative: str = ""
     error: str = ""
 
@@ -268,6 +285,10 @@ class GrowthQualityResult:
     organic_fraction: float | None = None  # organic / total
     margin_adjusted_growth: float | None = None
     incremental_roic: float | None = None  # ROIC on new capital
+    # Phase 5: Sustainable Growth Rate (Higgins 1977)
+    sgr: float | None = None                   # ROE * (1 - payout)
+    growth_gap_sgr: float | None = None        # actual - SGR
+    funding_gap_flag: bool = False              # actual > SGR
     narrative: str = ""
     error: str = ""
 
@@ -314,6 +335,13 @@ class DCFResult:
     riv_intrinsic: float | None = None        # residual income valuation
     riv_excess_return: float | None = None    # RI / book value
     riv_vs_dcf_divergence: float | None = None  # riv - dcf difference
+    # Phase 2: Stochastic DCF (Ang & Liu 2004)
+    stochastic_wacc_mean: float | None = None
+    stochastic_wacc_vol: float | None = None
+    growth_wacc_correlation: float | None = None
+    # Phase 2: Reverse DCF upgrade (Rappaport & Mauboussin 2001)
+    expectations_gap_pct: float | None = None     # implied - actual growth
+    expectations_label: str = ""                  # priced_for_perfection / fairly_priced / priced_for_failure
     # Multi-frequency merge metadata
     freq_intrinsics: dict = field(default_factory=dict)  # per-freq P50 {"A": 185.0, "Q": 192.0}
     merge_method: str = ""                               # "inverse_variance" or "single_freq"
@@ -384,6 +412,10 @@ class ThesisScorecard:
     risk_reward: str = "balanced"   # favorable, balanced, unfavorable
     data_sufficiency: float = 1.0   # fraction of metrics computed from real data (0-1)
     n_defaulted: int = 0            # number of metrics that hit defaults (score=50)
+    # Phase 9: Adaptive scorecard weights (rolling IC-based)
+    adaptive_tier_weights: dict = field(default_factory=dict)  # {tier_name: weight}
+    weight_stability: float | None = None     # how stable are IC-derived weights
+    dominant_tier: str = ""                    # tier with highest IC
 
 
 @dataclass
@@ -409,6 +441,9 @@ class PositionSignalResult:
     kelly_fraction: float | None = None       # full Kelly optimal bet size
     half_kelly_size: float | None = None      # conservative half-Kelly
     kelly_edge: float | None = None           # p*b - q (is there an edge?)
+    # Phase 4: CDaR (Chekhlov, Uryasev & Zabarankin 2005)
+    cdar_95: float | None = None              # 95th percentile max drawdown
+    cdar_adjusted_kelly: float | None = None  # Kelly scaled by drawdown tolerance
     narrative: str = ""
     error: str = ""
 
@@ -455,7 +490,16 @@ class HedgeFundResult:
     # Advanced methods (15 additional techniques)
     advanced: dict[str, Any] = field(default_factory=dict)
 
-    # Cross-pipeline fusion (8 methods combining HF + multi-freq)
+    # Phase 2: EVA decomposition (Stern Stewart 1991)
+    eva: dict[str, Any] = field(default_factory=dict)
+
+    # Phase 2: Sum-of-parts valuation (Berger & Ofek 1995)
+    sotp: dict[str, Any] = field(default_factory=dict)
+
+    # Phase 4: Risk attribution (Component CVaR + CDaR)
+    risk_attribution: dict[str, Any] = field(default_factory=dict)
+
+    # Cross-pipeline fusion (8+3 methods combining HF + multi-freq)
     fusion: dict[str, Any] = field(default_factory=dict)
 
     # Data readiness assessment (computed before HF runs)

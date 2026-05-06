@@ -216,6 +216,71 @@ def compute_earnings_smoothing(
             parts.append(f"Benford deviation chi2={result.benford_deviation:.1f} (significant)")
         if result.beneish_probability is not None and result.beneish_probability > -2.22:
             parts.append(f"Beneish M={result.beneish_probability:.2f} (manipulation risk)")
+        # --- Phase 1: Beneish M5-Score (5-variable variant, Beneish 1999) ---
+        try:
+            if fh_result is not None:
+                m8 = getattr(fh_result, "fh_beneish_m_score", None)
+                if m8 is None:
+                    # Try attribute name variants
+                    m8 = getattr(fh_result, "beneish_m_score", None)
+
+                # M5 uses only 5 of the 8 variables: DSRI, GMI, AQI, SGI, DEPI
+                # M5 = -6.065 + 0.823*DSRI + 0.906*GMI + 0.593*AQI + 0.717*SGI + 0.107*DEPI
+                # We compute M5 from raw data if we can, otherwise approximate from M8
+                _dsri = _gmii = _aqi = _sgi = _depi = None
+
+                if len(rev_series) >= 2 and len(ni_series) >= 2:
+                    rev_arr = rev_series.values
+                    rec_s = extract_quarterly_series(income_df, "receivables", n_periods)
+                    # DSRI: (Receivables_t / Revenue_t) / (Receivables_t-1 / Revenue_t-1)
+                    if len(rec_s) >= 2 and len(rev_arr) >= 2:
+                        r0 = safe_divide(float(rec_s.iloc[-1]), float(rev_arr[-1]))
+                        r1 = safe_divide(float(rec_s.iloc[-2]), float(rev_arr[-2]))
+                        if r0 is not None and r1 is not None and r1 > 0:
+                            _dsri = r0 / r1
+
+                    # SGI: Revenue_t / Revenue_t-1
+                    if abs(float(rev_arr[-2])) > 1e-6:
+                        _sgi = float(rev_arr[-1]) / float(rev_arr[-2])
+
+                    # GMI: Gross_margin_t-1 / Gross_margin_t
+                    gp_s = extract_quarterly_series(income_df, "gross_profit", n_periods)
+                    if len(gp_s) >= 2 and len(rev_arr) >= 2:
+                        gm_curr = safe_divide(float(gp_s.iloc[-1]), float(rev_arr[-1]))
+                        gm_prev = safe_divide(float(gp_s.iloc[-2]), float(rev_arr[-2]))
+                        if gm_curr is not None and gm_prev is not None and gm_curr > 0:
+                            _gmii = gm_prev / gm_curr
+
+                if _dsri is not None and _sgi is not None:
+                    # Use defaults for missing components
+                    _dsri = _dsri if _dsri is not None else 1.0
+                    _gmii = _gmii if _gmii is not None else 1.0
+                    _aqi = 1.0  # default (requires detailed asset quality data)
+                    _depi = 1.0  # default (requires detailed depreciation data)
+
+                    m5 = (-6.065
+                          + 0.823 * _dsri
+                          + 0.906 * _gmii
+                          + 0.593 * _aqi
+                          + 0.717 * _sgi
+                          + 0.107 * _depi)
+                    result.beneish_m5_score = round(m5, 4)
+
+                    import math
+                    prob_m5 = 1.0 / (1.0 + math.exp(-m5))
+                    result.beneish_m5_probability = round(prob_m5, 4)
+
+                    # Agreement: both M5 and M8 flag (or both clear)
+                    if m8 is not None:
+                        m8_flag = m8 > -2.22
+                        m5_flag = m5 > -2.22
+                        result.beneish_m5_m8_agreement = (m8_flag == m5_flag)
+
+                    if result.beneish_m5_probability > 0.5:
+                        parts.append(f"Beneish M5 P(manipulator)={result.beneish_m5_probability:.0%}")
+        except Exception as _m5_exc:
+            logger.debug("Beneish M5 computation failed: %s", _m5_exc)
+
         result.narrative = "; ".join(parts) if parts else "No significant smoothing detected"
 
         result.available = True
