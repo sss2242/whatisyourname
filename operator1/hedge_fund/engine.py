@@ -1181,19 +1181,19 @@ def _compute_component_cvar(
 def _compute_sgr(
     income_df: pd.DataFrame,
     cashflow_df: pd.DataFrame,
+    balance_df: pd.DataFrame | None = None,
 ) -> dict:
     """SGR = ROE * (1 - payout_ratio). Compare to actual growth."""
     try:
         ni = extract_latest_value(income_df, "net_income")
         divs = extract_latest_value(cashflow_df, "dividends_paid")
-        te = extract_latest_value(income_df, "total_equity")
+        # total_equity is a balance sheet field
+        te = None
+        if balance_df is not None and not balance_df.empty:
+            te = extract_latest_value(balance_df, "total_equity")
         if te is None:
-            # Try from any source
-            from operator1.hedge_fund.helpers import extract_quarterly_series as _eqs
-            te_s = _eqs(income_df, "total_equity", 4)
-            if len(te_s) == 0:
-                return {}
-            te = float(te_s.iloc[-1])
+            # Fallback: try from income_df (some PIT clients merge statements)
+            te = extract_latest_value(income_df, "total_equity")
 
         if ni is None or te is None or abs(te) < 1e-6:
             return {}
@@ -1704,7 +1704,7 @@ def run_hedge_fund_analysis(
 
     # --- Phase 5: SGR (Sustainable Growth Rate) ---
     try:
-        _sgr_result = _compute_sgr(income_df, cashflow_df)
+        _sgr_result = _compute_sgr(income_df, cashflow_df, balance_df)
         if _sgr_result:
             hf.growth_quality.sgr = _sgr_result.get("sgr")
             hf.growth_quality.growth_gap_sgr = _sgr_result.get("growth_gap_sgr")
