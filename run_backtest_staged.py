@@ -78,7 +78,10 @@ ALL_STAGES = [
     ("7.4.4", "Multi-Frequency: Weekly Pipeline"),
     ("7.4.5", "Multi-Frequency: Daily Pipeline"),
     ("7.4.6", "Multi-Frequency: Fusion (13 methods)"),
-    ("7.5", "Hedge Fund Analysis (15 metrics + fusion)"),
+    ("7.5.1", "Hedge Fund: Base Metrics + Scorecard (15 metrics + EVA + SOTP + CVaR + SGR)"),
+    ("7.5.2", "Hedge Fund: Advanced Methods (22 techniques: Piotroski, Merton, moat, factors)"),
+    ("7.5.3", "Hedge Fund: Multi-Frequency Variants (FCF MF, accruals MF, growth MF)"),
+    ("7.5.4", "Hedge Fund: Cross-Pipeline Fusion (11 methods: HRP, Brier, anomaly routing)"),
     # Backtest Stage 3: Profile build + prediction extraction
     ("3:profile", "Profile Build + Report Generation"),
 ]

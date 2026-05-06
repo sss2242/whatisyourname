@@ -1313,6 +1313,8 @@ def run_stage3(state: PipelineState) -> None:
                 survival_controller=state.survival_controller,
                 linked_caches=state.linked_caches,
                 macro_data=state.macro_data,
+                seg_result=state.seg_result or None,
+                prediction_log_summary=state.prediction_log_summary or None,
             )
             if hf_result and hf_result.available:
                 logger.info("HF Analysis: grade=%s, signal=%+.2f",

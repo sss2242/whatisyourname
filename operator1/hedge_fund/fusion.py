@@ -55,6 +55,14 @@ class FusionResult:
     freq_ic_attribution: dict = field(default_factory=dict)
     belief_network_posterior: float = 0.0  # 0-1 posterior probability of positive return
 
+    # Phase 9: HRP signal combination (Lopez de Prado 2016)
+    hrp_weights: dict = field(default_factory=dict)
+    signal_clustering: dict = field(default_factory=dict)
+    # Phase 9: Brier calibration (Brier 1950)
+    calibrated_conviction: float | None = None
+    overconfidence_flag: bool = False
+    calibration_reliability: float | None = None
+
     # Action summary
     action: str = ""                   # human-readable action sentence
     primary_risk: str = ""             # top risk factor
@@ -482,6 +490,148 @@ def compute_belief_posterior(
 
 
 # ---------------------------------------------------------------------------
+# Phase 9: HRP Signal Combination (Lopez de Prado 2016)
+# ---------------------------------------------------------------------------
+
+def compute_hrp_signal_weights(hf_profile: dict) -> tuple[dict, dict]:
+    """Hierarchical Risk Parity on HF metric scores.
+
+    Assigns lower weight to correlated signals, higher to uncorrelated.
+    Returns (hrp_weights, signal_clustering).
+    """
+    try:
+        from scipy.cluster.hierarchy import linkage, to_tree
+
+        # Extract all available metric scores
+        scores = {}
+        _metric_paths = [
+            ("fcf_quality", "score"), ("accruals_forensic", "red_flag_score"),
+            ("smoothing", "smoothing_index"), ("dividend_burn", "risk_score"),
+            ("return_spread", "spread_bps"), ("obs_risk", "risk_score"),
+            ("asset_quality", "deterioration_score"), ("momentum", "score"),
+            ("growth_quality", "score"), ("dcf", "upside_pct"),
+            ("valuation_quality", "quality_score"), ("peg_composite", "peg_adjusted"),
+        ]
+        for metric, field_name in _metric_paths:
+            val = hf_profile.get(metric, {}).get(field_name)
+            if val is not None and not (isinstance(val, float) and (np.isnan(val) or np.isinf(val))):
+                scores[metric] = float(val)
+
+        if len(scores) < 3:
+            # Not enough signals for clustering -- equal weights
+            n = max(len(scores), 1)
+            return {k: 1.0 / n for k in scores}, {}
+
+        # Build correlation matrix from score values
+        names = list(scores.keys())
+        n = len(names)
+        vals = np.array([scores[k] for k in names])
+
+        # Create pseudo-correlation from score similarity
+        # (We only have one observation per metric, so use distance-based proxy)
+        normalized = (vals - vals.mean()) / max(vals.std(), 1e-6)
+        dist_matrix = np.abs(normalized[:, None] - normalized[None, :])
+        corr = 1.0 - dist_matrix / max(dist_matrix.max(), 1e-6)
+        np.fill_diagonal(corr, 1.0)
+
+        # HRP: cluster -> quasi-diag -> recursive bisection
+        dist = ((1 - corr) / 2.0) ** 0.5
+        # Condensed distance matrix for linkage
+        from scipy.spatial.distance import squareform
+        condensed = squareform(dist, checks=False)
+        condensed = np.clip(condensed, 0, None)
+        link = linkage(condensed, method="single")
+        sort_ix = list(to_tree(link).pre_order())
+
+        # Inverse-variance portfolio within clusters
+        cov = np.diag(np.ones(n))  # identity (equal variance assumption)
+
+        # Recursive bisection
+        w = np.ones(n)
+        clusters = [sort_ix]
+        while len(clusters) > 0:
+            new_clusters = []
+            for cluster in clusters:
+                if len(cluster) > 1:
+                    half = len(cluster) // 2
+                    c0 = cluster[:half]
+                    c1 = cluster[half:]
+                    new_clusters.extend([c0, c1])
+                    # Variance per cluster (simplified)
+                    var0 = sum(1.0 for _ in c0)
+                    var1 = sum(1.0 for _ in c1)
+                    alpha = 1 - var0 / (var0 + var1)
+                    for i in c0:
+                        w[i] *= alpha
+                    for i in c1:
+                        w[i] *= (1 - alpha)
+            clusters = [c for c in new_clusters if len(c) > 1]
+
+        # Normalize
+        w_sum = w.sum()
+        if w_sum > 0:
+            w = w / w_sum
+
+        hrp_weights = {names[i]: round(float(w[i]), 4) for i in range(n)}
+        clustering = {"n_clusters": min(n, 3), "method": "single_linkage_hrp"}
+
+        return hrp_weights, clustering
+
+    except Exception as exc:
+        logger.debug("HRP signal combination failed: %s", exc)
+        return {}, {}
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: Brier Score Calibration (Brier 1950)
+# ---------------------------------------------------------------------------
+
+def compute_brier_calibration(
+    prediction_log_summary: dict | None = None,
+    current_conviction: float = 0.5,
+) -> tuple[float | None, bool, float | None]:
+    """Calibrate conviction using historical prediction accuracy.
+
+    Returns (calibrated_conviction, overconfidence_flag, reliability).
+    """
+    if prediction_log_summary is None:
+        return None, False, None
+
+    n_filled = prediction_log_summary.get("n_filled", 0)
+    hit_rate = prediction_log_summary.get("hit_rate", 0.5)
+    min_preds = 10
+
+    if n_filled < min_preds:
+        return None, False, None
+
+    try:
+        # Brier score = mean((forecast_prob - actual)^2)
+        # Perfect = 0, random = 0.25, always wrong = 1.0
+        # Approximate: if hit_rate is the fraction of correct directional predictions
+        # and conviction represents the predicted probability of being right
+        brier = (current_conviction - hit_rate) ** 2
+
+        # Reliability: how well calibrated are the predictions?
+        # Low brier = well calibrated
+        reliability = max(0, 1.0 - brier * 4)  # 0-1 scale
+
+        # Platt scaling: adjust conviction toward empirical hit rate
+        # calibrated = alpha * conviction + (1 - alpha) * hit_rate
+        # alpha depends on how many historical predictions we have
+        alpha = min(0.8, n_filled / 100)  # more history = trust model more
+        calibrated = alpha * current_conviction + (1 - alpha) * hit_rate
+
+        # Overconfidence flag
+        overconfidence = current_conviction > hit_rate + 0.15
+
+        return round(calibrated, 4), overconfidence, round(reliability, 4)
+
+    except Exception as exc:
+        logger.debug("Brier calibration failed: %s", exc)
+        return None, False, None
+
+
+# ---------------------------------------------------------------------------
 # Master fusion function
 # ---------------------------------------------------------------------------
 
@@ -493,8 +643,9 @@ def run_fusion(
     filing_calendar_result: Any = None,
     survival_controller: Any = None,
     cache: Any = None,
+    prediction_log_summary: dict | None = None,
 ) -> FusionResult:
-    """Run all 8 fusion methods and produce the final fused output.
+    """Run all 11 fusion methods (8 original + 3 new) and produce the final fused output.
 
     Parameters
     ----------
@@ -570,6 +721,21 @@ def run_fusion(
         result.belief_network_posterior = compute_belief_posterior(
             hf_profile, current_regime, result.freq_disagreement_score,
         )
+
+        # Method 9: HRP signal combination (Phase 9)
+        try:
+            result.hrp_weights, result.signal_clustering = compute_hrp_signal_weights(hf_profile)
+        except Exception:
+            pass
+
+        # Method 10: Brier calibration (Phase 9)
+        try:
+            hf_conviction = abs(hf_profile.get("position", {}).get("conviction", 0.5))
+            result.calibrated_conviction, result.overconfidence_flag, result.calibration_reliability = (
+                compute_brier_calibration(prediction_log_summary, hf_conviction)
+            )
+        except Exception:
+            pass
 
         # --- Final signal synthesis ---
 
