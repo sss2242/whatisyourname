@@ -2753,6 +2753,97 @@ def run_prediction_aggregation(
                 upper = mid + (upper - mid) * copula_multiplier
 
             # ----------------------------------------------------------
+            # Phase 3.5: Minimum half-width floor (Fix 1).
+            # A $0.45 band on a $250 stock is 0.18% -- absurdly narrow
+            # for 90% coverage.  Floor: 1% of price * sqrt(horizon).
+            # ----------------------------------------------------------
+            _MIN_HW_PCT = 0.01
+            if not math.isnan(point) and abs(point) > 0:
+                _min_hw = abs(point) * _MIN_HW_PCT * math.sqrt(max(horizon_days, 1))
+                _cur_hw = (upper - lower) / 2.0 if not (math.isnan(upper) or math.isnan(lower)) else 0.0
+                if _cur_hw < _min_hw:
+                    lower = point - _min_hw
+                    upper = point + _min_hw
+                    interval_source += "+floor"
+
+            # ----------------------------------------------------------
+            # Phase 3.6: Ensemble disagreement widening (Lakshminarayanan 2017).
+            # When models disagree, their disagreement IS the uncertainty.
+            # Use per-model RMSE spread as a proxy for forecast spread.
+            # ----------------------------------------------------------
+            if forecast_result is not None and hasattr(forecast_result, "metrics"):
+                _model_rmses = [
+                    m.rmse for m in forecast_result.metrics
+                    if m.variable == var_name and m.fitted and m.rmse > 0
+                ]
+                if len(_model_rmses) >= 2:
+                    _rmse_spread = max(_model_rmses) - min(_model_rmses)
+                    _disagree_hw = z_score * _rmse_spread * math.sqrt(max(horizon_days, 1))
+                    _cur_hw = (upper - lower) / 2.0 if not (math.isnan(upper) or math.isnan(lower)) else 0.0
+                    if _disagree_hw > _cur_hw:
+                        lower = point - _disagree_hw
+                        upper = point + _disagree_hw
+                        interval_source += "+disagreement"
+
+            # ----------------------------------------------------------
+            # Phase 3.7: IV-anchored interval blending (Hull 2018).
+            # Options-implied vol is the market's forward-looking consensus
+            # on uncertainty.  Blend with model-derived intervals.
+            # ----------------------------------------------------------
+            if "iv30" in cache.columns and var_name == "close":
+                _iv_series = cache["iv30"].dropna()
+                if len(_iv_series) > 0:
+                    _iv30_val = float(_iv_series.iloc[-1])
+                    if _iv30_val > 0 and not math.isnan(_iv30_val):
+                        _iv_daily = _iv30_val / math.sqrt(252)
+                        _last_px = last_value if last_value and not math.isnan(last_value) else point
+                        _iv_hw = z_score * _last_px * _iv_daily * math.sqrt(max(horizon_days, 1))
+                        _cur_hw = (upper - lower) / 2.0
+                        # Blend: 60% IV (forward), 40% model (backward)
+                        _blended_hw = 0.60 * _iv_hw + 0.40 * _cur_hw
+                        if _blended_hw > _cur_hw:
+                            lower = point - _blended_hw
+                            upper = point + _blended_hw
+                            interval_source += "+iv"
+
+            # ----------------------------------------------------------
+            # Phase 3.8: ATH volatility scaling (Bouchaud 2002).
+            # Near all-time highs, realized vol underestimates future vol.
+            # Scale by vol-of-vol ratio.
+            # ----------------------------------------------------------
+            if "anchoring_52w_high" in cache.columns:
+                _ath_s = cache["anchoring_52w_high"].dropna()
+                if len(_ath_s) > 0:
+                    _ath_v = float(_ath_s.iloc[-1])
+                    if _ath_v > 0.90:
+                        _vov = 0.0
+                        _vol = 0.02
+                        if "vol_of_vol_21d" in cache.columns:
+                            _vov_s = cache["vol_of_vol_21d"].dropna()
+                            if len(_vov_s) > 0:
+                                _vov = float(_vov_s.iloc[-1])
+                        if "volatility_21d" in cache.columns:
+                            _vol_s = cache["volatility_21d"].dropna()
+                            if len(_vol_s) > 0:
+                                _vol = max(0.001, float(_vol_s.iloc[-1]))
+                        _vov_ratio = max(1.0, _vov / _vol) if _vov > 0 else 1.0
+                        _ath_scale = 1.0 + (_ath_v - 0.90) * _vov_ratio
+                        _cur_hw = (upper - lower) / 2.0
+                        lower = point - _cur_hw * _ath_scale
+                        upper = point + _cur_hw * _ath_scale
+                        interval_source += "+ath"
+
+            # ----------------------------------------------------------
+            # Phase 3.9: Invariant guard -- lower <= point <= upper.
+            # Must ALWAYS hold regardless of which interval path fired.
+            # ----------------------------------------------------------
+            if not math.isnan(point) and not math.isnan(lower) and not math.isnan(upper):
+                if lower > point or upper < point:
+                    _hw = max(abs(upper - lower) / 2.0, abs(point) * _MIN_HW_PCT)
+                    lower = point - _hw
+                    upper = point + _hw
+
+            # ----------------------------------------------------------
             # Phase 4: DTW analog forecast.
             # ----------------------------------------------------------
             analog_point, analog_lower, analog_upper = compute_dtw_analog_forecast(
