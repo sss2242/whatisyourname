@@ -476,6 +476,9 @@ def run_7_5_hedge_fund(state: PipelineState) -> None:
             income_freq_groups=state.income_freq_groups or None,
             balance_freq_groups=state.balance_freq_groups or None,
             cashflow_freq_groups=state.cashflow_freq_groups or None,
+            # Phase 2/9: additional inputs for new methods
+            seg_result=state.seg_result or None,
+            prediction_log_summary=state.prediction_log_summary or None,
         )
     except Exception as exc:
         logger.warning("Hedge fund analysis failed: %s", exc)

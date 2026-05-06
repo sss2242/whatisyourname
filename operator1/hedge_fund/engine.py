@@ -1520,6 +1520,9 @@ def run_hedge_fund_analysis(
     income_freq_groups: dict | None = None,
     balance_freq_groups: dict | None = None,
     cashflow_freq_groups: dict | None = None,
+    # Phase 2/9: additional inputs for new methods
+    seg_result: dict | None = None,
+    prediction_log_summary: dict | None = None,
 ) -> HedgeFundResult:
     """Run the complete Hedge Fund Analysis pipeline.
 
@@ -1563,8 +1566,23 @@ def run_hedge_fund_analysis(
     from operator1.hedge_fund.accruals_forensics import compute_accruals_forensics
     from operator1.hedge_fund.earnings_smoothing import compute_earnings_smoothing
 
-    hf.fcf_quality = compute_fcf_quality(income_df, cashflow_df, balance_df, cache)
-    hf.accruals_forensic = compute_accruals_forensics(income_df, balance_df, cashflow_df, cache)
+    # FCF Quality: multi-freq when per-frequency groups available
+    if _has_freq_groups and cashflow_freq_groups:
+        from operator1.hedge_fund.multi_freq_metrics import compute_fcf_quality_multi_freq
+        hf.fcf_quality = compute_fcf_quality_multi_freq(
+            income_freq_groups, cashflow_freq_groups, balance_freq_groups, cache,
+        )
+    else:
+        hf.fcf_quality = compute_fcf_quality(income_df, cashflow_df, balance_df, cache)
+
+    # Accruals: multi-freq when per-frequency groups available
+    if _has_freq_groups and balance_freq_groups:
+        from operator1.hedge_fund.multi_freq_metrics import compute_accruals_multi_freq
+        hf.accruals_forensic = compute_accruals_multi_freq(
+            income_freq_groups, balance_freq_groups, cashflow_freq_groups, cache,
+        )
+    else:
+        hf.accruals_forensic = compute_accruals_forensics(income_df, balance_df, cashflow_df, cache)
     hf.smoothing = compute_earnings_smoothing(income_df, cashflow_df, cache, fh_result)
 
     logger.info(
@@ -1614,7 +1632,12 @@ def run_hedge_fund_analysis(
         )
     else:
         hf.momentum = _compute_momentum(income_df, cashflow_df, cache)
-    hf.growth_quality = _compute_growth_quality(income_df, balance_df)
+    # Growth Quality: multi-freq when per-frequency groups available
+    if _has_freq_groups and balance_freq_groups:
+        from operator1.hedge_fund.multi_freq_metrics import compute_growth_quality_multi_freq
+        hf.growth_quality = compute_growth_quality_multi_freq(income_freq_groups, balance_freq_groups)
+    else:
+        hf.growth_quality = _compute_growth_quality(income_df, balance_df)
     hf.earnings_surprise = _compute_earnings_surprise(income_df, cache, filing_calendar_result)
 
     logger.info(
@@ -1660,8 +1683,7 @@ def run_hedge_fund_analysis(
 
     # --- Phase 2: SOTP Valuation ---
     try:
-        _seg = locals().get("seg_result") or {}
-        hf.sotp = _compute_sotp(_seg, cache)
+        hf.sotp = _compute_sotp(seg_result, cache)
         if hf.sotp.get("available"):
             logger.info("  SOTP: EV=%.0f, discount=%s%%",
                         hf.sotp.get("sotp_ev", 0),
@@ -1741,6 +1763,7 @@ def run_hedge_fund_analysis(
             filing_calendar_result=filing_calendar_result,
             survival_controller=survival_controller,
             cache=cache,
+            prediction_log_summary=prediction_log_summary,
         )
         if fusion_result.available:
             hf.fusion = {

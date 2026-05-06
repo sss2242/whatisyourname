@@ -73,6 +73,21 @@ class AdvancedMethodsResult:
     merton_default_probability: dict = field(default_factory=dict)  # {"pd_1yr": float}
     cross_asset_regime: dict = field(default_factory=dict)
 
+    # Phase 3: Credit analysis
+    merton_term_structure: dict = field(default_factory=dict)  # multi-horizon PD
+    credit_migration: dict = field(default_factory=dict)       # 4x4 transition matrix
+
+    # Phase 5: Competitive positioning
+    moat: dict = field(default_factory=dict)                   # moat quantification
+
+    # Phase 7: Macro sensitivity
+    factor_exposure: dict = field(default_factory=dict)        # multi-factor betas
+    equity_duration: dict = field(default_factory=dict)        # interest rate sensitivity
+
+    # Phase 8: Governance
+    governance: dict = field(default_factory=dict)             # governance quality score
+    capital_allocation: dict = field(default_factory=dict)     # capital allocation quality
+
 
 # ---------------------------------------------------------------------------
 # P1: Piotroski F-Score (9 binary signals)
