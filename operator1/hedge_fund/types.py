@@ -216,6 +216,10 @@ class LeverageStressResult:
     revenue_miss: StressScenario = field(default_factory=StressScenario)
     systemic_crisis: StressScenario = field(default_factory=StressScenario)
     refinancing_risk: bool = False
+    # Multi-frequency merge metadata
+    freq_results: dict = field(default_factory=dict)   # per-freq results {"A": {...}, "Q": {...}}
+    merge_method: str = ""                             # "worst_case_envelope" or "single_freq"
+    freq_divergence: float = 0.0                       # do frequencies agree on risk?
     narrative: str = ""
     error: str = ""
 
@@ -244,6 +248,10 @@ class MomentumCompositeResult:
     # Layer 4 enhancement: regime-conditional momentum (4.10A)
     regime_adjusted_momentum: float | None = None
     momentum_regime_bias: str = ""  # which component drives score in this regime
+    # Multi-frequency merge metadata
+    freq_scores: dict = field(default_factory=dict)    # per-freq scores {"A": 45, "Q": 62}
+    merge_method: str = ""                             # "weighted_regression" or "single_freq"
+    freq_agreement: float = 1.0                        # do frequencies agree on direction? (0-1)
     narrative: str = ""
     error: str = ""
 
@@ -306,6 +314,10 @@ class DCFResult:
     riv_intrinsic: float | None = None        # residual income valuation
     riv_excess_return: float | None = None    # RI / book value
     riv_vs_dcf_divergence: float | None = None  # riv - dcf difference
+    # Multi-frequency merge metadata
+    freq_intrinsics: dict = field(default_factory=dict)  # per-freq P50 {"A": 185.0, "Q": 192.0}
+    merge_method: str = ""                               # "inverse_variance" or "single_freq"
+    freq_divergence: float = 0.0                         # how much do frequencies disagree?
     narrative: str = ""
     error: str = ""
 

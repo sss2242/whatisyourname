@@ -1251,6 +1251,10 @@ def run_hedge_fund_analysis(
     survival_controller: Any = None,
     linked_caches: dict | None = None,
     macro_data: dict | None = None,
+    # Per-frequency statement groups for multi-freq metrics
+    income_freq_groups: dict | None = None,
+    balance_freq_groups: dict | None = None,
+    cashflow_freq_groups: dict | None = None,
 ) -> HedgeFundResult:
     """Run the complete Hedge Fund Analysis pipeline.
 
@@ -1319,7 +1323,15 @@ def run_hedge_fund_analysis(
     # --- Tier 3: Balance Sheet Risk ---
     hf.obs_risk = _compute_obs_risk(balance_df, income_df)
     hf.asset_quality = _compute_asset_quality(income_df, balance_df, cashflow_df)
-    hf.leverage_stress = _compute_leverage_stress(income_df, balance_df, mc_result)
+    # Leverage stress: multi-freq when per-frequency groups available
+    _has_freq_groups = bool(income_freq_groups and len(income_freq_groups) > 1)
+    if _has_freq_groups and balance_freq_groups:
+        from operator1.hedge_fund.multi_freq_metrics import compute_leverage_stress_multi_freq
+        hf.leverage_stress = compute_leverage_stress_multi_freq(
+            income_freq_groups, balance_freq_groups, mc_result,
+        )
+    else:
+        hf.leverage_stress = _compute_leverage_stress(income_df, balance_df, mc_result)
 
     logger.info(
         "  Tier 3 (Balance Sheet): OBS=%d, AssetQ=%d, LevStress=%s",
@@ -1328,7 +1340,15 @@ def run_hedge_fund_analysis(
     )
 
     # --- Tier 4: Inflection Detection ---
-    hf.momentum = _compute_momentum(income_df, cashflow_df, cache)
+    # Momentum: multi-freq when per-frequency groups available
+    _has_freq_groups = bool(income_freq_groups and len(income_freq_groups) > 1)
+    if _has_freq_groups:
+        from operator1.hedge_fund.multi_freq_metrics import compute_momentum_multi_freq
+        hf.momentum = compute_momentum_multi_freq(
+            income_freq_groups, cashflow_freq_groups or {}, cache,
+        )
+    else:
+        hf.momentum = _compute_momentum(income_df, cashflow_df, cache)
     hf.growth_quality = _compute_growth_quality(income_df, balance_df)
     hf.earnings_surprise = _compute_earnings_surprise(income_df, cache, filing_calendar_result)
 
@@ -1339,7 +1359,16 @@ def run_hedge_fund_analysis(
     )
 
     # --- Tier 5: Valuation Engine ---
-    hf.dcf = _compute_dcf(cashflow_df, balance_df, cache, target_profile, mc_result, macro_data, income_df=income_df)
+    # DCF: multi-freq when per-frequency groups available
+    if _has_freq_groups and cashflow_freq_groups:
+        from operator1.hedge_fund.multi_freq_metrics import compute_dcf_multi_freq
+        hf.dcf = compute_dcf_multi_freq(
+            cashflow_freq_groups, balance_freq_groups or {},
+            cache, target_profile, mc_result, macro_data,
+            income_freq_groups=income_freq_groups,
+        )
+    else:
+        hf.dcf = _compute_dcf(cashflow_df, balance_df, cache, target_profile, mc_result, macro_data, income_df=income_df)
     hf_results_dict = {
         "fcf_quality": hf.fcf_quality, "accruals_forensic": hf.accruals_forensic,
         "asset_quality": hf.asset_quality, "leverage_stress": hf.leverage_stress,
