@@ -287,9 +287,14 @@ def _compute_cash_reality(df: pd.DataFrame) -> pd.DataFrame:
     df["free_cash_flow_ttm_asof"] = _rolling_4q_ttm(df["free_cash_flow"])
     df["is_missing_free_cash_flow_ttm_asof"] = df["free_cash_flow_ttm_asof"].isna().astype(int)
 
-    # FCF yield = FCF / market_cap
+    # FCF yield = FCF_TTM / market_cap.
+    # Use TTM (trailing 4-quarter sum) to avoid distortion from
+    # flow-variable interpolation on the daily cache.  The daily
+    # free_cash_flow is a daily rate from the interpolator; dividing
+    # it by market_cap gives ~0.005% instead of ~3.3%.
+    _fcf_for_yield = df.get("free_cash_flow_ttm_asof", df["free_cash_flow"])
     result, ism, inv = safe_ratio(
-        df["free_cash_flow"], market_cap, "fcf_yield",
+        _fcf_for_yield, market_cap, "fcf_yield",
     )
     _set_ratio_columns(df, "fcf_yield", result, ism, inv)
 
@@ -386,8 +391,22 @@ def _compute_valuation(df: pd.DataFrame) -> pd.DataFrame:
     total_debt = df.get("total_debt_asof", pd.Series(np.nan, index=df.index))
     cash = df.get("cash_and_equivalents", pd.Series(np.nan, index=df.index))
 
-    # Earnings per share (calc)
-    eps_calc = net_income / shares.where(shares.abs() > EPSILON, other=np.nan)
+    # Earnings per share: prefer eps_diluted from filings (already at correct
+    # per-share quarterly/annual scale) over recomputed eps_calc.  The daily
+    # cache interpolates flow variables (net_income) into daily rates, so
+    # eps_calc = daily_net_income / shares produces garbage PE ratios.
+    # eps_diluted comes directly from CompanyFacts/XBRL at the filing's
+    # native frequency and is forward-filled -- no interpolation distortion.
+    eps_from_filings = df.get("eps_diluted", pd.Series(np.nan, index=df.index))
+    if eps_from_filings.isna().all():
+        eps_from_filings = df.get("eps", pd.Series(np.nan, index=df.index))
+
+    if eps_from_filings.notna().any():
+        eps_calc = eps_from_filings
+    else:
+        # Fallback: recompute from net_income / shares (may be distorted
+        # by flow-variable interpolation on the daily cache)
+        eps_calc = net_income / shares.where(shares.abs() > EPSILON, other=np.nan)
 
     # P/E ratio = close / EPS
     result, ism, inv = safe_ratio(close, eps_calc, "pe_ratio_calc")
@@ -413,8 +432,10 @@ def _compute_valuation(df: pd.DataFrame) -> pd.DataFrame:
     result, ism, inv = safe_ratio(eps_calc, close, "earnings_yield_calc")
     _set_ratio_columns(df, "earnings_yield_calc", result, ism, inv)
 
-    # P/S ratio = market_cap / revenue
-    result, ism, inv = safe_ratio(market_cap, revenue, "ps_ratio_calc")
+    # P/S ratio = market_cap / revenue_TTM.
+    # Use TTM revenue to avoid flow-variable interpolation distortion.
+    _revenue_for_ps = df.get("revenue_ttm_asof", revenue)
+    result, ism, inv = safe_ratio(market_cap, _revenue_for_ps, "ps_ratio_calc")
     _set_ratio_columns(df, "ps_ratio_calc", result, ism, inv)
 
     # Enterprise value = market_cap + total_debt - cash
@@ -426,8 +447,11 @@ def _compute_valuation(df: pd.DataFrame) -> pd.DataFrame:
     df["enterprise_value"] = ev.where(~ev_missing, other=np.nan)
     df["is_missing_enterprise_value"] = ev_missing.astype(int)
 
-    # EV/EBITDA
-    result, ism, inv = safe_ratio(df["enterprise_value"], ebitda, "ev_to_ebitda")
+    # EV/EBITDA -- use TTM EBITDA to avoid flow-variable interpolation
+    # distortion on the daily cache.  The daily ebitda is a daily rate;
+    # EV / daily_rate gives absurd ratios (90x instead of ~25x).
+    _ebitda_for_ev = df.get("ebitda_ttm_asof", ebitda)
+    result, ism, inv = safe_ratio(df["enterprise_value"], _ebitda_for_ev, "ev_to_ebitda")
     _set_ratio_columns(df, "ev_to_ebitda", result, ism, inv)
 
     # P/B ratio = market_cap / total_equity

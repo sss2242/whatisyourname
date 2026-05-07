@@ -1010,6 +1010,37 @@ Non-interactive examples:
     logger.info("Cache built: %d rows x %d columns", len(cache), len(cache.columns))
 
     # ------------------------------------------------------------------
+    # Inject shares_outstanding from profile if missing from cache.
+    # shares_outstanding lives in the profile dict (from edgartools or
+    # yfinance) but is NOT in any financial statement DataFrame.
+    # Without it, market_cap, PE, EV, fcf_yield, and the cash adequacy
+    # survival floor all break.
+    # ------------------------------------------------------------------
+    if ("shares_outstanding" not in cache.columns
+            or cache.get("shares_outstanding") is None
+            or (cache["shares_outstanding"].isna().all() if "shares_outstanding" in cache.columns else True)):
+        _shares = target_profile.get("shares_outstanding")
+        if _shares is not None:
+            try:
+                _shares_val = float(_shares)
+                if _shares_val > 0:
+                    cache["shares_outstanding"] = _shares_val
+                    logger.info("Injected shares_outstanding from profile: %.0f", _shares_val)
+            except (TypeError, ValueError):
+                pass
+
+    # Compute market_cap from close * shares_outstanding if not already present
+    if ("close" in cache.columns
+            and "shares_outstanding" in cache.columns
+            and cache["shares_outstanding"].notna().any()):
+        if "market_cap" not in cache.columns or cache["market_cap"].isna().all():
+            cache["market_cap"] = cache["close"] * cache["shares_outstanding"]
+            logger.info(
+                "Computed market_cap: latest=%.0f",
+                cache["market_cap"].dropna().iloc[-1] if cache["market_cap"].notna().any() else 0,
+            )
+
+    # ------------------------------------------------------------------
     # Backtest date filter: trim cache to end at --end-date
     # ------------------------------------------------------------------
     if _backtest_end_date is not None:

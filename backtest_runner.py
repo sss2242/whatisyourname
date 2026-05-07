@@ -431,6 +431,12 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         "receivables": ["AccountsReceivableNetCurrent"],
         "inventory": ["InventoryNet"],
         "payables": ["AccountsPayableCurrent"],
+        "shares_outstanding": [
+            "EntityCommonStockSharesOutstanding",
+            "CommonStockSharesOutstanding",
+            "WeightedAverageNumberOfShareOutstandingBasicAndDiluted",
+            "WeightedAverageNumberOfDilutedSharesOutstanding",
+        ],
     }
     # P2/P3/P9: Extend CompanyFacts fallback to income statement fields.
     # Missing net_income/EPS disables PE anchor, full Piotroski, and HF
@@ -478,14 +484,19 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             )
             if _facts_resp.status_code == 200:
                 _usgaap = _facts_resp.json().get("facts", {}).get("us-gaap", {})
+                _dei = _facts_resp.json().get("facts", {}).get("dei", {})
                 _filled = 0
                 for _field, _concepts in _all_critical_fields.items():
                     if _field in cache.columns and not cache[_field].isna().all():
                         continue
                     for _concept in _concepts:
-                        _cdata = _usgaap.get(_concept, {})
-                        # EPS fields use USD/shares units, not USD
-                        _unit_key = "USD/shares" if _field in ("eps_diluted",) else "USD"
+                        # shares_outstanding concepts live in DEI namespace;
+                        # check DEI first, then us-gaap
+                        _cdata = _dei.get(_concept, {}) or _usgaap.get(_concept, {})
+                        # Field-specific unit keys
+                        _unit_key = "USD/shares" if _field in ("eps_diluted",) else (
+                            "shares" if _field == "shares_outstanding" else "USD"
+                        )
                         _entries = _cdata.get("units", {}).get(_unit_key, [])
                         if not _entries and _unit_key == "USD/shares":
                             _entries = _cdata.get("units", {}).get("USD", [])
@@ -561,6 +572,38 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     bt_start = bt_end - pd.Timedelta(days=int(state.years * 365))
     cache = cache[(cache.index >= bt_start) & (cache.index <= bt_end)]
     logger.info("Cache after backtest filter: %d rows x %d cols", len(cache), len(cache.columns))
+
+    # -- Inject shares_outstanding from profile if missing from cache --
+    # shares_outstanding lives in the profile dict (from edgartools
+    # company.shares_outstanding or yfinance info) but is NOT in any
+    # financial statement DataFrame. Without it, market_cap, PE, EV,
+    # fcf_yield, and the cash adequacy survival floor all break.
+    if ("shares_outstanding" not in cache.columns
+            or cache.get("shares_outstanding") is None
+            or (cache["shares_outstanding"].isna().all() if "shares_outstanding" in cache.columns else True)):
+        _shares = state.target_profile.get("shares_outstanding")
+        if _shares is not None:
+            try:
+                _shares_val = float(_shares)
+                if _shares_val > 0:
+                    cache["shares_outstanding"] = _shares_val
+                    logger.info(
+                        "Injected shares_outstanding from profile: %.0f",
+                        _shares_val,
+                    )
+            except (TypeError, ValueError):
+                pass
+
+    # Compute market_cap from close * shares_outstanding if not already present
+    if ("close" in cache.columns
+            and "shares_outstanding" in cache.columns
+            and cache["shares_outstanding"].notna().any()):
+        if "market_cap" not in cache.columns or cache["market_cap"].isna().all():
+            cache["market_cap"] = cache["close"] * cache["shares_outstanding"]
+            logger.info(
+                "Computed market_cap: latest=%.0f",
+                cache["market_cap"].dropna().iloc[-1] if cache["market_cap"].notna().any() else 0,
+            )
 
     # -- CHECKPOINT 1.4a: Cache built (OHLCV + statements merged) --
     state.cache = cache
