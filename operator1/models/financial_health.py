@@ -630,13 +630,21 @@ def _composite_label(score: float) -> str:
 # ---------------------------------------------------------------------------
 
 
-def compute_altman_z_score(df: pd.DataFrame) -> AltmanZResult:
-    """Compute daily Altman Z-Score series (bankruptcy predictor).
+def compute_altman_z_score(df: pd.DataFrame, freq: str = "D") -> AltmanZResult:
+    """Compute Altman Z-Score series (bankruptcy predictor, frequency-aware).
 
     Z = 1.2*X1 + 1.4*X2 + 3.3*X3 + 0.6*X4 + 1.0*X5
-    where X1..X5 are balance-sheet ratios.  Zones: safe (>2.99),
-    grey (1.81-2.99), distress (<1.81).
+
+    X1 (WC/TA) and X2 (RE/TA) are STOCK/STOCK -- correct at any freq.
+    X3 (EBIT/TA) and X5 (Revenue/TA) are FLOW/STOCK -- need annualization
+    at Q/A/S.  At D, ebit/revenue are daily rates -> x3/x5 are ~1000x
+    too small.  We annualize flow variables before dividing by TA.
+    X4 (MVE/TL) is MARKET/STOCK -- correct at any freq.
     """
+    freq = freq.upper() if freq else "D"
+    _annualize = {"D": 252.0, "W": 52.0, "M": 12.0, "Q": 4.0, "S": 2.0, "A": 1.0}
+    _mult = _annualize.get(freq, 1.0)
+
     result = AltmanZResult()
 
     total_assets = df.get("total_assets")
@@ -647,21 +655,26 @@ def compute_altman_z_score(df: pd.DataFrame) -> AltmanZResult:
     ta = total_assets.replace(0, np.nan)
     tl = df.get("total_liabilities", pd.Series(np.nan, index=df.index)).replace(0, np.nan)
 
+    # X1: Working Capital / TA (STOCK/STOCK -- OK at any freq)
     current_assets = df.get("current_assets", pd.Series(np.nan, index=df.index))
     current_liabilities = df.get("current_liabilities", pd.Series(np.nan, index=df.index))
     x1 = (current_assets - current_liabilities) / ta
 
+    # X2: Retained Earnings / TA (STOCK/STOCK -- OK at any freq)
     retained_earnings = df.get("retained_earnings", pd.Series(np.nan, index=df.index))
     x2 = retained_earnings / ta
 
+    # X3: EBIT / TA (FLOW/STOCK -- annualize EBIT at Q/A/S)
     ebit = df.get("ebit", df.get("operating_income", df.get("ebitda", pd.Series(np.nan, index=df.index))))
-    x3 = ebit / ta
+    x3 = (ebit * _mult) / ta
 
+    # X4: Market Cap / TL (MARKET/STOCK -- OK at any freq)
     market_cap = df.get("market_cap", pd.Series(np.nan, index=df.index))
     x4 = market_cap / tl
 
+    # X5: Revenue / TA (FLOW/STOCK -- annualize Revenue at Q/A/S)
     revenue = df.get("revenue", pd.Series(np.nan, index=df.index))
-    x5 = revenue / ta
+    x5 = (revenue * _mult) / ta
 
     z = (
         _Z_COEFF["x1_working_capital_ta"] * x1
@@ -806,12 +819,21 @@ def compute_beneish_m_score(df: pd.DataFrame) -> BeneishMResult:
     return result
 
 
-def compute_liquidity_runway(df: pd.DataFrame) -> LiquidityRunwayResult:
-    """Estimate months of cash runway at current burn rate.
+def compute_liquidity_runway(df: pd.DataFrame, freq: str = "D") -> LiquidityRunwayResult:
+    """Estimate months of cash runway at current burn rate (frequency-aware).
 
     Answers: "If revenue stopped today, how many months can this company
     survive on its current cash reserves at the current spending rate?"
+
+    OCF is a flow variable: at Q = quarterly total, at A = annual total,
+    at D = daily rate.  Monthly burn = |OCF| / months_in_period.
+    At Q: |OCF_q| / 3.  At A: |OCF_a| / 12.  At D: |OCF_daily| * 30.
     """
+    freq = freq.upper() if freq else "D"
+    # Months in one filing period at each frequency
+    _months_in_period = {"A": 12.0, "S": 6.0, "Q": 3.0, "M": 1.0, "W": 7/30, "D": 1/30}
+    _mip = _months_in_period.get(freq, 1/30)
+
     result = LiquidityRunwayResult()
 
     cash = df.get("cash_and_equivalents")
@@ -827,7 +849,8 @@ def compute_liquidity_runway(df: pd.DataFrame) -> LiquidityRunwayResult:
         latest_ocf = float(ocf.dropna().iloc[-1])
 
         if latest_ocf < 0:
-            monthly_burn = abs(latest_ocf) / 12.0
+            # OCF is negative: compute monthly burn from period OCF
+            monthly_burn = abs(latest_ocf) / max(_mip, 0.01)
             result.monthly_burn_rate = float(monthly_burn)
         else:
             capex = df.get("capex")
@@ -835,7 +858,7 @@ def compute_liquidity_runway(df: pd.DataFrame) -> LiquidityRunwayResult:
                 latest_capex = float(capex.dropna().iloc[-1])
                 net_outflow = abs(latest_capex) - latest_ocf
                 if net_outflow > 0:
-                    result.monthly_burn_rate = float(net_outflow / 12.0)
+                    result.monthly_burn_rate = float(net_outflow / max(_mip, 0.01))
                 else:
                     result.monthly_burn_rate = 0.0
             else:
@@ -1053,7 +1076,7 @@ def compute_financial_health(
 
     # Altman Z-Score -- bankruptcy predictor (strengthens Tier 1-2 signals)
     try:
-        z_result = compute_altman_z_score(cache)
+        z_result = compute_altman_z_score(cache, freq=freq)
         result.altman_z = z_result
         if z_result.available and z_result.z_score_series is not None:
             cache["fh_altman_z_score"] = z_result.z_score_series
@@ -1136,7 +1159,7 @@ def compute_financial_health(
 
     # Liquidity Runway -- months of cash survival (strengthens Tier 1)
     try:
-        runway_result = compute_liquidity_runway(cache)
+        runway_result = compute_liquidity_runway(cache, freq=freq)
         result.liquidity_runway = runway_result
         if runway_result.available and runway_result.months_of_runway is not None:
             months = runway_result.months_of_runway
