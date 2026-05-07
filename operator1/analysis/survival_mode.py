@@ -71,15 +71,22 @@ _COMPANY_THRESHOLDS = _load_company_thresholds()
 def compute_company_survival_flag(
     df: pd.DataFrame,
     thresholds: dict[str, float] | None = None,
+    freq: str = "D",
 ) -> pd.Series:
     """Compute daily company survival mode flag.
 
     Parameters
     ----------
     df:
-        Daily feature table with derived variables already computed.
+        Feature table with derived variables already computed.
     thresholds:
         Override default thresholds (mainly for testing).
+    freq:
+        Data frequency (D/W/M/Q/A/S).  At D/W/M, the ``fcf_yield``
+        trigger is skipped because flow-variable interpolation
+        produces a distorted value (~0.04% instead of ~3.3%).
+        The fcf_yield trigger is only reliable at Q/A/S where
+        the value is at native filing scale.
 
     Returns
     -------
@@ -87,6 +94,8 @@ def compute_company_survival_flag(
         Integer series: 1 = survival mode active, 0 = normal.
     """
     t = thresholds or _COMPANY_THRESHOLDS
+    _native_ratio_freqs = {"Q", "A", "S"}
+    freq = freq.upper() if freq else "D"
 
     # Two-category condition architecture: liquidity triggers (suppressible
     # by cash adequacy) vs non-liquidity triggers (never suppressed).
@@ -105,10 +114,14 @@ def compute_company_survival_flag(
         de = df["debt_to_equity_abs"]
         liquidity_conditions.append(de.notna() & (de > t.get("debt_to_equity_abs_gt", 3.0)))
 
-    # FCF yield < 0
-    if "fcf_yield" in df.columns:
+    # FCF yield < 0 -- ONLY at native filing freq (Q/A/S).
+    # At D/W/M, fcf_yield is distorted by flow-variable interpolation
+    # (~0.04% instead of ~3.3% for AAPL) and would false-trigger survival.
+    if "fcf_yield" in df.columns and freq in _native_ratio_freqs:
         fy = df["fcf_yield"]
         liquidity_conditions.append(fy.notna() & (fy < t.get("fcf_yield_lt", 0.0)))
+    elif "fcf_yield" in df.columns:
+        logger.debug("Skipping fcf_yield survival trigger at freq=%s (distorted)", freq)
 
     # --- Non-liquidity triggers (never suppressed by cash adequacy) ---
 

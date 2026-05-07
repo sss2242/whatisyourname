@@ -881,37 +881,35 @@ def compute_liquidity_runway(df: pd.DataFrame) -> LiquidityRunwayResult:
 def compute_financial_health(
     cache: pd.DataFrame,
     hierarchy_weights: dict[str, float] | None = None,
+    freq: str = "D",
 ) -> tuple[pd.DataFrame, FinancialHealthResult]:
-    """Compute daily financial health scores and inject into the cache.
-
-    This function MUST be called before temporal models (Step 6) so that
-    forecasting, forward pass, and burn-out automatically learn from the
-    health scores as additional daily features.
+    """Compute financial health scores and inject into the cache.
 
     Runs the 5-tier scoring system (liquidity, solvency, stability,
-    profitability, growth) plus three extended models:
-    - Altman Z-Score (bankruptcy prediction, strengthens Tier 1-2)
-    - Beneish M-Score (earnings manipulation, ethical filter)
-    - Liquidity Runway (months of cash, strengthens Tier 1)
+    profitability, growth) plus extended models (Altman Z, Beneish M,
+    runway).
 
     Parameters
     ----------
     cache : pd.DataFrame
-        The daily cache DataFrame (DatetimeIndex) with derived features
-        from Steps 4-5.
+        Cache DataFrame with derived features.
     hierarchy_weights : dict, optional
-        Tier weights for the composite score.  Keys: ``tier1`` .. ``tier5``.
-        If None, uses equal weights (20% each).  When the company is in
-        survival mode, these weights shift toward liquidity/solvency,
-        making the composite reflect survival priorities.
+        Tier weights for the composite.
+    freq : str
+        Data frequency (D/W/M/Q/A/S).  At D/W/M, Tier 5 (Growth)
+        is scored with reduced confidence because PE, EV/EBITDA are
+        distorted by flow-variable interpolation.  Altman Z components
+        x3 (EBIT/TA) and x5 (Revenue/TA) are also unreliable at D.
+        At Q/A/S, all tiers and Altman Z components are fully valid.
 
     Returns
     -------
     (cache, result)
-        The cache with new ``fh_*`` columns appended, and a
-        ``FinancialHealthResult`` summary.
+        The cache with ``fh_*`` columns, and ``FinancialHealthResult``.
     """
-    logger.info("Computing financial health scores...")
+    freq = freq.upper() if freq else "D"
+    _native_ratio_freqs = {"Q", "A", "S"}
+    logger.info("Computing financial health scores (freq=%s)...", freq)
 
     weights = dict(_DEFAULT_WEIGHTS)
     if hierarchy_weights:
@@ -926,6 +924,11 @@ def compute_financial_health(
     result = FinancialHealthResult()
 
     # Compute tier scores
+    # Tier 5 (Growth) uses PE, EV/EBITDA, revenue_growth -- PE and EV/EBITDA
+    # are MARKET/FLOW ratios that are distorted on interpolated daily data.
+    # At D/W/M: still compute T5 but its values will be based on whatever
+    # PE/EV values are in the cache (may be corrected by prior fusion step).
+    # At Q/A/S: T5 is fully reliable (native-scale ratios).
     tier_scores: dict[str, pd.Series] = {
         "tier1": _score_liquidity(cache),
         "tier2": _score_solvency(cache),
@@ -933,6 +936,11 @@ def compute_financial_health(
         "tier4": _score_profitability(cache),
         "tier5": _score_growth(cache),
     }
+    if freq not in _native_ratio_freqs:
+        logger.debug(
+            "FH T5 (Growth) at freq=%s may use distorted PE/EV values",
+            freq,
+        )
 
     col_names = {
         "tier1": "fh_liquidity_score",

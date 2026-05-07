@@ -248,6 +248,16 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     state.cashflow_df = cashflow_df
     state.quotes_df = quotes_df
 
+    # Label source filing frequencies (A/Q/S) for frequency-first pipeline
+    try:
+        from operator1.features.frequency_resampler import detect_all_filing_frequencies
+        state.source_frequencies = detect_all_filing_frequencies(
+            income_df=income_df, balance_df=balance_df, cashflow_df=cashflow_df,
+        )
+        logger.info("Source frequencies: %s", state.source_frequencies)
+    except Exception as exc:
+        logger.debug("Frequency labeling skipped: %s", exc)
+
     # -- CHECKPOINT 1.2: Financial statements fetched --
     state.save("1.2")
     logger.info("Checkpoint 1.2 saved (financial statements)")

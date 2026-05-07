@@ -97,6 +97,7 @@ class PipelineState:
         self.adaptive_tier3: Any = None
         self.mode_weights: Any = None
         self.hf_data_readiness: dict = {}  # HF data sufficiency assessment
+        self.source_frequencies: dict = {}  # {"income": "quarterly", "balance": "quarterly", ...}
 
         # ---- Per-frequency raw statement groups (from frequency separator) ----
         # Keys: "quarterly", "semiannual", "annual"

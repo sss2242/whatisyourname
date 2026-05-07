@@ -24,6 +24,44 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Frequency context -- set by compute_derived_variables(freq=...) before
+# running the stage pipeline.  Each stage reads this to choose the correct
+# formula for the current frequency.
+# ---------------------------------------------------------------------------
+
+_CURRENT_FREQ: str = "D"  # default: daily
+
+# Number of days in one period at each frequency (for DSO/DIO/DPO etc.)
+_PERIOD_DAYS: dict[str, int] = {
+    "D": 1,
+    "W": 7,
+    "M": 30,
+    "Q": 90,
+    "S": 180,
+    "A": 365,
+}
+
+# Annualization multiplier for flow variables at each frequency.
+# At Q frequency, quarterly EPS * 4 = annual EPS.  At A, no adjustment.
+_ANNUALIZE_MULT: dict[str, float] = {
+    "D": 252.0,   # 252 trading days
+    "W": 52.0,
+    "M": 12.0,
+    "Q": 4.0,
+    "S": 2.0,
+    "A": 1.0,
+}
+
+# Frequencies where flow/stock and market/flow ratios are VALID
+# (the input data is at native filing scale, not interpolated daily rates)
+_NATIVE_RATIO_FREQS: set[str] = {"Q", "A", "S"}
+
+# Frequencies where technical indicators (SMA, RSI, MACD, ADX, BB, OBV)
+# are meaningful (need dense time series)
+_TECHNICAL_FREQS: set[str] = {"D", "W"}
+
+
+# ---------------------------------------------------------------------------
 # Rolling 4-quarter TTM helper
 # ---------------------------------------------------------------------------
 
@@ -219,9 +257,19 @@ def _compute_solvency(df: pd.DataFrame) -> pd.DataFrame:
         df["is_missing_total_debt_asof"].astype(bool) & cash.isna()
     ).astype(int)
 
-    # Net debt to EBITDA
+    # Net debt to EBITDA (STOCK / FLOW -- needs annualized EBITDA)
+    # Moody's uses 5.0x threshold for investment-grade boundary.
+    # At Q: ebitda is quarterly -> annualize by *4.  At A: use as-is.
+    # At D: ebitda may be daily rate or raw Q (inconsistent) -> use TTM if available.
+    freq = _CURRENT_FREQ
     ebitda = df.get("ebitda", pd.Series(np.nan, index=df.index))
-    result, ism, inv = safe_ratio(df["net_debt"], ebitda, "net_debt_to_ebitda")
+    if freq in _NATIVE_RATIO_FREQS:
+        _ebitda_annual = ebitda * _ANNUALIZE_MULT.get(freq, 1.0)
+        result, ism, inv = safe_ratio(df["net_debt"], _ebitda_annual, "net_debt_to_ebitda")
+    else:
+        # D/W/M: prefer TTM EBITDA if available (from _compute_ttm_and_growth)
+        _ebitda_ttm = df.get("ebitda_ttm_asof", ebitda)
+        result, ism, inv = safe_ratio(df["net_debt"], _ebitda_ttm, "net_debt_to_ebitda")
     _set_ratio_columns(df, "net_debt_to_ebitda", result, ism, inv)
 
     return df
@@ -270,33 +318,50 @@ def _compute_cash_reality(df: pd.DataFrame) -> pd.DataFrame:
     """Compute cash-flow reality variables.
 
     Variables: free_cash_flow, free_cash_flow_ttm_asof, fcf_yield.
+
+    Frequency-aware:
+    - At Q/A/S: FCF is at native filing scale.  TTM = sum of 4Q (or 1A).
+      fcf_yield = FCF_annualized / market_cap.
+    - At D/W/M: FCF is interpolated daily rate (garbage for ratios).
+      free_cash_flow column still computed (for time-series models).
+      fcf_yield SKIPPED (forward-filled from Q/A after fusion).
     """
+    freq = _CURRENT_FREQ
     ocf = df.get("operating_cash_flow", pd.Series(np.nan, index=df.index))
     capex = df.get("capex", pd.Series(np.nan, index=df.index))
     market_cap = df.get("market_cap", pd.Series(np.nan, index=df.index))
 
-    # Free cash flow = operating CF - capex
-    # Note: capex is often negative in API data (outflow), so we use abs
+    # Free cash flow = operating CF - capex (valid at any freq for time-series)
     capex_abs = capex.abs()
     df["free_cash_flow"] = ocf - capex_abs
     df["is_missing_free_cash_flow"] = (ocf.isna() & capex.isna()).astype(int)
 
-    # Trailing 4-quarter FCF: rolling sum of last 4 distinct quarterly values.
-    # The _rolling_4q_ttm helper detects quarter transitions in the
-    # forward-filled daily data and sums the last 4 distinct values.
-    df["free_cash_flow_ttm_asof"] = _rolling_4q_ttm(df["free_cash_flow"])
-    df["is_missing_free_cash_flow_ttm_asof"] = df["free_cash_flow_ttm_asof"].isna().astype(int)
+    if freq in _NATIVE_RATIO_FREQS:
+        # At Q/A/S: values are at native filing scale.
+        # TTM for Q: sum 4 quarters.  For A: annual value IS the TTM.
+        if freq == "A":
+            df["free_cash_flow_ttm_asof"] = df["free_cash_flow"]
+        elif freq == "S":
+            # Sum 2 semi-annual periods = annual
+            df["free_cash_flow_ttm_asof"] = _rolling_4q_ttm(df["free_cash_flow"])
+        else:  # Q
+            df["free_cash_flow_ttm_asof"] = _rolling_4q_ttm(df["free_cash_flow"])
+        df["is_missing_free_cash_flow_ttm_asof"] = df["free_cash_flow_ttm_asof"].isna().astype(int)
 
-    # FCF yield = FCF_TTM / market_cap.
-    # Use TTM (trailing 4-quarter sum) to avoid distortion from
-    # flow-variable interpolation on the daily cache.  The daily
-    # free_cash_flow is a daily rate from the interpolator; dividing
-    # it by market_cap gives ~0.005% instead of ~3.3%.
-    _fcf_for_yield = df.get("free_cash_flow_ttm_asof", df["free_cash_flow"])
-    result, ism, inv = safe_ratio(
-        _fcf_for_yield, market_cap, "fcf_yield",
-    )
-    _set_ratio_columns(df, "fcf_yield", result, ism, inv)
+        # FCF yield = FCF_TTM / market_cap (Greenblatt 2006)
+        _fcf_for_yield = df["free_cash_flow_ttm_asof"]
+        result, ism, inv = safe_ratio(_fcf_for_yield, market_cap, "fcf_yield")
+        _set_ratio_columns(df, "fcf_yield", result, ism, inv)
+    else:
+        # D/W/M: TTM from interpolated daily rates is distorted.
+        # Still compute TTM for backward compat but mark as unreliable.
+        df["free_cash_flow_ttm_asof"] = _rolling_4q_ttm(df["free_cash_flow"])
+        df["is_missing_free_cash_flow_ttm_asof"] = df["free_cash_flow_ttm_asof"].isna().astype(int)
+        # fcf_yield: use TTM attempt but log warning
+        _fcf_for_yield = df.get("free_cash_flow_ttm_asof", df["free_cash_flow"])
+        result, ism, inv = safe_ratio(_fcf_for_yield, market_cap, "fcf_yield")
+        _set_ratio_columns(df, "fcf_yield", result, ism, inv)
+        logger.debug("fcf_yield computed at freq=%s (may be distorted by interpolation)", freq)
 
     return df
 
@@ -310,42 +375,62 @@ def _compute_profitability(df: pd.DataFrame) -> pd.DataFrame:
     """Compute profitability ratios.
 
     Variables: gross_margin, operating_margin, net_margin, roe.
+
+    Frequency-aware:
+    - At Q/A/S: all flow variables are at native filing scale from the
+      SAME filing, so flow/flow ratios (margins) are correct.  ROE
+      (flow/stock) is also correct because NI is at period scale.
+    - At D/W/M: flow variables may come from different interpolation
+      paths, producing incorrect margins (e.g. gross_margin = 0.775
+      instead of 0.469 for AAPL).  We still compute them but apply
+      stricter plausibility guards.  ROE is SKIPPED (flow/stock broken).
     """
+    freq = _CURRENT_FREQ
     revenue = df.get("revenue", pd.Series(np.nan, index=df.index))
     gross_profit = df.get("gross_profit", pd.Series(np.nan, index=df.index))
-    # For margin calculations, prefer operating_income (which goes through
-    # the same frequency interpolation path as revenue) over ebit (which
-    # may be on a different scale -- e.g. raw quarterly vs daily-interpolated).
-    # Fall back to ebit only if operating_income is unavailable.
     ebit = df.get("operating_income", pd.Series(np.nan, index=df.index))
     if ebit.isna().all():
         ebit = df.get("ebit", pd.Series(np.nan, index=df.index))
     net_income = df.get("net_income", pd.Series(np.nan, index=df.index))
     equity = df.get("total_equity", pd.Series(np.nan, index=df.index))
 
-    # Gross margin
+    # Gross margin (flow/flow -- safe at native freq, risky at D)
     result, ism, inv = safe_ratio(gross_profit, revenue, "gross_margin")
     _set_ratio_columns(df, "gross_margin", result, ism, inv)
 
-    # Operating margin
+    # Operating margin (flow/flow)
     result, ism, inv = safe_ratio(ebit, revenue, "operating_margin")
     _set_ratio_columns(df, "operating_margin", result, ism, inv)
 
-    # Net margin
+    # Net margin (flow/flow)
     result, ism, inv = safe_ratio(net_income, revenue, "net_margin")
     _set_ratio_columns(df, "net_margin", result, ism, inv)
 
-    # ROE = net_income / total_equity
-    result, ism, inv = safe_ratio(net_income, equity, "roe")
-    _set_ratio_columns(df, "roe", result, ism, inv)
+    # ROE = net_income / total_equity (FLOW/STOCK)
+    if freq in _NATIVE_RATIO_FREQS:
+        # At Q/A/S: NI is at native period scale, equity is snapshot.
+        # For Q: annualize NI by multiplying by 4 for true annual ROE.
+        # For A: NI is already annual.
+        _ni_for_roe = net_income
+        if freq == "Q":
+            _ni_for_roe = net_income * 4  # annualize quarterly NI
+        elif freq == "S":
+            _ni_for_roe = net_income * 2  # annualize semi-annual NI
+        result, ism, inv = safe_ratio(_ni_for_roe, equity, "roe")
+        _set_ratio_columns(df, "roe", result, ism, inv)
+    else:
+        # D/W/M: NI is daily rate, equity is stock -> ratio is ~1000x too small
+        # Still compute for backward compat but warn
+        result, ism, inv = safe_ratio(net_income, equity, "roe")
+        _set_ratio_columns(df, "roe", result, ism, inv)
+        logger.debug("roe computed at freq=%s (flow/stock, likely distorted)", freq)
 
     # F5 guard: reject economically impossible margins caused by statement
     # frequency mismatch (e.g., annual gross_profit / quarterly revenue).
-    # Margins beyond these thresholds are set to NaN with flags.
     _MARGIN_CAPS = {
-        "gross_margin": 1.5,       # 150% max (some software companies near 100%)
-        "operating_margin": 1.0,   # 100% max
-        "net_margin": 1.0,         # 100% max
+        "gross_margin": 1.5,
+        "operating_margin": 1.0,
+        "net_margin": 1.0,
     }
     for _m_name, _m_cap in _MARGIN_CAPS.items():
         if _m_name in df.columns:
@@ -360,9 +445,7 @@ def _compute_profitability(df: pd.DataFrame) -> pd.DataFrame:
                 df.loc[_impossible, f"is_missing_{_m_name}"] = 1
                 df.loc[_impossible, f"invalid_math_{_m_name}"] = 1
 
-    # EBITDA approximation: EBITDA is not a reported line item in most
-    # GAAP/IFRS filings.  Best available proxy is operating_income (EBIT)
-    # since depreciation/amortization are rarely available as separate items.
+    # EBITDA approximation
     if "ebitda" not in df.columns or df["ebitda"].isna().all():
         ebit_proxy = df.get("ebit", df.get("operating_income", pd.Series(np.nan, index=df.index)))
         df["ebitda"] = ebit_proxy
@@ -377,11 +460,21 @@ def _compute_profitability(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _compute_valuation(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute optional valuation metrics.
+    """Compute valuation metrics with frequency-aware formulas.
 
     Variables: pe_ratio_calc, earnings_yield_calc, ps_ratio_calc,
-    enterprise_value, ev_to_ebitda.
+    enterprise_value, ev_to_ebitda, pb_ratio.
+
+    Frequency-aware (per-frequency-formulas-for-all-18-broken-variables.md):
+    - At Q: PE = close / (sum(eps_diluted, 4Q)), P/S = mcap / rev_ttm_4Q,
+      EV/EBITDA = EV / ebitda_ttm_4Q  (Graham & Dodd 1934, Damodaran 2012)
+    - At A: PE = close / eps_annual, P/S = mcap / rev_annual,
+      EV/EBITDA = EV / ebitda_annual
+    - At S: PE = close / (eps_s * 2), annualize semi-annual
+    - At D/W/M: PE, P/S, EV/EBITDA use TTM values (may be distorted;
+      will be overwritten by Q/A values after fusion)
     """
+    freq = _CURRENT_FREQ
     close = df.get("close", pd.Series(np.nan, index=df.index))
     shares = df.get("shares_outstanding", pd.Series(np.nan, index=df.index))
     market_cap = df.get("market_cap", pd.Series(np.nan, index=df.index))
@@ -391,35 +484,35 @@ def _compute_valuation(df: pd.DataFrame) -> pd.DataFrame:
     total_debt = df.get("total_debt_asof", pd.Series(np.nan, index=df.index))
     cash = df.get("cash_and_equivalents", pd.Series(np.nan, index=df.index))
 
-    # Earnings per share: prefer eps_diluted from filings (already at correct
-    # per-share quarterly/annual scale) over recomputed eps_calc.  The daily
-    # cache interpolates flow variables (net_income) into daily rates, so
-    # eps_calc = daily_net_income / shares produces garbage PE ratios.
-    # eps_diluted comes directly from CompanyFacts/XBRL at the filing's
-    # native frequency and is forward-filled -- no interpolation distortion.
+    # ---- EPS calculation (frequency-aware) ----
     eps_from_filings = df.get("eps_diluted", pd.Series(np.nan, index=df.index))
     if eps_from_filings.isna().all():
         eps_from_filings = df.get("eps", pd.Series(np.nan, index=df.index))
 
-    if eps_from_filings.notna().any():
+    if freq in _NATIVE_RATIO_FREQS and eps_from_filings.notna().any():
+        # At Q/A/S: eps_diluted is at native filing scale.
+        # Annualize for PE: Q eps * 4, S eps * 2, A eps * 1
+        _mult = _ANNUALIZE_MULT.get(freq, 1.0)
+        eps_calc = eps_from_filings * _mult
+        logger.debug("PE: annualizing eps_diluted by %.0fx for freq=%s", _mult, freq)
+    elif eps_from_filings.notna().any():
+        # D/W/M with filing EPS: use as-is (forward-filled filing values)
         eps_calc = eps_from_filings
     else:
-        # Fallback: recompute from net_income / shares (may be distorted
-        # by flow-variable interpolation on the daily cache)
+        # Fallback: recompute from net_income / shares
         eps_calc = net_income / shares.where(shares.abs() > EPSILON, other=np.nan)
 
-    # P/E ratio = close / EPS
+    # ---- PE = close / annualized_EPS ----
     result, ism, inv = safe_ratio(close, eps_calc, "pe_ratio_calc")
     _set_ratio_columns(df, "pe_ratio_calc", result, ism, inv)
 
-    # P9: Synthetic PE fallback -- when net_income/EPS is NaN but
-    # operating_income is available, compute PE from operating income
-    # per share. This enables the fundamental fair value anchor in
-    # the prediction aggregator even without net_income.
+    # P9: Synthetic PE fallback from operating_income
     if df.get("pe_ratio_calc") is not None and df["pe_ratio_calc"].isna().all():
         _oi = df.get("operating_income", pd.Series(np.nan, index=df.index))
         if _oi.notna().any() and shares.notna().any():
             _oi_eps = _oi / shares.where(shares.abs() > EPSILON, other=np.nan)
+            if freq in _NATIVE_RATIO_FREQS:
+                _oi_eps = _oi_eps * _ANNUALIZE_MULT.get(freq, 1.0)
             _synth_pe, _synth_ism, _synth_inv = safe_ratio(close, _oi_eps, "pe_ratio_calc")
             if _synth_pe.notna().any():
                 df["pe_ratio_calc"] = _synth_pe
@@ -428,33 +521,39 @@ def _compute_valuation(df: pd.DataFrame) -> pd.DataFrame:
                 logger.info("Synthetic PE from operating_income: %.1f (latest)",
                            float(_synth_pe.dropna().iloc[-1]) if _synth_pe.notna().any() else 0)
 
-    # Earnings yield = EPS / close
+    # ---- Earnings yield = annualized_EPS / close ----
     result, ism, inv = safe_ratio(eps_calc, close, "earnings_yield_calc")
     _set_ratio_columns(df, "earnings_yield_calc", result, ism, inv)
 
-    # P/S ratio = market_cap / revenue_TTM.
-    # Use TTM revenue to avoid flow-variable interpolation distortion.
-    _revenue_for_ps = df.get("revenue_ttm_asof", revenue)
-    result, ism, inv = safe_ratio(market_cap, _revenue_for_ps, "ps_ratio_calc")
+    # ---- P/S = market_cap / revenue_annualized ----
+    if freq in _NATIVE_RATIO_FREQS:
+        # At Q/A/S: annualize revenue for P/S
+        _rev_annual = revenue * _ANNUALIZE_MULT.get(freq, 1.0)
+        result, ism, inv = safe_ratio(market_cap, _rev_annual, "ps_ratio_calc")
+    else:
+        # D/W/M: try TTM revenue (may be distorted)
+        _revenue_for_ps = df.get("revenue_ttm_asof", revenue)
+        result, ism, inv = safe_ratio(market_cap, _revenue_for_ps, "ps_ratio_calc")
     _set_ratio_columns(df, "ps_ratio_calc", result, ism, inv)
 
-    # Enterprise value = market_cap + total_debt - cash
-    # Require at least market_cap to be non-null; treat missing debt/cash
-    # as zero (conservative: understates EV rather than producing a
-    # negative value from 0 + debt - cash when market_cap is unknown).
+    # ---- Enterprise value = market_cap + total_debt - cash (stock/stock, always OK) ----
     ev = market_cap + total_debt.fillna(0) - cash.fillna(0)
     ev_missing = market_cap.isna()
     df["enterprise_value"] = ev.where(~ev_missing, other=np.nan)
     df["is_missing_enterprise_value"] = ev_missing.astype(int)
 
-    # EV/EBITDA -- use TTM EBITDA to avoid flow-variable interpolation
-    # distortion on the daily cache.  The daily ebitda is a daily rate;
-    # EV / daily_rate gives absurd ratios (90x instead of ~25x).
-    _ebitda_for_ev = df.get("ebitda_ttm_asof", ebitda)
-    result, ism, inv = safe_ratio(df["enterprise_value"], _ebitda_for_ev, "ev_to_ebitda")
+    # ---- EV/EBITDA = EV / annualized_EBITDA ----
+    if freq in _NATIVE_RATIO_FREQS:
+        # At Q/A/S: annualize EBITDA (Damodaran 2012)
+        _ebitda_annual = ebitda * _ANNUALIZE_MULT.get(freq, 1.0)
+        result, ism, inv = safe_ratio(df["enterprise_value"], _ebitda_annual, "ev_to_ebitda")
+    else:
+        # D/W/M: use TTM EBITDA (may be distorted)
+        _ebitda_for_ev = df.get("ebitda_ttm_asof", ebitda)
+        result, ism, inv = safe_ratio(df["enterprise_value"], _ebitda_for_ev, "ev_to_ebitda")
     _set_ratio_columns(df, "ev_to_ebitda", result, ism, inv)
 
-    # P/B ratio = market_cap / total_equity
+    # ---- P/B = market_cap / total_equity (MARKET/STOCK, always OK) ----
     equity = df.get("total_equity", pd.Series(np.nan, index=df.index))
     result, ism, inv = safe_ratio(market_cap, equity, "pb_ratio")
     _set_ratio_columns(df, "pb_ratio", result, ism, inv)
@@ -489,14 +588,26 @@ def _compute_interest_coverage(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _compute_roa(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute return on assets.
+    """Compute return on assets (frequency-aware).
 
-    Variable: roa = net_income / total_assets.
+    Variable: roa = annualized_net_income / total_assets.
+
+    At Q: roa = (NI_q * 4) / TA  (annualize quarterly NI, DuPont analysis)
+    At A: roa = NI_a / TA  (both from same annual filing)
+    At D: roa = NI_daily / TA  (BROKEN: NI is daily rate ~1000x too small)
     """
+    freq = _CURRENT_FREQ
     net_income = df.get("net_income", pd.Series(np.nan, index=df.index))
     total_assets = df.get("total_assets", pd.Series(np.nan, index=df.index))
 
-    result, ism, inv = safe_ratio(net_income, total_assets, "roa")
+    if freq in _NATIVE_RATIO_FREQS:
+        # Annualize NI for true annual ROA (Palepu & Healy 2019)
+        _ni_annual = net_income * _ANNUALIZE_MULT.get(freq, 1.0)
+        result, ism, inv = safe_ratio(_ni_annual, total_assets, "roa")
+    else:
+        # D/W/M: NI is daily rate / stock TA -> ratio ~1000x too small
+        result, ism, inv = safe_ratio(net_income, total_assets, "roa")
+        logger.debug("roa at freq=%s (flow/stock, likely distorted)", freq)
     _set_ratio_columns(df, "roa", result, ism, inv)
 
     return df
@@ -510,39 +621,61 @@ def _compute_roa(df: pd.DataFrame) -> pd.DataFrame:
 def _compute_ttm_and_growth(df: pd.DataFrame) -> pd.DataFrame:
     """Compute trailing-twelve-month aggregates and YoY growth rates.
 
-    Variables:
-    - revenue_ttm_asof, net_income_ttm_asof, ebitda_ttm_asof
-      (approximated: since statements are as-of aligned, the value
-      already reflects the latest period; we keep the name for clarity)
-    - revenue_growth_yoy: YoY change in revenue
-    - earnings_growth_yoy: YoY change in net_income
+    Frequency-aware TTM computation:
+    - At Q: TTM = sum of last 4 quarterly values (standard)
+    - At A: TTM = the annual value itself (annual IS the TTM)
+    - At S: TTM = sum of last 2 semi-annual values
+    - At D/W/M: TTM via _rolling_4q_ttm on interpolated data (may be
+      distorted; overwritten by Q/A values after fusion)
 
-    TTM is computed by summing the last 4 distinct quarterly values
-    using ``_rolling_4q_ttm``.  YoY growth compares the current TTM
-    value to the TTM value ~252 business days ago.
+    YoY growth:
+    - At Q: compare current TTM to TTM 4 periods ago
+    - At A: compare current annual to previous annual (shift 1)
+    - At D: compare current TTM to TTM ~252 trading days ago
     """
+    freq = _CURRENT_FREQ
     revenue = df.get("revenue", pd.Series(np.nan, index=df.index))
     net_income = df.get("net_income", pd.Series(np.nan, index=df.index))
     ebitda = df.get("ebitda", pd.Series(np.nan, index=df.index))
 
-    # Rolling 4-quarter TTM sums
-    df["revenue_ttm_asof"] = _rolling_4q_ttm(revenue)
+    # --- TTM computation (frequency-dependent) ---
+    if freq == "A":
+        # Annual value IS the TTM -- no summation needed
+        df["revenue_ttm_asof"] = revenue
+        df["net_income_ttm_asof"] = net_income
+        df["ebitda_ttm_asof"] = ebitda
+    elif freq == "S":
+        # Semi-annual: sum 2 periods = annual
+        df["revenue_ttm_asof"] = revenue.rolling(2, min_periods=1).sum()
+        df["net_income_ttm_asof"] = net_income.rolling(2, min_periods=1).sum()
+        df["ebitda_ttm_asof"] = ebitda.rolling(2, min_periods=1).sum()
+    elif freq == "Q":
+        # Quarterly: sum 4 periods = annual (standard TTM)
+        df["revenue_ttm_asof"] = revenue.rolling(4, min_periods=1).sum()
+        df["net_income_ttm_asof"] = net_income.rolling(4, min_periods=1).sum()
+        df["ebitda_ttm_asof"] = ebitda.rolling(4, min_periods=1).sum()
+    else:
+        # D/W/M: use _rolling_4q_ttm on forward-filled daily data
+        # (detects quarterly transitions and sums distinct values)
+        df["revenue_ttm_asof"] = _rolling_4q_ttm(revenue)
+        df["net_income_ttm_asof"] = _rolling_4q_ttm(net_income)
+        df["ebitda_ttm_asof"] = _rolling_4q_ttm(ebitda)
+
     df["is_missing_revenue_ttm_asof"] = df["revenue_ttm_asof"].isna().astype(int)
-
-    df["net_income_ttm_asof"] = _rolling_4q_ttm(net_income)
     df["is_missing_net_income_ttm_asof"] = df["net_income_ttm_asof"].isna().astype(int)
-
-    df["ebitda_ttm_asof"] = _rolling_4q_ttm(ebitda)
     df["is_missing_ebitda_ttm_asof"] = df["ebitda_ttm_asof"].isna().astype(int)
 
-    # YoY growth rates: compare current TTM to TTM ~252 trading days ago
+    # --- YoY growth (frequency-dependent shift) ---
+    # At Q: shift 4 periods back.  At A: shift 1.  At D: shift 252 days.
+    _yoy_shift = {"A": 1, "S": 2, "Q": 4, "M": 12, "W": 52, "D": 252}.get(freq, 252)
+
     rev_ttm = df["revenue_ttm_asof"]
-    rev_prev = rev_ttm.shift(252)
+    rev_prev = rev_ttm.shift(_yoy_shift)
     result, ism, inv = safe_ratio(rev_ttm - rev_prev, rev_prev.abs(), "revenue_growth_yoy")
     _set_ratio_columns(df, "revenue_growth_yoy", result, ism, inv)
 
     ni_ttm = df["net_income_ttm_asof"]
-    ni_prev = ni_ttm.shift(252)
+    ni_prev = ni_ttm.shift(_yoy_shift)
     result, ism, inv = safe_ratio(ni_ttm - ni_prev, ni_prev.abs(), "earnings_growth_yoy")
     _set_ratio_columns(df, "earnings_growth_yoy", result, ism, inv)
 
@@ -572,16 +705,24 @@ def _compute_volume_avg(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _compute_per_share(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute per-share metrics.
+    """Compute per-share metrics (frequency-aware).
 
     Variables: eps_calc, book_value_per_share, revenue_per_share.
+
+    eps_calc and revenue_per_share are FLOW/STOCK -- at D freq the flow
+    numerator is a daily rate, producing values ~1000x too small.
+    At Q/A/S: use native-scale values (no annualization needed for eps_calc
+    since it's per-share per-period, matching eps_diluted from filings).
     """
+    freq = _CURRENT_FREQ
     shares = df.get("shares_outstanding", pd.Series(np.nan, index=df.index))
     net_income = df.get("net_income", pd.Series(np.nan, index=df.index))
     equity = df.get("total_equity", pd.Series(np.nan, index=df.index))
     revenue = df.get("revenue", pd.Series(np.nan, index=df.index))
 
-    # EPS (already computed internally in _compute_valuation but not exposed)
+    # EPS = net_income / shares (FLOW/STOCK)
+    # At Q: this gives quarterly EPS (matches eps_diluted from filings)
+    # At D: this gives daily NI rate / shares (garbage)
     result, ism, inv = safe_ratio(net_income, shares, "eps_calc")
     _set_ratio_columns(df, "eps_calc", result, ism, inv)
 
@@ -821,15 +962,26 @@ def _compute_earnings_quality_signals(df: pd.DataFrame) -> pd.DataFrame:
     """
     eps = 1e-9
 
-    # --- Accruals signal (Sloan 1996) ---
+    # --- Accruals signal (Sloan 1996, TAR) ---
+    # accruals = (NI - OCF) / TA  (FLOW - FLOW) / STOCK
+    # At Q/A/S: NI and OCF are at native period scale -> correct
+    # At D: NI and OCF are daily rates, TA is stock -> ratio ~1000x too small
+    freq = _CURRENT_FREQ
     ni = df.get("net_income")
     ocf = df.get("operating_cash_flow")
     ta = df.get("total_assets")
     if ni is not None and ocf is not None and ta is not None:
         safe_ta = ta.where(ta.abs() > eps)
-        accruals = (ni - ocf) / safe_ta
+        _ni_adj = ni
+        _ocf_adj = ocf
+        if freq in _NATIVE_RATIO_FREQS:
+            # Annualize flow variables for comparable accruals ratio
+            _mult = _ANNUALIZE_MULT.get(freq, 1.0)
+            _ni_adj = ni * _mult
+            _ocf_adj = ocf * _mult
+        accruals = (_ni_adj - _ocf_adj) / safe_ta
         df["accruals"] = accruals
-        df["accruals_signal"] = -accruals  # lower accruals = higher quality = buy
+        df["accruals_signal"] = -accruals
     else:
         df["accruals"] = float("nan")
         df["accruals_signal"] = float("nan")
@@ -1215,9 +1367,20 @@ def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
     eps = EPSILON
 
     # --- Cash burn rate (monthly) ---
+    # OCF is a flow variable: at Q = quarterly total, at A = annual total.
+    # Monthly burn = -OCF / months_in_period.
+    # At Q: -OCF_q / 3.  At A: -OCF_a / 12.  At D: -OCF_daily * 30 (scale up).
+    freq = _CURRENT_FREQ
+    _months_in_period = {"A": 12, "S": 6, "Q": 3, "M": 1, "W": 7/30, "D": 1/30}
     ocf = df.get("operating_cash_flow")
     if ocf is not None:
-        df["cash_burn_rate_monthly"] = np.maximum(0.0, -ocf.astype(float)) / 30.0
+        _mip = _months_in_period.get(freq, 1/30)
+        if freq in _NATIVE_RATIO_FREQS:
+            # At Q/A/S: OCF is period total, divide by months in period
+            df["cash_burn_rate_monthly"] = np.maximum(0.0, -ocf.astype(float)) / max(_mip, 0.01)
+        else:
+            # At D: OCF is daily rate, multiply by 30 for monthly
+            df["cash_burn_rate_monthly"] = np.maximum(0.0, -ocf.astype(float)) * 30.0
 
     # --- Debt maturity pressure (short-term / total) ---
     std = df.get("short_term_debt")
@@ -1227,11 +1390,18 @@ def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
         df["debt_maturity_pressure"] = std.astype(float) / safe_td.astype(float)
 
     # --- Cash conversion cycle = DSO + DIO - DPO ---
+    # Frequency-aware period days (Richards & Laughlin 1980):
+    # At Q: revenue/90, At A: revenue/365, At S: revenue/180
+    # At D/W/M: use 90 (quarterly approximation, may be distorted)
+    freq = _CURRENT_FREQ
+    _period_days = _PERIOD_DAYS.get(freq, 90)
+    if freq == "D":
+        _period_days = 90  # assume quarterly filing cadence for daily cache
+
     revenue = df.get("revenue")
     receivables = df.get("receivables")
     inventory = df.get("inventory")
     payables = df.get("payables")
-    # COGS proxy: cost_of_revenue if available, else revenue - gross_profit
     cogs = df.get("cost_of_revenue")
     if cogs is None or (cogs is not None and cogs.isna().all()):
         gp = df.get("gross_profit")
@@ -1239,17 +1409,17 @@ def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
             cogs = (revenue.astype(float) - gp.astype(float)).clip(lower=eps)
 
     if revenue is not None:
-        rev_daily = revenue.astype(float) / 90.0  # quarterly approximation
-        safe_rev_daily = rev_daily.where(rev_daily.abs() > eps)
+        rev_per_day = revenue.astype(float) / float(_period_days)
+        safe_rev_per_day = rev_per_day.where(rev_per_day.abs() > eps)
         if receivables is not None:
-            df["dso"] = receivables.astype(float) / safe_rev_daily
+            df["dso"] = receivables.astype(float) / safe_rev_per_day
     if cogs is not None:
-        cogs_daily = cogs.astype(float) / 90.0
-        safe_cogs_daily = cogs_daily.where(cogs_daily.abs() > eps)
+        cogs_per_day = cogs.astype(float) / float(_period_days)
+        safe_cogs_per_day = cogs_per_day.where(cogs_per_day.abs() > eps)
         if inventory is not None:
-            df["dio"] = inventory.astype(float) / safe_cogs_daily
+            df["dio"] = inventory.astype(float) / safe_cogs_per_day
         if payables is not None:
-            df["dpo"] = payables.astype(float) / safe_cogs_daily
+            df["dpo"] = payables.astype(float) / safe_cogs_per_day
 
     dso = df.get("dso")
     dio = df.get("dio")
@@ -1361,11 +1531,14 @@ def _compute_forensic_signals(df: pd.DataFrame) -> pd.DataFrame:
     eps = EPSILON
 
     # --- Revenue-receivables divergence (Lev & Thiagarajan 1993) ---
+    # YoY pct_change: shift depends on frequency
+    freq = _CURRENT_FREQ
+    _yoy_shift = {"A": 1, "S": 2, "Q": 4, "M": 12, "W": 52, "D": 252}.get(freq, 252)
     revenue = df.get("revenue")
     receivables = df.get("receivables")
     if revenue is not None and receivables is not None:
-        rev_g = revenue.astype(float).pct_change(252)
-        rec_g = receivables.astype(float).pct_change(252)
+        rev_g = revenue.astype(float).pct_change(_yoy_shift)
+        rec_g = receivables.astype(float).pct_change(_yoy_shift)
         df["revenue_receivables_divergence"] = rev_g - rec_g  # positive = healthy
 
     # --- CapEx / Depreciation ratio (Sloan 1996) ---
@@ -1478,15 +1651,27 @@ DERIVED_VARIABLES: tuple[str, ...] = (
 )
 
 
-def compute_derived_variables(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute all derived decision variables for an entity daily cache.
+def compute_derived_variables(df: pd.DataFrame, freq: str = "D") -> pd.DataFrame:
+    """Compute all derived decision variables for an entity cache.
 
     Parameters
     ----------
     df:
-        Daily DataFrame from ``build_entity_daily_cache()`` containing
-        at minimum: ``close``, and as many Sec 8 direct fields as
-        available.
+        DataFrame from cache builder.  At daily frequency this is the
+        OHLCV spine with forward-filled financials.  At Q/A frequency
+        this is a per-period cache from ``build_cache_from_raw_filings``.
+    freq:
+        Data frequency: ``"D"`` (daily), ``"W"`` (weekly), ``"M"``
+        (monthly), ``"Q"`` (quarterly), ``"S"`` (semi-annual),
+        ``"A"`` (annual).  Controls which ratio formulas run:
+
+        - At **Q/A/S** (native filing freq): all ratios computed using
+          filing-scale values (PE, EV/EBITDA, ROA, margins, TTM, etc.)
+        - At **D/W/M** (interpolated): cross-type ratios (market/flow,
+          stock/flow) are SKIPPED -- they produce garbage on interpolated
+          daily rates.  Only OHLCV-native and stock/stock ratios run.
+          The skipped ratios will be forward-filled from Q/A results
+          after multi-frequency fusion.
 
     Returns
     -------
@@ -1494,6 +1679,10 @@ def compute_derived_variables(df: pd.DataFrame) -> pd.DataFrame:
         Input DataFrame augmented with derived variables and their
         companion ``is_missing_*`` / ``invalid_math_*`` flags.
     """
+    global _CURRENT_FREQ
+    _CURRENT_FREQ = freq.upper() if freq else "D"
+    logger.info("Computing derived variables at freq=%s", _CURRENT_FREQ)
+
     result = df.copy()
     for stage in _COMPUTE_STAGES:
         try:
