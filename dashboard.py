@@ -597,6 +597,40 @@ def render_home():
                         if val is not None:
                             _card(field.upper(), f"{val:.2f}", "", "candlestick_chart")
 
+            # Beyond Bands: Scenario Decomposition
+            _bb_scenarios_shown = False
+            _bb_preds = profile.get("predictions", {})
+            for _bb_h_key, _bb_h_data in _bb_preds.items():
+                if not isinstance(_bb_h_data, dict):
+                    continue
+                for _bb_var, _bb_pred_entry in _bb_h_data.items():
+                    if not isinstance(_bb_pred_entry, dict):
+                        continue
+                    _bb_scenarios = _bb_pred_entry.get("scenarios")
+                    if not _bb_scenarios or not isinstance(_bb_scenarios, list):
+                        continue
+                    if not _bb_scenarios_shown:
+                        ui.separator()
+                        ui.label("Scenario Decomposition").classes("text-lg font-bold mt-3")
+                        _bb_h_title = str(_bb_h_key).replace("_", " ").title()
+                        ui.label(f"{_bb_var} ({_bb_h_title})").classes("text-sm text-gray-400")
+                        _bb_scenarios_shown = True
+                    with ui.row().classes("gap-4"):
+                        for _s in _bb_scenarios:
+                            _s_label = str(_s.get("label", "?")).replace("_", " ").title()
+                            _s_prob = _s.get("probability", 0)
+                            _s_tgt = _s.get("target_price", 0)
+                            _card(_s_label, f"${_s_tgt:.2f}", f"{_s_prob:.0%}", "casino")
+                    # Skew signal
+                    _bb_skew = _bb_pred_entry.get("skew_signal")
+                    if _bb_skew is not None:
+                        _sk_dir = "upside" if _bb_skew > 0 else "downside"
+                        with ui.row().classes("gap-4 mt-2"):
+                            _card("Skew", f"{_bb_skew:+.2f}", f"More {_sk_dir}", "trending_flat")
+                    break  # first variable with scenarios per horizon
+                if _bb_scenarios_shown:
+                    break
+
             # Prediction Log (historical accuracy)
             plog = profile.get("prediction_log", {})
             if plog.get("n_filled", 0) > 0:

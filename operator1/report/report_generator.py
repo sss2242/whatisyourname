@@ -1394,6 +1394,57 @@ def _build_predictions_forecasts(profile: dict[str, Any]) -> str:
             for a in analog_list[:5]:
                 lines.append(f"- {a.get('narrative', a.get('period', 'Unknown'))}")
 
+    # --- Beyond Bands: Scenario Decomposition ---
+    # Renders the entropy-pooling scenario table from distributional forecasting.
+    # Data comes from profile["predictions"][horizon][var]["scenarios"].
+    _scenario_rendered = False
+    for h_label in ["next_day", "next_week", "next_month", "next_year"]:
+        h_data = preds.get(h_label, {})
+        if not isinstance(h_data, dict):
+            continue
+        # Check if any variable in this horizon has scenarios
+        for var_name, pred_entry in h_data.items():
+            if not isinstance(pred_entry, dict):
+                continue
+            scenarios = pred_entry.get("scenarios")
+            if not scenarios or not isinstance(scenarios, list):
+                continue
+            if not _scenario_rendered:
+                lines.append("")
+                lines.append("### Distributional Forecast Analysis")
+                lines.append("")
+                lines.append("*Probability-weighted scenario decomposition from entropy pooling*")
+                lines.append("*(Meucci 2010 -- MC paths reweighted to match model ensemble view):*")
+                lines.append("")
+                _scenario_rendered = True
+
+            h_title = h_label.replace("_", " ").title()
+            lines.append(f"**{_humanize_var(var_name)} ({h_title}):**")
+            lines.append("")
+            lines.append("| Scenario | Probability | Target Price |")
+            lines.append("|----------|-------------|-------------|")
+            for s in scenarios:
+                _lbl = s.get("label", "?").replace("_", " ").title()
+                _prob = s.get("probability", 0)
+                _tgt = s.get("target_price", 0)
+                lines.append(f"| {_lbl} | {_prob:.0%} | {_fmt(_tgt)} |")
+            lines.append("")
+
+            # Skew signal
+            skew = pred_entry.get("skew_signal")
+            if skew is not None:
+                _direction = "right-skewed (more upside potential)" if skew > 0 else "left-skewed (more downside risk)"
+                lines.append(f"**Skew Signal:** {skew:+.2f} ({_direction})")
+                lines.append("")
+
+            # Between-model disagreement
+            bms = pred_entry.get("between_model_std")
+            if bms is not None and bms > 0:
+                lines.append(f"**Model Disagreement:** Between-model std = {_fmt(bms)} (higher = models disagree more)")
+                lines.append("")
+
+            break  # Only render first variable with scenarios per horizon
+
     return "\n".join(lines)
 
 
