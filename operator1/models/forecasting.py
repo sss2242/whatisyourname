@@ -105,6 +105,20 @@ class ModelMetrics:
     # If None, the calibrator falls back to synthetic +/-RMSE pairs.
     test_residuals: list[float] | None = None
 
+    # --- Beyond Bands: distributional forecasting fields ---
+
+    # Multi-quantile forecasts from tree ensemble (Method 1: Quantile Regression).
+    # Keyed by quantile level: {0.05: val, 0.25: val, 0.50: val, 0.75: val, 0.95: val}.
+    # Produces asymmetric prediction intervals conditioned on features.
+    # Skew signal = (P95-P50) - (P50-P05): positive = right-skewed (upside).
+    quantile_forecasts: dict[float, float] | None = None
+
+    # Feature-dependent standard deviation from distributional model (Method 2: NGBoost-lite).
+    # Unlike static RMSE, this varies with input features -- high during volatile
+    # periods, low during stable trends. Consumed by prediction_aggregator for
+    # data-driven band width instead of fixed RMSE * sqrt(h).
+    conditional_sigma: float | None = None
+
 
 @dataclass
 class ForecastResult:
@@ -1705,6 +1719,50 @@ def fit_tree_ensemble(
         metrics.n_test = len(X_test)
         metrics.fitted = True
 
+        # --- Beyond Bands Method 1: Multi-quantile prediction ---
+        # Train quantile models to produce asymmetric prediction intervals.
+        # Uses the same features as the point forecast model, so intervals
+        # are conditioned on the current market state (not a fixed RMSE).
+        # XGBoost uses native quantile_alpha; sklearn GBM uses loss="quantile".
+        _bb_quantiles = [0.05, 0.25, 0.50, 0.75, 0.95]
+        try:
+            _qf: dict[float, float] = {}
+            if metrics.model_name == "xgboost":
+                from xgboost import XGBRegressor as _XGBReg
+                for _q in _bb_quantiles:
+                    _qm = _XGBReg(
+                        objective="reg:quantileerror", quantile_alpha=_q,
+                        n_estimators=80, max_depth=4, learning_rate=0.05,
+                        random_state=random_state, verbosity=0,
+                    )
+                    _qm.fit(X, y)
+                    _qf[_q] = float(_qm.predict(last_features)[0])
+            else:
+                from sklearn.ensemble import GradientBoostingRegressor as _GBReg
+                for _q in _bb_quantiles:
+                    _qm = _GBReg(
+                        loss="quantile", alpha=_q,
+                        n_estimators=80, max_depth=3, learning_rate=0.05,
+                        min_samples_leaf=10,
+                    )
+                    _qm.fit(X, y)
+                    _qf[_q] = float(_qm.predict(last_features)[0])
+            # Enforce monotonicity: P05 <= P25 <= P50 <= P75 <= P95
+            _sorted_vals = sorted(_qf.values())
+            if _sorted_vals == [_qf[q] for q in sorted(_qf.keys())]:
+                metrics.quantile_forecasts = _qf
+            else:
+                # Fix crossing by sorting
+                _qf_fixed = dict(zip(sorted(_qf.keys()), _sorted_vals))
+                metrics.quantile_forecasts = _qf_fixed
+            logger.info(
+                "Quantile forecasts: P5=%.4f P50=%.4f P95=%.4f skew=%.4f",
+                _qf.get(0.05, 0), _qf.get(0.50, 0), _qf.get(0.95, 0),
+                (_qf.get(0.95, 0) - _qf.get(0.50, 0)) - (_qf.get(0.50, 0) - _qf.get(0.05, 0)),
+            )
+        except Exception as _qe:
+            logger.debug("Quantile regression skipped: %s", _qe)
+
         logger.info(
             "%s fit: %d features, %d train, MAE=%.6f, RMSE=%.6f",
             metrics.model_name, len(feature_cols), len(X_train), mae, rmse,
@@ -1759,6 +1817,124 @@ def _try_load_tree_model(
     metrics.error = "No tree ensemble library available (xgboost/sklearn)"
     logger.warning(metrics.error)
     return None
+
+
+# ---------------------------------------------------------------------------
+# 5b. Distributional Forecast (NGBoost-lite two-tree: mean + variance)
+# Beyond Bands Method 2: Feature-dependent uncertainty estimation.
+# ---------------------------------------------------------------------------
+
+
+def fit_distributional(
+    features: pd.DataFrame,
+    target_col: str,
+    random_state: int = 42,
+) -> tuple[np.ndarray | None, ModelMetrics]:
+    """NGBoost-lite: two-tree distributional forecast (mean + conditional variance).
+
+    Trains a mean model (point forecast) and a variance model (uncertainty)
+    on the SAME features.  The variance model learns when the data is
+    predictable (low sigma) vs noisy (high sigma), giving feature-dependent
+    uncertainty that varies with market conditions.
+
+    Reference: Duan et al. 2020, 'NGBoost: Natural Gradient Boosting for
+    Probabilistic Prediction' (simplified two-model approximation).
+
+    Parameters
+    ----------
+    features:
+        DataFrame with feature columns and ``target_col``.
+    target_col:
+        Column to forecast.
+    random_state:
+        Random seed.
+
+    Returns
+    -------
+    (forecasts, metrics) where metrics.conditional_sigma is the
+    feature-dependent standard deviation.
+    """
+    metrics = ModelMetrics(model_name="distributional")
+
+    clean = features.dropna()
+    if len(clean) < _MIN_OBS_TREE:
+        metrics.error = (
+            f"Insufficient observations for distributional model "
+            f"({len(clean)} < {_MIN_OBS_TREE})"
+        )
+        return None, metrics
+
+    if target_col not in clean.columns:
+        metrics.error = f"Target column '{target_col}' not in features"
+        return None, metrics
+
+    try:
+        from sklearn.ensemble import GradientBoostingRegressor
+
+        feature_cols = [c for c in clean.columns if c != target_col]
+        if not feature_cols:
+            metrics.error = "No feature columns for distributional model"
+            return None, metrics
+
+        X = clean[feature_cols].values
+        y = clean[target_col].values
+        split = max(1, int(len(X) * 0.85))
+        X_train, X_test = X[:split], X[split:]
+        y_train, y_test = y[:split], y[split:]
+
+        # Model 1: conditional mean
+        mean_model = GradientBoostingRegressor(
+            n_estimators=100, max_depth=4, learning_rate=0.05,
+            random_state=random_state,
+        )
+        mean_model.fit(X_train, y_train)
+
+        # Model 2: conditional log-variance (heteroscedastic)
+        train_residuals = y_train - mean_model.predict(X_train)
+        var_model = GradientBoostingRegressor(
+            n_estimators=80, max_depth=3, learning_rate=0.05,
+            min_samples_leaf=10, random_state=random_state,
+        )
+        var_model.fit(X_train, train_residuals ** 2)
+
+        # Validation metrics
+        if len(X_test) > 0:
+            preds = mean_model.predict(X_test)
+            mae, rmse = _compute_metrics(y_test, preds)
+            metrics.test_residuals = _compute_residuals(y_test, preds)
+        else:
+            mae, rmse = float("nan"), float("nan")
+
+        # Refit on all data for production forecast
+        mean_model.fit(X, y)
+        all_residuals = y - mean_model.predict(X)
+        var_model.fit(X, all_residuals ** 2)
+
+        last_features = X[-1:]
+        mu = float(mean_model.predict(last_features)[0])
+        sigma2 = max(float(var_model.predict(last_features)[0]), 1e-8)
+        # Cap variance at 10x the unconditional variance
+        _uncond_var = float(np.var(y)) if len(y) > 1 else 1.0
+        sigma2 = min(sigma2, 10.0 * max(_uncond_var, 1e-8))
+
+        metrics.mae = mae
+        metrics.rmse = rmse
+        metrics.n_train = len(X_train)
+        metrics.n_test = len(X_test)
+        metrics.fitted = True
+        metrics.conditional_sigma = float(np.sqrt(sigma2))
+
+        logger.info(
+            "Distributional fit: %d features, sigma=%.6f (unconditional_std=%.6f)",
+            len(feature_cols), metrics.conditional_sigma,
+            float(np.std(y)) if len(y) > 1 else 0.0,
+        )
+        return np.array([mu]), metrics
+
+    except Exception as exc:
+        metrics.error = f"Distributional fitting failed: {exc}"
+        logger.debug(metrics.error)
+        return None, metrics
 
 
 # ---------------------------------------------------------------------------

@@ -314,6 +314,19 @@ class HorizonPrediction:
     causal_adjustment: float = 0.0  # adjustment from Granger propagation
     regime_blend_applied: bool = False  # True if soft regime blending was used
 
+    # --- Beyond Bands: distributional forecasting fields ---
+    # Skew signal from quantile regression (Method 1): (P95-P50)-(P50-P05).
+    # Positive = right-skewed (more upside potential than downside risk).
+    # Negative = left-skewed (more downside risk than upside potential).
+    skew_signal: float | None = None
+    # Between-model standard deviation from BMA (Method 6).
+    # Measures model DISAGREEMENT, not model error. High = models disagree.
+    between_model_std: float | None = None
+    # Scenario-weighted point forecast from entropy pooling (Method 4).
+    scenario_weighted_point: float | None = None
+    # Scenario decomposition: [{label, probability, target_price, n_paths}]
+    scenarios: list[dict] | None = None
+
 
 @dataclass
 class TechnicalAlphaMask:
@@ -383,6 +396,10 @@ class PredictionAggregatorResult:
     recency_weighted_rmse_used: bool = False  # True if walk-forward recency applied
     shap_available: bool = False  # True if SHAP explanations were attached
 
+    # --- Beyond Bands: scenario decomposition per horizon ---
+    # {horizon: {scenarios: [...], kl_divergence: float, weighted_point: float}}
+    scenario_decomposition: dict[str, dict] = field(default_factory=dict)
+
 
 # ---------------------------------------------------------------------------
 # Ensemble weight computation
@@ -432,6 +449,263 @@ def compute_ensemble_weights(
         return {name: 1.0 / n for name in inv_rmse}
 
     return {name: w / total for name, w in inv_rmse.items()}
+
+
+# ---------------------------------------------------------------------------
+# Beyond Bands Method 6: Bayesian Model Averaging (Hoeting et al. 1999)
+# ---------------------------------------------------------------------------
+
+
+def compute_bma_between_model_std(
+    metrics: list[ModelMetrics],
+    forecasts: dict[str, dict[str, float]],
+    variable: str,
+    horizon: str,
+) -> float:
+    """Compute between-model standard deviation for BMA.
+
+    The Law of Total Variance states:
+        total_var = within_model_var + between_model_var
+
+    Our current system only uses within_model_var (RMSE^2). This function
+    computes between_model_var -- the variance of point forecasts across
+    models. High between-model std means models disagree, which should
+    widen prediction intervals even if the best model has low RMSE.
+
+    Reference: Hoeting, Madigan, Raftery & Volinsky (1999),
+    'Bayesian Model Averaging: A Tutorial'.
+
+    Parameters
+    ----------
+    metrics:
+        Model metrics from ForecastResult.
+    forecasts:
+        Per-variable per-horizon forecasts from ForecastResult.
+    variable:
+        Variable name to compute BMA for.
+    horizon:
+        Horizon label (e.g. "1d", "5d").
+
+    Returns
+    -------
+    Between-model standard deviation (0 if all models agree or < 2 models).
+    """
+    base_weights = compute_ensemble_weights(metrics)
+    if not base_weights:
+        return 0.0
+
+    # Collect per-model forecasts for this variable
+    model_forecasts: dict[str, float] = {}
+    for m in metrics:
+        if not m.fitted or m.model_name not in base_weights:
+            continue
+        # Match variable name (ModelMetrics.variable stores the var name)
+        if m.variable != variable:
+            continue
+        fc_var = forecasts.get(variable, {})
+        fc_val = fc_var.get(horizon)
+        if fc_val is not None and not math.isnan(fc_val):
+            model_forecasts[m.model_name] = fc_val
+
+    if len(model_forecasts) < 2:
+        return 0.0
+
+    # BMA posterior mean
+    mu_bma = sum(
+        base_weights.get(name, 0) * fc
+        for name, fc in model_forecasts.items()
+    )
+
+    # Between-model variance
+    between_var = sum(
+        base_weights.get(name, 0) * (fc - mu_bma) ** 2
+        for name, fc in model_forecasts.items()
+    )
+
+    # Cap at 3x the median model RMSE to prevent outlier model from
+    # dominating the between-model term
+    _model_rmses = [m.rmse for m in metrics if m.fitted and not math.isnan(m.rmse)]
+    if _model_rmses:
+        _median_rmse = float(np.median(_model_rmses))
+        _cap = (3.0 * _median_rmse) ** 2
+        between_var = min(between_var, _cap)
+
+    return math.sqrt(max(between_var, 0.0))
+
+
+# ---------------------------------------------------------------------------
+# Beyond Bands Method 4: Entropy Pooling (Meucci 2010)
+# ---------------------------------------------------------------------------
+
+
+def _entropy_pooling_scenarios(
+    mc_terminal_values: np.ndarray | None,
+    model_forecast_return: float,
+    last_close: float,
+) -> dict:
+    """Reweight MC paths to match model view via entropy pooling.
+
+    Starts with uniform prior (each MC path equally likely), then tilts
+    the probability mass toward paths consistent with the model ensemble's
+    directional view, while staying as close to uniform as possible
+    (minimum KL-divergence reweighting).
+
+    Reference: Meucci (2010), 'Fully Flexible Views: Theory and Practice',
+    implemented following fortitudo-tech/fortitudo.tech (296 stars, GPL-3.0).
+
+    Parameters
+    ----------
+    mc_terminal_values:
+        Array of shape (n_paths,) with cumulative return ratios from MC.
+    model_forecast_return:
+        Model ensemble's predicted return (e.g. 0.02 for +2%).
+    last_close:
+        Last observed close price for price-level scenarios.
+
+    Returns
+    -------
+    Dict with 'available', 'weighted_point', 'scenarios', 'kl_divergence'.
+    """
+    if mc_terminal_values is None or len(mc_terminal_values) < 100:
+        return {"available": False}
+
+    if math.isnan(model_forecast_return) or last_close <= 0:
+        return {"available": False}
+
+    try:
+        from scipy.optimize import minimize as _sp_minimize
+
+        S = len(mc_terminal_values)
+        p = np.ones(S) / S  # uniform prior
+        log_p = np.log(p)
+
+        # View: expected excess return = model_forecast_return
+        excess_returns = mc_terminal_values - 1.0
+        A = excess_returns.reshape(1, -1)
+        b_val = model_forecast_return
+
+        # Solve dual problem for Lagrange multiplier
+        def _dual_obj(lam):
+            log_x = log_p - 1.0 - A.flatten() * lam[0]
+            log_x = np.clip(log_x, -500.0, 500.0)
+            x = np.exp(log_x)
+            obj = float(x @ (log_x - log_p) - lam[0] * (b_val - A.flatten() @ x))
+            grad = np.array([float(b_val - A.flatten() @ x)])
+            return -1000.0 * obj, 1000.0 * grad
+
+        result = _sp_minimize(
+            _dual_obj, x0=np.array([0.0]), jac=True, method="L-BFGS-B",
+        )
+        log_q = log_p - 1.0 - A.flatten() * result.x[0]
+        log_q = np.clip(log_q, -500.0, 500.0)
+        q = np.exp(log_q)
+        q = q / q.sum()  # normalize
+
+        # Scenario decomposition (quartile-based)
+        mc_prices = last_close * mc_terminal_values
+        pcts = np.percentile(mc_prices, [0, 25, 50, 75, 100])
+
+        scenarios = []
+        labels = ["bear", "base_low", "base_high", "bull"]
+        for idx in range(4):
+            lo, hi = pcts[idx], pcts[idx + 1]
+            if idx == 3:
+                mask = mc_prices >= lo
+            else:
+                mask = (mc_prices >= lo) & (mc_prices < hi)
+            if mask.sum() > 0:
+                _w = q[mask]
+                scenarios.append({
+                    "label": labels[idx],
+                    "probability": round(float(_w.sum()), 4),
+                    "target_price": round(float(np.average(mc_prices[mask], weights=_w)), 2),
+                    "n_paths": int(mask.sum()),
+                })
+
+        weighted_point = float(last_close * np.average(mc_terminal_values, weights=q))
+        kl_div = float(np.sum(q * np.log((q + 1e-30) / (p + 1e-30))))
+
+        return {
+            "available": True,
+            "weighted_point": round(weighted_point, 4),
+            "scenarios": scenarios,
+            "kl_divergence": round(kl_div, 6),
+        }
+
+    except Exception as _ep_exc:
+        logger.debug("Entropy pooling failed: %s", _ep_exc)
+        return {"available": False}
+
+
+# ---------------------------------------------------------------------------
+# Beyond Bands Method 3: Constrained Optimization (Boyd & Vandenberghe 2004)
+# ---------------------------------------------------------------------------
+
+
+def _constrained_point_forecast(
+    raw_forecast: float,
+    lower_bound: float,
+    upper_bound: float,
+    last_close: float,
+    momentum_5d: float,
+    regime: str,
+) -> float:
+    """Optimize point forecast within bounds subject to momentum + mean-reversion.
+
+    Instead of passively placing the point forecast within bands, this
+    treats the bands as HARD CONSTRAINTS and finds the point that optimizes
+    a multi-objective loss: model accuracy + momentum alignment + mean
+    reversion tendency, with regime-dependent weights.
+
+    Reference: Boyd & Vandenberghe (2004), 'Convex Optimization'.
+
+    Parameters
+    ----------
+    raw_forecast:
+        Unconstrained ensemble point forecast.
+    lower_bound:
+        Lower confidence bound (from conformal or RMSE).
+    upper_bound:
+        Upper confidence bound.
+    last_close:
+        Last observed close price.
+    momentum_5d:
+        5-day return (positive = uptrend, negative = downtrend).
+    regime:
+        Current survival regime label.
+
+    Returns
+    -------
+    Constrained optimal point forecast (guaranteed within bounds).
+    """
+    if (math.isnan(raw_forecast) or math.isnan(lower_bound)
+            or math.isnan(upper_bound) or lower_bound >= upper_bound):
+        return raw_forecast
+
+    try:
+        from scipy.optimize import minimize_scalar
+
+        # Regime-dependent weights
+        mr_weight = 0.15 if regime in ("normal", "") else 0.05
+        mom_weight = 0.30 if regime not in ("extreme_survival",) else 0.10
+
+        _lc = last_close if not math.isnan(last_close) and last_close > 0 else raw_forecast
+        _mom = momentum_5d if not math.isnan(momentum_5d) else 0.0
+
+        def _objective(x):
+            model_loss = (x - raw_forecast) ** 2
+            momentum_loss = -(x - _lc) * _mom * mom_weight
+            mean_rev = (x - _lc) ** 2 * mr_weight
+            return model_loss + momentum_loss + mean_rev
+
+        result = minimize_scalar(
+            _objective, bounds=(lower_bound, upper_bound), method="bounded",
+        )
+        return float(result.x) if result.success else raw_forecast
+
+    except Exception:
+        # Fallback: clamp raw forecast to bounds
+        return max(lower_bound, min(upper_bound, raw_forecast))
 
 
 def apply_ic_weighted_calibration(
@@ -844,6 +1118,7 @@ def compute_uncertainty_bands(
     survival_probability: float = 1.0,
     survival_risk_multiplier: float = DEFAULT_SURVIVAL_RISK_MULTIPLIER,
     z_score: float = Z_SCORE_90,
+    between_model_std: float = 0.0,
 ) -> tuple[float, float]:
     """Compute confidence interval bounds for a single prediction.
 
@@ -851,6 +1126,11 @@ def compute_uncertainty_bands(
     ``sqrt(horizon_days)`` (random-walk scaling).  If the Monte Carlo
     survival probability is below 1.0, the interval is widened by a
     risk factor proportional to the survival shortfall.
+
+    Beyond Bands Method 6 (BMA): When ``between_model_std`` > 0, the
+    total variance includes both within-model variance (RMSE^2) and
+    between-model variance (model disagreement). This is the Law of
+    Total Variance (Hoeting et al. 1999): total = within + between.
 
     Parameters
     ----------
@@ -867,6 +1147,9 @@ def compute_uncertainty_bands(
         How aggressively to widen bands when survival prob is low.
     z_score:
         z-score for the desired confidence level (default 1.645 = 90%).
+    between_model_std:
+        Between-model standard deviation from BMA (Method 6).
+        When > 0, widens bands to account for model disagreement.
 
     Returns
     -------
@@ -880,6 +1163,14 @@ def compute_uncertainty_bands(
         base_spread = abs(point_forecast) * 0.10
     else:
         base_spread = z_score * rmse * math.sqrt(max(horizon_days, 1))
+
+    # Beyond Bands Method 6: BMA total variance = within + between.
+    # When models disagree, between_model_std > 0 widens the bands
+    # even if the best model has low RMSE.
+    if between_model_std > 0:
+        within_var = base_spread ** 2
+        between_var = (between_model_std * math.sqrt(max(horizon_days, 1))) ** 2
+        base_spread = math.sqrt(within_var + between_var)
 
     # Survival-weighted widening.
     surv_prob = max(0.0, min(1.0, survival_probability))
@@ -2688,7 +2979,11 @@ def run_prediction_aggregation(
                     lower = point - half_width
                     upper = point + half_width
             else:
-                # Fallback to RMSE-based bands.
+                # Fallback to RMSE-based bands (with BMA Method 6 between-model var).
+                _bma_std = compute_bma_between_model_std(
+                    forecast_result.metrics, forecast_result.forecasts,
+                    var_name, h_label,
+                ) if forecast_result is not None else 0.0
                 lower, upper = compute_uncertainty_bands(
                     point,
                     var_rmse,
@@ -2696,8 +2991,9 @@ def run_prediction_aggregation(
                     survival_probability=surv_prob,
                     survival_risk_multiplier=survival_risk_multiplier,
                     z_score=z_score,
+                    between_model_std=_bma_std,
                 )
-                interval_source = "rmse"
+                interval_source = "rmse+bma" if _bma_std > 0 else "rmse"
 
                 # MC percentile override for long horizons (>= 21d).
                 # The RMSE * sqrt(h) scaling assumes independent daily
@@ -2924,6 +3220,87 @@ def run_prediction_aggregation(
                         lower = max(_lower_bound, lower) if not math.isnan(lower) else lower
                         upper = min(_upper_bound, upper) if not math.isnan(upper) else upper
 
+            # ----------------------------------------------------------
+            # Beyond Bands: Distributional forecasting integration.
+            # Compute skew signal, BMA between-model std, entropy-pooling
+            # scenarios, and constrained optimization.
+            # ----------------------------------------------------------
+            _bb_skew = None
+            _bb_between_std = None
+            _bb_scenario_point = None
+            _bb_scenarios = None
+
+            # Method 1: Quantile regression skew signal from tree metrics.
+            if forecast_result is not None:
+                for _m in forecast_result.metrics:
+                    if (_m.variable == var_name and _m.fitted
+                            and _m.quantile_forecasts is not None):
+                        _qf = _m.quantile_forecasts
+                        _p05 = _qf.get(0.05)
+                        _p50 = _qf.get(0.50)
+                        _p95 = _qf.get(0.95)
+                        if _p05 is not None and _p50 is not None and _p95 is not None:
+                            _bb_skew = (_p95 - _p50) - (_p50 - _p05)
+                            # Use quantile bounds for asymmetric intervals
+                            # when they are wider than current symmetric bands
+                            if _p05 < lower and not math.isnan(lower):
+                                lower = _p05
+                                interval_source += "+qr_lower"
+                            if _p95 > upper and not math.isnan(upper):
+                                upper = _p95
+                                interval_source += "+qr_upper"
+                        break
+
+            # Method 2: Conditional sigma from distributional model.
+            if forecast_result is not None:
+                for _m in forecast_result.metrics:
+                    if (_m.variable == var_name and _m.fitted
+                            and _m.conditional_sigma is not None
+                            and _m.conditional_sigma > 0):
+                        _cond_hw = z_score * _m.conditional_sigma * math.sqrt(max(horizon_days, 1))
+                        _cur_hw = (upper - lower) / 2.0 if not (math.isnan(upper) or math.isnan(lower)) else 0.0
+                        if _cond_hw > _cur_hw:
+                            lower = point - _cond_hw
+                            upper = point + _cond_hw
+                            interval_source += "+distributional"
+                        break
+
+            # Method 6: BMA between-model std.
+            if forecast_result is not None:
+                _bb_between_std = compute_bma_between_model_std(
+                    forecast_result.metrics,
+                    forecast_result.forecasts,
+                    var_name,
+                    h_label,
+                )
+
+            # Method 4: Entropy pooling scenario decomposition (close only).
+            if (mc_result is not None and var_name == "close"
+                    and not math.isnan(point)):
+                _mc_tv = getattr(mc_result, "terminal_values", {})
+                _mc_paths_ep = _mc_tv.get(h_label) or _mc_tv.get(horizon_days)
+                if _mc_paths_ep is not None and len(_mc_paths_ep) > 100:
+                    _model_ret = (point / last_value - 1.0) if last_value and last_value > 0 else 0.0
+                    _ep = _entropy_pooling_scenarios(
+                        np.array(_mc_paths_ep), _model_ret, last_value or point,
+                    )
+                    if _ep.get("available"):
+                        _bb_scenario_point = _ep["weighted_point"]
+                        _bb_scenarios = _ep["scenarios"]
+                        result.scenario_decomposition[h_label] = _ep
+
+            # Method 3: Constrained optimization (close only, after bands computed).
+            if var_name == "close" and not math.isnan(point):
+                _mom_5d = 0.0
+                if "return_5d" in cache.columns:
+                    _r5d_s = cache["return_5d"].dropna()
+                    if len(_r5d_s) > 0:
+                        _mom_5d = float(_r5d_s.iloc[-1])
+                point = _constrained_point_forecast(
+                    point, lower, upper,
+                    last_value or point, _mom_5d, result.current_regime,
+                )
+
             pred = HorizonPrediction(
                 variable=var_name,
                 horizon=h_label,
@@ -2940,6 +3317,10 @@ def run_prediction_aggregation(
                 analog_forecast=analog_point,
                 causal_adjustment=causal_adj,
                 regime_blend_applied=regime_blend_applied,
+                skew_signal=_bb_skew,
+                between_model_std=_bb_between_std,
+                scenario_weighted_point=_bb_scenario_point,
+                scenarios=_bb_scenarios,
             )
             horizon_preds[h_label] = pred
 

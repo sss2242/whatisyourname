@@ -522,6 +522,8 @@ def simulate_return_paths(
     jump_mean: float = 0.0,
     jump_std: float = 0.01,
     antithetic: bool = False,
+    ath_barrier: float = 0.0,
+    support_barrier: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Simulate return paths with optional importance sampling tilt.
 
@@ -565,6 +567,20 @@ def simulate_return_paths(
     # Jump-diffusion parameters (Merton 1976): dt = 1 day
     _dt = 1.0 / 252.0
     _jump_active = jump_lambda > 0 and jump_std > 0
+
+    # Beyond Bands Method 5: Reflected Brownian Motion at boundaries (Harrison 1985).
+    # When price approaches ATH or major support, it tends to bounce back rather
+    # than break through. Reflection creates naturally asymmetric distributions
+    # near boundaries -- left-skewed near ATH (limited upside), right-skewed
+    # near support (limited downside). Only active when both barriers are set.
+    _barriers_active = (ath_barrier > 0 and support_barrier > 0
+                        and ath_barrier > support_barrier)
+    if _barriers_active:
+        # Convert price barriers to cumulative log-return barriers
+        # relative to current price (mid-point between barriers as reference)
+        _start_price_ref = (ath_barrier + support_barrier) / 2.0
+        _ath_log = np.log(ath_barrier / _start_price_ref)
+        _support_log = np.log(support_barrier / _start_price_ref)
 
     for i in range(effective_n):
         regime_path = _simulate_regime_path(
@@ -610,6 +626,19 @@ def simulate_return_paths(
                     z += jump_return
 
             return_paths[i, t] = z
+
+            # Beyond Bands Method 5: Barrier reflection (Harrison 1985).
+            # Reflect cumulative return if the implied price breaches ATH
+            # or support. This creates naturally asymmetric terminal
+            # distributions near boundaries.
+            if _barriers_active:
+                _cum_log_return = np.sum(return_paths[i, :t + 1])
+                if _cum_log_return > _ath_log:
+                    _excess = _cum_log_return - _ath_log
+                    return_paths[i, t] -= 2.0 * _excess
+                elif _cum_log_return < _support_log:
+                    _deficit = _support_log - _cum_log_return
+                    return_paths[i, t] += 2.0 * _deficit
 
             if importance_tilt > 0:
                 # Log importance weight: log(p_nominal / p_tilted).
@@ -1262,6 +1291,21 @@ def run_monte_carlo(
     if survival_thresholds is None:
         survival_thresholds = DEFAULT_SURVIVAL_THRESHOLDS
 
+    # Beyond Bands Method 5: Extract ATH and support barriers for reflected BM.
+    # ATH = 252-day rolling max; support = 252-day rolling min.
+    # Barriers are only active when we have sufficient price history.
+    _ath_barrier = 0.0
+    _support_barrier = 0.0
+    if "close" in cache.columns and cache["close"].notna().sum() >= 63:
+        _close = cache["close"].dropna()
+        _ath_barrier = float(_close.max())
+        _support_barrier = float(_close.rolling(252, min_periods=63).min().iloc[-1])
+        if _ath_barrier > _support_barrier > 0:
+            logger.info(
+                "MC barrier reflection: ATH=%.2f, support=%.2f",
+                _ath_barrier, _support_barrier,
+            )
+
     # ------------------------------------------------------------------
     # Extract regime information
     # ------------------------------------------------------------------
@@ -1540,6 +1584,8 @@ def run_monte_carlo(
                 _n_tv, h_steps, current_idx,
                 transition_matrix, dist_list, rng,
                 importance_tilt=0.0,
+                ath_barrier=_ath_barrier,
+                support_barrier=_support_barrier,
             )
             # Terminal cumulative return as price ratio (e^sum(log_returns))
             _tv_cum = np.exp(np.sum(_tv_returns, axis=1))
