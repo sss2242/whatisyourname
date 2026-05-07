@@ -2497,6 +2497,24 @@ def run_forecasting(
                         result.tree_error = met.error
                 tree_attempted = True
 
+        # --- Beyond Bands Method 2: Distributional forecast (conditional sigma) ---
+        # Runs ALONGSIDE the tree model (not as a replacement). The point
+        # forecast comes from whatever model won the cascade above. This
+        # model provides conditional_sigma: a feature-dependent std that
+        # varies with market conditions, used by the prediction aggregator
+        # for data-driven band width instead of fixed RMSE * sqrt(h).
+        try:
+            feat_df_dist = _extract_features(var_name)
+            if not feat_df_dist.empty and len(feat_df_dist.dropna()) >= _MIN_OBS_TREE:
+                _dist_fcast, _dist_met = fit_distributional(
+                    feat_df_dist, var_name, random_state=random_state,
+                )
+                _dist_met.variable = var_name
+                if _dist_met.fitted:
+                    result.metrics.append(_dist_met)
+        except Exception as _dist_exc:
+            logger.debug("Distributional model skipped for %s: %s", var_name, _dist_exc)
+
         # --- Baseline (always succeeds) ---
         if best_forecast is None:
             fcast, met = fit_baseline(series, n_forecast=max_horizon)

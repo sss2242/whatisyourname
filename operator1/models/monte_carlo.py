@@ -806,6 +806,8 @@ def run_simulation(
     jump_lambda: float = 0.0,
     jump_mean: float = 0.0,
     jump_std: float = 0.0,
+    ath_barrier: float = 0.0,
+    support_barrier: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Run Monte Carlo simulation for a single horizon.
 
@@ -873,6 +875,8 @@ def run_simulation(
             jump_mean=jump_mean,
             jump_std=jump_std,
             antithetic=True,
+            ath_barrier=ath_barrier,
+            support_barrier=support_barrier,
         )
 
         vars_nom = evolve_variables(
@@ -904,6 +908,8 @@ def run_simulation(
             jump_mean=jump_mean,
             jump_std=jump_std,
             antithetic=False,
+            ath_barrier=ath_barrier,
+            support_barrier=support_barrier,
         )
 
         vars_is = evolve_variables(
@@ -1560,6 +1566,8 @@ def run_monte_carlo(
             jump_lambda=jump_lambda,
             jump_mean=jump_mean,
             jump_std=jump_std,
+            ath_barrier=_ath_barrier,
+            support_barrier=_support_barrier,
         )
 
         # Weighted survival probability (clip to [0, 1] for float safety).
