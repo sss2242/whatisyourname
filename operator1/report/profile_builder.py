@@ -496,6 +496,11 @@ def _build_predictions_section(
                     "lower_ci": _safe_float(pred.get("lower_ci")),
                     "upper_ci": _safe_float(pred.get("upper_ci")),
                     "confidence": _safe_float(pred.get("confidence")),
+                    # Beyond Bands distributional forecasting fields
+                    "skew_signal": _safe_float(pred.get("skew_signal")),
+                    "between_model_std": _safe_float(pred.get("between_model_std")),
+                    "scenario_weighted_point": _safe_float(pred.get("scenario_weighted_point")),
+                    "scenarios": pred.get("scenarios"),
                 }
             else:
                 # Might be a dataclass
@@ -513,6 +518,17 @@ def _build_predictions_section(
                     "confidence": _safe_float(
                         getattr(pred, "confidence", None),
                     ),
+                    # Beyond Bands distributional forecasting fields
+                    "skew_signal": _safe_float(
+                        getattr(pred, "skew_signal", None),
+                    ),
+                    "between_model_std": _safe_float(
+                        getattr(pred, "between_model_std", None),
+                    ),
+                    "scenario_weighted_point": _safe_float(
+                        getattr(pred, "scenario_weighted_point", None),
+                    ),
+                    "scenarios": getattr(pred, "scenarios", None),
                 }
             horizon_summaries[h_label].append(entry)
 
