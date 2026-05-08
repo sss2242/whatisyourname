@@ -208,6 +208,16 @@ def run_2_F_fusion(state: PipelineState) -> None:
                 if "survival_regime" in cache.columns and cache["survival_regime"].notna().any()
                 else "unknown",
             )
+            # Also re-run financial health with correct Q/A ratios
+            try:
+                from operator1.models.financial_health import compute_financial_health
+                cache, _fh = compute_financial_health(cache, freq="Q")
+                state.fh_result = _fh
+                state.cache = cache
+                logger.info("Post-fusion FH re-run: composite=%.1f (%s)",
+                            _fh.latest_composite, _fh.latest_label)
+            except Exception as fh_exc:
+                logger.debug("Post-fusion FH re-run failed: %s", fh_exc)
         except Exception as exc:
             logger.warning("Post-fusion survival re-run failed: %s", exc)
 

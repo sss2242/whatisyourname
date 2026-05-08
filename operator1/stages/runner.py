@@ -180,6 +180,7 @@ _DEFAULT_TIMEOUT: int = 120  # 2 min for everything else
 
 # Required state fields per sub-stage. Validated before dispatch.
 _SUBSTAGE_REQUIREMENTS: dict[str, list[str]] = {
+    "2.0": ["cache"],      # resample prep needs cache + raw DFs
     "2.1": ["income_df"],  # needs at least one raw statement DF
     "3.1": ["cache"],
     "4.1": ["cache", "extra_vars"],

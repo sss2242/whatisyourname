@@ -13,6 +13,7 @@ appropriate flags are set.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Sequence
 
 import numpy as np
@@ -27,9 +28,17 @@ logger = logging.getLogger(__name__)
 # Frequency context -- set by compute_derived_variables(freq=...) before
 # running the stage pipeline.  Each stage reads this to choose the correct
 # formula for the current frequency.
+#
+# Thread-safe via threading.local: each thread gets its own frequency
+# context, so parallel MF frequency pipelines won't corrupt each other.
 # ---------------------------------------------------------------------------
 
-_CURRENT_FREQ: str = "D"  # default: daily
+_freq_context = threading.local()
+
+
+def _get_freq() -> str:
+    """Get the current frequency from thread-local context (default: D)."""
+    return getattr(_freq_context, "freq", "D")
 
 # Number of days in one period at each frequency (for DSO/DIO/DPO etc.)
 _PERIOD_DAYS: dict[str, int] = {
@@ -265,7 +274,7 @@ def _compute_solvency(df: pd.DataFrame) -> pd.DataFrame:
     # Moody's uses 5.0x threshold for investment-grade boundary.
     # At Q: ebitda is quarterly -> annualize by *4.  At A: use as-is.
     # At D: ebitda may be daily rate or raw Q (inconsistent) -> use TTM if available.
-    freq = _CURRENT_FREQ
+    freq = _get_freq()
     ebitda = df.get("ebitda", pd.Series(np.nan, index=df.index))
     if freq in _NATIVE_RATIO_FREQS:
         _ebitda_annual = ebitda * _ANNUALIZE_MULT.get(freq, 1.0)
@@ -330,7 +339,7 @@ def _compute_cash_reality(df: pd.DataFrame) -> pd.DataFrame:
       free_cash_flow column still computed (for time-series models).
       fcf_yield SKIPPED (forward-filled from Q/A after fusion).
     """
-    freq = _CURRENT_FREQ
+    freq = _get_freq()
     ocf = df.get("operating_cash_flow", pd.Series(np.nan, index=df.index))
     capex = df.get("capex", pd.Series(np.nan, index=df.index))
     market_cap = df.get("market_cap", pd.Series(np.nan, index=df.index))
@@ -389,7 +398,7 @@ def _compute_profitability(df: pd.DataFrame) -> pd.DataFrame:
       instead of 0.469 for AAPL).  We still compute them but apply
       stricter plausibility guards.  ROE is SKIPPED (flow/stock broken).
     """
-    freq = _CURRENT_FREQ
+    freq = _get_freq()
     revenue = df.get("revenue", pd.Series(np.nan, index=df.index))
     gross_profit = df.get("gross_profit", pd.Series(np.nan, index=df.index))
     ebit = df.get("operating_income", pd.Series(np.nan, index=df.index))
@@ -478,7 +487,7 @@ def _compute_valuation(df: pd.DataFrame) -> pd.DataFrame:
     - At D/W/M: PE, P/S, EV/EBITDA use TTM values (may be distorted;
       will be overwritten by Q/A values after fusion)
     """
-    freq = _CURRENT_FREQ
+    freq = _get_freq()
     close = df.get("close", pd.Series(np.nan, index=df.index))
     shares = df.get("shares_outstanding", pd.Series(np.nan, index=df.index))
     market_cap = df.get("market_cap", pd.Series(np.nan, index=df.index))
@@ -600,7 +609,7 @@ def _compute_roa(df: pd.DataFrame) -> pd.DataFrame:
     At A: roa = NI_a / TA  (both from same annual filing)
     At D: roa = NI_daily / TA  (BROKEN: NI is daily rate ~1000x too small)
     """
-    freq = _CURRENT_FREQ
+    freq = _get_freq()
     net_income = df.get("net_income", pd.Series(np.nan, index=df.index))
     total_assets = df.get("total_assets", pd.Series(np.nan, index=df.index))
 
@@ -637,7 +646,7 @@ def _compute_ttm_and_growth(df: pd.DataFrame) -> pd.DataFrame:
     - At A: compare current annual to previous annual (shift 1)
     - At D: compare current TTM to TTM ~252 trading days ago
     """
-    freq = _CURRENT_FREQ
+    freq = _get_freq()
     revenue = df.get("revenue", pd.Series(np.nan, index=df.index))
     net_income = df.get("net_income", pd.Series(np.nan, index=df.index))
     ebitda = df.get("ebitda", pd.Series(np.nan, index=df.index))
@@ -718,7 +727,7 @@ def _compute_per_share(df: pd.DataFrame) -> pd.DataFrame:
     At Q/A/S: use native-scale values (no annualization needed for eps_calc
     since it's per-share per-period, matching eps_diluted from filings).
     """
-    freq = _CURRENT_FREQ
+    freq = _get_freq()
     shares = df.get("shares_outstanding", pd.Series(np.nan, index=df.index))
     net_income = df.get("net_income", pd.Series(np.nan, index=df.index))
     equity = df.get("total_equity", pd.Series(np.nan, index=df.index))
@@ -970,7 +979,7 @@ def _compute_earnings_quality_signals(df: pd.DataFrame) -> pd.DataFrame:
     # accruals = (NI - OCF) / TA  (FLOW - FLOW) / STOCK
     # At Q/A/S: NI and OCF are at native period scale -> correct
     # At D: NI and OCF are daily rates, TA is stock -> ratio ~1000x too small
-    freq = _CURRENT_FREQ
+    freq = _get_freq()
     ni = df.get("net_income")
     ocf = df.get("operating_cash_flow")
     ta = df.get("total_assets")
@@ -1374,7 +1383,7 @@ def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
     # OCF is a flow variable: at Q = quarterly total, at A = annual total.
     # Monthly burn = -OCF / months_in_period.
     # At Q: -OCF_q / 3.  At A: -OCF_a / 12.  At D: -OCF_daily * 30 (scale up).
-    freq = _CURRENT_FREQ
+    freq = _get_freq()
     _months_in_period = {"A": 12, "S": 6, "Q": 3, "M": 1, "W": 7/30, "D": 1/30}
     ocf = df.get("operating_cash_flow")
     if ocf is not None:
@@ -1397,7 +1406,7 @@ def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
     # Frequency-aware period days (Richards & Laughlin 1980):
     # At Q: revenue/90, At A: revenue/365, At S: revenue/180
     # At D/W/M: use 90 (quarterly approximation, may be distorted)
-    freq = _CURRENT_FREQ
+    freq = _get_freq()
     _period_days = _PERIOD_DAYS.get(freq, 90)
     if freq == "D":
         _period_days = 90  # assume quarterly filing cadence for daily cache
@@ -1536,7 +1545,7 @@ def _compute_forensic_signals(df: pd.DataFrame) -> pd.DataFrame:
 
     # --- Revenue-receivables divergence (Lev & Thiagarajan 1993) ---
     # YoY pct_change: shift depends on frequency
-    freq = _CURRENT_FREQ
+    freq = _get_freq()
     _yoy_shift = {"A": 1, "S": 2, "Q": 4, "M": 12, "W": 52, "D": 252}.get(freq, 252)
     revenue = df.get("revenue")
     receivables = df.get("receivables")
@@ -1683,9 +1692,8 @@ def compute_derived_variables(df: pd.DataFrame, freq: str = "D") -> pd.DataFrame
         Input DataFrame augmented with derived variables and their
         companion ``is_missing_*`` / ``invalid_math_*`` flags.
     """
-    global _CURRENT_FREQ
-    _CURRENT_FREQ = freq.upper() if freq else "D"
-    logger.info("Computing derived variables at freq=%s", _CURRENT_FREQ)
+    _freq_context.freq = freq.upper() if freq else "D"
+    logger.info("Computing derived variables at freq=%s", _freq_context.freq)
 
     result = df.copy()
     for stage in _COMPUTE_STAGES:
