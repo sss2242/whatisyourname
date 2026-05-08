@@ -9,19 +9,18 @@ After all frequencies complete, the fusion step reconciles results and
 forward-fills Q/A-computed ratios (PE, EV/EBITDA, ROA, etc.) into the
 daily cache so downstream temporal models have correct values.
 
-Sub-stages:
-  2.0  Resample prep (build per-freq caches from raw filings)
-  2.A  Annual pipeline
-  2.Q  Quarterly pipeline
-  2.M  Monthly pipeline
-  2.W  Weekly pipeline
-  2.D  Daily pipeline
-  2.F  Fusion + forward-fill Q/A ratios to daily cache
+Sub-stages (2-wave parallel):
+  2.0   Resample prep (build per-freq caches from raw filings)
+  2.W1  Wave 1: A + Q + S in parallel (native filing frequencies, no inter-deps)
+  2.W2  Wave 2: M + W + D in parallel (interpolated, use Q context from Wave 1)
+  2.F   Fusion + forward-fill Q/A ratios to daily cache
 """
 
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -75,42 +74,165 @@ def run_2_0_resample_prep(state: PipelineState) -> None:
     run_7_4_0_resample_prep(state)
 
 
-def run_2_A_annual(state: PipelineState) -> None:
-    """2.A: Run full pipeline at Annual frequency."""
-    logger.info("Stage 2.A: Annual pipeline")
-    from operator1.stages.stage7_integration import _run_7_4_single_freq
-    _run_7_4_single_freq(state, "A")
+# ---------------------------------------------------------------------------
+# Internal: run one frequency in an isolated thread
+# ---------------------------------------------------------------------------
+
+def _run_freq_isolated(state: "PipelineState", freq: str, prior_context_freq: str | None) -> str:
+    """Run a single frequency pipeline in an isolated thread.
+
+    Each thread loads its own resampled cache from disk, runs the full
+    per-frequency pipeline, and saves results back to disk via unique
+    file paths (no shared mutable state between threads).
+
+    Args:
+        state: Shared PipelineState (only disk I/O methods used, which
+               write to frequency-specific file paths -- no contention).
+        freq: Frequency label ("A", "Q", "S", "M", "W", "D").
+        prior_context_freq: Frequency to load cascading context from,
+                            or None for Wave 1 (no prior context).
+
+    Returns:
+        freq label on success.
+
+    Raises:
+        Exception on pipeline failure (caught by caller).
+    """
+    from operator1.steps.multi_frequency_runner import run_single_frequency_pipeline
+    from operator1.stages.stage7_integration import _get_mf_secrets
+
+    resampled = state.load_mf_cache(freq)
+    if resampled is None:
+        logger.info("[%s] No resampled cache found -- skipping", freq)
+        return freq
+
+    # Load cascading context from a prior frequency (if specified)
+    prior_context = None
+    if prior_context_freq is not None:
+        prior_context = state.load_mf_context(prior_context_freq)
+
+    secrets = _get_mf_secrets()
+
+    result = run_single_frequency_pipeline(
+        resampled=resampled,
+        prior_context=prior_context,
+        secrets=secrets,
+        market_id=state.market_id,
+        ticker=state.company,
+        skip_models=False,
+    )
+
+    # Save to disk (unique file paths per freq -- no contention)
+    state.save_mf_result(freq, result)
+    state.save_mf_context(freq, result.context_for_next)
+    logger.info(
+        "[%s] Pipeline complete: %d periods, survival=%.3f (%.1fs)",
+        freq, result.n_periods, result.survival_probability, result.elapsed_seconds,
+    )
+    return freq
 
 
-def run_2_Q_quarterly(state: PipelineState) -> None:
-    """2.Q: Run full pipeline at Quarterly (or Semi-Annual) frequency."""
-    logger.info("Stage 2.Q: Quarterly pipeline")
-    from operator1.stages.stage7_integration import _run_7_4_single_freq
+# ---------------------------------------------------------------------------
+# Wave 1: Native filing frequencies in parallel (A + Q + S)
+# ---------------------------------------------------------------------------
+
+def run_2_wave1_native(state: PipelineState) -> None:
+    """2.W1: Run A/Q/S pipelines in parallel (native filing frequencies).
+
+    Wave 1 frequencies are native filing frequencies -- they use raw
+    statement DataFrames directly, not interpolated daily data.  There
+    are NO inter-dependencies between A, Q, and S: each uses its own
+    filing data independently.
+
+    All three run in parallel threads.  Each thread reads its own
+    resampled cache from disk, runs the full per-frequency pipeline,
+    and saves results to frequency-specific file paths.
+    """
+    logger.info("Stage 2.W1: Wave 1 -- native freq pipelines in parallel")
+
     freqs = state.load_mf_frequencies()
-    for f in freqs:
-        if f in ("Q", "S"):
-            _run_7_4_single_freq(state, f)
+    native_freqs = [f for f in freqs if f in ("A", "Q", "S")]
+
+    if not native_freqs:
+        logger.info("No native filing frequencies to run in Wave 1")
+        return
+
+    t0 = time.time()
+
+    with ThreadPoolExecutor(max_workers=len(native_freqs)) as pool:
+        futures = {
+            pool.submit(_run_freq_isolated, state, freq, None): freq
+            for freq in native_freqs
+        }
+
+        for future in as_completed(futures):
+            freq = futures[future]
+            try:
+                future.result(timeout=300)
+            except Exception as exc:
+                logger.warning("[%s] Wave 1 pipeline failed: %s", freq, exc)
+
+    elapsed = time.time() - t0
+    logger.info(
+        "Wave 1 complete: %d native frequencies in %.1fs (parallel)",
+        len(native_freqs), elapsed,
+    )
 
 
-def run_2_M_monthly(state: PipelineState) -> None:
-    """2.M: Run full pipeline at Monthly frequency."""
-    logger.info("Stage 2.M: Monthly pipeline")
-    from operator1.stages.stage7_integration import _run_7_4_single_freq
-    _run_7_4_single_freq(state, "M")
+# ---------------------------------------------------------------------------
+# Wave 2: Interpolated frequencies in parallel (M + W + D)
+# ---------------------------------------------------------------------------
 
+def run_2_wave2_interpolated(state: PipelineState) -> None:
+    """2.W2: Run M/W/D pipelines in parallel (interpolated frequencies).
 
-def run_2_W_weekly(state: PipelineState) -> None:
-    """2.W: Run full pipeline at Weekly frequency."""
-    logger.info("Stage 2.W: Weekly pipeline")
-    from operator1.stages.stage7_integration import _run_7_4_single_freq
-    _run_7_4_single_freq(state, "W")
+    Wave 2 frequencies are derived from interpolation -- they don't have
+    native filing data at their frequency.  They CAN benefit from
+    cascading context from Wave 1 (A/Q) but NOT from each other.
 
+    All three use the Q pipeline context as their prior (the most
+    relevant native frequency).  If Q is unavailable, falls back to A.
+    This avoids cross-dependency within Wave 2.
+    """
+    logger.info("Stage 2.W2: Wave 2 -- interpolated freq pipelines in parallel")
 
-def run_2_D_daily(state: PipelineState) -> None:
-    """2.D: Run full pipeline at Daily frequency."""
-    logger.info("Stage 2.D: Daily pipeline")
-    from operator1.stages.stage7_integration import _run_7_4_single_freq
-    _run_7_4_single_freq(state, "D")
+    freqs = state.load_mf_frequencies()
+    interp_freqs = [f for f in freqs if f in ("M", "W", "D")]
+
+    if not interp_freqs:
+        logger.info("No interpolated frequencies to run in Wave 2")
+        return
+
+    # Determine best prior context: prefer Q, fall back to S, then A
+    prior_context_freq = None
+    for candidate in ("Q", "S", "A"):
+        if state.load_mf_context(candidate) is not None:
+            prior_context_freq = candidate
+            break
+
+    if prior_context_freq:
+        logger.info("Wave 2 using %s context as prior for all interpolated freqs", prior_context_freq)
+
+    t0 = time.time()
+
+    with ThreadPoolExecutor(max_workers=len(interp_freqs)) as pool:
+        futures = {
+            pool.submit(_run_freq_isolated, state, freq, prior_context_freq): freq
+            for freq in interp_freqs
+        }
+
+        for future in as_completed(futures):
+            freq = futures[future]
+            try:
+                future.result(timeout=180)
+            except Exception as exc:
+                logger.warning("[%s] Wave 2 pipeline failed: %s", freq, exc)
+
+    elapsed = time.time() - t0
+    logger.info(
+        "Wave 2 complete: %d interpolated frequencies in %.1fs (parallel)",
+        len(interp_freqs), elapsed,
+    )
 
 
 def run_2_F_fusion(state: PipelineState) -> None:
@@ -222,13 +344,10 @@ def run_2_F_fusion(state: PipelineState) -> None:
             logger.warning("Post-fusion survival re-run failed: %s", exc)
 
 
-# Registry of all Stage 2 sub-stages in order
+# Registry of all Stage 2 sub-stages in order (2-wave parallel)
 STAGE_2_FREQ_SUBSTAGES = [
     ("2.0", run_2_0_resample_prep),
-    ("2.A", run_2_A_annual),
-    ("2.Q", run_2_Q_quarterly),
-    ("2.M", run_2_M_monthly),
-    ("2.W", run_2_W_weekly),
-    ("2.D", run_2_D_daily),
+    ("2.W1", run_2_wave1_native),         # A + Q + S in parallel
+    ("2.W2", run_2_wave2_interpolated),    # M + W + D in parallel
     ("2.F", run_2_F_fusion),
 ]
