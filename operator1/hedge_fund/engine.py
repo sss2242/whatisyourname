@@ -677,6 +677,16 @@ def _compute_dcf(
     result = DCFResult()
     try:
         cfg = get_hf_weight("valuation.dcf", {})
+        # Merge scoring_weights.yml overrides (editable via dashboard Scoring
+        # Weights panel) on top of hedge_fund_weights.yml defaults.
+        try:
+            from operator1.scoring_weights import get_weight as _sw_get
+            _sw_dcf = _sw_get("dcf_calibration", {})
+            if isinstance(_sw_dcf, dict) and _sw_dcf:
+                for _k, _v in _sw_dcf.items():
+                    cfg.setdefault(_k, _v)
+        except Exception:
+            pass
         fcf_latest = extract_latest_value(cashflow_df, "free_cash_flow")
         if fcf_latest is None:
             ocf = extract_latest_value(cashflow_df, "operating_cash_flow")
