@@ -42,6 +42,14 @@ ALL_STAGES = [
     # Backtest Stage 2: Data preprocessing (frequency separation + reconciliation)
     ("2.1", "Frequency Separation (Bayesian + Chow-Lin/Denton)"),
     ("2.2", "Data Reconciliation (identity checks + dedup)"),
+    # Backtest Stage 2-freq: Frequency-first pipeline (each freq runs own full pipeline)
+    ("2.0", "Freq Pipeline: Resample Prep (build per-freq caches from raw filings)"),
+    ("2.A", "Freq Pipeline: Annual (derived vars + survival + FH + regime + forecast + MC)"),
+    ("2.Q", "Freq Pipeline: Quarterly (derived vars + survival + FH + regime + forecast + MC)"),
+    ("2.M", "Freq Pipeline: Monthly (interpolated from Q/A)"),
+    ("2.W", "Freq Pipeline: Weekly (interpolated from Q/A)"),
+    ("2.D", "Freq Pipeline: Daily (OHLCV + stock/stock ratios only)"),
+    ("2.F", "Freq Pipeline: Fusion (13-method fusion + forward-fill Q/A ratios to daily cache)"),
     # Backtest Stage 3+: Temporal models (36 sub-stages via staged runner)
     ("3.1", "Regime Detection (HMM/GMM/PELT/BCP/ChangeFinder)"),
     ("3.2", "Dual Regime Mixer"),
