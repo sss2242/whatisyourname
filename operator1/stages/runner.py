@@ -32,8 +32,17 @@ def _build_registry() -> list[tuple[str, callable]]:
 
     Imports are deferred to avoid circular imports and to only load
     stage modules when they are actually needed.
+
+    Execution order:
+      Stage 2-pre: Data preprocessing (frequency separation, reconciliation)
+      Stage 2-freq: Frequency-first pipeline (A->Q->M->W->D, then fusion)
+                    Each freq runs its own derived_vars + survival + regime + forecast + MC
+                    Fusion forward-fills correct Q/A ratios into daily cache
+      Stage 3: Temporal models (on daily cache WITH correct Q/A ratios)
+      Stage 4-7: Forward modeling, ensemble, integration, HF
     """
     from operator1.stages.stage2_preprocessing import STAGE_2_SUBSTAGES
+    from operator1.stages.stage2_freq_pipeline import STAGE_2_FREQ_SUBSTAGES
     from operator1.stages.stage3_temporal import STAGE_3_SUBSTAGES
     from operator1.stages.stage4_forecasting import STAGE_4_SUBSTAGES
     from operator1.stages.stage5_forward import STAGE_5_SUBSTAGES
@@ -42,6 +51,7 @@ def _build_registry() -> list[tuple[str, callable]]:
 
     return (
         STAGE_2_SUBSTAGES
+        + STAGE_2_FREQ_SUBSTAGES  # NEW: frequency-first pipeline runs BEFORE temporal models
         + STAGE_3_SUBSTAGES
         + STAGE_4_SUBSTAGES
         + STAGE_5_SUBSTAGES
@@ -170,6 +180,7 @@ _DEFAULT_TIMEOUT: int = 120  # 2 min for everything else
 
 # Required state fields per sub-stage. Validated before dispatch.
 _SUBSTAGE_REQUIREMENTS: dict[str, list[str]] = {
+    "2.0": ["cache"],      # resample prep needs cache + raw DFs
     "2.1": ["income_df"],  # needs at least one raw statement DF
     "3.1": ["cache"],
     "4.1": ["cache", "extra_vars"],

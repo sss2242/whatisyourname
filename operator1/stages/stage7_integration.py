@@ -377,17 +377,29 @@ def _run_7_4_single_freq(state: PipelineState, freq: str) -> None:
                 freq, result.n_periods, result.survival_probability, result.elapsed_seconds)
 
 
+def _stage2_already_ran(state: PipelineState, freq: str) -> bool:
+    """Check if Stage 2 frequency-first pipeline already produced this freq result."""
+    result = state.load_mf_result(freq)
+    return result is not None
+
+
 def run_7_4_1_annual(state: PipelineState) -> None:
     """7.4.1: Annual frequency pipeline."""
+    if _stage2_already_ran(state, "A"):
+        logger.info("Sub-stage 7.4.1: Annual already ran in Stage 2, skipping")
+        return
     logger.info("Sub-stage 7.4.1: Annual pipeline")
     _run_7_4_single_freq(state, "A")
 
 
 def run_7_4_2_quarterly(state: PipelineState) -> None:
     """7.4.2: Quarterly (or Semi-Annual) frequency pipeline."""
-    logger.info("Sub-stage 7.4.2: Quarterly pipeline")
     freqs = state.load_mf_frequencies()
-    # Run Q, S, or both depending on what prep detected
+    all_done = all(_stage2_already_ran(state, f) for f in freqs if f in ("Q", "S"))
+    if all_done and any(f in ("Q", "S") for f in freqs):
+        logger.info("Sub-stage 7.4.2: Quarterly already ran in Stage 2, skipping")
+        return
+    logger.info("Sub-stage 7.4.2: Quarterly pipeline")
     for f in freqs:
         if f in ("Q", "S"):
             _run_7_4_single_freq(state, f)
@@ -395,24 +407,37 @@ def run_7_4_2_quarterly(state: PipelineState) -> None:
 
 def run_7_4_3_monthly(state: PipelineState) -> None:
     """7.4.3: Monthly frequency pipeline."""
+    if _stage2_already_ran(state, "M"):
+        logger.info("Sub-stage 7.4.3: Monthly already ran in Stage 2, skipping")
+        return
     logger.info("Sub-stage 7.4.3: Monthly pipeline")
     _run_7_4_single_freq(state, "M")
 
 
 def run_7_4_4_weekly(state: PipelineState) -> None:
     """7.4.4: Weekly frequency pipeline."""
+    if _stage2_already_ran(state, "W"):
+        logger.info("Sub-stage 7.4.4: Weekly already ran in Stage 2, skipping")
+        return
     logger.info("Sub-stage 7.4.4: Weekly pipeline")
     _run_7_4_single_freq(state, "W")
 
 
 def run_7_4_5_daily(state: PipelineState) -> None:
     """7.4.5: Daily frequency pipeline."""
+    if _stage2_already_ran(state, "D"):
+        logger.info("Sub-stage 7.4.5: Daily already ran in Stage 2, skipping")
+        return
     logger.info("Sub-stage 7.4.5: Daily pipeline")
     _run_7_4_single_freq(state, "D")
 
 
 def run_7_4_6_fusion(state: PipelineState) -> None:
     """7.4.6: Fuse all frequency results into a single FusedMultiFreqResult."""
+    # Skip if Stage 2.F already produced a multi_frequency_result
+    if state.multi_frequency_result is not None and getattr(state.multi_frequency_result, "available", False):
+        logger.info("Sub-stage 7.4.6: Fusion already ran in Stage 2.F, skipping")
+        return
     logger.info("Sub-stage 7.4.6: Multi-frequency fusion")
     try:
         from operator1.models.frequency_fusion import fuse_multi_frequency_results

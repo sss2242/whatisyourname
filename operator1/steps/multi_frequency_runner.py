@@ -203,10 +203,10 @@ def run_single_frequency_pipeline(
         freq_label, resampled.lookback_years, resampled.n_periods,
     )
 
-    # Step 1: Derived variables
+    # Step 1: Derived variables (frequency-aware)
     try:
         from operator1.features.derived_variables import compute_derived_variables
-        cache = compute_derived_variables(cache)
+        cache = compute_derived_variables(cache, freq=freq)
         logger.info("[%s] Derived variables: %d columns", freq, len(cache.columns))
     except Exception as exc:
         logger.warning("[%s] Derived variables failed: %s", freq, exc)
@@ -231,7 +231,7 @@ def run_single_frequency_pipeline(
                 compute_survival_probability,
             )
             from operator1.analysis.hierarchy_weights import compute_hierarchy_weights
-            cache["company_survival_mode_flag"] = compute_company_survival_flag(cache)
+            cache["company_survival_mode_flag"] = compute_company_survival_flag(cache, freq=freq)
             cache["survival_probability"] = compute_survival_probability(cache)
             cache = compute_hierarchy_weights(cache)
             if "survival_probability" in cache.columns:
