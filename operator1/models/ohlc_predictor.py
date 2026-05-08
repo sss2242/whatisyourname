@@ -179,7 +179,8 @@ def predict_ohlc_series(
     if vol_col in cache.columns and cache[vol_col].notna().any():
         sigma = float(cache[vol_col].dropna().iloc[-1])
         # Convert annualised vol to daily
-        sigma_daily = sigma / math.sqrt(252) if sigma > 0.05 else sigma
+        from operator1.freq_constants import get_vol_annualization as _gva
+        sigma_daily = sigma / _gva() if sigma > 0.05 else sigma
     else:
         sigma_daily = float(returns.tail(21).std())
 

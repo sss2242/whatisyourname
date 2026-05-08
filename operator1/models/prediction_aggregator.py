@@ -2152,7 +2152,8 @@ def build_multi_horizon_predictions(
     if "volatility_21d" in cache.columns:
         vol = cache["volatility_21d"].dropna()
         if len(vol) > 0:
-            regime_std = float(vol.iloc[-1]) / np.sqrt(252)  # daily vol
+            from operator1.freq_constants import get_vol_annualization as _gva
+            regime_std = float(vol.iloc[-1]) / _gva()  # period vol
 
     horizons = {"next_day": 1, "next_week": 5, "next_month": 21, "next_year": 252}
     output: dict[str, Any] = {}
@@ -3091,7 +3092,8 @@ def run_prediction_aggregation(
                 if len(_iv_series) > 0:
                     _iv30_val = float(_iv_series.iloc[-1])
                     if _iv30_val > 0 and not math.isnan(_iv30_val):
-                        _iv_daily = _iv30_val / math.sqrt(252)
+                        from operator1.freq_constants import get_vol_annualization as _gva2
+                        _iv_daily = _iv30_val / _gva2()
                         _last_px = last_value if last_value and not math.isnan(last_value) else point
                         _iv_hw = z_score * _last_px * _iv_daily * math.sqrt(max(horizon_days, 1))
                         _cur_hw = (upper - lower) / 2.0
