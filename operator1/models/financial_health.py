@@ -642,7 +642,9 @@ def compute_altman_z_score(df: pd.DataFrame, freq: str = "D") -> AltmanZResult:
     X4 (MVE/TL) is MARKET/STOCK -- correct at any freq.
     """
     freq = freq.upper() if freq else "D"
-    _annualize = {"D": 252.0, "W": 52.0, "M": 12.0, "Q": 4.0, "S": 2.0, "A": 1.0}
+    # D/W/M = 1.0 (no annualization -- mixed scale on daily cache).
+    # Q/A/S = annualize to annual scale for correct Altman Z.
+    _annualize = {"D": 1.0, "W": 1.0, "M": 1.0, "Q": 4.0, "S": 2.0, "A": 1.0}
     _mult = _annualize.get(freq, 1.0)
 
     result = AltmanZResult()
@@ -830,9 +832,12 @@ def compute_liquidity_runway(df: pd.DataFrame, freq: str = "D") -> LiquidityRunw
     At Q: |OCF_q| / 3.  At A: |OCF_a| / 12.  At D: |OCF_daily| * 30.
     """
     freq = freq.upper() if freq else "D"
-    # Months in one filing period at each frequency
-    _months_in_period = {"A": 12.0, "S": 6.0, "Q": 3.0, "M": 1.0, "W": 7/30, "D": 1/30}
-    _mip = _months_in_period.get(freq, 1/30)
+    # Months in one filing period at each frequency.
+    # D=12.0 (backward compatible: assumes OCF in daily cache is annual-scale
+    # from forward-fill of quarterly/annual filing).  Correct runway comes
+    # from Q/A pipeline results after Stage 2.F fusion.
+    _months_in_period = {"A": 12.0, "S": 6.0, "Q": 3.0, "M": 1.0, "W": 1.0, "D": 12.0}
+    _mip = _months_in_period.get(freq, 12.0)
 
     result = LiquidityRunwayResult()
 

@@ -43,13 +43,17 @@ _PERIOD_DAYS: dict[str, int] = {
 
 # Annualization multiplier for flow variables at each frequency.
 # At Q frequency, quarterly EPS * 4 = annual EPS.  At A, no adjustment.
+# At D/W/M: set to 1.0 (NO annualization) because daily cache has flow
+# variables at MIXED scales (some daily rates from interpolator, some raw
+# quarterly values from CompanyFacts).  Correct ratios come from Q/A
+# pipeline results forward-filled by Stage 2.F fusion.
 _ANNUALIZE_MULT: dict[str, float] = {
-    "D": 252.0,   # 252 trading days
-    "W": 52.0,
-    "M": 12.0,
-    "Q": 4.0,
-    "S": 2.0,
-    "A": 1.0,
+    "D": 1.0,    # no annualization -- mixed scale on daily cache
+    "W": 1.0,    # no annualization -- interpolated from Q/A
+    "M": 1.0,    # no annualization -- interpolated from Q/A
+    "Q": 4.0,    # quarterly -> annual
+    "S": 2.0,    # semi-annual -> annual
+    "A": 1.0,    # already annual
 }
 
 # Frequencies where flow/stock and market/flow ratios are VALID
