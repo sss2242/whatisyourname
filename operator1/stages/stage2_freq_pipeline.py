@@ -180,6 +180,37 @@ def run_2_F_fusion(state: PipelineState) -> None:
         n_filled, len(RATIOS_FROM_NATIVE_FREQ),
     )
 
+    # Step 3: Re-run survival on daily cache with correct Q/A ratios.
+    # After forward-fill, fcf_yield, revenue_growth_yoy, etc. are now
+    # correct on the daily cache.  Re-run survival with freq="Q" trigger
+    # set so the daily survival_probability reflects all triggers including
+    # the now-correct flow-based ones (fcf_yield, revenue decline, Altman Z).
+    if n_filled > 0:
+        try:
+            from operator1.analysis.survival_mode import (
+                compute_company_survival_flag,
+                compute_survival_probability,
+            )
+            from operator1.analysis.hierarchy_weights import compute_hierarchy_weights
+
+            # Use "Q" trigger set since ratios are now at Q-quality
+            cache["company_survival_mode_flag"] = compute_company_survival_flag(
+                cache, freq="Q",
+            )
+            cache["survival_probability"] = compute_survival_probability(cache)
+            cache = compute_hierarchy_weights(cache)
+            state.cache = cache
+            logger.info(
+                "Post-fusion survival re-run (Q triggers): prob=%.3f, regime=%s",
+                float(cache["survival_probability"].dropna().iloc[-1])
+                if cache["survival_probability"].notna().any() else 0.0,
+                str(cache["survival_regime"].dropna().iloc[-1])
+                if "survival_regime" in cache.columns and cache["survival_regime"].notna().any()
+                else "unknown",
+            )
+        except Exception as exc:
+            logger.warning("Post-fusion survival re-run failed: %s", exc)
+
 
 # Registry of all Stage 2 sub-stages in order
 STAGE_2_FREQ_SUBSTAGES = [

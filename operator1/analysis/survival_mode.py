@@ -95,6 +95,7 @@ def compute_company_survival_flag(
     """
     t = thresholds or _COMPANY_THRESHOLDS
     _native_ratio_freqs = {"Q", "A", "S"}
+    _daily_freqs = {"D", "W"}
     freq = freq.upper() if freq else "D"
 
     # Two-category condition architecture: liquidity triggers (suppressible
@@ -102,48 +103,26 @@ def compute_company_survival_flag(
     liquidity_conditions: list[pd.Series] = []
     non_liquidity_conditions: list[pd.Series] = []
 
-    # --- Liquidity / solvency triggers (suppressible by cash adequacy) ---
+    # ===================================================================
+    # UNIVERSAL TRIGGERS (all frequencies)
+    # ===================================================================
 
-    # Current ratio < 1.0
+    # Current ratio < 1.0 (STOCK/STOCK -- valid at any freq)
     if "current_ratio" in df.columns:
         cr = df["current_ratio"]
         liquidity_conditions.append(cr.notna() & (cr < t.get("current_ratio_lt", 1.0)))
 
-    # Debt-to-equity (absolute) > 3.0
+    # Debt-to-equity (absolute) > 3.0 (STOCK/STOCK -- valid at any freq)
     if "debt_to_equity_abs" in df.columns:
         de = df["debt_to_equity_abs"]
         liquidity_conditions.append(de.notna() & (de > t.get("debt_to_equity_abs_gt", 3.0)))
 
-    # FCF yield < 0 -- ONLY at native filing freq (Q/A/S).
-    # At D/W/M, fcf_yield is distorted by flow-variable interpolation
-    # (~0.04% instead of ~3.3% for AAPL) and would false-trigger survival.
-    if "fcf_yield" in df.columns and freq in _native_ratio_freqs:
-        fy = df["fcf_yield"]
-        liquidity_conditions.append(fy.notna() & (fy < t.get("fcf_yield_lt", 0.0)))
-    elif "fcf_yield" in df.columns:
-        logger.debug("Skipping fcf_yield survival trigger at freq=%s (distorted)", freq)
-
-    # --- Non-liquidity triggers (never suppressed by cash adequacy) ---
-
-    # Drawdown < -40%
+    # Drawdown < -40% (OHLCV -- valid at any freq)
     if "drawdown_252d" in df.columns:
         dd = df["drawdown_252d"]
         non_liquidity_conditions.append(dd.notna() & (dd < t.get("drawdown_252d_lt", -0.40)))
 
-    # Institutional selling: extreme outflow triggers survival mode
-    if "inst_flow_momentum" in df.columns:
-        ifm = df["inst_flow_momentum"]
-        non_liquidity_conditions.append(ifm.notna() & (ifm < t.get("inst_flow_momentum_lt", -0.15)))
-
-    # Crowded + illiquid: fragile ownership structure
-    if "inst_crowding_score" in df.columns and "inst_amihud_illiquidity" in df.columns:
-        cs = df["inst_crowding_score"]
-        ai = df["inst_amihud_illiquidity"]
-        high_crowd = cs.notna() & (cs > t.get("inst_crowding_score_gt", 0.8))
-        high_illiq = ai.notna() & (ai > ai.quantile(0.9))
-        non_liquidity_conditions.append(high_crowd & high_illiq)
-
-    # Geopolitical conflict: country_conflict_flag OR intensity > 0.7 OR sanctions
+    # Geopolitical conflict (static/news -- valid at any freq)
     if "country_conflict_flag" in df.columns:
         cf = df["country_conflict_flag"]
         non_liquidity_conditions.append(cf.notna() & (cf == 1))
@@ -153,6 +132,65 @@ def compute_company_survival_flag(
     if "sanctions_flag" in df.columns:
         sf = df["sanctions_flag"]
         non_liquidity_conditions.append(sf.notna() & (sf == 1))
+
+    # ===================================================================
+    # Q/A/S-ONLY TRIGGERS (native filing frequency -- flow-based ratios)
+    # ===================================================================
+
+    if freq in _native_ratio_freqs:
+        # FCF yield < 0 (FLOW/MARKET -- only valid at native freq)
+        if "fcf_yield" in df.columns:
+            fy = df["fcf_yield"]
+            liquidity_conditions.append(fy.notna() & (fy < t.get("fcf_yield_lt", 0.0)))
+
+        # Revenue decline > 20% YoY (FLOW-based, Altman 1968)
+        if "revenue_growth_yoy" in df.columns:
+            rg = df["revenue_growth_yoy"]
+            non_liquidity_conditions.append(rg.notna() & (rg < -0.20))
+
+        # Altman Z-Score < 1.81 = distress zone (needs correct x3/x5 at Q/A)
+        if "fh_altman_z_score" in df.columns:
+            az = df["fh_altman_z_score"]
+            non_liquidity_conditions.append(az.notna() & (az < 1.81))
+
+        # Negative gross margin = selling below cost (Q/A only, same-filing data)
+        if freq in ("Q", "S") and "gross_margin" in df.columns:
+            gm = df["gross_margin"]
+            non_liquidity_conditions.append(gm.notna() & (gm < 0))
+
+    else:
+        if "fcf_yield" in df.columns:
+            logger.debug("Skipping fcf_yield trigger at freq=%s (distorted)", freq)
+
+    # ===================================================================
+    # D/W-ONLY TRIGGERS (daily OHLCV-native + institutional signals)
+    # ===================================================================
+
+    if freq in _daily_freqs:
+        # Institutional selling (computed from daily holder/volume data)
+        if "inst_flow_momentum" in df.columns:
+            ifm = df["inst_flow_momentum"]
+            non_liquidity_conditions.append(ifm.notna() & (ifm < t.get("inst_flow_momentum_lt", -0.15)))
+
+        # Crowded + illiquid ownership structure
+        if "inst_crowding_score" in df.columns and "inst_amihud_illiquidity" in df.columns:
+            cs = df["inst_crowding_score"]
+            ai = df["inst_amihud_illiquidity"]
+            high_crowd = cs.notna() & (cs > t.get("inst_crowding_score_gt", 0.8))
+            high_illiq = ai.notna() & (ai > ai.quantile(0.9))
+            non_liquidity_conditions.append(high_crowd & high_illiq)
+
+        # Merton distance-to-default < 1.0 (uses daily vol + stock debt, Merton 1974)
+        if "merton_dd" in df.columns:
+            mdd = df["merton_dd"]
+            non_liquidity_conditions.append(mdd.notna() & (mdd < 1.0))
+
+        # Vol-of-vol spike > P95 of own history (regime instability, Cont & da Fonseca 2002)
+        if "vol_of_vol_21d" in df.columns:
+            vov = df["vol_of_vol_21d"]
+            _p95 = vov.quantile(0.95)
+            if _p95 > 0:
+                non_liquidity_conditions.append(vov.notna() & (vov > _p95))
 
     all_conditions = liquidity_conditions + non_liquidity_conditions
     if not all_conditions:
