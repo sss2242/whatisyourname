@@ -72,6 +72,7 @@ def compute_company_survival_flag(
     df: pd.DataFrame,
     thresholds: dict[str, float] | None = None,
     freq: str = "D",
+    sector: str = "",
 ) -> pd.Series:
     """Compute daily company survival mode flag.
 
@@ -93,7 +94,29 @@ def compute_company_survival_flag(
     pd.Series
         Integer series: 1 = survival mode active, 0 = normal.
     """
-    t = thresholds or _COMPANY_THRESHOLDS
+    t = dict(thresholds or _COMPANY_THRESHOLDS)  # copy to avoid mutating defaults
+
+    # Apply sector-specific threshold overrides from scoring_weights.yml.
+    # Tech mega-caps (Apple, Google, Meta) deliberately run current_ratio < 1.0
+    # as a capital structure choice -- not distress.
+    if sector:
+        try:
+            from operator1.scoring_weights import get_weight
+            _sector_key = sector.lower().replace(" ", "_").replace("&", "and")
+            _overrides = get_weight(f"survival_thresholds.sector_overrides.{_sector_key}", {})
+            if isinstance(_overrides, dict):
+                for k, v in _overrides.items():
+                    if k == "current_ratio":
+                        t["current_ratio_lt"] = float(v)
+                    elif k == "debt_to_equity":
+                        t["debt_to_equity_abs_gt"] = float(v)
+                    elif k == "fcf_yield":
+                        t["fcf_yield_lt"] = float(v)
+                if _overrides:
+                    logger.info("Sector override applied for '%s': %s", sector, _overrides)
+        except Exception:
+            pass
+
     _native_ratio_freqs = {"Q", "A", "S"}
     _daily_freqs = {"D", "W"}
     freq = freq.upper() if freq else "D"
@@ -220,8 +243,20 @@ def compute_company_survival_flag(
         try:
             _cash = df["cash_and_equivalents"].astype(float)
             _mcap = df["market_cap"].astype(float)
-            # Cash > 5% of market cap = cash-adequate, suppress liquidity triggers
-            _cash_adequate = (_cash > 0) & (_mcap > 0) & (_cash / _mcap > 0.05)
+            # Cash adequacy: suppress liquidity triggers for cash-rich companies.
+            # Two tests (OR): ratio-based (5% of mcap) + absolute floor ($10B).
+            # The absolute floor handles mega-caps like Apple where $30B cash
+            # is only 0.8% of $3.8T market cap but is clearly not distress.
+            try:
+                from operator1.scoring_weights import get_weight as _sw_get
+                _cash_ratio_thresh = float(_sw_get("survival_thresholds.cash_adequacy_ratio", 0.05))
+                _cash_abs_thresh = float(_sw_get("survival_thresholds.cash_adequacy_absolute", 10_000_000_000))
+            except Exception:
+                _cash_ratio_thresh = 0.05
+                _cash_abs_thresh = 10_000_000_000
+            _cash_ratio_ok = (_cash > 0) & (_mcap > 0) & (_cash / _mcap > _cash_ratio_thresh)
+            _cash_absolute_ok = _cash > _cash_abs_thresh
+            _cash_adequate = _cash_ratio_ok | _cash_absolute_ok
             if _cash_adequate.any():
                 _n_before = int(liquidity_combined.sum())
                 liquidity_combined = liquidity_combined & ~_cash_adequate

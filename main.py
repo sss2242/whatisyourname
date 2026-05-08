@@ -1544,7 +1544,8 @@ Non-interactive examples:
     # Survival mode
     weights: dict = {f"tier{i}": 20.0 for i in range(1, 6)}
     try:
-        cache["company_survival_mode_flag"] = compute_company_survival_flag(cache)
+        cache["company_survival_mode_flag"] = compute_company_survival_flag(
+            cache, sector=target_profile.get("sector", ""))
         cache["survival_probability"] = compute_survival_probability(cache)
         # Cox PH data-driven survival risk score (lifelines)
         try:
@@ -2325,6 +2326,7 @@ Non-interactive examples:
             _adapted_survival_dict = threshold_set_to_survival_dict(_adaptive_thresholds)
             cache["company_survival_mode_flag"] = compute_company_survival_flag(
                 cache, thresholds=_adapted_survival_dict,
+                sector=target_profile.get("sector", ""),
             )
             cache["survival_probability"] = compute_survival_probability(
                 cache, thresholds=_adapted_survival_dict,

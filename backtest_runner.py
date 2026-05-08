@@ -768,7 +768,8 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     from operator1.analysis.hierarchy_weights import compute_hierarchy_weights
     state.weights = {f"tier{i}": 20.0 for i in range(1, 6)}
     try:
-        cache["company_survival_mode_flag"] = compute_company_survival_flag(cache)
+        cache["company_survival_mode_flag"] = compute_company_survival_flag(
+            cache, sector=state.target_profile.get("sector", ""))
         cache["survival_probability"] = compute_survival_probability(cache)
         try:
             from operator1.analysis.survival_mode import compute_cox_survival_score
@@ -976,7 +977,8 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         )
         if state.adaptive_thresholds.adapted:
             adapted = threshold_set_to_survival_dict(state.adaptive_thresholds)
-            cache["company_survival_mode_flag"] = compute_company_survival_flag(cache, thresholds=adapted)
+            cache["company_survival_mode_flag"] = compute_company_survival_flag(
+                cache, thresholds=adapted, sector=state.target_profile.get("sector", ""))
             cache["survival_probability"] = compute_survival_probability(cache, thresholds=adapted)
             cache = compute_hierarchy_weights(cache)
     except Exception:
