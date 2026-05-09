@@ -142,6 +142,34 @@ def get_rolling_year(freq: str | None = None) -> int:
     return get_periods_per_year(freq)
 
 
+def get_hurst_vol_annualization(
+    hurst: float = 0.5,
+    freq: str | None = None,
+) -> float:
+    """Hurst-corrected volatility annualization factor.
+
+    Standard ``sqrt(T)`` scaling assumes i.i.d. returns (H=0.5).
+    Financial returns often exhibit persistence (H>0.5) or mean-reversion
+    (H<0.5), making ``T^H`` more accurate than ``T^0.5``.
+
+    Parameters
+    ----------
+    hurst:
+        Hurst exponent (0-1).  0.5 = random walk (reduces to sqrt(T)).
+        >0.5 = trending (vol scales faster). <0.5 = mean-reverting.
+    freq:
+        Frequency to compute for (default: current thread-local).
+
+    Returns
+    -------
+    Annualization factor ``periods_per_year ** hurst``.
+    """
+    ppy = get_periods_per_year(freq)
+    # Clamp H to [0.1, 0.9] for numerical safety
+    h = max(0.1, min(0.9, hurst))
+    return ppy ** h
+
+
 def get_horizons(freq: str | None = None) -> dict[str, int]:
     """Return the horizon label -> period count map for the frequency."""
     return HORIZON_PERIODS.get(freq or get_freq(), HORIZON_PERIODS["D"])
