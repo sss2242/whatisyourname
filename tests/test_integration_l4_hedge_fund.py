@@ -127,7 +127,7 @@ class TestL4HedgeFundOnGolden:
             income_df=aapl_statements["income"],
             balance_df=aapl_statements["balance"],
             cashflow_df=aapl_statements["cashflow"],
-            cache=aapl_cache,
+            cache=aapl_cache.copy(),
             target_profile={"sector": "Technology", "name": "Apple Inc"},
         )
         if hf.available and hf.scorecard:

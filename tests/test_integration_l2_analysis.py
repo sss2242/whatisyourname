@@ -77,7 +77,7 @@ class TestL2AnalysisOnGolden:
 
     def test_apple_not_in_survival_most_days(self, aapl_cache):
         from operator1.analysis.survival_mode import compute_company_survival_flag
-        flag = compute_company_survival_flag(aapl_cache, sector="Technology")
+        flag = compute_company_survival_flag(aapl_cache.copy(), sector="Technology")
         flag_rate = flag.sum() / len(flag)
         max_rate = AAPL_EXPECTED.get("l2_survival_flag_rate_max", 0.15)
         assert flag_rate < max_rate, (
@@ -87,7 +87,7 @@ class TestL2AnalysisOnGolden:
 
     def test_apple_survival_probability_high(self, aapl_cache):
         from operator1.analysis.survival_mode import compute_survival_probability
-        prob = compute_survival_probability(aapl_cache)
+        prob = compute_survival_probability(aapl_cache.copy())
         latest = float(prob.dropna().iloc[-1])
         min_prob = AAPL_EXPECTED.get("l2_survival_prob_min", 0.60)
         assert latest > min_prob, (
