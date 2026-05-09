@@ -1267,6 +1267,18 @@ def run_monte_carlo(
     # jump_spike_flag is available (from Layer 1 Stage 16 vol decomposition).
     # When jump_params is None, auto-calibrate from data; when explicitly
     # passed, use the provided values.
+    # Load jump-diffusion config bounds from scoring_weights.yml
+    # (editable via dashboard Scoring Weights panel).
+    try:
+        from operator1.scoring_weights import get_weight as _sw_get
+        _jd_cfg = _sw_get("jump_diffusion", {})
+    except Exception:
+        _jd_cfg = {}
+    _jd_lambda_min = float(_jd_cfg.get("min_lambda", 0.0))
+    _jd_lambda_max = float(_jd_cfg.get("max_lambda", 50.0))
+    _jd_default_mean = float(_jd_cfg.get("mu_jump_default", -0.05))
+    _jd_default_std = float(_jd_cfg.get("sigma_jump_default", 0.10))
+
     jump_lambda = 0.0
     jump_mean = 0.0
     jump_std = 0.01
@@ -1284,8 +1296,12 @@ def run_monte_carlo(
                 if len(_spike_returns) > 2:
                     jump_mean = float(_spike_returns.mean())
                     jump_std = float(max(_spike_returns.std(), 0.005))
-            # Cap lambda at 50 (max ~1 jump per 5 trading days)
-            jump_lambda = min(jump_lambda, 50.0)
+            # Apply config bounds (prevents unreasonable data-derived values)
+            jump_lambda = max(_jd_lambda_min, min(jump_lambda, _jd_lambda_max))
+        else:
+            # No spikes detected: use config defaults as fallback
+            jump_mean = _jd_default_mean
+            jump_std = _jd_default_std
             logger.info(
                 "Jump-diffusion calibrated: lambda=%.1f/yr, jump_mu=%.4f, jump_sigma=%.4f",
                 jump_lambda, jump_mean, jump_std,

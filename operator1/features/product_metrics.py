@@ -329,8 +329,12 @@ def _compute_geo_hhi(shares: dict[str, float]) -> float:
 def _estimate_china_pct(geo_segments: dict[str, float]) -> float:
     """Estimate fraction of revenue attributable to China/Greater China.
 
-    Exact match for China-specific segment names, 0.5 weight for
+    Exact match for China-specific segment names, configurable weight for
     broad Asia-Pacific segments (not all APAC revenue is China).
+
+    The APAC-to-China attribution weight is configurable via
+    ``config/scoring_weights.yml`` key ``geographic_metrics.china_apac_weight``
+    (default 0.5 = 50% of APAC revenue attributed to China).
     """
     if not geo_segments:
         return 0.0
@@ -338,14 +342,21 @@ def _estimate_china_pct(geo_segments: dict[str, float]) -> float:
     if total < EPSILON:
         return 0.0
 
+    # Load configurable APAC-to-China weight from scoring_weights.yml
+    try:
+        from operator1.scoring_weights import get_weight as _sw_get
+        _apac_weight = float(_sw_get("geographic_metrics.china_apac_weight", 0.5))
+    except Exception:
+        _apac_weight = 0.5
+
     china_rev = 0.0
     for name, value in geo_segments.items():
         name_lower = name.lower().strip()
         if any(p in name_lower for p in _CHINA_PATTERNS):
             china_rev += abs(value)
         elif any(p in name_lower for p in _ASIA_PACIFIC_PATTERNS):
-            # Approximate: 50% of APAC revenue attributed to China
-            china_rev += abs(value) * 0.5
+            # Approximate: configurable fraction of APAC revenue attributed to China
+            china_rev += abs(value) * _apac_weight
 
     return min(china_rev / total, 1.0)
 

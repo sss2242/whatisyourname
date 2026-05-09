@@ -267,6 +267,7 @@ options_signals:
 geographic_metrics:
   geo_hhi_threshold: 0.5
   china_revenue_pct_threshold: 0.30
+  china_apac_weight: 0.5           # Fraction of APAC revenue attributed to China (0-1)
   tariff_exposure_weight: 0.4
   trade_policy_weight: 0.3
   geo_concentration_weight: 0.3
@@ -384,7 +385,10 @@ event_calendar:
 
 # --- Jump-diffusion Monte Carlo ---
 jump_diffusion:
-  max_lambda: 50.0
+  min_lambda: 0.0                  # Floor for jump intensity (annualized)
+  max_lambda: 50.0                 # Cap for jump intensity (annualized)
+  mu_jump_default: -0.05           # Default jump mean when data estimation fails
+  sigma_jump_default: 0.10         # Default jump vol when data estimation fails
   spike_threshold_percentile: 95
   min_spike_count: 3
 
