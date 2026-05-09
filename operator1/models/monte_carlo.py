@@ -565,7 +565,8 @@ def simulate_return_paths(
     log_weights = np.zeros(effective_n)
 
     # Jump-diffusion parameters (Merton 1976): dt = 1 day
-    _dt = 1.0 / 252.0
+    from operator1.freq_constants import get_periods_per_year as _gppy
+    _dt = 1.0 / _gppy()
     _jump_active = jump_lambda > 0 and jump_std > 0
 
     # Beyond Bands Method 5: Reflected Brownian Motion at boundaries (Harrison 1985).

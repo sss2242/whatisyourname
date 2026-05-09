@@ -679,7 +679,8 @@ def compute_adaptive_mc_params(
         if not vol_series.empty:
             vol = max(float(vol_series.iloc[-1]), 0.005)
 
-    annual_vol = vol * math.sqrt(252)
+    from operator1.freq_constants import get_vol_annualization as _gva
+    annual_vol = vol * _gva()
     if p_tail > 0.01 and annual_vol > 0.01:
         is_tilt = min(-math.log(p_tail) / annual_vol, 5.0)
     else:

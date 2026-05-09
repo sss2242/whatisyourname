@@ -78,18 +78,21 @@ def compute_feature_normalization(cache: pd.DataFrame) -> pd.DataFrame:
 
         s = result[var].astype(float)
 
-        # 1. Rolling z-score (63d)
-        mean_63 = s.rolling(63, min_periods=10).mean()
-        std_63 = s.rolling(63, min_periods=10).std().clip(lower=EPSILON)
+        # 1. Rolling z-score (1-quarter window, freq-adaptive)
+        from operator1.freq_constants import get_rolling_quarter, get_periods_per_year
+        _rpq = get_rolling_quarter()
+        _ppy = get_periods_per_year()
+        mean_63 = s.rolling(_rpq, min_periods=min(10, _rpq)).mean()
+        std_63 = s.rolling(_rpq, min_periods=min(10, _rpq)).std().clip(lower=EPSILON)
         col_z = f"{var}_zscore_63d"
         if col_z not in result.columns:
             result[col_z] = (s - mean_63) / std_63
             n_added += 1
 
-        # 2. Expanding percentile rank (252d window)
+        # 2. Expanding percentile rank (1-year window, freq-adaptive)
         col_p = f"{var}_percentile_252d"
         if col_p not in result.columns:
-            result[col_p] = s.rolling(252, min_periods=20).apply(
+            result[col_p] = s.rolling(_ppy, min_periods=min(20, _ppy)).apply(
                 lambda x: pd.Series(x).rank(pct=True).iloc[-1],
                 raw=False,
             )

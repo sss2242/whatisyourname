@@ -83,6 +83,7 @@ ALL_STAGES = [
     ("7.4.4", "Multi-Frequency: Weekly Pipeline"),
     ("7.4.5", "Multi-Frequency: Daily Pipeline"),
     ("7.4.6", "Multi-Frequency: Fusion (13 methods)"),
+    ("7.4.7", "Multi-Frequency: Hierarchical Reconciliation (MinTrace mint_shrink)"),
     ("7.5.1", "Hedge Fund: Base Metrics + Scorecard (15 metrics + EVA + SOTP + CVaR + SGR)"),
     ("7.5.2", "Hedge Fund: Advanced Methods (22 techniques: Piotroski, Merton, moat, factors)"),
     ("7.5.3", "Hedge Fund: Multi-Frequency Variants (FCF MF, accruals MF, growth MF)"),

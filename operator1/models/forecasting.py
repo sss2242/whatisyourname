@@ -56,7 +56,7 @@ HORIZONS: dict[str, int] = {
     "1d": 1,
     "5d": 5,
     "21d": 21,
-    "252d": 252,
+    "252d": 252,  # NOTE: at non-daily freq, overridden by freq_constants.get_horizons()
 }
 
 # Minimum observations required for each model type.

@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 
 # Number of simulation paths per scenario
 _DEFAULT_N_PATHS = 5_000
-_DEFAULT_HORIZON_DAYS = 252
+from operator1.freq_constants import get_periods_per_year as _gppy
+_DEFAULT_HORIZON_DAYS = _gppy()
 
 
 @dataclass

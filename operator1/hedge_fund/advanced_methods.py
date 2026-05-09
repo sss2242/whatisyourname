@@ -561,10 +561,13 @@ def compute_garch_vol_term_structure(cache: pd.DataFrame | None) -> dict:
             return result
 
         # Compute realized vol at multiple horizons
-        vol_5d = float(returns.iloc[-5:].std() * np.sqrt(252))
-        vol_21d = float(returns.iloc[-21:].std() * np.sqrt(252))
-        vol_63d = float(returns.iloc[-63:].std() * np.sqrt(252))
-        vol_252d = float(returns.std() * np.sqrt(252)) if len(returns) >= 252 else vol_63d
+        from operator1.freq_constants import get_vol_annualization, get_periods_per_year
+        _vol_ann = get_vol_annualization()
+        _ppy = get_periods_per_year()
+        vol_5d = float(returns.iloc[-5:].std() * _vol_ann)
+        vol_21d = float(returns.iloc[-21:].std() * _vol_ann)
+        vol_63d = float(returns.iloc[-63:].std() * _vol_ann)
+        vol_252d = float(returns.std() * _vol_ann) if len(returns) >= _ppy else vol_63d
 
         result["vol_5d"] = round(vol_5d, 4)
         result["vol_21d"] = round(vol_21d, 4)
@@ -785,7 +788,8 @@ def compute_vrp_proxy(cache: pd.DataFrame | None) -> dict:
         if len(returns) < 63:
             return result
 
-        realized = float(returns.iloc[-21:].std() * np.sqrt(252))
+        from operator1.freq_constants import get_vol_annualization as _gva
+        realized = float(returns.iloc[-21:].std() * _gva())
 
         # Simple GARCH(1,1) forecast proxy: EWMA variance
         lambda_ewma = 0.94
@@ -1041,7 +1045,8 @@ def _compute_merton_term_structure(cache: pd.DataFrame | None) -> dict:
         return {}
 
     E = close.dropna().iloc[-1]  # equity value per share
-    sigma_E = vol.dropna().iloc[-1] * np.sqrt(252)  # annualized
+    from operator1.freq_constants import get_vol_annualization as _gva
+    sigma_E = vol.dropna().iloc[-1] * _gva()  # annualized
     D = debt.dropna().iloc[-1]
     so = shares.dropna().iloc[-1] if shares is not None and shares.notna().any() else 1.0
 
