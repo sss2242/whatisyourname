@@ -196,6 +196,7 @@ def run_2_F_fusion(state: PipelineState) -> None:
             # Use "Q" trigger set since ratios are now at Q-quality
             cache["company_survival_mode_flag"] = compute_company_survival_flag(
                 cache, freq="Q",
+                sector=state.target_profile.get("sector", ""),
             )
             cache["survival_probability"] = compute_survival_probability(cache)
             cache = compute_hierarchy_weights(cache)

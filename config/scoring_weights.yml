@@ -1,5 +1,15 @@
 survival_thresholds:
   current_ratio: 1.0
+  # Sector-specific overrides (tech mega-caps run lean balance sheets deliberately)
+  sector_overrides:
+    technology:
+      current_ratio: 0.7
+      debt_to_equity: 4.0
+    communication_services:
+      current_ratio: 0.8
+  # Cash adequacy: suppress liquidity triggers for cash-rich companies
+  cash_adequacy_ratio: 0.05           # Cash/market_cap ratio floor (default 5%)
+  cash_adequacy_absolute: 10000000000  # $10B absolute cash floor for mega-caps
   debt_to_equity: 3.0
   fcf_yield: 0.0
   drawdown_252d: -0.4

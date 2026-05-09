@@ -4532,6 +4532,7 @@ class ExponentialGradientWeightLearner:
         regime: str,
         per_model_preds: dict[str, float],
         actual: float,
+        variable: str = "",
     ) -> float:
         """Process one observation: update weights, return weighted prediction.
 
@@ -4604,8 +4605,12 @@ class ExponentialGradientWeightLearner:
             self._regime_errors[regime] = []
             self._regime_weighted_returns[regime] = []
         self._regime_errors[regime].append(weighted_error)
-        # Store the actual return for distribution estimation
-        self._regime_weighted_returns[regime].append(actual)
+        # Store the actual value WITH variable name for distribution estimation.
+        # get_regime_distributions() filters by variable to avoid mixing scales
+        # (return_1d ~0.001 vs cash_and_equivalents ~30B would corrupt MC).
+        self._regime_weighted_returns[regime].append(
+            {"actual": actual, "variable": variable}
+        )
 
         # Decay learning rate
         self.eta *= self.eta_decay
@@ -4617,26 +4622,50 @@ class ExponentialGradientWeightLearner:
         """Return learned per-regime weight vectors."""
         return {r: dict(w) for r, w in self._regime_weights.items()}
 
-    def get_regime_distributions(self) -> dict[str, dict[str, float]]:
-        """Return per-regime distribution parameters (weighted by model quality).
+    def get_regime_distributions(
+        self, variable: str = "return_1d",
+    ) -> dict[str, dict[str, float]]:
+        """Return per-regime distribution parameters for a specific variable.
 
-        These are superior to raw return distributions because they
-        incorporate model uncertainty: weighted mean/std across models.
+        Filters stored actuals to the target variable only, preventing
+        scale contamination (e.g., cash_and_equivalents ~30B mixed with
+        return_1d ~0.001 would produce billion-scale distributions that
+        overflow Monte Carlo's exp(cumsum(returns))).
+
+        Parameters
+        ----------
+        variable:
+            Variable name to filter to.  Default ``"return_1d"`` since
+            Monte Carlo consumes these as daily return distributions.
         """
         distributions: dict[str, dict[str, float]] = {}
-        for regime, returns in self._regime_weighted_returns.items():
-            if len(returns) >= 5:
-                arr = np.array(returns)
+        for regime, entries in self._regime_weighted_returns.items():
+            # Filter to target variable only
+            filtered = [
+                e["actual"] for e in entries
+                if isinstance(e, dict) and e.get("variable") == variable
+            ]
+            # Fallback: if no entries match the variable name (backward compat
+            # with old-format lists), use entries with return-like scale (<1.0)
+            if not filtered:
+                filtered = [
+                    (e["actual"] if isinstance(e, dict) else e)
+                    for e in entries
+                    if (isinstance(e, dict) and abs(e.get("actual", 999)) < 1.0)
+                    or (not isinstance(e, dict) and abs(e) < 1.0)
+                ]
+            if len(filtered) >= 5:
+                arr = np.array(filtered)
                 distributions[regime] = {
                     "mean": float(np.mean(arr)),
-                    "std": float(np.std(arr, ddof=1)),
-                    "n_obs": len(returns),
+                    "std": float(max(np.std(arr, ddof=1), 1e-6)),
+                    "n_obs": len(filtered),
                 }
             else:
                 distributions[regime] = {
                     "mean": 0.0,
                     "std": 0.01,
-                    "n_obs": len(returns),
+                    "n_obs": len(filtered),
                 }
         return distributions
 
@@ -4874,9 +4903,10 @@ def run_burnout(
             regime = entry.get("regime", "unknown")
             per_model = entry.get("per_model", {})
             actual = entry.get("actual", 0.0)
+            variable = entry.get("variable", "")
 
             if isinstance(per_model, dict) and per_model:
-                learner.update(regime, per_model, actual)
+                learner.update(regime, per_model, actual, variable=variable)
 
         stability = learner.weight_stability
         result.rmse_history.append(stability)

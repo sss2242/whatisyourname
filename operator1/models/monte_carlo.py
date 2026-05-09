@@ -1370,6 +1370,19 @@ def run_monte_carlo(
     if burnout_distributions:
         _n_overrides = 0
         for regime, params in burnout_distributions.items():
+            # Scale validation: reject distributions with non-return-scale
+            # values (e.g., mean=1B from cash_and_equivalents leak).
+            # Daily returns should be in [-1, 1] range; allow some headroom.
+            _bo_mean = abs(params.get("mean", 0))
+            _bo_std = abs(params.get("std", 0))
+            if _bo_mean > 1.0 or _bo_std > 1.0:
+                logger.warning(
+                    "MC: rejecting burn-out override for regime '%s' "
+                    "(mean=%.2f, std=%.2f -- non-return-scale values detected, "
+                    "likely variable leak from burn-out multi-variable walk)",
+                    regime, params.get("mean", 0), params.get("std", 0),
+                )
+                continue
             if regime in distributions and params.get("n_obs", 0) >= 10:
                 old = distributions[regime]
                 distributions[regime] = RegimeDistribution(

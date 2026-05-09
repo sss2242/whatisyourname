@@ -907,6 +907,51 @@ class USEdgarClient:
             remaining = 10 - len(peers)
             peers.extend(broad_peers[:remaining])
 
+        # Fallback 3: Static peer map for major tickers whose SIC codes
+        # don't match their real competitors (e.g., AAPL SIC 3571 vs
+        # MSFT SIC 7372, GOOG SIC 7375).
+        if len(peers) < 3:
+            _STATIC_PEERS: dict[str, list[str]] = {
+                "AAPL": ["MSFT", "GOOG", "AMZN", "META", "NVDA"],
+                "MSFT": ["AAPL", "GOOG", "AMZN", "ORCL", "CRM"],
+                "GOOG": ["AAPL", "MSFT", "META", "AMZN", "NFLX"],
+                "GOOGL": ["AAPL", "MSFT", "META", "AMZN", "NFLX"],
+                "AMZN": ["AAPL", "MSFT", "GOOG", "WMT", "SHOP"],
+                "META": ["GOOG", "AAPL", "SNAP", "PINS", "MSFT"],
+                "NVDA": ["AMD", "INTC", "AAPL", "MSFT", "TSM"],
+                "TSLA": ["F", "GM", "RIVN", "NIO", "LCID"],
+                "NFLX": ["DIS", "WBD", "CMCSA", "PARA", "GOOG"],
+            }
+            static = _STATIC_PEERS.get(target_ticker, [])
+            if static:
+                _new = [p for p in static if p != target_ticker and p not in peers]
+                peers.extend(_new[:max(0, 5 - len(peers))])
+                logger.info(
+                    "Static peer map fallback for %s: %d peers added",
+                    target_ticker, len(_new),
+                )
+
+        # Fallback 4: yfinance sector peers
+        if len(peers) < 3:
+            try:
+                import yfinance as yf
+                _info = yf.Ticker(target_ticker).info or {}
+                _sector_key = _info.get("sectorKey", "")
+                if _sector_key:
+                    _sector_obj = yf.Sector(_sector_key)
+                    if hasattr(_sector_obj, "top_companies") and _sector_obj.top_companies is not None:
+                        _yf_peers = [
+                            str(t) for t in _sector_obj.top_companies.index
+                            if str(t).upper() != target_ticker and str(t) not in peers
+                        ][:10]
+                        peers.extend(_yf_peers[:max(0, 5 - len(peers))])
+                        logger.info(
+                            "yfinance sector fallback for %s: %d peers from sector=%s",
+                            target_ticker, len(_yf_peers), _sector_key,
+                        )
+            except Exception as exc:
+                logger.debug("yfinance peer fallback failed: %s", exc)
+
         logger.info(
             "SEC EDGAR peers for %s (SIC %s): %d returned",
             target_ticker, sic_4, len(peers),
