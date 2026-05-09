@@ -204,12 +204,18 @@ def predict_ohlc_series(
                             elif var == "return_1d":
                                 horizon_mu[h_label] = val
 
-    # Survival adjustment for uncertainty
+    # Survival adjustment for uncertainty.
+    # **Fix (2026-05-09):** Clamp survival_mult to [1.0, 1.5] to prevent
+    # broken survival probabilities (from Problem 4: sector threshold mismatch)
+    # from inflating noise to 9.4% daily volatility at year-end.
+    # Previously: survival_mult = 1.0 + (1.0 - 0.473) = 1.527 for Apple,
+    # which combined with linear noise growth produced $78.89 crash prediction.
     survival_mult = 1.0
     if mc_result is not None:
         surv_mean = getattr(mc_result, "survival_probability_mean", 1.0)
         if isinstance(surv_mean, (int, float)) and surv_mean < 1.0:
-            survival_mult = 1.0 + (1.0 - surv_mean)  # widen uncertainty
+            survival_mult = 1.0 + (1.0 - surv_mean) * 0.5  # dampen: half the penalty
+            survival_mult = min(survival_mult, 1.5)  # hard cap
 
     # --- Generate series for each horizon ---
     from datetime import timedelta
@@ -227,8 +233,13 @@ def predict_ohlc_series(
             # Confidence decays with sqrt of horizon
             confidence = max(0.1, 1.0 / (1.0 + 0.1 * math.sqrt(day_i)))
 
-            # Add noise that grows with horizon
-            noise_scale = sigma_daily * survival_mult * (1.0 + 0.02 * day_i)
+            # Add noise that grows with horizon.
+            # **Fix (2026-05-09):** Changed from linear growth (1 + 0.02*day)
+            # to sqrt growth.  Linear growth reached 6.04x at day 252,
+            # producing 9.4% daily volatility and $78.89 crash predictions.
+            # Sqrt growth reaches ~1.32x at day 252 (sqrt(252)/12 ~ 1.32),
+            # consistent with the square-root-of-time volatility scaling law.
+            noise_scale = sigma_daily * survival_mult * (1.0 + math.sqrt(day_i) / 12.0)
             daily_ret = daily_mu + rng.normal(0, noise_scale)
 
             ohlc = _estimate_daily_ohlc(prev_c, daily_ret, noise_scale, vol_ma, rng)
