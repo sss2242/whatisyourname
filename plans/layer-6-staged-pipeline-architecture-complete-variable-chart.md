@@ -1,4 +1,13 @@
-# Layer 6: Staged Pipeline Architecture -- Complete Variable Chart (v2)
+# Layer 6: Staged Pipeline Architecture -- Complete Variable Chart (v3)
+
+**v3 update (2026-05-09):**
+- **Stage 2 sub-stages (2026-05-02 to 2026-05-08):** Added `stage2_preprocessing.py` (2.1 frequency separation, 2.2 data reconciliation) and `stage2_freq_pipeline.py` (2.0 resample prep, 2.A annual, 2.Q quarterly, 2.M monthly, 2.W weekly, 2.D daily, 2.F fusion + ratio forward-fill). Total: 9 new sub-stages running BEFORE Stage 3.
+- **Stage 1 split (2026-05-03):** Split monolithic Stage 1 into 6-8 sub-stages with per-sub-stage checkpoints for finer-grained resumability.
+- **HF sub-stage split (2026-05-06):** Stage 7.5 split into 7.5.1 (base + scorecard), 7.5.2 (advanced methods), 7.5.3 (multi-freq variants), 7.5.4 (fusion).
+- **Self-restart pattern (2026-05-03):** `run_backtest_staged.py` and `run_lean_backtest.py` now support self-restarting sub-stage execution for cloud environments with process limits.
+- **Per-sub-stage data snapshots (2026-05-06):** `PipelineState.save_snapshot()` copies cache + state to `snapshots/{sub_id}/` directory for post-hoc inspection.
+- **True terminal separation (2026-05-06):** Staged backtest compiler runs each sub-stage in a separate `subprocess.run()` with terminal isolation.
+- **Total sub-stages: 44** (was 35): +9 from Stage 2, +4 from HF split, -4 from deduplication with Stage 7.4 (which now skips if Stage 2 already ran).
 
 Every variable and sub-stage in the 6 Layer 6 modules. This layer decomposes the monolithic pipeline into per-model sub-stages with checkpoint save/resume via `PipelineState`. It produces no new analytical variables -- it orchestrates execution of Layers 1-5 and persists their state to disk.
 

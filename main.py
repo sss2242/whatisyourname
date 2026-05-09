@@ -1704,6 +1704,7 @@ Non-interactive examples:
         cache, fh_result = compute_financial_health(
             cache,
             hierarchy_weights=weights,
+            sector=target_profile.get("sector", ""),
         )
         logger.info(
             "Financial health: composite=%.1f (%s), %d columns added",

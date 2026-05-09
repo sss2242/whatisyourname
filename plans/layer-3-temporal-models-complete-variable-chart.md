@@ -1,4 +1,13 @@
-# Layer 3: Temporal Models -- Complete Variable Chart
+# Layer 3: Temporal Models -- Complete Variable Chart (v2)
+
+**v2 update (2026-05-09):**
+- **Beyond Bands distributional forecasting (2026-05-07):** 6 new methods added to forecasting cascade via `fit_distributional()`: Distributional Random Forest, Quantile Regression Forest, Conformalized Quantile Regression, NGBoost, GAMLSS, Bayesian Neural Network. MC barriers passed through `run_simulation()`.
+- **Confidence band inversion fix (2026-05-06):** 6 expert uncertainty methods: ConformalPIDCalibrator with PID alpha tracking, IV blend weight calibration, width caps at 3x base, skew-aware asymmetric widening, regime-conditional scaling, event proximity widening.
+- **Signal IC 287x speedup (2026-05-06):** Vectorized Spearman IC via `scipy.stats.spearmanr` on full matrix.
+- **MC burn-out contamination fix (2026-05-09):** `ExponentialGradientWeightLearner.get_regime_distributions()` now filters to return-scale values only (`|value|<1.0`). MC `run_monte_carlo()` rejects burn-out distributions with implausible scale.
+- **Sector-aware MC thresholds (2026-05-09):** `SECTOR_SURVIVAL_OVERRIDES` + `get_sector_aware_thresholds()` propagate sector-specific survival triggers to MC simulation.
+- **OHLC noise fix (2026-05-09):** Noise growth changed from linear `(1+0.02*day)` to sqrt `(1+sqrt(day)/12)`. `survival_mult` clamped to [1.0, 1.5] with 0.5x damping.
+- **Prediction accuracy (2026-05-06):** Technical Alpha mask moved to report-only (no longer zeros out OHLC predictions in aggregator).
 
 Every variable produced by the 25 Layer 3 modules in `operator1/models/`. These are the statistical and ML models that consume the ~372-column enriched cache and produce forecasts, uncertainty bands, regime classifications, and ensemble predictions. Most outputs are result objects stored in the profile, not cache columns.
 

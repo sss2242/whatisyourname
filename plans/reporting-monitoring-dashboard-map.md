@@ -1,4 +1,10 @@
-# Reporting, Monitoring & Dashboard Map (2026-04-17)
+# Reporting, Monitoring & Dashboard Map (2026-05-09)
+
+**Changes since 2026-04-17:**
+- Report generator now renders Beyond Bands scenario decomposition, ensemble distress, CVaR composite, DuPont decomposition, Kelly sizing, cross-frequency momentum sections.
+- HF sub-stage 7.5 split into 7.5.1-7.5.4 for finer timeout control.
+- Per-sub-stage data snapshots added to Stage Runner for inspection.
+- Signal IC computation vectorized (270s -> 1s, 287x speedup).
 
 Complete map of all modules in the output/presentation layer: report generation (4 modules, ~6,850 lines), monitoring (3 modules, ~3,100 lines), and dashboard (1 module, ~1,850 lines). Covers inputs, outputs, wiring status, and current state.
 

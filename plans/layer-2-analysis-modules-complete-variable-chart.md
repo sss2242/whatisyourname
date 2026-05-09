@@ -1,4 +1,11 @@
-# Layer 2: Analysis Modules -- Complete Variable Chart (v2)
+# Layer 2: Analysis Modules -- Complete Variable Chart (v3)
+
+**v3 update (2026-05-09):**
+- **Frequency-aware survival mode:** `compute_company_survival_flag(cache, freq="D")` accepts frequency parameter. Survival thresholds scale by frequency (e.g., fcf_yield at Q frequency uses quarterly FCF, not daily-interpolated).
+- **Frequency-aware financial health:** `compute_financial_health(cache, freq="D", sector="")` accepts both frequency and sector parameters. Altman Z components x3 (EBIT/TA) and x5 (Revenue/TA) use annualized flow values at Q/A/S. Liquidity runway uses frequency-appropriate monthly burn rate.
+- **Sector-aware FH baseline floors (2026-05-09):** Technology companies with >30% gross margin + positive FCF get profitability floor=40, solvency floor=35. Financial services get solvency floor=40, liquidity floor=35. Communication services get profitability floor=35, solvency floor=30. Prevents Apple from scoring 28/100 "Weak".
+- **Sector-aware MC survival thresholds (2026-05-09):** `SECTOR_SURVIVAL_OVERRIDES` in `monte_carlo.py` adjusts survival triggers per sector (technology: current_ratio<0.7 instead of <1.0, D/E<5.0 instead of <3.0). Wired through `stage5_forward.py` via `get_sector_aware_thresholds()`.
+- **MC burn-out scale guard (2026-05-09):** `get_regime_distributions()` filters to return-scale values only (`|value|<1.0`). `run_monte_carlo()` rejects burn-out distributions with `|mean|>1.0` or `std>1.0`. Prevents billion-scale financial values from contaminating MC path generation.
 
 Every variable produced by the 10 Layer 2 modules in `operator1/analysis/` + the Financial Health module in `operator1/models/`. These modules produce survival flags, regime classifications, protection assessments, adaptive calibration, and health scores that control how all downstream temporal models behave.
 

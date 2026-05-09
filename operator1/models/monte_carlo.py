@@ -154,6 +154,64 @@ DEFAULT_SURVIVAL_THRESHOLDS: dict[str, tuple[str, float]] = {
     "drawdown_252d": ("lt", -0.40),
 }
 
+# Sector-aware survival threshold overrides (2026-05-09).
+# Technology companies (Apple, Google, etc.) structurally operate with
+# current_ratio < 1.0 and high D/E due to stock buybacks + negative
+# working capital models.  Using the generic current_ratio < 1.0 threshold
+# causes Apple to show 0% 1-day survival (current_ratio = 0.92, already
+# breached at t=0).  These overrides match the sector-aware thresholds
+# added to survival_mode.py but were never propagated to MC.
+SECTOR_SURVIVAL_OVERRIDES: dict[str, dict[str, tuple[str, float]]] = {
+    "technology": {
+        "current_ratio": ("lt", 0.7),
+        "debt_to_equity_abs": ("gt", 5.0),
+    },
+    "consumer cyclical": {
+        "current_ratio": ("lt", 0.8),
+    },
+    "financial services": {
+        "current_ratio": ("lt", 0.6),
+        "debt_to_equity_abs": ("gt", 10.0),
+    },
+    "communication services": {
+        "current_ratio": ("lt", 0.8),
+        "debt_to_equity_abs": ("gt", 5.0),
+    },
+}
+
+
+def get_sector_aware_thresholds(
+    sector: str | None = None,
+    base_thresholds: dict[str, tuple[str, float]] | None = None,
+) -> dict[str, tuple[str, float]]:
+    """Return survival thresholds adjusted for sector-specific norms.
+
+    Parameters
+    ----------
+    sector:
+        Company sector string (e.g. "Technology", "Financial Services").
+        Case-insensitive matching.
+    base_thresholds:
+        Base thresholds to start from.  Defaults to DEFAULT_SURVIVAL_THRESHOLDS.
+
+    Returns
+    -------
+    Merged thresholds dict with sector overrides applied on top of base.
+    """
+    thresholds = dict(base_thresholds or DEFAULT_SURVIVAL_THRESHOLDS)
+    if not sector:
+        return thresholds
+    sector_lower = sector.lower().strip()
+    for sector_key, overrides in SECTOR_SURVIVAL_OVERRIDES.items():
+        if sector_key in sector_lower:
+            thresholds.update(overrides)
+            logger.info(
+                "MC: sector-aware thresholds applied for '%s': %s",
+                sector, {k: v for k, v in overrides.items()},
+            )
+            break
+    return thresholds
+
 # Importance sampling tilt factor: how much to shift the distribution
 # mean toward the danger zone for tail sampling.
 DEFAULT_IS_TILT: float = 1.5
@@ -1368,8 +1426,18 @@ def run_monte_carlo(
     # Burn-out distributions are model-weighted (incorporating ensemble
     # quality) rather than raw sample statistics, producing more realistic
     # tail behavior for survival probability estimation.
+    #
+    # **Scale guard (2026-05-09):** Burn-out distributions can be
+    # contaminated with billion-scale values when the ExponentialGradient
+    # learner mixes all variable scales (cash=$30B, return_1d=0.001).
+    # Reject distributions where |mean| > 1.0 or std > 1.0 -- these
+    # are clearly not daily return distributions (daily returns have
+    # mean ~0 and std ~0.01-0.05).
+    _MAX_RETURN_MEAN = 1.0   # daily returns never exceed |1.0|
+    _MAX_RETURN_STD = 1.0    # daily return std never exceeds 1.0
     if burnout_distributions:
         _n_overrides = 0
+        _n_rejected = 0
         for regime, params in burnout_distributions.items():
             # Scale validation: reject distributions with non-return-scale
             # values (e.g., mean=1B from cash_and_equivalents leak).
@@ -1385,24 +1453,37 @@ def run_monte_carlo(
                 )
                 continue
             if regime in distributions and params.get("n_obs", 0) >= 10:
+                _bo_mean = params["mean"]
+                _bo_std = params["std"]
+                # Reject distributions that are clearly not return-scale
+                if abs(_bo_mean) > _MAX_RETURN_MEAN or _bo_std > _MAX_RETURN_STD:
+                    _n_rejected += 1
+                    logger.warning(
+                        "MC: REJECTING burn-out override for regime '%s': "
+                        "mean=%.2e, std=%.2e (not return-scale, likely "
+                        "contaminated with financial statement values)",
+                        regime, _bo_mean, _bo_std,
+                    )
+                    continue
                 old = distributions[regime]
                 distributions[regime] = RegimeDistribution(
                     regime_label=regime,
-                    mean=params["mean"],
-                    std=params["std"],
+                    mean=_bo_mean,
+                    std=max(_bo_std, 1e-6),
                     n_obs=params["n_obs"],
                 )
                 _n_overrides += 1
                 logger.info(
                     "MC: burn-out override for regime '%s': "
                     "mean %.6f->%.6f, std %.6f->%.6f",
-                    regime, old.mean, params["mean"],
-                    old.std, params["std"],
+                    regime, old.mean, _bo_mean,
+                    old.std, _bo_std,
                 )
-        if _n_overrides > 0:
+        if _n_overrides > 0 or _n_rejected > 0:
             logger.info(
-                "MC: %d/%d regime distributions overridden by burn-out calibration",
-                _n_overrides, len(distributions),
+                "MC: %d/%d regime distributions overridden by burn-out calibration"
+                " (%d rejected as non-return-scale)",
+                _n_overrides, len(distributions), _n_rejected,
             )
 
     result.regime_distributions = distributions

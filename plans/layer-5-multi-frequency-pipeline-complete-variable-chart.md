@@ -1,4 +1,13 @@
-# Layer 5: Multi-Frequency Pipeline -- Complete Variable Chart (v2)
+# Layer 5: Multi-Frequency Pipeline -- Complete Variable Chart (v3)
+
+**v3 update (2026-05-09):**
+- **Frequency-first architecture (2026-05-07):** MF pipeline moved from Stage 7.4 (after temporal models) to Stage 2 (before temporal models). This is the single biggest architectural change since the staged pipeline. Each frequency runs its own `compute_derived_variables()` + `compute_company_survival_flag()` + `compute_financial_health()` + `detect_regimes_and_breaks()` + `run_forecasting()` + `run_monte_carlo()` using frequency-aware formulas. Fusion forward-fills correct Q/A-computed ratios (PE, EV/EBITDA, fcf_yield, P/S, ROA, ROE, eps, CCC, etc.) into the daily cache so downstream Stage 3+ temporal models see correct values.
+- **Per-frequency filing decomposition (2026-05-05):** The frequency separator (Step 3d) preserves per-frequency raw filing groups (`income_freq_groups`, `balance_freq_groups`, `cashflow_freq_groups`). Stage 2 MF pipeline uses actual Q/A filing data per frequency instead of resampling the daily cache, avoiding interpolation artifacts.
+- **Frequency-aware formulas (2026-05-07):** `freq_constants.py` provides `steps_per_year(freq)` returning 252/52/12/4/2/1. Volatility annualization uses `T^H` (Hurst-corrected) instead of `sqrt(T)`. Altman Z components x3/x5 use annualized flow values.
+- **Per-frequency survival criteria (2026-05-08):** Survival triggers are frequency-appropriate: at Q, `fcf_yield` is quarterly FCF / market_cap (not daily-interpolated). Post-fusion survival re-run uses "Q" trigger set.
+- **Silent degradation exposure (2026-05-05):** When raw filing DFs are empty, the MF pipeline now logs explicit warnings about OHLCV-only quality instead of silently using resampled daily cache.
+- **Semi-annual pipeline (2026-05-08):** Both Q and S frequencies detected and run when both filing types exist in freq_groups.
+- **Thread-safe frequency context (2026-05-08):** Frequency context passing between MF sub-stages made thread-safe for parallel execution.
 
 Every variable produced by the 3 Layer 5 modules. This layer runs the full analytical pipeline at 5 frequencies (Annual -> Daily) with cascading context, then fuses results via a 13-method architecture. All outputs are result objects stored in `profile["multi_frequency"]` -- no direct cache columns added to the daily cache.
 

@@ -1,4 +1,4 @@
-# Middleware Status Review (2026-04-17)
+# Middleware Status Review (2026-05-09)
 
 Status of the data processing pipeline between wrapper outputs and analytical models.
 Covers: Canonical Translator, Data Reconciliation, Cache Builder, Frequency Interpolator, Estimator, and Survival Timeline.
@@ -481,7 +481,10 @@ Post-cache validation layer:
 | Stage 6 (Ensemble) | 414 | WORKING | None. 11 sub-stages: transformer, PF, conformal, DTW, aggregation, SHAP, Sobol, etc. |
 | Stage 7 (Integration) | 371 | WORKING | None. 5 sub-stages: USS, retro-cal, diagnostics, multi-freq, HF |
 | Product Metrics | 289 | WORKING | None. 9 quantitative metrics from segment revenue data |
-| **Total** | **15,149** | **All 28 operational** | **0 blocking issues** |
+| Frequency Separator | 903 | WORKING | **UPGRADED (2026-05-02)**: Bayesian detection + Chow-Lin + Denton disaggregation. Revenue-ratio-scaled backfill. |
+| Stage 2 Freq Pipeline | 235 | WORKING | **NEW (2026-05-07)**: Frequency-first architecture. Each freq runs own pipeline. Fusion forward-fills Q/A ratios. |
+| freq_constants.py | ~50 | WORKING | **NEW (2026-05-08)**: `steps_per_year(freq)` replacing hardcoded 252 across 7+ modules. |
+| **Total** | **~16,337** | **All 31 operational** | **0 blocking issues** |
 
 ---
 

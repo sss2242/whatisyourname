@@ -910,6 +910,7 @@ def compute_financial_health(
     cache: pd.DataFrame,
     hierarchy_weights: dict[str, float] | None = None,
     freq: str = "D",
+    sector: str = "",
 ) -> tuple[pd.DataFrame, FinancialHealthResult]:
     """Compute financial health scores and inject into the cache.
 
@@ -929,6 +930,8 @@ def compute_financial_health(
         distorted by flow-variable interpolation.  Altman Z components
         x3 (EBIT/TA) and x5 (Revenue/TA) are also unreliable at D.
         At Q/A/S, all tiers and Altman Z components are fully valid.
+    sector : str
+        Company sector for sector-aware scoring adjustments.
 
     Returns
     -------
@@ -1053,6 +1056,102 @@ def compute_financial_health(
             cash_ratio_to_debt = (cash / debt.clip(lower=1)).clip(upper=3.0)
             bonus = (cash_ratio_to_debt - 1.0).clip(lower=0) * 4.0 * net_cash_positive.astype(float)
             composite = composite + bonus.clip(upper=8.0)
+
+    # ------------------------------------------------------------------
+    # Adjustment 3: Sector-aware baseline floors (2026-05-09 fix)
+    # ------------------------------------------------------------------
+    # Technology companies (Apple, Google, Microsoft) structurally operate
+    # with current_ratio < 1.0 (negative working capital model), high D/E
+    # (stock buybacks funded by cheap debt), and thin net margins relative
+    # to gross margins (massive R&D spend).  The expanding percentile rank
+    # self-referentially scores these as "bad" because the company has
+    # always operated this way.
+    #
+    # Fix: when a sector has known structural norms that differ from
+    # textbook ideals, apply a floor boost so fundamentally healthy
+    # mega-caps don't score 28/100 ("Weak").
+    #
+    # The boost is proportional to evidence of health (gross margin > 30%
+    # and positive FCF) to avoid rescuing truly distressed tech companies.
+    _SECTOR_FLOORS: dict[str, dict[str, float]] = {
+        "technology": {
+            "profitability_floor": 40.0,  # tech with high gross margins
+            "solvency_floor": 35.0,       # tech uses leverage for buybacks
+            "gross_margin_gate": 0.30,     # only apply if gross margin > 30%
+        },
+        "financial services": {
+            "solvency_floor": 40.0,       # banks are inherently leveraged
+            "liquidity_floor": 35.0,      # banks operate with low current ratio
+            "gross_margin_gate": 0.0,     # not applicable for banks
+        },
+        "communication services": {
+            "profitability_floor": 35.0,
+            "solvency_floor": 30.0,
+            "gross_margin_gate": 0.25,
+        },
+    }
+    sector_lower = sector.lower().strip() if sector else ""
+    _sector_config = None
+    for _sk, _sv in _SECTOR_FLOORS.items():
+        if _sk in sector_lower:
+            _sector_config = _sv
+            break
+
+    if _sector_config is not None:
+        _gm_gate = _sector_config.get("gross_margin_gate", 0.30)
+        _has_gm = "gross_margin" in cache.columns and cache["gross_margin"].notna().any()
+        _gm_ok = True  # default pass if no margin data
+        if _has_gm and _gm_gate > 0:
+            _latest_gm = float(cache["gross_margin"].dropna().iloc[-1]) if cache["gross_margin"].notna().any() else 0
+            _gm_ok = _latest_gm >= _gm_gate
+        _has_positive_fcf = (
+            "free_cash_flow" in cache.columns
+            and cache["free_cash_flow"].notna().any()
+            and float(cache["free_cash_flow"].dropna().iloc[-1]) > 0
+        )
+
+        if _gm_ok:
+            _boost_applied = False
+            # Profitability floor: tech with 77% gross margins should not score 11/100
+            _prof_floor = _sector_config.get("profitability_floor", 0)
+            if _prof_floor > 0 and "tier4" in tier_scores:
+                _prof = tier_scores["tier4"]
+                _prof_deficit = (_prof_floor - _prof).clip(lower=0)
+                _prof_boost = _prof_deficit * weights.get("tier4", 0.2)
+                composite = composite + _prof_boost
+                if _prof_deficit.max() > 0:
+                    _boost_applied = True
+
+            # Solvency floor: buyback-funded leverage should not dominate
+            _solv_floor = _sector_config.get("solvency_floor", 0)
+            if _solv_floor > 0 and "tier2" in tier_scores:
+                _solv = tier_scores["tier2"]
+                _solv_deficit = (_solv_floor - _solv).clip(lower=0)
+                _solv_boost = _solv_deficit * weights.get("tier2", 0.2)
+                composite = composite + _solv_boost
+                if _solv_deficit.max() > 0:
+                    _boost_applied = True
+
+            # Liquidity floor
+            _liq_floor = _sector_config.get("liquidity_floor", 0)
+            if _liq_floor > 0 and "tier1" in tier_scores:
+                _liq = tier_scores["tier1"]
+                _liq_deficit = (_liq_floor - _liq).clip(lower=0)
+                _liq_boost = _liq_deficit * weights.get("tier1", 0.2)
+                composite = composite + _liq_boost
+                if _liq_deficit.max() > 0:
+                    _boost_applied = True
+
+            # Extra bonus for positive FCF (confirms the model is working)
+            if _has_positive_fcf and _boost_applied:
+                composite = composite + 5.0
+
+            if _boost_applied:
+                logger.info(
+                    "FH sector adjustment (%s): composite boosted "
+                    "(gross_margin_ok=%s, positive_fcf=%s)",
+                    sector, _gm_ok, _has_positive_fcf,
+                )
 
     composite = composite.clip(0, 100)
     cache["fh_composite_score"] = composite
