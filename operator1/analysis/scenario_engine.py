@@ -457,8 +457,8 @@ def compute_reverse_stress_test(
     # Default thresholds
     if thresholds is None:
         try:
-            from operator1.analysis.survival_mode import _load_company_thresholds
-            thresholds = _load_company_thresholds()
+            from operator1.analysis.threshold_registry import get_registry
+            thresholds = get_registry().survival_dict
         except Exception:
             thresholds = {"fcf_yield_lt": 0.0, "debt_to_equity_abs_gt": 3.0, "current_ratio_lt": 1.0}
 

@@ -166,7 +166,8 @@ def run_5_4_monte_carlo(state: PipelineState) -> None:
     cache = state.cache
 
     try:
-        from operator1.models.monte_carlo import run_monte_carlo, get_sector_aware_thresholds
+        from operator1.models.monte_carlo import run_monte_carlo
+        from operator1.analysis.threshold_registry import get_registry
         _mc_returns = "equity_change_rate" if state.is_private else "return_1d"
         _mc_thresholds = None
         if state.adaptive_thresholds is not None and getattr(state.adaptive_thresholds, "adapted", False):
@@ -175,14 +176,11 @@ def run_5_4_monte_carlo(state: PipelineState) -> None:
                 _mc_thresholds = threshold_set_to_mc_dict(state.adaptive_thresholds)
             except Exception:
                 pass
-        # Apply sector-aware threshold overrides (2026-05-09 fix).
-        # Without this, technology companies like Apple (current_ratio=0.92)
-        # show 0% 1-day survival because the generic threshold is 1.0.
-        _sector = state.target_profile.get("sector", "") if state.target_profile else ""
-        _mc_thresholds = get_sector_aware_thresholds(
-            sector=_sector,
-            base_thresholds=_mc_thresholds,
-        )
+        # Use unified ThresholdRegistry for MC thresholds (sector-aware).
+        # Registry was initialized in main.py after adaptive calibration with
+        # sector overrides already merged. Falls back to defaults if no registry.
+        if _mc_thresholds is None:
+            _mc_thresholds = get_registry().mc_dict
         _mc_n = (
             state.adaptive_model_params.mc_n_paths
             if state.adaptive_model_params is not None
