@@ -239,6 +239,20 @@ def run_single_frequency_pipeline(
             from operator1.analysis.hierarchy_weights import compute_hierarchy_weights
             cache["company_survival_mode_flag"] = compute_company_survival_flag(cache, freq=freq)
             cache["survival_probability"] = compute_survival_probability(cache)
+            # At Q/A/S frequencies, use discrete-time survival instead of Cox PH
+            # (continuous-time Cox breaks down with <10 observations)
+            if freq in ("Q", "A", "S"):
+                try:
+                    from operator1.analysis.survival_mode import compute_discrete_time_survival
+                    _dts = compute_discrete_time_survival(cache, freq=freq)
+                    if _dts.notna().any():
+                        cache["discrete_survival_score"] = _dts
+                        # Blend with sigmoid probability
+                        cache["survival_probability"] = (
+                            0.5 * cache["survival_probability"] + 0.5 * _dts
+                        ).clip(0, 1)
+                except Exception:
+                    pass
             cache = compute_hierarchy_weights(cache)
             if "survival_probability" in cache.columns:
                 sp = cache["survival_probability"].dropna()

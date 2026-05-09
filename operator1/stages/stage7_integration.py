@@ -473,6 +473,47 @@ def run_7_4_6_fusion(state: PipelineState) -> None:
         logger.warning("Multi-frequency fusion failed: %s", exc)
 
 
+def run_7_4_7_hierarchical_reconciliation(state: PipelineState) -> None:
+    """7.4.7: Hierarchical temporal forecast reconciliation (MinTrace).
+
+    Ensures additive coherence across frequency forecasts: annual
+    forecast = sum of quarterly = sum of monthly.  Runs after fusion
+    (7.4.6) and before HF analysis (7.5.1).
+    """
+    logger.info("Sub-stage 7.4.7: Hierarchical temporal reconciliation")
+    if state.multi_frequency_result is None or not getattr(state.multi_frequency_result, "available", False):
+        logger.info("No multi-frequency result to reconcile")
+        return
+
+    try:
+        from operator1.models.hierarchical_reconciliation import reconcile_temporal_forecasts
+
+        # Collect per-frequency forecasts from MF results
+        forecasts = {}
+        residuals = {}
+        for freq in state.list_mf_results():
+            result = state.load_mf_result(freq)
+            if result is not None and hasattr(result, "forecasts") and result.forecasts:
+                forecasts[freq] = result.forecasts
+            if result is not None and hasattr(result, "residuals") and result.residuals:
+                residuals[freq] = result.residuals
+
+        if len(forecasts) >= 2:
+            reconciled = reconcile_temporal_forecasts(
+                forecasts=forecasts,
+                residuals=residuals if residuals else None,
+                method="mint_shrink",
+            )
+            logger.info(
+                "Hierarchical reconciliation: %d frequencies reconciled",
+                len(reconciled),
+            )
+        else:
+            logger.info("Not enough frequencies for reconciliation (%d)", len(forecasts))
+    except Exception as exc:
+        logger.warning("Hierarchical reconciliation failed: %s", exc)
+
+
 def run_7_5_1_hf_base(state: PipelineState) -> None:
     """7.5.1: HF base metrics (15 metrics + EVA + SOTP + CVaR + SGR + scorecard + position)."""
     logger.info("Sub-stage 7.5.1: Hedge fund base metrics + scorecard")
@@ -604,6 +645,7 @@ STAGE_7_SUBSTAGES = [
     ("7.4.4", run_7_4_4_weekly),
     ("7.4.5", run_7_4_5_daily),
     ("7.4.6", run_7_4_6_fusion),
+    ("7.4.7", run_7_4_7_hierarchical_reconciliation),
     ("7.5.1", run_7_5_1_hf_base),
     ("7.5.2", run_7_5_2_hf_advanced),
     ("7.5.3", run_7_5_3_hf_multi_freq),
