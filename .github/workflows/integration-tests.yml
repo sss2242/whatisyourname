@@ -1,0 +1,16 @@
+name: Integration Tests
+on: [pull_request]
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install Stage 1+2 dependencies
+        run: |
+          pip install --timeout 300 -r requirements/stage1-core.txt
+          pip install --timeout 300 -r requirements/stage2-ml.txt
+      - name: Run integration tests (synthetic data only)
+        run: |
+          pytest tests/test_integration_*.py -v --tb=short -x \
+            -k "Synthetic or threshold or serialization or degradation or regression"

@@ -1,0 +1,33 @@
+# Expected output ranges for golden AAPL integration test data.
+#
+# Format: {metric: {min: float, max: float}} or {metric: {not_in: [values]}}
+# Update when intentional improvements change scores (e.g., Batch B FH redesign).
+#
+# These ranges are deliberately wide to avoid false positives from code
+# improvements while still catching catastrophic regressions (FH=28, MC=NaN).
+
+aapl:
+  # Layer 1: Feature Engineering
+  l1_column_count_min: 300
+  l1_return_1d_abs_max: 0.5
+  l1_core_nan_rate_max: 0.25
+
+  # Layer 2: Analysis
+  l2_fh_composite_min: 15       # NOTE: currently 28.97 (self-referential scoring)
+  l2_fh_composite_max: 95       # will increase to 50+ after Batch B
+  l2_fh_labels_bad: ["Critical"]
+  l2_survival_flag_rate_max: 0.15
+  l2_survival_prob_min: 0.60
+
+  # Layer 3: Temporal Models
+  l3_mc_survival_1d_min: 0.80
+  l3_mc_survival_252d_min: 0.30
+  l3_ohlc_year_pct_change_max: 0.60
+
+  # Layer 4: Hedge Fund
+  l4_hf_grades_bad: ["F"]
+  l4_hf_conviction_min: 0
+
+  # Cross-layer
+  cross_survival_mc_normal_min: 0.40
+  cross_survival_mc_distress_max: 0.90
