@@ -1,4 +1,6 @@
-# Layer 1: Feature Engineering -- Complete Variable Chart (v3)
+# Layer 1: Feature Engineering -- Complete Variable Chart (v4)
+
+**v4 update (2026-05-09):** Added frequency-aware formula support across derived_variables, survival_mode, and financial_health. `freq_constants.py` replaces hardcoded 252 in volatility annualization, Altman Z, and runway computation. `compute_derived_variables(cache, freq="D")` now accepts frequency parameter. All 24 computation stages scale window sizes and annualization factors by `steps_per_year(freq)`. Sector-aware financial health baseline floors added for technology, financial services, and communication services sectors (gated by gross margin + positive FCF).
 
 Every variable produced by the 21 Layer 1 modules (14 from analysis-models-map + 4 additional feature modules found in source code + 3 new modules from PR #1), with formula, input dependencies, tier classification, and downstream consumers.
 

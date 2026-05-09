@@ -1,8 +1,20 @@
-# Analysis Models Map (2026-05-02)
+# Analysis Models Map (2026-05-09)
 
-Comprehensive reference for all 78 analytical modules in Operator 1. Each module documented with purpose, mathematical basis, inputs, outputs, pipeline wiring, profile/report integration, dependencies, and current status.
+Comprehensive reference for all 78+ analytical modules in Operator 1. Each module documented with purpose, mathematical basis, inputs, outputs, pipeline wiring, profile/report integration, dependencies, and current status.
 
-Total: ~56,000 lines of analytical code across 6 layers.
+Total: ~118,000 lines of Python code across 6 layers + orchestration.
+
+**Changes since 2026-05-02:**
+- **Frequency-first pipeline (Stage 2):** Multi-frequency pipeline moved BEFORE temporal models. Each frequency (A/Q/S/M/W/D) runs its own full pipeline. Fusion forward-fills correct Q/A ratios into daily cache. Fixes distorted PE/EV/fcf_yield from flow-variable interpolation.
+- **Frequency-aware formulas:** `derived_variables.py`, `survival_mode.py`, `financial_health.py` accept `freq` parameter. `freq_constants.py` provides `steps_per_year(freq)` replacing hardcoded 252.
+- **Beyond Bands distributional forecasting:** 6 methods (DRF, QRF, CQR, NGBoost, GAMLSS, BNN) added to forecasting cascade via `fit_distributional()`.
+- **HF 30-method upgrade:** Expanded from 15 to 30+ methods in 9 phases. Split sub-stage 7.5 into 7.5.1-7.5.4. Multi-frequency HF metrics. Data sufficiency validation.
+- **Confidence band inversion fix:** 6 expert uncertainty methods (PID calibrator, IV blend, width caps, skew-aware widening, regime scaling, event proximity).
+- **Signal IC 287x speedup:** Vectorized Spearman IC.
+- **shares_outstanding/market_cap injection:** From profile dict into cache.
+- **Frequency separator upgrade:** Bayesian detection + Chow-Lin + Denton disaggregation.
+- **4 cascading backtest bug fixes (2026-05-09):** MC burn-out contamination filter, sector-aware MC survival thresholds, OHLC sqrt noise growth, sector-aware FH baseline floors.
+- **30+ deep scan bug fixes:** Forward pass KeyError, pickle serialization, CopulaResult mismatches, profile defaults, balance field gaps, NameError bugs.
 
 ---
 

@@ -1,4 +1,9 @@
-# Wrappers Status Review (2026-04-17)
+# Wrappers Status Review (2026-05-09)
+
+**Changes since 2026-04-17:**
+- **shares_outstanding injection (2026-05-07):** Profile dict `shares_outstanding` now injected into cache. `market_cap = close * shares_outstanding` computed when missing. Fixes PE, EV, fcf_yield all being NaN.
+- **CompanyFacts fallback expanded (2026-05-02):** SEC EDGAR `companyfacts` fallback now includes `shares_outstanding`, `current_liabilities`, and additional balance sheet fields.
+- **SEC EDGAR rate limiting (2026-05-06):** Peer discovery now respects 429 rate limits with exponential backoff.
 
 Current state of all Tier 1 and Tier 2 market wrappers based on code review.
 

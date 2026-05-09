@@ -1,4 +1,11 @@
-# Layer 4: Hedge Fund Analysis -- Complete Variable Chart (v2)
+# Layer 4: Hedge Fund Analysis -- Complete Variable Chart (v3)
+
+**v3 update (2026-05-09):**
+- **30-method upgrade (2026-05-06):** Expanded from 19 to 30+ fields in `AdvancedMethodsResult`. 9-phase implementation: (P1) Piotroski F-Score, balance sheet velocity, earnings persistence, forensic cashflow, OU mean reversion, accruals rank, Altman Z''. (P2) GARCH vol term structure, insider alignment, capital cycle, earnings torpedo, VRP proxy. (P3) Fama-French alpha stub, implied cost of capital, Merton default, cross-asset regime.
+- **Multi-frequency HF metrics (2026-05-06):** Momentum, DCF, and Leverage Stress now computed at Q and A frequencies and reconciled.
+- **HF data sufficiency validation (2026-05-06):** `_assess_data_readiness()` checks minimum filing count before computing HF metrics, preventing misleading F/D grades from insufficient data.
+- **Sub-stage split (2026-05-06):** HF 7.5 split into 7.5.1 (base + scorecard), 7.5.2 (advanced methods), 7.5.3 (multi-freq variants), 7.5.4 (fusion). Each with independent timeout (60-180s).
+- **Price momentum fix (2026-05-02):** HF position engine now includes 63-day price momentum to prevent fighting strong trends.
 
 Every variable produced by the 20 Layer 4 modules in `operator1/hedge_fund/`. This is a parallel analytical track that answers "Can I make money on this, when, and how much?" Primary data source: raw quarterly statement DataFrames (8-24 rows), NOT the 504-row daily cache. All outputs are result objects stored in `profile["hedge_fund"]` -- no cache columns.
 
