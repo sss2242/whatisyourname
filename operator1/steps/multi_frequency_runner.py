@@ -188,6 +188,12 @@ def run_single_frequency_pipeline(
     freq = resampled.frequency
     freq_label = resampled.label
 
+    # Set the thread-local frequency context so all downstream models
+    # (via get_periods_per_year(), get_vol_annualization(), etc.) use
+    # the correct frequency-specific constants automatically.
+    from operator1.freq_constants import set_freq as _set_freq
+    _set_freq(freq)
+
     _data_source = getattr(resampled, "data_source", "unknown")
     _is_degraded = _data_source == "resampled_daily" and freq != "D"
 
