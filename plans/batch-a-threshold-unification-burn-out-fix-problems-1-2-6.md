@@ -2,6 +2,8 @@
 
 *Problems 1 (threshold fragmentation), 2 (forward pass scale mixing), 6 (burn-out contamination)*
 
+*Updated 2026-05-09 after merging PRs #1-#5*
+
 ## Current State
 
 Three interconnected bugs share a root cause: **modules that should communicate through structured contracts instead pass raw values through untyped channels.**
@@ -11,6 +13,17 @@ Three interconnected bugs share a root cause: **modules that should communicate 
 1. Survival thresholds exist in 6 places that can disagree
 2. The burn-out weight learner mixes $30B cash with 0.001 returns in one list
 3. Contaminated distributions flow from burn-out to MC, producing NaN/Inf
+
+### What's already been fixed (PRs #3 and #5, now merged)
+
+**Problem 2/6 partially fixed:** PR #5 (freq-aware models) upgraded `ExponentialGradientWeightLearner` to store entries as `{"variable": var_name, "actual": actual}` dicts and added a `variable` parameter to `get_regime_distributions(variable="return_1d")` for per-variable filtering. PR #3 added a `|value| < 1.0` scale filter as fallback for old-format entries.
+
+**Problem 1 partially patched:** PR #3 added `SECTOR_SURVIVAL_OVERRIDES` dict and `get_sector_aware_thresholds()` in `monte_carlo.py`. PR #2 wired 3 dead `scoring_weights.yml` keys. These are patches, not the unified registry.
+
+**What remains:**
+- Phase 1 (ThresholdRegistry) -- fully needed. The patches added a 6th and 7th threshold source instead of unifying them.
+- Phase 2 -- **mostly done**. Per-variable filtering exists. Remaining: clean up the `|value| < 1.0` fallback filter and the `_MAX_RETURN_MEAN` / `_MAX_RETURN_STD` MC scale guard (both are redundant now that per-variable tracking works).
+- Phase 3 (wiring) -- fully needed. `SECTOR_SURVIVAL_OVERRIDES` should be replaced by registry. Scenario engine and USS still need to consume unified thresholds.
 
 ### Expert methods from different domains
 
@@ -77,64 +90,29 @@ sector_threshold_overrides:
 - Stored in `PipelineState.threshold_registry`
 - Passed to all consumers via `state.threshold_registry`
 
-### Phase 2: Scoped burn-out learner (solves Problems 2 and 6)
+### Phase 2: Clean up burn-out learner redundancies (PARTIALLY DONE)
 
-**File:** `operator1/models/forecasting.py` lines 4482-4660
+**File:** `operator1/models/forecasting.py`
 
-**Current design flaw:**
+**Status after PR #5 merge:** The `ExponentialGradientWeightLearner` now stores entries as `{"variable": var_name, "actual": actual}` dicts and `get_regime_distributions(variable="return_1d")` filters by variable name. The core per-variable tracking is implemented.
+
+**Remaining cleanup:**
+
+1. **Remove `|value| < 1.0` fallback filter** from `get_regime_distributions()` (added in PR #3 as a band-aid, now redundant since per-variable filtering works):
 ```python
-# Line 4608 -- called for EVERY variable (return, close, cash, revenue...)
-self._regime_weighted_returns[regime].append(actual)
+# Remove this fallback block (no longer needed):
+if not filtered:
+    filtered = [
+        (e["actual"] if isinstance(e, dict) else e)
+        for e in entries
+        if (isinstance(e, dict) and abs(e.get("actual", 999)) < 1.0)
+        or (not isinstance(e, dict) and abs(e) < 1.0)
+    ]
 ```
 
-**Fix approach (control theory observer design):**
+2. **Remove MC scale guard** from `run_monte_carlo()` (the `_MAX_RETURN_MEAN` / `_MAX_RETURN_STD` / `_n_rejected` rejection logic added in PR #3) -- no longer needed when burn-out only exports return-variable distributions.
 
-Replace single `_regime_weighted_returns` accumulator with per-variable tracking:
-
-```python
-class ExponentialGradientWeightLearner:
-    def __init__(self, model_names, ...):
-        # Per-variable per-regime tracking (instead of mixed accumulator)
-        self._regime_per_var_returns: dict[str, dict[str, list[float]]] = {}
-        # Explicit return variable name for distribution export
-        self._return_var: str = "return_1d"
-    
-    def update(self, regime, per_model_preds, actual, variable_name):
-        # ... weight update logic unchanged ...
-        
-        # Track per-variable (not mixed)
-        if regime not in self._regime_per_var_returns:
-            self._regime_per_var_returns[regime] = {}
-        if variable_name not in self._regime_per_var_returns[regime]:
-            self._regime_per_var_returns[regime][variable_name] = []
-        self._regime_per_var_returns[regime][variable_name].append(actual)
-    
-    def get_regime_distributions(self) -> dict[str, dict[str, float]]:
-        # Export ONLY the return variable distribution (not mixed)
-        distributions = {}
-        for regime, var_dict in self._regime_per_var_returns.items():
-            returns = var_dict.get(self._return_var, [])
-            if len(returns) >= 5:
-                arr = np.array(returns)
-                distributions[regime] = {
-                    "mean": float(np.mean(arr)),
-                    "std": max(float(np.std(arr, ddof=1)), 1e-6),
-                    "n_obs": len(returns),
-                }
-            else:
-                distributions[regime] = {"mean": 0.0, "std": 0.01, "n_obs": 0}
-        return distributions
-```
-
-**Call site change** (burn-out loop, ~line 4905):
-```python
-# Before: learner.update(regime, per_model, actual)
-# After:  learner.update(regime, per_model, actual, variable_name=var_name)
-```
-
-**Remove my band-aid filter** from `get_regime_distributions()` (the `|value| < 1.0` filter) -- no longer needed when variables are tracked separately.
-
-**Remove MC scale guard** from `run_monte_carlo()` (the `_MAX_RETURN_MEAN` / `_MAX_RETURN_STD` rejection) -- no longer needed when burn-out only exports return distributions.
+3. **Remove `SECTOR_SURVIVAL_OVERRIDES`** from `monte_carlo.py` and `get_sector_aware_thresholds()` (added in PR #3) -- will be replaced by ThresholdRegistry in Phase 1.
 
 ### Phase 3: Wire ThresholdRegistry into PipelineState
 
