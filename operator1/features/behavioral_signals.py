@@ -53,8 +53,10 @@ def compute_behavioral_signals(cache: pd.DataFrame) -> pd.DataFrame:
     # The ratio is bounded [0, 1] for high and [1, inf) for low.
     # ------------------------------------------------------------------
     if close is not None and close.notna().sum() > 30:
-        high_252 = close.rolling(252, min_periods=20).max()
-        low_252 = close.rolling(252, min_periods=20).min()
+        from operator1.freq_constants import get_periods_per_year
+        _ppy = get_periods_per_year()
+        high_252 = close.rolling(_ppy, min_periods=min(20, _ppy)).max()
+        low_252 = close.rolling(_ppy, min_periods=min(20, _ppy)).min()
         result["anchoring_52w_high"] = close / high_252.clip(lower=EPSILON)
         safe_low = low_252.clip(lower=EPSILON)
         result["anchoring_52w_low"] = close / safe_low

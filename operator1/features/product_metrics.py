@@ -281,7 +281,8 @@ def _compute_input_cost_pressure(cache: pd.DataFrame) -> float:
     ratio = cogs / safe_rev
 
     # Drop NaN and compute slope over last 252 days
-    valid = ratio.dropna().tail(252)
+    from operator1.freq_constants import get_periods_per_year
+    valid = ratio.dropna().tail(get_periods_per_year())
     if len(valid) < 20:
         return np.nan
 
@@ -293,7 +294,8 @@ def _compute_input_cost_pressure(cache: pd.DataFrame) -> float:
         y_mean = y.mean()
         slope = float(np.sum((x - x_mean) * (y - y_mean)) / max(np.sum((x - x_mean) ** 2), EPSILON))
         # Annualize: slope * 252
-        return float(slope * 252)
+        from operator1.freq_constants import get_periods_per_year
+        return float(slope * get_periods_per_year())
     except Exception:
         return np.nan
 

@@ -235,7 +235,8 @@ def _capital_misallocation(df: pd.DataFrame) -> pd.Series:
     # Signal 3: Excessive leverage without growth
     if nd_ebitda.notna().any():
         leverage_excess = (nd_ebitda - 4.0).clip(lower=0) * 10.0
-        rev_growth = revenue.pct_change(252, fill_method=None).clip(-1, 1).fillna(0)
+        from operator1.freq_constants import get_periods_per_year
+        rev_growth = revenue.pct_change(get_periods_per_year(), fill_method=None).clip(-1, 1).fillna(0)
         # Penalize only if no revenue growth
         growth_offset = rev_growth.clip(lower=0) * 100.0
         signal3 = (leverage_excess - growth_offset).clip(lower=0)
