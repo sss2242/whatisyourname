@@ -727,6 +727,7 @@ Return valid JSON only, no markdown.
         self,
         target_profile: dict[str, Any],
         sector_hints: str = "",
+        available_markets: str = "",
     ) -> dict[str, list[str]]:
         """3-call LLM entity discovery for thicker linked entity caches.
 
@@ -866,7 +867,10 @@ Return valid JSON only, no markdown.
         if total == 0:
             # Fall back to single-call if 3-call produced nothing
             logger.warning("3-call discovery returned 0 entities; falling back to single call")
-            return self.propose_linked_entities(target_profile, sector_hints=sector_hints)
+            return self.propose_linked_entities(
+                target_profile, sector_hints=sector_hints,
+                available_markets=available_markets,
+            )
 
         return all_entities
 
