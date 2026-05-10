@@ -217,7 +217,68 @@ def predict_ohlc_series(
             survival_mult = 1.0 + (1.0 - surv_mean) * 0.5  # dampen: half the penalty
             survival_mult = min(survival_mult, 1.5)  # hard cap
 
-    # --- Generate series for each horizon ---
+    # --- MC-derived predictions (primary path when MC available) ---
+    # Derive Close from MC terminal distributions, H/L from Parkinson formula.
+    # This replaces the random walk with statistically grounded estimates.
+    _mc_terminal = {}
+    if mc_result is not None:
+        _mc_terminal = getattr(mc_result, "terminal_values", {}) or {}
+
+    # Skewness for asymmetric H/L estimation
+    _skew = 0.0
+    if "skewness_63d" in cache.columns:
+        _sk = cache["skewness_63d"].dropna()
+        if len(_sk) > 0:
+            _skew = float(_sk.iloc[-1])
+            if math.isnan(_skew):
+                _skew = 0.0
+    _skew = max(-1.0, min(1.0, _skew))
+
+    def _mc_derived_candle(horizon_key: str, n_days: int, prev_close: float) -> OHLCCandle | None:
+        """Derive a single candle from MC terminal distribution (Parkinson + skew)."""
+        terminal = _mc_terminal.get(horizon_key)
+        if terminal is None or not hasattr(terminal, "__len__") or len(terminal) < 50:
+            return None
+        terminal_arr = np.asarray(terminal, dtype=float)
+        terminal_arr = terminal_arr[np.isfinite(terminal_arr)]
+        if len(terminal_arr) < 30:
+            return None
+
+        # Close: MC median
+        close_est = prev_close * float(np.median(terminal_arr))
+
+        # Parkinson range: expected H-L from volatility
+        log_terminal = np.log(np.maximum(terminal_arr, 1e-10))
+        sigma_est = float(np.std(log_terminal))
+        if sigma_est < 1e-6:
+            sigma_est = sigma_daily * math.sqrt(n_days / 252)
+        expected_range = sigma_est * math.sqrt(8.0 / math.pi)
+
+        # Skewness-adjusted split
+        up_ratio = 0.5 + 0.1 * _skew
+        down_ratio = 0.5 - 0.1 * _skew
+
+        high_est = close_est * (1.0 + expected_range * up_ratio)
+        low_est = close_est * (1.0 - expected_range * down_ratio)
+
+        # Sanity: H >= C >= L, all positive
+        high_est = max(high_est, close_est * 1.001)
+        low_est = min(low_est, close_est * 0.999)
+        low_est = max(low_est, 0.01)
+
+        confidence = max(0.1, 1.0 / (1.0 + 0.05 * math.sqrt(n_days)))
+
+        return OHLCCandle(
+            date="",  # filled by caller
+            open=round(prev_close, 4),
+            high=round(high_est, 4),
+            low=round(low_est, 4),
+            close=round(close_est, 4),
+            volume=round(vol_ma, 0) if vol_ma else None,
+            confidence=round(confidence, 4),
+        )
+
+    # --- Fallback: random walk series (when no MC terminal values) ---
     from datetime import timedelta
     last_date = cache.index[-1] if hasattr(cache.index[-1], "date") else pd.Timestamp.now()
 
@@ -306,14 +367,43 @@ def predict_ohlc_series(
             _robust_low, _N_NEXT_DAY_SIMS, _median_low, float(np.std(_sim_lows)),
         )
 
-        # Next week (5 trading days, full OHLC)
-        result.next_week = _generate_series(5, "5d")
+        # Next week (5 trading days) -- MC-derived if available, else random walk
+        _mc_week = _mc_derived_candle("5d", 5, last_close)
+        if _mc_week is not None:
+            _d = last_date + timedelta(days=5)
+            _mc_week = OHLCCandle(date=str(_d.date()) if hasattr(_d, "date") else str(_d),
+                                  open=_mc_week.open, high=_mc_week.high, low=_mc_week.low,
+                                  close=_mc_week.close, volume=_mc_week.volume, confidence=_mc_week.confidence)
+            result.next_week = [_mc_week]
+            logger.debug("OHLC week: MC-derived close=%.2f", _mc_week.close)
+        else:
+            result.next_week = _generate_series(5, "5d")
 
-        # Next month (21 trading days, full OHLC)
-        result.next_month = _generate_series(21, "21d")
+        # Next month (21 trading days) -- MC-derived if available
+        _mc_month = _mc_derived_candle("21d", 21, last_close)
+        if _mc_month is not None:
+            _d = last_date + timedelta(days=30)
+            _mc_month = OHLCCandle(date=str(_d.date()) if hasattr(_d, "date") else str(_d),
+                                   open=_mc_month.open, high=_mc_month.high, low=_mc_month.low,
+                                   close=_mc_month.close, volume=_mc_month.volume, confidence=_mc_month.confidence)
+            result.next_month = [_mc_month]
+            logger.debug("OHLC month: MC-derived close=%.2f", _mc_month.close)
+        else:
+            result.next_month = _generate_series(21, "21d")
 
-        # Next year (252 trading days, full OHLC)
-        result.next_year = _generate_series(252, "252d")
+        # Next year (252 trading days) -- MC-derived if available
+        _mc_year = _mc_derived_candle("252d", 252, last_close)
+        if _mc_year is not None:
+            _d = last_date + timedelta(days=365)
+            _mc_year = OHLCCandle(date=str(_d.date()) if hasattr(_d, "date") else str(_d),
+                                  open=_mc_year.open, high=_mc_year.high, low=_mc_year.low,
+                                  close=_mc_year.close, volume=_mc_year.volume, confidence=_mc_year.confidence)
+            result.next_year = [_mc_year]
+            logger.info("OHLC year: MC-derived close=%.2f (vs current %.2f, %.1f%%)",
+                        _mc_year.close, last_close,
+                        (_mc_year.close - last_close) / last_close * 100)
+        else:
+            result.next_year = _generate_series(252, "252d")
 
         result.fitted = True
         logger.info(

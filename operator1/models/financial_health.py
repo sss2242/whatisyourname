@@ -337,6 +337,103 @@ class FinancialHealthResult:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Cross-sectional scoring (Batch B -- sector reference ranges)
+# ---------------------------------------------------------------------------
+
+_SECTOR_RANGES: dict | None = None
+
+
+def _load_sector_ranges() -> dict:
+    """Load sector reference ranges from config/sector_reference_ranges.yml."""
+    global _SECTOR_RANGES
+    if _SECTOR_RANGES is not None:
+        return _SECTOR_RANGES
+    try:
+        from operator1.config_loader import load_config
+        _SECTOR_RANGES = load_config("sector_reference_ranges")
+    except Exception:
+        _SECTOR_RANGES = {}
+    return _SECTOR_RANGES
+
+
+def _get_sector_range(sector: str, variable: str) -> list[float] | None:
+    """Get [p10, p25, median, p75, p90] for a variable in a sector."""
+    ranges = _load_sector_ranges()
+    if not ranges:
+        return None
+    sector_key = sector.lower().replace(" ", "_") if sector else "_default"
+    # Try exact match, then substring, then default
+    section = ranges.get(sector_key)
+    if section is None:
+        for key in ranges:
+            if key != "_default" and (key in sector_key or sector_key in key):
+                section = ranges[key]
+                break
+    if section is None:
+        section = ranges.get("_default", {})
+    return section.get(variable)
+
+
+def _cross_sectional_score(
+    value: float,
+    sector_range: list[float],
+    higher_is_better: bool = True,
+) -> float:
+    """Score 0-100 based on sector reference range.
+
+    Uses linear interpolation between [p10, p25, median, p75, p90]
+    breakpoints. Value at sector median = 50, at p90 = 90, etc.
+    """
+    if value is None or np.isnan(value):
+        return np.nan
+    bp = list(sector_range)
+    if len(bp) != 5:
+        return np.nan
+    if not higher_is_better:
+        bp = bp[::-1]
+    score_anchors = [10.0, 25.0, 50.0, 75.0, 90.0]
+    # Within range: linear interpolation
+    for i in range(len(bp) - 1):
+        lo, hi = min(bp[i], bp[i + 1]), max(bp[i], bp[i + 1])
+        if lo <= value <= hi:
+            if abs(bp[i + 1] - bp[i]) < 1e-12:
+                return score_anchors[i]
+            frac = (value - bp[i]) / (bp[i + 1] - bp[i])
+            return score_anchors[i] + frac * (score_anchors[i + 1] - score_anchors[i])
+    # Below p10
+    if (higher_is_better and value < bp[0]) or (not higher_is_better and value > bp[0]):
+        return max(0.0, 5.0)
+    # Above p90
+    return min(100.0, 95.0)
+
+
+def _hybrid_score_series(
+    s: pd.Series,
+    sector: str,
+    variable: str,
+    higher_is_better: bool = True,
+    cross_weight: float = 0.7,
+) -> pd.Series:
+    """Compute hybrid score: 70% cross-sectional + 30% self-history trend.
+
+    When sector reference range is available, uses cross-sectional scoring
+    anchored to sector peers. Falls back to pure self-percentile when
+    no sector range exists.
+    """
+    sr = _get_sector_range(sector, variable)
+    if sr is None:
+        # No sector range: pure self-percentile (original behavior)
+        return _normalize_series(s, invert=not higher_is_better)
+
+    # Cross-sectional score
+    cross = s.apply(lambda v: _cross_sectional_score(v, sr, higher_is_better))
+    # Self-history trend score (existing method)
+    trend = _normalize_series(s, invert=not higher_is_better)
+    # Weighted combination
+    return cross_weight * cross + (1 - cross_weight) * trend
+
+
 def _normalize_series(
     s: pd.Series,
     *,
@@ -427,22 +524,27 @@ def _ewm_percentile_rank(s: pd.Series, halflife: int = 63) -> pd.Series:
     return pd.Series(result, index=s.index)
 
 
-def _score_liquidity(cache: pd.DataFrame) -> pd.Series:
+def _score_liquidity(cache: pd.DataFrame, sector: str = "") -> pd.Series:
     """Tier 1 -- Liquidity & Cash score.
 
     Looks at: cash_ratio, free_cash_flow_ttm (or operating_cash_flow),
     cash_and_equivalents.
+
+    When ``sector`` is provided and sector reference ranges exist,
+    uses 70% cross-sectional + 30% self-history hybrid scoring.
     """
     components: list[pd.Series] = []
 
     if "cash_ratio" in cache.columns:
         components.append(
-            _normalize_series(cache["cash_ratio"], lower=0, upper=10)
+            _hybrid_score_series(cache["cash_ratio"], sector, "current_ratio", higher_is_better=True)
+            if sector else _normalize_series(cache["cash_ratio"], lower=0, upper=10)
         )
 
     if "free_cash_flow_ttm_asof" in cache.columns:
         components.append(
-            _normalize_series(cache["free_cash_flow_ttm_asof"])
+            _hybrid_score_series(cache["free_cash_flow_ttm_asof"], sector, "fcf_yield", higher_is_better=True)
+            if sector else _normalize_series(cache["free_cash_flow_ttm_asof"])
         )
     elif "operating_cash_flow" in cache.columns:
         components.append(
@@ -462,7 +564,7 @@ def _score_liquidity(cache: pd.DataFrame) -> pd.Series:
     return score
 
 
-def _score_solvency(cache: pd.DataFrame) -> pd.Series:
+def _score_solvency(cache: pd.DataFrame, sector: str = "") -> pd.Series:
     """Tier 2 -- Debt & Solvency score.
 
     Looks at: debt_to_equity (inverted), net_debt_to_ebitda (inverted),
@@ -504,7 +606,7 @@ def _score_solvency(cache: pd.DataFrame) -> pd.Series:
     return score
 
 
-def _score_stability(cache: pd.DataFrame) -> pd.Series:
+def _score_stability(cache: pd.DataFrame, sector: str = "") -> pd.Series:
     """Tier 3 -- Market Stability score.
 
     Looks at: volatility_21d (inverted), drawdown_252d (inverted), volume.
@@ -546,7 +648,7 @@ def _score_stability(cache: pd.DataFrame) -> pd.Series:
     return score
 
 
-def _score_profitability(cache: pd.DataFrame) -> pd.Series:
+def _score_profitability(cache: pd.DataFrame, sector: str = "") -> pd.Series:
     """Tier 4 -- Profitability score.
 
     Looks at: gross_margin, operating_margin, net_margin.
@@ -567,7 +669,7 @@ def _score_profitability(cache: pd.DataFrame) -> pd.Series:
     return score
 
 
-def _score_growth(cache: pd.DataFrame) -> pd.Series:
+def _score_growth(cache: pd.DataFrame, sector: str = "") -> pd.Series:
     """Tier 5 -- Growth & Valuation score.
 
     Looks at: revenue trend (rolling % change), pe_ratio (inverted --
@@ -961,11 +1063,11 @@ def compute_financial_health(
     # PE/EV values are in the cache (may be corrected by prior fusion step).
     # At Q/A/S: T5 is fully reliable (native-scale ratios).
     tier_scores: dict[str, pd.Series] = {
-        "tier1": _score_liquidity(cache),
-        "tier2": _score_solvency(cache),
-        "tier3": _score_stability(cache),
-        "tier4": _score_profitability(cache),
-        "tier5": _score_growth(cache),
+        "tier1": _score_liquidity(cache, sector=sector),
+        "tier2": _score_solvency(cache, sector=sector),
+        "tier3": _score_stability(cache, sector=sector),
+        "tier4": _score_profitability(cache, sector=sector),
+        "tier5": _score_growth(cache, sector=sector),
     }
     if freq not in _native_ratio_freqs:
         logger.debug(

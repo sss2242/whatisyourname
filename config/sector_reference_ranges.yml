@@ -1,0 +1,140 @@
+# Sector reference ranges for cross-sectional FH scoring.
+#
+# Each sector: {variable: [p10, p25, median, p75, p90]}
+# Sources: Damodaran NYU sector averages (2025), S&P Capital IQ.
+#
+# Used by financial_health.py _cross_sectional_score() to score a company
+# relative to its sector peers instead of its own history.
+
+technology:
+  current_ratio: [0.7, 0.9, 1.2, 1.8, 2.5]
+  debt_to_equity: [0.3, 0.8, 1.5, 2.5, 4.0]
+  gross_margin: [0.35, 0.50, 0.62, 0.72, 0.82]
+  operating_margin: [0.05, 0.12, 0.22, 0.30, 0.40]
+  net_margin: [0.03, 0.08, 0.18, 0.25, 0.35]
+  fcf_yield: [-0.02, 0.01, 0.03, 0.05, 0.08]
+  revenue_growth_yoy: [-0.05, 0.02, 0.08, 0.15, 0.30]
+  volatility_21d: [0.01, 0.015, 0.02, 0.03, 0.05]
+  interest_coverage: [3, 8, 15, 30, 60]
+
+financial_services:
+  current_ratio: [0.3, 0.5, 0.8, 1.2, 1.5]
+  debt_to_equity: [2.0, 5.0, 8.0, 12.0, 18.0]
+  gross_margin: [0.20, 0.35, 0.50, 0.65, 0.80]
+  operating_margin: [0.05, 0.15, 0.25, 0.35, 0.45]
+  net_margin: [0.05, 0.12, 0.20, 0.28, 0.35]
+  fcf_yield: [-0.01, 0.02, 0.04, 0.06, 0.10]
+  revenue_growth_yoy: [-0.05, 0.00, 0.05, 0.10, 0.20]
+  volatility_21d: [0.008, 0.012, 0.018, 0.025, 0.04]
+  interest_coverage: [1, 2, 4, 8, 15]
+
+healthcare:
+  current_ratio: [1.0, 1.5, 2.2, 3.0, 4.5]
+  debt_to_equity: [0.2, 0.5, 1.0, 2.0, 3.5]
+  gross_margin: [0.40, 0.55, 0.65, 0.75, 0.85]
+  operating_margin: [0.05, 0.10, 0.18, 0.25, 0.35]
+  net_margin: [0.02, 0.06, 0.12, 0.20, 0.30]
+  fcf_yield: [-0.02, 0.01, 0.03, 0.05, 0.08]
+  revenue_growth_yoy: [-0.02, 0.03, 0.08, 0.15, 0.25]
+  volatility_21d: [0.01, 0.015, 0.022, 0.032, 0.05]
+  interest_coverage: [3, 6, 12, 25, 50]
+
+consumer_cyclical:
+  current_ratio: [0.8, 1.0, 1.3, 1.8, 2.5]
+  debt_to_equity: [0.5, 1.0, 1.8, 3.0, 5.0]
+  gross_margin: [0.25, 0.35, 0.45, 0.55, 0.65]
+  operating_margin: [0.03, 0.07, 0.12, 0.18, 0.25]
+  net_margin: [0.01, 0.04, 0.08, 0.12, 0.18]
+  fcf_yield: [-0.02, 0.01, 0.03, 0.05, 0.08]
+  revenue_growth_yoy: [-0.08, 0.00, 0.06, 0.12, 0.22]
+  volatility_21d: [0.01, 0.015, 0.02, 0.03, 0.045]
+  interest_coverage: [2, 5, 10, 20, 40]
+
+energy:
+  current_ratio: [0.8, 1.0, 1.2, 1.5, 2.0]
+  debt_to_equity: [0.5, 1.0, 1.5, 2.5, 4.0]
+  gross_margin: [0.15, 0.25, 0.35, 0.50, 0.65]
+  operating_margin: [0.02, 0.08, 0.15, 0.22, 0.30]
+  net_margin: [0.01, 0.05, 0.10, 0.15, 0.22]
+  fcf_yield: [-0.05, 0.00, 0.04, 0.08, 0.15]
+  revenue_growth_yoy: [-0.15, -0.03, 0.05, 0.15, 0.30]
+  volatility_21d: [0.012, 0.018, 0.025, 0.035, 0.055]
+  interest_coverage: [1, 3, 6, 12, 25]
+
+industrials:
+  current_ratio: [1.0, 1.3, 1.6, 2.0, 2.8]
+  debt_to_equity: [0.3, 0.8, 1.3, 2.2, 3.5]
+  gross_margin: [0.20, 0.30, 0.38, 0.48, 0.58]
+  operating_margin: [0.04, 0.08, 0.13, 0.18, 0.25]
+  net_margin: [0.02, 0.05, 0.08, 0.12, 0.18]
+  fcf_yield: [-0.01, 0.02, 0.04, 0.06, 0.09]
+  revenue_growth_yoy: [-0.05, 0.01, 0.05, 0.10, 0.18]
+  volatility_21d: [0.008, 0.013, 0.018, 0.025, 0.038]
+  interest_coverage: [2, 5, 10, 18, 35]
+
+communication_services:
+  current_ratio: [0.6, 0.8, 1.0, 1.4, 2.0]
+  debt_to_equity: [0.5, 1.2, 2.0, 3.5, 6.0]
+  gross_margin: [0.35, 0.45, 0.55, 0.65, 0.78]
+  operating_margin: [0.05, 0.12, 0.20, 0.28, 0.38]
+  net_margin: [0.02, 0.08, 0.15, 0.22, 0.30]
+  fcf_yield: [-0.02, 0.01, 0.03, 0.05, 0.08]
+  revenue_growth_yoy: [-0.03, 0.02, 0.06, 0.12, 0.22]
+  volatility_21d: [0.01, 0.016, 0.022, 0.032, 0.048]
+  interest_coverage: [2, 5, 10, 20, 40]
+
+consumer_defensive:
+  current_ratio: [0.8, 1.0, 1.2, 1.6, 2.2]
+  debt_to_equity: [0.5, 1.0, 1.5, 2.5, 4.0]
+  gross_margin: [0.25, 0.35, 0.42, 0.52, 0.62]
+  operating_margin: [0.04, 0.08, 0.12, 0.17, 0.24]
+  net_margin: [0.02, 0.04, 0.07, 0.10, 0.15]
+  fcf_yield: [0.00, 0.02, 0.04, 0.06, 0.09]
+  revenue_growth_yoy: [-0.02, 0.01, 0.04, 0.08, 0.14]
+  volatility_21d: [0.006, 0.009, 0.013, 0.018, 0.028]
+  interest_coverage: [3, 6, 12, 22, 40]
+
+utilities:
+  current_ratio: [0.5, 0.7, 0.9, 1.2, 1.6]
+  debt_to_equity: [1.0, 1.5, 2.0, 3.0, 4.5]
+  gross_margin: [0.20, 0.30, 0.40, 0.50, 0.60]
+  operating_margin: [0.10, 0.15, 0.22, 0.30, 0.40]
+  net_margin: [0.05, 0.08, 0.12, 0.18, 0.25]
+  fcf_yield: [-0.02, 0.01, 0.03, 0.05, 0.08]
+  revenue_growth_yoy: [-0.05, 0.00, 0.03, 0.06, 0.12]
+  volatility_21d: [0.006, 0.008, 0.012, 0.018, 0.028]
+  interest_coverage: [1, 2, 3, 5, 8]
+
+real_estate:
+  current_ratio: [0.3, 0.5, 0.8, 1.2, 1.8]
+  debt_to_equity: [1.0, 2.0, 3.0, 5.0, 8.0]
+  gross_margin: [0.30, 0.45, 0.55, 0.65, 0.78]
+  operating_margin: [0.15, 0.25, 0.35, 0.45, 0.55]
+  net_margin: [0.05, 0.12, 0.20, 0.30, 0.40]
+  fcf_yield: [-0.01, 0.02, 0.04, 0.06, 0.10]
+  revenue_growth_yoy: [-0.05, 0.00, 0.04, 0.08, 0.15]
+  volatility_21d: [0.008, 0.012, 0.018, 0.025, 0.04]
+  interest_coverage: [1, 2, 3, 5, 10]
+
+basic_materials:
+  current_ratio: [0.8, 1.1, 1.5, 2.0, 3.0]
+  debt_to_equity: [0.3, 0.7, 1.2, 2.0, 3.5]
+  gross_margin: [0.15, 0.25, 0.35, 0.45, 0.58]
+  operating_margin: [0.03, 0.08, 0.14, 0.20, 0.28]
+  net_margin: [0.01, 0.04, 0.08, 0.13, 0.20]
+  fcf_yield: [-0.03, 0.00, 0.03, 0.06, 0.10]
+  revenue_growth_yoy: [-0.10, 0.00, 0.06, 0.12, 0.25]
+  volatility_21d: [0.01, 0.015, 0.022, 0.032, 0.05]
+  interest_coverage: [2, 4, 8, 15, 30]
+
+# Fallback for sectors not listed above
+_default:
+  current_ratio: [0.5, 0.8, 1.2, 2.0, 3.0]
+  debt_to_equity: [0.3, 0.8, 1.5, 3.0, 5.0]
+  gross_margin: [0.20, 0.35, 0.50, 0.65, 0.80]
+  operating_margin: [0.02, 0.08, 0.15, 0.22, 0.30]
+  net_margin: [0.01, 0.05, 0.10, 0.18, 0.25]
+  fcf_yield: [-0.03, 0.00, 0.03, 0.06, 0.10]
+  revenue_growth_yoy: [-0.10, 0.00, 0.05, 0.12, 0.25]
+  volatility_21d: [0.008, 0.012, 0.018, 0.028, 0.045]
+  interest_coverage: [1, 3, 8, 15, 30]
