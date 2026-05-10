@@ -146,13 +146,57 @@ def _build_frequency_aware_horizons(cache_len: int) -> dict[str, int]:
         "long": max(2, spy),
     }
 
-# Default survival thresholds (aligned with T4.1).
-DEFAULT_SURVIVAL_THRESHOLDS: dict[str, tuple[str, float]] = {
-    "current_ratio": ("lt", 1.0),
-    "debt_to_equity_abs": ("gt", 3.0),
-    "fcf_yield": ("lt", 0.0),
-    "drawdown_252d": ("lt", -0.40),
-}
+# Default survival thresholds -- now reads from ThresholdRegistry for
+# sector-aware, layered thresholds. Falls back to hardcoded values
+# only when registry is not initialized (standalone/test usage).
+def _get_default_survival_thresholds() -> dict[str, tuple[str, float]]:
+    """Get survival thresholds from the unified ThresholdRegistry."""
+    try:
+        from operator1.analysis.threshold_registry import get_registry
+        return get_registry().mc_dict
+    except Exception:
+        return {
+            "current_ratio": ("lt", 1.0),
+            "debt_to_equity_abs": ("gt", 3.0),
+            "fcf_yield": ("lt", 0.0),
+            "drawdown_252d": ("lt", -0.40),
+        }
+
+
+# Backward-compat module-level reference (lazy -- evaluated on first use)
+class _LazyThresholds:
+    """Lazy proxy that reads from registry on first access."""
+    _cache = None
+    def __getitem__(self, key):
+        if self._cache is None:
+            self._cache = _get_default_survival_thresholds()
+        return self._cache[key]
+    def __iter__(self):
+        if self._cache is None:
+            self._cache = _get_default_survival_thresholds()
+        return iter(self._cache)
+    def __len__(self):
+        if self._cache is None:
+            self._cache = _get_default_survival_thresholds()
+        return len(self._cache)
+    def keys(self):
+        if self._cache is None:
+            self._cache = _get_default_survival_thresholds()
+        return self._cache.keys()
+    def items(self):
+        if self._cache is None:
+            self._cache = _get_default_survival_thresholds()
+        return self._cache.items()
+    def values(self):
+        if self._cache is None:
+            self._cache = _get_default_survival_thresholds()
+        return self._cache.values()
+    def get(self, key, default=None):
+        if self._cache is None:
+            self._cache = _get_default_survival_thresholds()
+        return self._cache.get(key, default)
+
+DEFAULT_SURVIVAL_THRESHOLDS = _LazyThresholds()
 
 # Sector-aware survival threshold overrides (2026-05-09).
 # Technology companies (Apple, Google, etc.) structurally operate with
