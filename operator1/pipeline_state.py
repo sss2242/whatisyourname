@@ -118,6 +118,7 @@ class PipelineState:
         self.pattern_result: Any = None
         self.synergy_meta: dict = {}
         self.extra_vars: list = []
+        self.model_feature_sets: dict = {}  # Per-model feature routing from FeatureClassifier
         self.economic_plane: Any = None
 
         # ---- Stage 4: Forecasting ----

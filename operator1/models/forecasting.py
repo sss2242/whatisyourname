@@ -2150,6 +2150,7 @@ def run_forecasting(
     variables: list[str] | None = None,
     *,
     extra_variables: list[str] | None = None,
+    model_feature_sets: dict[str, list[str]] | None = None,
     windows: Any | None = None,
     random_state: int = 42,
     enable_burnout: bool = True,
@@ -2167,6 +2168,13 @@ def run_forecasting(
     variables:
         List of variable names to forecast.  If ``None``, all tier
         variables from the survival hierarchy are used.
+    model_feature_sets:
+        Per-model-type feature sets from :class:`FeatureClassifier`.
+        Keys: ``"lstm"``, ``"tree"``, ``"var"``, ``"kalman"``, ``"all"``.
+        When provided, each model type receives only features matching
+        its temporal resolution (tick-level for LSTM/VAR, tick+normalized
+        for Tree).  When ``None``, falls back to ``extra_variables``
+        for all models (backward compatible).
     windows:
         Adaptive window sizes from ``adaptive_windows.compute_adaptive_windows()``.
         If provided, overrides hardcoded LSTM lookback and burnout window
@@ -2202,6 +2210,32 @@ def run_forecasting(
             "Adaptive windows applied: lstm_lookback=%d (was %d), burnout=%d (was %d)",
             _LSTM_LOOKBACK, _orig_lstm_lookback, _BURNOUT_WINDOW, _orig_burnout_window,
         )
+
+    # ------------------------------------------------------------------
+    # Per-model feature routing (from FeatureClassifier)
+    # ------------------------------------------------------------------
+    def _get_model_features(model_type: str) -> list[str] | None:
+        """Return feature list for a specific model type.
+
+        When ``model_feature_sets`` is provided, returns the routed
+        feature list for the given model type.  Falls back to
+        ``extra_variables`` when no routing is available.
+
+        Model types: "lstm", "tree", "var", "kalman", "baseline", "all".
+        """
+        if model_feature_sets:
+            feats = model_feature_sets.get(model_type)
+            if feats is not None:
+                return feats
+            # Fall back to "all" key if specific model type not found
+            feats = model_feature_sets.get("all")
+            if feats is not None:
+                return feats
+        return extra_variables
+
+    if model_feature_sets:
+        _mfs_summary = {k: len(v) for k, v in model_feature_sets.items()}
+        logger.info("Feature routing active: %s", _mfs_summary)
 
     result = ForecastResult()
     tier_map = _load_tier_variables()
@@ -2261,11 +2295,27 @@ def run_forecasting(
     def _extract_multivariate(target: str, max_cols: int = 10) -> pd.DataFrame:
         """Extract a multivariate DataFrame for VAR from the cache.
 
-        Mixed-frequency aware: forward-filled quarterly/annual columns are
-        replaced with their filing-change derivatives (the actual change
-        on filing days, zero between filings). This prevents near-singular
-        covariance matrices that cause VAR to fall back to AR(1).
+        When ``model_feature_sets`` provides a ``"var"`` key, uses only
+        those pre-classified tick-level features (already filtered by
+        FeatureClassifier to exclude forward-filled periodic columns).
+
+        Otherwise falls back to mixed-frequency aware extraction:
+        forward-filled quarterly/annual columns are replaced with their
+        filing-change derivatives (the actual change on filing days, zero
+        between filings). This prevents near-singular covariance matrices
+        that cause VAR to fall back to AR(1).
         """
+        # Use routed features when available (tick-level only for VAR)
+        _var_feats = _get_model_features("var")
+        if _var_feats and _var_feats is not extra_variables:
+            candidates = [
+                c for c in _var_feats
+                if c in cache.columns and cache[c].notna().any()
+            ][:max_cols]
+            if target not in candidates:
+                candidates = [target] + candidates[:max_cols - 1]
+            return cache[candidates].copy()
+
         from operator1.models._frequency_classifier import (
             classify_column_frequency,
             get_filing_change_derivative,
@@ -2288,14 +2338,36 @@ def run_forecasting(
             candidates = [target] + candidates[:max_cols - 1]
         return cache[candidates].copy()
 
-    def _extract_features(target: str, max_cols: int = 15) -> pd.DataFrame:
+    def _extract_features(target: str, max_cols: int = 15,
+                          model_type: str = "tree") -> pd.DataFrame:
         """Extract a feature DataFrame for tree ensembles from the cache.
 
-        Mixed-frequency aware: for quarterly/annual columns, adds
-        engineered features (pct_change_at_filing, days_since_filing)
-        that give the tree meaningful split points instead of only 3-4
-        unique values from forward-filled quarterly data.
+        When ``model_feature_sets`` provides a routed list for *model_type*,
+        uses only those pre-classified features (tick + normalized periodic
+        for tree, tick-only for LSTM).  This eliminates forward-filled
+        periodic columns that produce constant splits.
+
+        Otherwise falls back to mixed-frequency aware extraction: for
+        quarterly/annual columns, adds engineered features
+        (pct_change_at_filing, days_since_filing) that give the tree
+        meaningful split points instead of only 3-4 unique values from
+        forward-filled quarterly data.
         """
+        # Use routed features when available
+        _routed = _get_model_features(model_type)
+        if _routed and _routed is not extra_variables:
+            feature_cols = [
+                c for c in _routed
+                if c != target
+                and c in cache.columns
+                and cache[c].notna().any()
+            ][:max_cols]
+            if not feature_cols:
+                return pd.DataFrame()
+            all_cols = feature_cols + [target]
+            all_cols = [c for c in all_cols if c in cache.columns]
+            return cache[all_cols].copy()
+
         from operator1.models._frequency_classifier import (
             classify_column_frequency,
             add_filing_timing_features,
@@ -2477,7 +2549,7 @@ def run_forecasting(
 
         # --- Tree ensemble on tabular features ---
         if best_forecast is None:
-            feat_df = _extract_features(var_name)
+            feat_df = _extract_features(var_name, model_type="tree")
             if not feat_df.empty:
                 fcast, met = fit_tree_ensemble(
                     feat_df,
@@ -2504,7 +2576,7 @@ def run_forecasting(
         # varies with market conditions, used by the prediction aggregator
         # for data-driven band width instead of fixed RMSE * sqrt(h).
         try:
-            feat_df_dist = _extract_features(var_name)
+            feat_df_dist = _extract_features(var_name, model_type="tree")
             if not feat_df_dist.empty and len(feat_df_dist.dropna()) >= _MIN_OBS_TREE:
                 _dist_fcast, _dist_met = fit_distributional(
                     feat_df_dist, var_name, random_state=random_state,
@@ -2651,8 +2723,10 @@ def run_forecasting(
 
             # Step 2: Residual feature adjustment -- augment univariate model
             # forecasts with feature-based residual regression (Prophet/Greykite
-            # pattern). Only applies when extra_variables are available.
-            if extra_variables:
+            # pattern). Uses model-routed features when available, otherwise
+            # falls back to extra_variables.
+            _rfa_features = _get_model_features("tree") or extra_variables
+            if _rfa_features:
                 try:
                     _fitted_vals = None
                     if best_metrics and best_metrics.test_residuals is not None:
@@ -2666,7 +2740,7 @@ def run_forecasting(
                     for _rfa_label in _horizon_forecasts:
                         _rfa_orig = _horizon_forecasts[_rfa_label]
                         _rfa_adj = apply_residual_feature_adjustment(
-                            cache, var_name, _rfa_orig, extra_variables,
+                            cache, var_name, _rfa_orig, _rfa_features,
                             fitted_values=_fitted_vals,
                         )
                         _horizon_forecasts[_rfa_label] = _rfa_adj
@@ -2679,7 +2753,7 @@ def run_forecasting(
                           "garch", "var", "ar1", "lstm", "lstm_fallback_gbm",
                           "lstm_fallback_lr", "ets"}
             if best_model_name.lower().split("(")[0] in _ar_models:
-                feat_df = _extract_features(var_name)
+                feat_df = _extract_features(var_name, model_type="tree")
                 if not feat_df.empty:
                     _lh_fcast, _lh_met = fit_tree_ensemble(
                         feat_df, var_name,
@@ -2725,10 +2799,11 @@ def run_forecasting(
         v for v, m in result.model_used.items()
         if "tree" in m or "xgboost" in m or "gbm" in m or "rf" in m
     }
-    if extra_variables and len(extra_variables) > 0:
+    _any_features = (_get_model_features("tree") or extra_variables)
+    if _any_features and len(_any_features) > 0:
         for _ptv in _parallel_tree_vars:
             if _ptv in cache.columns and _ptv not in _tree_already_primary:
-                _pt_feat_df = _extract_features(_ptv)
+                _pt_feat_df = _extract_features(_ptv, model_type="tree")
                 if not _pt_feat_df.empty:
                     try:
                         _pt_fcast, _pt_met = fit_tree_ensemble(
