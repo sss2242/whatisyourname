@@ -307,6 +307,18 @@ def run_3_8_feature_selection(state: PipelineState) -> None:
     except Exception as exc:
         logger.warning("Feature selection failed (keeping all features): %s", exc)
 
+    # Classify selected features by temporal resolution for per-model routing.
+    # LSTM gets tick-only (~20), Tree gets tick+normalized (~45), VAR gets tick.
+    try:
+        from operator1.features.feature_classifier import FeatureClassifier
+        classifier = FeatureClassifier()
+        state.model_feature_sets = classifier.build_model_feature_sets(
+            state.cache, state.extra_vars,
+        )
+    except Exception as exc:
+        logger.warning("Feature classification failed (all models get all features): %s", exc)
+        state.model_feature_sets = {"all": state.extra_vars}
+
 
 # Registry of all Stage 3 sub-stages in order
 STAGE_3_SUBSTAGES = [
