@@ -2346,6 +2346,20 @@ Non-interactive examples:
     except Exception as exc:
         logger.warning("Adaptive threshold calibration failed (using defaults): %s", exc)
 
+    # ------------------------------------------------------------------
+    # Initialize unified ThresholdRegistry (single source of truth)
+    # ------------------------------------------------------------------
+    try:
+        from operator1.analysis.threshold_registry import init_registry
+        from operator1.scoring_weights import get_scoring_weights as _get_sw
+        init_registry(
+            base_config=_get_sw(),
+            sector=target_profile.get("sector", ""),
+            adaptive_thresholds=_adaptive_thresholds,
+        )
+    except Exception as exc:
+        logger.warning("ThresholdRegistry init failed (using defaults): %s", exc)
+
     # Refresh USS controller after adaptive thresholds recalibrate survival
     if survival_controller is not None:
         try:

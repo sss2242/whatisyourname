@@ -4645,15 +4645,9 @@ class ExponentialGradientWeightLearner:
                 e["actual"] for e in entries
                 if isinstance(e, dict) and e.get("variable") == variable
             ]
-            # Fallback: if no entries match the variable name (backward compat
-            # with old-format lists), use entries with return-like scale (<1.0)
-            if not filtered:
-                filtered = [
-                    (e["actual"] if isinstance(e, dict) else e)
-                    for e in entries
-                    if (isinstance(e, dict) and abs(e.get("actual", 999)) < 1.0)
-                    or (not isinstance(e, dict) and abs(e) < 1.0)
-                ]
+            # Note: the |value| < 1.0 fallback filter was removed (Batch A cleanup).
+            # Per-variable filtering above is now the only path. If no entries
+            # match, the regime gets a default distribution (mean=0, std=0.01).
             if len(filtered) >= 5:
                 arr = np.array(filtered)
                 distributions[regime] = {
