@@ -35,6 +35,7 @@ def run_4_1_forecasting(state: PipelineState) -> None:
         cache, state.forecast_result = run_forecasting(
             cache,
             extra_variables=state.extra_vars,
+            model_feature_sets=getattr(state, "model_feature_sets", None),
             windows=(
                 state.adaptive_tier3.windows
                 if state.adaptive_tier3 is not None

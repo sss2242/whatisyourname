@@ -119,6 +119,32 @@ def _init_extra_vars(state: PipelineState) -> None:
         except Exception:
             pass
 
+    # Prefer normalized features over raw periodic: when both
+    # `current_ratio` and `current_ratio_zscore_63d` exist, drop the raw
+    # periodic version.  Normalized features change daily (tick-level)
+    # even if the underlying fundamental updates quarterly, making them
+    # far more useful for temporal models.
+    _normalized_suffixes = ("_zscore_63d", "_percentile_252d", "_change_21d")
+    _bases_with_normalized: set[str] = set()
+    for v in state.extra_vars:
+        for suffix in _normalized_suffixes:
+            if v.endswith(suffix):
+                _bases_with_normalized.add(v[: len(v) - len(suffix)])
+    if _bases_with_normalized:
+        _before = len(state.extra_vars)
+        state.extra_vars = [
+            v for v in state.extra_vars
+            if v not in _bases_with_normalized
+            or any(v.endswith(s) for s in _normalized_suffixes)
+        ]
+        _removed = _before - len(state.extra_vars)
+        if _removed > 0:
+            logger.info(
+                "Normalized preference: removed %d raw periodic features "
+                "that have normalized versions",
+                _removed,
+            )
+
 
 def run_3_1_regime(state: PipelineState) -> None:
     """3.1: Regime detection (HMM + GMM + PELT + BCP + ChangeFinder)."""
