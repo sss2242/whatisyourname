@@ -524,22 +524,27 @@ def _ewm_percentile_rank(s: pd.Series, halflife: int = 63) -> pd.Series:
     return pd.Series(result, index=s.index)
 
 
-def _score_liquidity(cache: pd.DataFrame) -> pd.Series:
+def _score_liquidity(cache: pd.DataFrame, sector: str = "") -> pd.Series:
     """Tier 1 -- Liquidity & Cash score.
 
     Looks at: cash_ratio, free_cash_flow_ttm (or operating_cash_flow),
     cash_and_equivalents.
+
+    When ``sector`` is provided and sector reference ranges exist,
+    uses 70% cross-sectional + 30% self-history hybrid scoring.
     """
     components: list[pd.Series] = []
 
     if "cash_ratio" in cache.columns:
         components.append(
-            _normalize_series(cache["cash_ratio"], lower=0, upper=10)
+            _hybrid_score_series(cache["cash_ratio"], sector, "current_ratio", higher_is_better=True)
+            if sector else _normalize_series(cache["cash_ratio"], lower=0, upper=10)
         )
 
     if "free_cash_flow_ttm_asof" in cache.columns:
         components.append(
-            _normalize_series(cache["free_cash_flow_ttm_asof"])
+            _hybrid_score_series(cache["free_cash_flow_ttm_asof"], sector, "fcf_yield", higher_is_better=True)
+            if sector else _normalize_series(cache["free_cash_flow_ttm_asof"])
         )
     elif "operating_cash_flow" in cache.columns:
         components.append(
@@ -559,7 +564,7 @@ def _score_liquidity(cache: pd.DataFrame) -> pd.Series:
     return score
 
 
-def _score_solvency(cache: pd.DataFrame) -> pd.Series:
+def _score_solvency(cache: pd.DataFrame, sector: str = "") -> pd.Series:
     """Tier 2 -- Debt & Solvency score.
 
     Looks at: debt_to_equity (inverted), net_debt_to_ebitda (inverted),
@@ -601,7 +606,7 @@ def _score_solvency(cache: pd.DataFrame) -> pd.Series:
     return score
 
 
-def _score_stability(cache: pd.DataFrame) -> pd.Series:
+def _score_stability(cache: pd.DataFrame, sector: str = "") -> pd.Series:
     """Tier 3 -- Market Stability score.
 
     Looks at: volatility_21d (inverted), drawdown_252d (inverted), volume.
@@ -643,7 +648,7 @@ def _score_stability(cache: pd.DataFrame) -> pd.Series:
     return score
 
 
-def _score_profitability(cache: pd.DataFrame) -> pd.Series:
+def _score_profitability(cache: pd.DataFrame, sector: str = "") -> pd.Series:
     """Tier 4 -- Profitability score.
 
     Looks at: gross_margin, operating_margin, net_margin.
@@ -664,7 +669,7 @@ def _score_profitability(cache: pd.DataFrame) -> pd.Series:
     return score
 
 
-def _score_growth(cache: pd.DataFrame) -> pd.Series:
+def _score_growth(cache: pd.DataFrame, sector: str = "") -> pd.Series:
     """Tier 5 -- Growth & Valuation score.
 
     Looks at: revenue trend (rolling % change), pe_ratio (inverted --
@@ -1058,11 +1063,11 @@ def compute_financial_health(
     # PE/EV values are in the cache (may be corrected by prior fusion step).
     # At Q/A/S: T5 is fully reliable (native-scale ratios).
     tier_scores: dict[str, pd.Series] = {
-        "tier1": _score_liquidity(cache),
-        "tier2": _score_solvency(cache),
-        "tier3": _score_stability(cache),
-        "tier4": _score_profitability(cache),
-        "tier5": _score_growth(cache),
+        "tier1": _score_liquidity(cache, sector=sector),
+        "tier2": _score_solvency(cache, sector=sector),
+        "tier3": _score_stability(cache, sector=sector),
+        "tier4": _score_profitability(cache, sector=sector),
+        "tier5": _score_growth(cache, sector=sector),
     }
     if freq not in _native_ratio_freqs:
         logger.debug(
