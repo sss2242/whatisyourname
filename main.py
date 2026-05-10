@@ -1879,10 +1879,17 @@ Non-interactive examples:
                         elif isinstance(ent, dict):
                             ent_id = ent.get("isin", "") or ent.get("ticker", "")
                         if ent_id and ent_id not in {e.get("id") for e in _all_linked}:
+                            # Extract market_id for cross-region data fetch
+                            _ent_market_id = ""
+                            if hasattr(ent, "market_id"):
+                                _ent_market_id = ent.market_id
+                            elif isinstance(ent, dict):
+                                _ent_market_id = ent.get("market_id", "")
                             _all_linked.append({
                                 "id": ent_id,
                                 "name": getattr(ent, "name", "") if hasattr(ent, "name") else ent.get("name", ""),
                                 "group": group_name,
+                                "market_id": _ent_market_id,
                             })
                             group_ids.append(ent_id)
                 _entity_groups[group_name] = group_ids
@@ -1894,11 +1901,29 @@ Non-interactive examples:
                 """Fetch and build daily cache for one linked entity."""
                 ent_id = ent_info["id"]
                 try:
+                    # Use the correct PIT client for this entity's market.
+                    # When the LLM provided a market_id (cross-region routing),
+                    # create that market's client instead of using the target's.
+                    _ent_client = pit_client  # default: target's market
+                    _ent_market_id = ent_info.get("market_id", "")
+                    if _ent_market_id and _ent_market_id != market_id:
+                        try:
+                            _ent_client = _create_pit_client(_ent_market_id, secrets)
+                            logger.info(
+                                "  Cross-region fetch: using %s client for %s",
+                                _ent_market_id, ent_id,
+                            )
+                        except Exception as _cr_exc:
+                            logger.debug(
+                                "  Failed to create %s client for %s, using target's: %s",
+                                _ent_market_id, ent_id, _cr_exc,
+                            )
+
                     # Fetch financial statements
-                    _inc = pit_client.get_income_statement(ent_id)
-                    _bal = pit_client.get_balance_sheet(ent_id)
-                    _cf = pit_client.get_cashflow_statement(ent_id)
-                    _qt = pit_client.get_quotes(ent_id)
+                    _inc = _ent_client.get_income_statement(ent_id)
+                    _bal = _ent_client.get_balance_sheet(ent_id)
+                    _cf = _ent_client.get_cashflow_statement(ent_id)
+                    _qt = _ent_client.get_quotes(ent_id)
 
                     # Build minimal daily cache (OHLCV spine + ffill statements)
                     if not _qt.empty and "date" in _qt.columns:

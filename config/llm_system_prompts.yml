@@ -104,6 +104,15 @@ entity_discovery: |
     "Samsung Electronics Co., Ltd."
   - Each entity must have the temporal context fields specified
     in the prompt (relationship_start, relationship_end, stability).
+  - When the prompt provides an "AVAILABLE MARKETS" list, set the
+    "market_id" field to one of those exact values for each entity.
+    Use the market where the company is primarily listed.
+    Example: Foxconn is listed on TWSE, so market_id = "tw_mops".
+  - Set the "ticker" field to the company's ticker in that market.
+    Example: Foxconn's ticker on TWSE is "2317".
+  - If you genuinely don't know which market a company trades on,
+    set market_id and ticker to empty strings -- the pipeline will
+    search for it.
   - Do not repeat companies across relationship groups.
 
 sentiment_scoring: |

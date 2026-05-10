@@ -47,6 +47,7 @@ class LinkedEntity:
     relationship_group: str
     match_score: int
     market_cap: float | None = None
+    market_id: str = ""  # PIT wrapper that resolved this entity (for cross-region data fetch)
     # Temporal context (from Gemini discovery)
     relationship_start: str = "unknown"   # "YYYY", "ongoing", "unknown"
     relationship_end: str = "current"     # "current", "YYYY", "unknown"
@@ -413,6 +414,62 @@ def _resolve_entity_cross_region(
     return None
 
 
+def _resolve_entity_direct(
+    entity_dict: dict,
+    group: str,
+    secrets: dict[str, str] | None,
+    target_country: str,
+    target_sector: str,
+) -> LinkedEntity | None:
+    """Resolve entity using LLM-provided market_id + ticker (direct routing).
+
+    Creates the exact PIT client needed and searches by ticker, then by
+    name.  Falls back to None if the market_id is invalid or no match
+    is found.  This replaces the brute-force 25-wrapper loop with a
+    single targeted API call.
+    """
+    market_id = entity_dict.get("market_id", "")
+    ticker = entity_dict.get("ticker", "")
+    name = entity_dict.get("name", "")
+
+    if not market_id or not name:
+        return None
+
+    # Validate market_id against the registry
+    from operator1.clients.pit_registry import MARKETS
+    if market_id not in MARKETS:
+        logger.debug("LLM returned unknown market_id '%s' for '%s'", market_id, name)
+        return None
+
+    try:
+        from operator1.clients.equity_provider import create_pit_client
+        client = create_pit_client(market_id, secrets or {})
+
+        # Search by ticker first (more precise), then by name
+        query = ticker if ticker else name
+        entity = _resolve_entity(query, group, client, target_country, target_sector)
+
+        if entity is not None:
+            entity.market_id = market_id
+            logger.info(
+                "  Direct-routed: '%s' -> %s via %s (1 API call)",
+                name, entity.ticker or entity.isin, market_id,
+            )
+            return entity
+
+        # Ticker failed, try name as fallback
+        if ticker and ticker != name:
+            entity = _resolve_entity(name, group, client, target_country, target_sector)
+            if entity is not None:
+                entity.market_id = market_id
+                return entity
+
+    except Exception as exc:
+        logger.debug("Direct resolution failed for '%s' via %s: %s", name, market_id, exc)
+
+    return None
+
+
 def _build_all_pit_clients(secrets: dict[str, str] | None = None) -> list[EquityProvider]:
     """Instantiate a PIT client for every supported market.
 
@@ -543,6 +600,16 @@ def discover_linked_entities(
     if llm_client is not None:
         sector_hints = f"{target_sector}, country={target_country}"
 
+        # Build market summary for LLM prompt injection (Pattern P1 from
+        # Claude Code: inject available capabilities into the prompt so
+        # the LLM can route entities to the correct wrapper).
+        _available_markets = ""
+        try:
+            from operator1.clients.pit_registry import get_market_summary_for_llm
+            _available_markets = get_market_summary_for_llm()
+        except Exception:
+            pass
+
         # Use single-call discovery (more reliable with free-tier LLM providers
         # that have strict rate limits -- 3-call burns through the budget and
         # all 3 fail, leaving nothing for the fallback either).
@@ -551,6 +618,7 @@ def discover_linked_entities(
             try:
                 proposals = llm_client.propose_linked_entities_3call(
                     target_profile, sector_hints=sector_hints,
+                    available_markets=_available_markets,
                 )
                 _used_3call = bool(proposals)
             except Exception as exc:
@@ -560,6 +628,7 @@ def discover_linked_entities(
         if not _used_3call:
             proposals = llm_client.propose_linked_entities(
                 target_profile, sector_hints=sector_hints,
+                available_markets=_available_markets,
             )
 
         logger.info(
@@ -590,11 +659,11 @@ def discover_linked_entities(
             logger.debug("Group '%s' already resolved from checkpoint", group)
             continue
 
-        names = proposals.get(group, [])
+        items = proposals.get(group, [])
         resolved: list[LinkedEntity] = []
         group_calls = 0
 
-        for name in names:
+        for item in items:
             if group_calls >= budget_per_group:
                 logger.info("Budget exhausted for group '%s'", group)
                 break
@@ -602,10 +671,36 @@ def discover_linked_entities(
                 logger.info("Global search budget exhausted")
                 break
 
-            entity = _resolve_entity_cross_region(
-                name, group, pit_client, all_clients,
-                target_country, target_sector,
-            )
+            # Extract name and optional market routing info from LLM
+            if isinstance(item, dict):
+                name = item.get("name", "")
+                _entity_market_id = item.get("market_id", "")
+                _entity_ticker = item.get("ticker", "")
+            else:
+                name = str(item)
+                _entity_market_id = ""
+                _entity_ticker = ""
+
+            if not name:
+                continue
+
+            entity = None
+
+            # Path A: Direct routing when LLM provided market_id
+            # (1 targeted API call instead of brute-force 25-wrapper loop)
+            if _entity_market_id:
+                entity = _resolve_entity_direct(
+                    {"name": name, "market_id": _entity_market_id, "ticker": _entity_ticker},
+                    group, secrets, target_country, target_sector,
+                )
+
+            # Path B: Fallback to cross-region search (original behavior)
+            if entity is None:
+                entity = _resolve_entity_cross_region(
+                    name, group, pit_client, all_clients,
+                    target_country, target_sector,
+                )
+
             group_calls += 1
             global_calls += 1
 
@@ -635,6 +730,7 @@ def discover_linked_entities(
                 "country": e.country, "sector": e.sector,
                 "relationship_group": e.relationship_group,
                 "match_score": e.match_score, "market_cap": e.market_cap,
+                "market_id": e.market_id,
             }
             for e in resolved
         ]
@@ -667,6 +763,7 @@ def discover_linked_entities(
                 "country": e.country, "sector": e.sector,
                 "relationship_group": e.relationship_group,
                 "match_score": e.match_score, "market_cap": e.market_cap,
+                "market_id": e.market_id,
             }
             for e in peers
         ]

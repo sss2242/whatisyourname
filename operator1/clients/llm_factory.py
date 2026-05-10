@@ -112,12 +112,17 @@ class PooledLLMClient:
         self,
         primary_clients: list[LLMClient],
         fallback_clients: list[LLMClient] | None = None,
+        proactive_rotate: bool = False,
     ) -> None:
         self._primary = primary_clients
         self._fallback = fallback_clients or []
         self._all_clients = self._primary + self._fallback
         self._current_idx = 0
         self._exhausted: set[int] = set()
+        # Proactive rotation: pre-rotate to next key after each SUCCESSFUL
+        # call (not waiting for failure).  For free-tier providers where each
+        # key supports only ~1 call before exhaustion.
+        self._proactive_rotate = proactive_rotate
 
         if not self._all_clients:
             raise ValueError("No LLM clients available")
@@ -167,12 +172,28 @@ class PooledLLMClient:
         return any(indicator in msg for indicator in _EXHAUSTION_ERRORS)
 
     def _call_with_rotation(self, method_name: str, *args, **kwargs):
-        """Call a method on the active client, rotating on exhaustion."""
+        """Call a method on the active client, rotating on exhaustion.
+
+        When ``_proactive_rotate`` is True, pre-rotates to the next key
+        after each SUCCESSFUL call.  This avoids the overhead of a failed
+        request + retry cycle for free-tier keys that support only 1 call.
+        """
         attempts = len(self._all_clients) - len(self._exhausted)
         for _ in range(max(attempts, 1)):
             try:
+                logger.info(
+                    "LLM call: key %d/%d (%s) for %s",
+                    self._current_idx + 1, len(self._all_clients),
+                    self._active.provider_name,
+                    method_name,
+                )
                 method = getattr(self._active, method_name)
-                return method(*args, **kwargs)
+                result = method(*args, **kwargs)
+                # Proactive rotation: move to the next key BEFORE it fails.
+                # For free-tier providers where each key ~ 1 call.
+                if self._proactive_rotate:
+                    self._rotate()
+                return result
             except Exception as exc:
                 if self._is_exhaustion_error(exc):
                     if not self._rotate():
@@ -334,11 +355,25 @@ def _build_pooled_or_single(
             if fc:
                 fallback_clients.append(fc)
 
-    logger.info(
-        "PooledLLMClient: %d %s keys + %d fallback keys",
-        len(primary_clients), provider, len(fallback_clients),
+    # Detect free-tier OpenRouter: enable proactive rotation so each
+    # successful call advances to the next key before it gets a 429.
+    # Free keys support ~1 call each -- reactive rotation wastes a
+    # failed request + 5 retries per key transition.
+    _proactive = (
+        provider == "openrouter"
+        and len(primary_clients) > 1
+        and all(
+            ":free" in getattr(c, "_model", "")
+            for c in primary_clients
+        )
     )
-    return PooledLLMClient(primary_clients, fallback_clients or None)
+
+    logger.info(
+        "PooledLLMClient: %d %s keys + %d fallback keys%s",
+        len(primary_clients), provider, len(fallback_clients),
+        " (proactive rotation)" if _proactive else "",
+    )
+    return PooledLLMClient(primary_clients, fallback_clients or None, proactive_rotate=_proactive)
 
 
 def _auto_detect_provider(secrets: dict[str, str]) -> str:

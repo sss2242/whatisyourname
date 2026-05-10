@@ -550,8 +550,7 @@ Company profile:
 
 Sector hints: {sector_hints}
 
-Return a JSON object with these keys. Each value is a list of objects
-with the entity name and temporal context:
+Return a JSON object with these keys. Each value is a list of objects:
 
 - competitors: direct competitors in the same industry
 - suppliers: known major suppliers
@@ -561,20 +560,26 @@ with the entity name and temporal context:
 - regulators: relevant regulatory bodies (if publicly listed)
 
 Each entity should be an object with:
-  "name": "Company Name" (publicly traded, not a ticker),
+  "name": "Company Name" (publicly traded, common English trading name),
+  "market_id": "the market_id from the AVAILABLE MARKETS list below",
+  "ticker": "the company's ticker symbol in that market",
   "relationship_start": "YYYY" or "ongoing" or "unknown",
   "relationship_end": "current" or "YYYY" or "unknown",
   "stability": "stable" or "volatile" or "new"
 
+AVAILABLE MARKETS (use these exact market_id values):
+{available_markets}
+
 Example format:
-{{"competitors": [{{"name": "Example Corp", "relationship_start": "2020", "relationship_end": "current", "stability": "stable"}}]}}
+{{"competitors": [{{"name": "Taiwan Semiconductor", "market_id": "tw_mops", "ticker": "2330", "relationship_start": "2020", "relationship_end": "current", "stability": "stable"}}]}}
 
-IMPORTANT: Relationships change over time. A supplier from 3 years ago
-may no longer be a supplier. Only include entities with CURRENT or
-RECENT relationships (within the last 2 years). Mark ended relationships
-with their approximate end date.
+IMPORTANT:
+- Relationships change over time. Only include entities with CURRENT or
+  RECENT relationships (within the last 2 years).
+- Use the market_id where the company is PRIMARILY listed.
+- If unsure of the market_id or ticker, omit them and set to empty string.
+- Only include companies you are reasonably confident about.
 
-Only include companies you are reasonably confident about.
 Return valid JSON only, no markdown.
 """
 
@@ -582,37 +587,43 @@ Return valid JSON only, no markdown.
         self,
         target_profile: dict[str, Any],
         sector_hints: str = "",
-    ) -> dict[str, list[str]]:
+        available_markets: str = "",
+    ) -> dict[str, list]:
         """Ask LLM to propose linked entities for a target company.
 
-        Returns dict mapping relationship_group -> list of company names.
+        Returns dict mapping relationship_group -> list of entity items.
+        Each item is either a plain name string (backward compat) or a dict
+        with ``name``, ``market_id``, and ``ticker`` for direct routing.
         Returns empty dict on any failure.
         """
         try:
             prompt = self._LINKED_ENTITIES_PROMPT.format(
                 profile_json=json.dumps(target_profile, indent=2),
                 sector_hints=sector_hints or "none",
+                available_markets=available_markets or "Not available -- omit market_id",
             )
             text = self._generate(prompt, task_type="entity_discovery")
             parsed = self._parse_json_response(text)
             if isinstance(parsed, dict):
-                # Handle both new format (list of objects) and old format (list of strings)
-                result: dict[str, list[str]] = {}
+                result: dict[str, list] = {}
                 for k, vs in parsed.items():
                     if not isinstance(vs, list):
                         continue
-                    names: list[str] = []
+                    entities: list = []
                     for v in vs:
                         if isinstance(v, dict):
-                            # New temporal format: extract name
                             name = v.get("name", "")
                             if name:
-                                names.append(str(name))
+                                # Preserve market routing info from LLM
+                                entities.append({
+                                    "name": str(name),
+                                    "market_id": str(v.get("market_id", "") or ""),
+                                    "ticker": str(v.get("ticker", "") or ""),
+                                })
                         elif isinstance(v, str):
-                            # Old format: plain string
-                            names.append(v)
-                    if names:
-                        result[k] = names
+                            entities.append(v)
+                    if entities:
+                        result[k] = entities
                 # Store the raw parsed data for temporal extraction
                 self._last_entity_proposals_raw = parsed
                 return result
@@ -716,6 +727,7 @@ Return valid JSON only, no markdown.
         self,
         target_profile: dict[str, Any],
         sector_hints: str = "",
+        available_markets: str = "",
     ) -> dict[str, list[str]]:
         """3-call LLM entity discovery for thicker linked entity caches.
 
@@ -855,7 +867,10 @@ Return valid JSON only, no markdown.
         if total == 0:
             # Fall back to single-call if 3-call produced nothing
             logger.warning("3-call discovery returned 0 entities; falling back to single call")
-            return self.propose_linked_entities(target_profile, sector_hints=sector_hints)
+            return self.propose_linked_entities(
+                target_profile, sector_hints=sector_hints,
+                available_markets=available_markets,
+            )
 
         return all_entities
 
