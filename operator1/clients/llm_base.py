@@ -872,7 +872,10 @@ Return valid JSON only, no markdown.
                 available_markets=available_markets,
             )
 
-        return all_entities
+        # Return all_raw (preserves dict items with market_id/ticker routing
+        # info) instead of all_entities (name-only strings).  The caller in
+        # entity_discovery.py handles both str and dict items.
+        return all_raw if all_raw else all_entities
 
     # ------------------------------------------------------------------
     # World Bank mapping suggestions (Sec 4)
