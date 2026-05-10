@@ -334,7 +334,8 @@ def run_2_F_fusion(state: PipelineState) -> None:
             # Also re-run financial health with correct Q/A ratios
             try:
                 from operator1.models.financial_health import compute_financial_health
-                cache, _fh = compute_financial_health(cache, freq="Q")
+                _sector = state.target_profile.get("sector", "") if state.target_profile else ""
+                cache, _fh = compute_financial_health(cache, freq="Q", sector=_sector)
                 state.fh_result = _fh
                 state.cache = cache
                 logger.info("Post-fusion FH re-run: composite=%.1f (%s)",
