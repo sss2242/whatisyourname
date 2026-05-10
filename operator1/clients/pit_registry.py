@@ -741,6 +741,20 @@ def get_tier1_markets() -> list[MarketInfo]:
     return [m for m in get_all_markets() if m.tier == 1]
 
 
+def get_market_summary_for_llm() -> str:
+    """Build compact market list for LLM entity discovery prompt.
+
+    Returns a string listing all available markets with their market_id,
+    country, and exchange.  Injected into the entity discovery prompt so
+    the LLM can route entities to the correct PIT wrapper in a single
+    call (no brute-force cross-region search needed).
+    """
+    lines = []
+    for m in sorted(MARKETS.values(), key=lambda x: (x.tier, x.market_id)):
+        lines.append(f"  {m.market_id}: {m.country} ({m.exchange})")
+    return "\n".join(lines)
+
+
 def format_region_menu() -> str:
     """Build a human-readable menu of regions for CLI display."""
     lines = ["", "Available Regions:", ""]
