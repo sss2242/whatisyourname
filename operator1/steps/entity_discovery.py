@@ -420,54 +420,56 @@ def _resolve_entity_direct(
     secrets: dict[str, str] | None,
     target_country: str,
     target_sector: str,
-) -> LinkedEntity | None:
+) -> tuple[LinkedEntity | None, int]:
     """Resolve entity using LLM-provided market_id + ticker (direct routing).
 
     Creates the exact PIT client needed and searches by ticker, then by
-    name.  Falls back to None if the market_id is invalid or no match
-    is found.  This replaces the brute-force 25-wrapper loop with a
-    single targeted API call.
+    name.  Returns ``(entity_or_None, api_call_count)`` so the caller can
+    correctly track the search budget.
     """
     market_id = entity_dict.get("market_id", "")
     ticker = entity_dict.get("ticker", "")
     name = entity_dict.get("name", "")
 
     if not market_id or not name:
-        return None
+        return None, 0
 
     # Validate market_id against the registry
     from operator1.clients.pit_registry import MARKETS
     if market_id not in MARKETS:
         logger.debug("LLM returned unknown market_id '%s' for '%s'", market_id, name)
-        return None
+        return None, 0
 
+    api_calls = 0
     try:
         from operator1.clients.equity_provider import create_pit_client
         client = create_pit_client(market_id, secrets or {})
 
         # Search by ticker first (more precise), then by name
         query = ticker if ticker else name
+        api_calls += 1
         entity = _resolve_entity(query, group, client, target_country, target_sector)
 
         if entity is not None:
             entity.market_id = market_id
             logger.info(
-                "  Direct-routed: '%s' -> %s via %s (1 API call)",
-                name, entity.ticker or entity.isin, market_id,
+                "  Direct-routed: '%s' -> %s via %s (%d API call(s))",
+                name, entity.ticker or entity.isin, market_id, api_calls,
             )
-            return entity
+            return entity, api_calls
 
         # Ticker failed, try name as fallback
         if ticker and ticker != name:
+            api_calls += 1
             entity = _resolve_entity(name, group, client, target_country, target_sector)
             if entity is not None:
                 entity.market_id = market_id
-                return entity
+                return entity, api_calls
 
     except Exception as exc:
         logger.debug("Direct resolution failed for '%s' via %s: %s", name, market_id, exc)
 
-    return None
+    return None, api_calls
 
 
 def _build_all_pit_clients(secrets: dict[str, str] | None = None) -> list[EquityProvider]:
@@ -687,9 +689,10 @@ def discover_linked_entities(
             entity = None
 
             # Path A: Direct routing when LLM provided market_id
-            # (1 targeted API call instead of brute-force 25-wrapper loop)
+            # (1-2 targeted API calls instead of brute-force 25-wrapper loop)
+            calls_used = 0
             if _entity_market_id:
-                entity = _resolve_entity_direct(
+                entity, calls_used = _resolve_entity_direct(
                     {"name": name, "market_id": _entity_market_id, "ticker": _entity_ticker},
                     group, secrets, target_country, target_sector,
                 )
@@ -700,9 +703,10 @@ def discover_linked_entities(
                     name, group, pit_client, all_clients,
                     target_country, target_sector,
                 )
+                calls_used = max(calls_used, 1)  # at least 1 for the fallback
 
-            group_calls += 1
-            global_calls += 1
+            group_calls += calls_used
+            global_calls += calls_used
 
             if entity is not None:
                 # Deduplicate by ISIN

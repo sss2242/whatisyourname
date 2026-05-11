@@ -165,6 +165,30 @@ class PooledLLMClient:
         logger.warning("All %d LLM keys exhausted -- falling back to templates", len(self._all_clients))
         return False
 
+    def _proactive_rotate_next(self) -> None:
+        """Pre-rotate to the next key after a successful call.
+
+        Unlike ``_rotate()``, this does NOT log a WARNING when all keys
+        have been used -- that is expected on the last call of a normal
+        3-key run.  Silently stays on the current key if no others remain.
+        """
+        self._exhausted.add(self._current_idx)
+        for i in range(len(self._all_clients)):
+            if i not in self._exhausted:
+                logger.debug(
+                    "Proactive rotate: key %d/%d -> %d/%d",
+                    self._current_idx + 1, len(self._all_clients),
+                    i + 1, len(self._all_clients),
+                )
+                self._current_idx = i
+                return
+        # All keys used -- this is normal after the last call in a
+        # proactive rotation pool.  Log at DEBUG, not WARNING.
+        logger.debug(
+            "Proactive rotate: all %d keys used (normal after last call)",
+            len(self._all_clients),
+        )
+
     @staticmethod
     def _is_exhaustion_error(exc: Exception) -> bool:
         """Check if an exception indicates credit exhaustion or rate limiting."""
@@ -191,8 +215,10 @@ class PooledLLMClient:
                 result = method(*args, **kwargs)
                 # Proactive rotation: move to the next key BEFORE it fails.
                 # For free-tier providers where each key ~ 1 call.
+                # Use _proactive_rotate_next() to avoid spurious WARNING
+                # when the last key in the pool has just been used.
                 if self._proactive_rotate:
-                    self._rotate()
+                    self._proactive_rotate_next()
                 return result
             except Exception as exc:
                 if self._is_exhaustion_error(exc):
