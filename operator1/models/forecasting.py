@@ -2577,16 +2577,22 @@ def run_forecasting(
     # Fast-path configuration: which tiers skip the LSTM/Tree cascade
     # and use the lightweight ETS+Naive+WindowAvg+Drift ensemble instead.
     # Configurable via config/global_config.yml -> forecasting.fast_ensemble_tiers
+    from operator1.config_loader import get_global_config
+    _forecasting_cfg = get_global_config().get("forecasting", {})
     _fast_tiers: set[int] = set(
-        _cfg.get("forecasting", {}).get("fast_ensemble_tiers", [3, 4, 5])
+        _forecasting_cfg.get("fast_ensemble_tiers", [3, 4, 5])
     )
     _distributional_vars: set[str] = set(
-        _cfg.get("forecasting", {}).get(
+        _forecasting_cfg.get(
             "distributional_vars",
             list(_KEY_DISTRIBUTIONAL_VARS),
         )
     )
-    _lstm_enabled: bool = _cfg.get("forecasting", {}).get("lstm_enabled", False)
+    _lstm_enabled: bool = _forecasting_cfg.get("lstm_enabled", False)
+    # Variables that must go through the full cascade even if their tier
+    # is in _fast_tiers, because they have post-cascade accuracy fixes
+    # (regime directional shift, momentum overlay, horizon-specific blending).
+    _fast_path_excluded: frozenset = frozenset({"close", "return_1d"})
 
     if _fast_tiers:
         logger.info(
@@ -2608,8 +2614,11 @@ def run_forecasting(
         # on sub-1000-point financial series (M4 Competition, Makridakis
         # et al. 2020) at ~0.06s vs ~40s for the LSTM cascade.
         # Tier1/2 (survival-critical) keep their Kalman path unchanged.
+        # close/return_1d are excluded: they need the regime directional
+        # shift (Method 5) and momentum overlay (P1) that run after the
+        # cascade, plus the C1 horizon-specific tree blending.
         _tier_num = int(tier.replace("tier", "")) if tier.startswith("tier") else 0
-        if _tier_num in _fast_tiers:
+        if _tier_num in _fast_tiers and var_name not in _fast_path_excluded:
             fcast, met = _fit_fast_ensemble(series, n_forecast=max_horizon)
             met.variable = var_name
             result.metrics.append(met)
