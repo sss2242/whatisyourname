@@ -44,6 +44,12 @@ vae_kl_weight: 0.5
 # If left empty, auto-detects based on which API key is available.
 llm_provider: ""
 
+# LLM key rotation strategy for multi-key setups (comma-separated keys in .env):
+#   auto       -- auto-detect: proactive for free-tier models (:free), reactive for paid
+#   per_call   -- rotate to next key after every successful call (best for free-tier keys)
+#   on_failure -- rotate only when a key gets 429/exhausted (best for paid keys)
+llm_key_rotation: "auto"
+
 # LLM model override (optional). Leave empty to use the provider default.
 # Can also be set via the LLM_MODEL environment variable.
 # Use "auto" to let the factory pick the best report-capable model.
@@ -112,6 +118,23 @@ forecasting:
     - volatility_21d
     - revenue
     - fcf_yield
+
+# ---------------------------------------------------------------------------
+# Frequency Pipeline Configuration
+# ---------------------------------------------------------------------------
+# Controls how the multi-frequency pipeline (Stage 2) executes.
+frequency_pipeline:
+  # Execution mode:
+  #   parallel   -- 2-wave parallel (A+Q+S then M+W+D), fastest on 4+ cores
+  #   sequential -- one frequency at a time (A->Q->S->M->W->D), lower memory
+  #                 Better cascading context (A informs Q, Q informs D).
+  #                 Per-frequency checkpoint resume on crash.
+  #                 Peak memory = 1x base instead of 3x.
+  mode: "parallel"
+  # Which frequencies to run. Default: all detected from filing data.
+  # Set fewer for speed on weak devices: ["Q", "D"] is the minimum for
+  # correct Q/A ratios in the daily cache.
+  # frequencies: ["A", "Q", "S", "M", "W", "D"]
 
 # Logging
 log_level: INFO

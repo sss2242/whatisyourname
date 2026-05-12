@@ -47,6 +47,13 @@ ALL_STAGES = [
     ("2.W1", "Freq Pipeline: Wave 1 -- A/Q/S in parallel (native filing frequencies)"),
     ("2.W2", "Freq Pipeline: Wave 2 -- M/W/D in parallel (interpolated, uses Q context)"),
     ("2.F", "Freq Pipeline: Fusion (13-method fusion + forward-fill Q/A ratios to daily cache)"),
+    # Sequential mode alternatives (used when frequency_pipeline.mode = "sequential")
+    ("2.S.A", "Freq Pipeline: Annual (sequential mode)"),
+    ("2.S.Q", "Freq Pipeline: Quarterly (sequential mode)"),
+    ("2.S.S", "Freq Pipeline: Semi-annual (sequential mode)"),
+    ("2.S.M", "Freq Pipeline: Monthly (sequential mode)"),
+    ("2.S.W", "Freq Pipeline: Weekly (sequential mode)"),
+    ("2.S.D", "Freq Pipeline: Daily (sequential mode)"),
     # Backtest Stage 3+: Temporal models (36 sub-stages via staged runner)
     ("3.1", "Regime Detection (HMM/GMM/PELT/BCP/ChangeFinder)"),
     ("3.2", "Dual Regime Mixer"),
