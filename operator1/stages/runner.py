@@ -42,7 +42,7 @@ def _build_registry() -> list[tuple[str, callable]]:
       Stage 4-7: Forward modeling, ensemble, integration, HF
     """
     from operator1.stages.stage2_preprocessing import STAGE_2_SUBSTAGES
-    from operator1.stages.stage2_freq_pipeline import STAGE_2_FREQ_SUBSTAGES
+    from operator1.stages.stage2_freq_pipeline import build_freq_substages
     from operator1.stages.stage3_temporal import STAGE_3_SUBSTAGES
     from operator1.stages.stage4_forecasting import STAGE_4_SUBSTAGES
     from operator1.stages.stage5_forward import STAGE_5_SUBSTAGES
@@ -51,7 +51,7 @@ def _build_registry() -> list[tuple[str, callable]]:
 
     return (
         STAGE_2_SUBSTAGES
-        + STAGE_2_FREQ_SUBSTAGES  # NEW: frequency-first pipeline runs BEFORE temporal models
+        + build_freq_substages()  # dynamic: parallel or sequential based on config
         + STAGE_3_SUBSTAGES
         + STAGE_4_SUBSTAGES
         + STAGE_5_SUBSTAGES

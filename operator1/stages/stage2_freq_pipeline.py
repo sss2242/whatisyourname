@@ -9,11 +9,27 @@ After all frequencies complete, the fusion step reconciles results and
 forward-fills Q/A-computed ratios (PE, EV/EBITDA, ROA, etc.) into the
 daily cache so downstream temporal models have correct values.
 
-Sub-stages (2-wave parallel):
-  2.0   Resample prep (build per-freq caches from raw filings)
-  2.W1  Wave 1: A + Q + S in parallel (native filing frequencies, no inter-deps)
-  2.W2  Wave 2: M + W + D in parallel (interpolated, use Q context from Wave 1)
-  2.F   Fusion + forward-fill Q/A ratios to daily cache
+Two execution modes (set via ``frequency_pipeline.mode`` in global_config.yml):
+
+  **Parallel** (default, fastest on 4+ cores):
+    2.0   Resample prep (build per-freq caches from raw filings)
+    2.W1  Wave 1: A + Q + S in parallel (native filing frequencies)
+    2.W2  Wave 2: M + W + D in parallel (interpolated, Q context)
+    2.F   Fusion + forward-fill Q/A ratios to daily cache
+
+  **Sequential** (lower memory, better cascading context):
+    2.0    Resample prep
+    2.S.A  Annual pipeline (no prior context)
+    2.S.Q  Quarterly pipeline (uses A context)
+    2.S.S  Semi-annual pipeline (uses Q context)
+    2.S.M  Monthly pipeline (uses Q context)
+    2.S.W  Weekly pipeline (uses Q context)
+    2.S.D  Daily pipeline (uses Q context)
+    2.F    Fusion + forward-fill
+
+  Sequential mode runs one frequency at a time with checkpoint resume
+  and explicit memory cleanup between frequencies.  Peak memory = 1x
+  instead of 3x.  Better cascading context: A informs Q, Q informs D.
 """
 
 from __future__ import annotations
@@ -130,6 +146,78 @@ def _run_freq_isolated(state: "PipelineState", freq: str, prior_context_freq: st
         freq, result.n_periods, result.survival_probability, result.elapsed_seconds,
     )
     return freq
+
+
+# ---------------------------------------------------------------------------
+# Sequential mode: one frequency at a time with checkpoint resume
+# ---------------------------------------------------------------------------
+
+def _run_freq_sequential(state: "PipelineState", freq: str, prior_context_freq: str | None) -> None:
+    """Run one frequency pipeline sequentially with checkpoint resume + memory cleanup.
+
+    Reuses _run_freq_isolated() but adds:
+    1. Checkpoint check: skip if result already exists on disk (crash resume)
+    2. Explicit gc.collect() after completion to free memory for next frequency
+
+    Used by the sequential sub-stage functions (run_2_seq_*) when
+    frequency_pipeline.mode = "sequential" in global_config.yml.
+    """
+    import gc
+
+    freqs = state.load_mf_frequencies()
+    if freq not in freqs:
+        logger.info("[%s] Not in available frequencies, skipping", freq)
+        return
+
+    # Checkpoint resume: skip if this frequency already completed
+    existing = state.load_mf_result(freq)
+    if existing is not None:
+        logger.info("[%s] Already completed (found checkpoint), skipping", freq)
+        return
+
+    _run_freq_isolated(state, freq, prior_context_freq)
+
+    # Explicit memory cleanup for low-resource devices.
+    # After save_mf_result/save_mf_context in _run_freq_isolated(),
+    # the result is on disk -- safe to free the in-memory copy.
+    gc.collect()
+    logger.info("[%s] Sequential pipeline complete, memory freed", freq)
+
+
+def run_2_seq_annual(state: "PipelineState") -> None:
+    """2.S.A: Run Annual frequency pipeline (sequential mode)."""
+    logger.info("Stage 2.S.A: Annual pipeline (sequential)")
+    _run_freq_sequential(state, "A", prior_context_freq=None)
+
+
+def run_2_seq_quarterly(state: "PipelineState") -> None:
+    """2.S.Q: Run Quarterly frequency pipeline (sequential mode)."""
+    logger.info("Stage 2.S.Q: Quarterly pipeline (sequential)")
+    _run_freq_sequential(state, "Q", prior_context_freq="A")
+
+
+def run_2_seq_semiannual(state: "PipelineState") -> None:
+    """2.S.S: Run Semi-annual frequency pipeline (sequential mode)."""
+    logger.info("Stage 2.S.S: Semi-annual pipeline (sequential)")
+    _run_freq_sequential(state, "S", prior_context_freq="Q")
+
+
+def run_2_seq_monthly(state: "PipelineState") -> None:
+    """2.S.M: Run Monthly frequency pipeline (sequential mode)."""
+    logger.info("Stage 2.S.M: Monthly pipeline (sequential)")
+    _run_freq_sequential(state, "M", prior_context_freq="Q")
+
+
+def run_2_seq_weekly(state: "PipelineState") -> None:
+    """2.S.W: Run Weekly frequency pipeline (sequential mode)."""
+    logger.info("Stage 2.S.W: Weekly pipeline (sequential)")
+    _run_freq_sequential(state, "W", prior_context_freq="Q")
+
+
+def run_2_seq_daily(state: "PipelineState") -> None:
+    """2.S.D: Run Daily frequency pipeline (sequential mode)."""
+    logger.info("Stage 2.S.D: Daily pipeline (sequential)")
+    _run_freq_sequential(state, "D", prior_context_freq="Q")
 
 
 # ---------------------------------------------------------------------------
@@ -346,10 +434,51 @@ def run_2_F_fusion(state: PipelineState) -> None:
             logger.warning("Post-fusion survival re-run failed: %s", exc)
 
 
-# Registry of all Stage 2 sub-stages in order (2-wave parallel)
-STAGE_2_FREQ_SUBSTAGES = [
-    ("2.0", run_2_0_resample_prep),
-    ("2.W1", run_2_wave1_native),         # A + Q + S in parallel
-    ("2.W2", run_2_wave2_interpolated),    # M + W + D in parallel
-    ("2.F", run_2_F_fusion),
-]
+# ---------------------------------------------------------------------------
+# Dynamic registry builder: parallel or sequential based on config
+# ---------------------------------------------------------------------------
+
+def build_freq_substages() -> list[tuple[str, callable]]:
+    """Build frequency pipeline sub-stages based on config mode.
+
+    Reads ``frequency_pipeline.mode`` from ``config/global_config.yml``:
+
+    - ``"parallel"`` (default): 2-wave parallel (A+Q+S then M+W+D).
+      Fastest on 4+ core machines.  Peak memory = 3x base.
+    - ``"sequential"``: one frequency at a time (A->Q->S->M->W->D).
+      Lower memory (1x base), better cascading context (A informs Q
+      informs D), per-frequency checkpoint resume on crash.
+
+    Both modes start with 2.0 (resample prep) and end with 2.F (fusion).
+    """
+    try:
+        from operator1.config_loader import get_global_config
+        cfg = get_global_config().get("frequency_pipeline", {})
+    except Exception:
+        cfg = {}
+
+    mode = cfg.get("mode", "parallel")
+
+    if mode == "sequential":
+        return [
+            ("2.0", run_2_0_resample_prep),
+            ("2.S.A", run_2_seq_annual),
+            ("2.S.Q", run_2_seq_quarterly),
+            ("2.S.S", run_2_seq_semiannual),
+            ("2.S.M", run_2_seq_monthly),
+            ("2.S.W", run_2_seq_weekly),
+            ("2.S.D", run_2_seq_daily),
+            ("2.F", run_2_F_fusion),
+        ]
+    else:  # parallel (default)
+        return [
+            ("2.0", run_2_0_resample_prep),
+            ("2.W1", run_2_wave1_native),         # A + Q + S in parallel
+            ("2.W2", run_2_wave2_interpolated),    # M + W + D in parallel
+            ("2.F", run_2_F_fusion),
+        ]
+
+
+# Backward compat: static constant for any code that imports it directly.
+# The runner uses build_freq_substages() dynamically instead.
+STAGE_2_FREQ_SUBSTAGES = build_freq_substages()
