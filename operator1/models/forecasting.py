@@ -2476,6 +2476,180 @@ def _fit_global_lightgbm(
     return forecasts, model
 
 
+def _forecast_single_variable(
+    var_name: str,
+    pre: dict[str, Any],
+    *,
+    fast_tiers: set[int],
+    fast_path_excluded: frozenset,
+    use_global_lgbm: bool,
+    distributional_vars: set[str],
+    random_state: int,
+    enable_burnout: bool,
+) -> dict[str, Any]:
+    """Fit models for a single variable (pure function, no shared mutable state).
+
+    Extracted from the per-variable loop body for parallel execution.
+    All inputs are read-only. Returns a result dict merged by the caller.
+
+    Parameters
+    ----------
+    var_name: Variable name.
+    pre: Pre-extracted data dict with keys: series, tier, tier_num,
+         max_horizon, multivariate_df, regime_labels, regime_probs,
+         has_returns, n_available_vars, feat_df_dist.
+    """
+    series = pre["series"]
+    tier = pre["tier"]
+    tier_num = pre["tier_num"]
+    max_horizon = pre["max_horizon"]
+
+    best_forecast: np.ndarray | None = None
+    best_model_name = ""
+    best_metrics: ModelMetrics | None = None
+    metrics_list: list[ModelMetrics] = []
+    distributional_item: tuple[str, pd.DataFrame] | None = None
+    model_flags: dict[str, Any] = {}
+
+    # --- Fast ensemble path for Tier3+ ---
+    if tier_num in fast_tiers and var_name not in fast_path_excluded:
+        fcast, met = _fit_fast_ensemble(series, n_forecast=max_horizon)
+        met.variable = var_name
+        metrics_list.append(met)
+        if fcast is not None:
+            best_forecast = fcast
+            best_model_name = met.model_name
+            best_metrics = met
+
+        # Distributional deferral
+        feat_df_dist = pre.get("feat_df_dist")
+        if var_name in distributional_vars and feat_df_dist is not None:
+            distributional_item = (var_name, feat_df_dist)
+
+        # Baseline fallback
+        if best_forecast is None:
+            fcast, met = fit_baseline(series, n_forecast=max_horizon)
+            met.variable = var_name
+            metrics_list.append(met)
+            best_forecast = fcast
+            best_model_name = met.model_name
+            best_metrics = met
+
+        # Fast path: skip cascade
+        horizons: dict[str, float] = {}
+        if best_forecast is not None:
+            for label, h in HORIZONS.items():
+                horizons[label] = float(best_forecast[min(h - 1, len(best_forecast) - 1)])
+
+        return {
+            "var_name": var_name,
+            "best_forecast": best_forecast,
+            "best_model_name": best_model_name,
+            "best_metrics": best_metrics,
+            "metrics_list": metrics_list,
+            "model_flags": model_flags,
+            "horizons": horizons,
+            "distributional_item": distributional_item,
+            "fast_path": True,
+        }
+
+    # --- Kalman (preferred for tier1/tier2) ---
+    if tier in ("tier1", "tier2"):
+        regime_labels = pre.get("regime_labels")
+        regime_probs = pre.get("regime_probs")
+        has_returns = pre.get("has_returns", False)
+        if regime_labels is not None and has_returns:
+            fcast, met = fit_kalman_per_regime(
+                series, regime_labels, regime_probs=regime_probs,
+                n_forecast=max_horizon,
+            )
+        else:
+            fcast, met = fit_kalman(series, n_forecast=max_horizon)
+        met.variable = var_name
+        metrics_list.append(met)
+        if fcast is not None:
+            best_forecast = fcast
+            best_model_name = "kalman"
+            best_metrics = met
+        else:
+            model_flags["model_failed_kalman"] = True
+            model_flags["kalman_error"] = met.error
+
+    # --- VAR ---
+    if best_forecast is None and pre.get("n_available_vars", 0) >= 2:
+        var_df = pre.get("multivariate_df")
+        if var_df is not None and not var_df.empty:
+            fcast, met = fit_var(var_df, var_name, n_forecast=max_horizon)
+            met.variable = var_name
+            metrics_list.append(met)
+            if fcast is not None:
+                best_forecast = fcast
+                best_model_name = met.model_name
+                best_metrics = met
+            else:
+                model_flags["model_failed_var"] = True
+                model_flags["var_error"] = met.error
+
+    # --- Tree ensemble (skipped when global LightGBM replaces it) ---
+    if best_forecast is None and not use_global_lgbm:
+        feat_df = pre.get("feat_df_tree")
+        if feat_df is not None and not feat_df.empty:
+            fcast, met = fit_tree_ensemble(
+                feat_df, var_name,
+                n_forecast=max_horizon,
+                random_state=random_state,
+            )
+            met.variable = var_name
+            metrics_list.append(met)
+            if fcast is not None:
+                best_forecast = fcast
+                best_model_name = met.model_name
+                best_metrics = met
+            else:
+                model_flags["model_failed_tree"] = True
+                model_flags["tree_error"] = met.error
+
+    # --- Distributional deferral ---
+    feat_df_dist = pre.get("feat_df_dist")
+    if var_name in distributional_vars and feat_df_dist is not None:
+        distributional_item = (var_name, feat_df_dist)
+
+    # --- Baseline (always succeeds) ---
+    if best_forecast is None:
+        fcast, met = fit_baseline(series, n_forecast=max_horizon)
+        met.variable = var_name
+        metrics_list.append(met)
+        best_forecast = fcast
+        best_model_name = met.model_name
+        best_metrics = met
+
+    # --- Burnout refinement ---
+    if enable_burnout and best_forecast is not None and best_model_name == "kalman":
+        burnout_fcast, burnout_met = _burnout_refit(
+            series, fit_kalman, n_forecast=max_horizon,
+        )
+        if (
+            burnout_fcast is not None
+            and not np.isnan(burnout_met.rmse)
+            and (best_metrics is None or np.isnan(best_metrics.rmse)
+                 or burnout_met.rmse < best_metrics.rmse)
+        ):
+            best_forecast = burnout_fcast
+            best_model_name = f"{best_model_name}_burnout"
+            best_metrics = burnout_met
+
+    return {
+        "var_name": var_name,
+        "best_forecast": best_forecast,
+        "best_model_name": best_model_name,
+        "best_metrics": best_metrics,
+        "metrics_list": metrics_list,
+        "model_flags": model_flags,
+        "distributional_item": distributional_item,
+        "fast_path": False,
+    }
+
+
 def run_forecasting(
     cache: pd.DataFrame,
     variables: list[str] | None = None,
@@ -2856,197 +3030,133 @@ def run_forecasting(
     _deferred_distributional: list[tuple[str, pd.DataFrame]] = []
     _n_workers: int = _forecasting_cfg.get("parallel_workers", 4)
 
+    # ------------------------------------------------------------------
+    # Phase 1: Pre-extract all data before parallel phase (thread safety)
+    # ------------------------------------------------------------------
+    _max_horizon = max(HORIZONS.values())
+    _regime_labels_arr = cache.get("regime_label")
+    _regime_labels_np = (
+        _regime_labels_arr.values if _regime_labels_arr is not None
+        and hasattr(_regime_labels_arr, "values") else None
+    )
+    _regime_probs_dict = None
+    _prob_cols = [c for c in cache.columns if c.startswith("regime_hmm_prob_")]
+    if _prob_cols and len(cache) > 0:
+        _last_probs = cache[_prob_cols].iloc[-1]
+        _regime_map = {0: "bull", 1: "bear", 2: "high_vol", 3: "low_vol"}
+        _regime_probs_dict = {
+            _regime_map.get(i, str(i)): float(_last_probs.iloc[i])
+            for i in range(len(_last_probs))
+            if not np.isnan(_last_probs.iloc[i])
+        }
+
+    _pre_extracted: dict[str, dict[str, Any]] = {}
     for var_name in available_vars:
-        series = _extract_series(var_name)
         tier = _get_tier_for_variable(var_name, tier_map)
-        max_horizon = max(HORIZONS.values())
-        best_forecast: np.ndarray | None = None
-        best_model_name = ""
-        best_metrics: ModelMetrics | None = None
-
-        # --- Fast ensemble path for Tier3+ variables ---
-        # ETS+Naive+WindowAvg+Drift ensemble gives equivalent accuracy
-        # on sub-1000-point financial series (M4 Competition, Makridakis
-        # et al. 2020) at ~0.06s vs ~40s for the LSTM cascade.
-        # Tier1/2 (survival-critical) keep their Kalman path unchanged.
-        # close/return_1d are excluded: they need the regime directional
-        # shift (Method 5) and momentum overlay (P1) that run after the
-        # cascade, plus the C1 horizon-specific tree blending.
         _tier_num = int(tier.replace("tier", "")) if tier.startswith("tier") else 0
-        if _tier_num in _fast_tiers and var_name not in _fast_path_excluded:
-            fcast, met = _fit_fast_ensemble(series, n_forecast=max_horizon)
-            met.variable = var_name
-            result.metrics.append(met)
-            if fcast is not None:
-                best_forecast = fcast
-                best_model_name = met.model_name
-                best_metrics = met
-
-            # Distributional model: deferred to parallel batch after main loop
-            if var_name in _distributional_vars:
-                try:
-                    feat_df_dist = _extract_features(var_name, model_type="tree")
-                    if not feat_df_dist.empty and len(feat_df_dist.dropna()) >= _MIN_OBS_TREE:
-                        _deferred_distributional.append((var_name, feat_df_dist.copy()))
-                except Exception:
-                    pass
-
-            # Baseline fallback if fast ensemble failed
-            if best_forecast is None:
-                fcast, met = fit_baseline(series, n_forecast=max_horizon)
-                met.variable = var_name
-                result.metrics.append(met)
-                best_forecast = fcast
-                best_model_name = met.model_name
-                best_metrics = met
-
-            # Record and skip to next variable (bypass LSTM/Tree cascade)
-            if best_forecast is not None:
-                for label, h in HORIZONS.items():
-                    result.forecasts.setdefault(var_name, {})[label] = float(
-                        best_forecast[min(h - 1, len(best_forecast) - 1)]
-                    )
-                result.model_used[var_name] = best_model_name
-            continue
-
-        # --- Kalman (preferred for tier1/tier2) ---
-        # Try per-regime Kalman first (Section K.2), fall back to standard
-        if tier in ("tier1", "tier2"):
-            _regime_labels_arr = cache.get("regime_label")
-            if _regime_labels_arr is not None and has_returns:
-                _rl = _regime_labels_arr.values if hasattr(_regime_labels_arr, "values") else _regime_labels_arr
-                # Build regime probability dict from current HMM state
-                _rp = None
-                _prob_cols = [c for c in cache.columns if c.startswith("regime_hmm_prob_")]
-                if _prob_cols and len(cache) > 0:
-                    _last_probs = cache[_prob_cols].iloc[-1]
-                    _regime_map = {0: "bull", 1: "bear", 2: "high_vol", 3: "low_vol"}
-                    _rp = {_regime_map.get(i, str(i)): float(_last_probs.iloc[i]) for i in range(len(_last_probs)) if not np.isnan(_last_probs.iloc[i])}
-                fcast, met = fit_kalman_per_regime(series, _rl, regime_probs=_rp, n_forecast=max_horizon)
-            else:
-                fcast, met = fit_kalman(series, n_forecast=max_horizon)
-            met.variable = var_name
-            result.metrics.append(met)
-            if fcast is not None:
-                best_forecast = fcast
-                best_model_name = "kalman"
-                best_metrics = met
-            else:
-                if not kalman_attempted:
-                    result.model_failed_kalman = True
-                    result.kalman_error = met.error
-            kalman_attempted = True
-
-        # --- VAR (if multiple variables available) ---
-        if best_forecast is None and len(available_vars) >= 2:
-            var_df = _extract_multivariate(var_name)
-
-            fcast, met = fit_var(var_df, var_name, n_forecast=max_horizon)
-            met.variable = var_name
-            result.metrics.append(met)
-            if fcast is not None:
-                best_forecast = fcast
-                best_model_name = met.model_name
-                best_metrics = met
-            else:
-                if not var_attempted:
-                    result.model_failed_var = True
-                    result.var_error = met.error
-            var_attempted = True
-
-        # --- Per-variable LSTM fallback (legacy, disabled in 2-mode system) ---
-        # In 2-mode system, LSTM runs via fit_batched_lstm() AFTER the
-        # per-variable loop (all 31 vars in one batch, 31x faster).
-        # Per-variable LSTM kept only for edge cases where batched fails.
-        _lstm_enabled = False  # always off in cascade; batched LSTM runs post-loop
-        if best_forecast is None and _lstm_enabled:
-            fcast, met = fit_lstm(
-                series,
-                n_forecast=max_horizon,
-                random_state=random_state,
-            )
-            met.variable = var_name
-            result.metrics.append(met)
-            if fcast is not None:
-                best_forecast = fcast
-                best_model_name = met.model_name
-                best_metrics = met
-            else:
-                if not lstm_attempted:
-                    result.model_failed_lstm = True
-                    result.lstm_error = met.error
-            lstm_attempted = True
-
-        # --- Tree ensemble on tabular features ---
-        # Skipped when global LightGBM is enabled (replaces 31 per-variable
-        # tree fits with 1 global model, per plan Change 5).
-        if best_forecast is None and not _use_global_lgbm:
-            feat_df = _extract_features(var_name, model_type="tree")
-            if not feat_df.empty:
-                fcast, met = fit_tree_ensemble(
-                    feat_df,
-                    var_name,
-                    n_forecast=max_horizon,
-                    random_state=random_state,
-                )
-                met.variable = var_name
-                result.metrics.append(met)
-                if fcast is not None:
-                    best_forecast = fcast
-                    best_model_name = met.model_name
-                    best_metrics = met
-                else:
-                    if not tree_attempted:
-                        result.model_failed_tree = True
-                        result.tree_error = met.error
-                tree_attempted = True
-
-        # --- Beyond Bands Method 2: Distributional forecast (conditional sigma) ---
-        # Deferred to parallel batch after main loop for speed.
-        # Collects inputs here; fitting runs via joblib after the loop.
-        # GUARDED: only runs on key distributional variables (saves ~50s).
+        _feat_df_dist = None
         try:
-            feat_df_dist = _extract_features(var_name, model_type="tree")
-            if (var_name in _distributional_vars
-                    and not feat_df_dist.empty
-                    and len(feat_df_dist.dropna()) >= _MIN_OBS_TREE):
-                _deferred_distributional.append((var_name, feat_df_dist.copy()))
-            if False:  # original inline code preserved but deferred to batch
-                _dist_fcast, _dist_met = fit_distributional(
-                    feat_df_dist, var_name, random_state=random_state,
+            _fdd = _extract_features(var_name, model_type="tree")
+            if not _fdd.empty and len(_fdd.dropna()) >= _MIN_OBS_TREE:
+                _feat_df_dist = _fdd.copy()
+        except Exception:
+            pass
+        _multivariate_df = None
+        if len(available_vars) >= 2:
+            try:
+                _multivariate_df = _extract_multivariate(var_name)
+            except Exception:
+                pass
+        _pre_extracted[var_name] = {
+            "series": _extract_series(var_name),
+            "tier": tier,
+            "tier_num": _tier_num,
+            "max_horizon": _max_horizon,
+            "multivariate_df": _multivariate_df,
+            "regime_labels": _regime_labels_np,
+            "regime_probs": _regime_probs_dict,
+            "has_returns": has_returns,
+            "n_available_vars": len(available_vars),
+            "feat_df_dist": _feat_df_dist,
+            "feat_df_tree": _feat_df_dist,  # reuse same extracted features
+        }
+
+    # ------------------------------------------------------------------
+    # Phase 2: Run model fitting (parallel in full mode, sequential in fast)
+    # ------------------------------------------------------------------
+    _common_kwargs = dict(
+        fast_tiers=_fast_tiers,
+        fast_path_excluded=_fast_path_excluded,
+        use_global_lgbm=_use_global_lgbm,
+        distributional_vars=_distributional_vars,
+        random_state=random_state,
+        enable_burnout=enable_burnout,
+    )
+
+    if _parallel and len(available_vars) > 1:
+        try:
+            from joblib import Parallel, delayed
+            _raw_results_list = Parallel(
+                n_jobs=min(_n_workers, len(available_vars)),
+                backend="threading",
+                prefer="threads",
+            )(
+                delayed(_forecast_single_variable)(
+                    vn, _pre_extracted[vn], **_common_kwargs,
                 )
-                _dist_met.variable = var_name
-                if _dist_met.fitted:
-                    result.metrics.append(_dist_met)
-        except Exception as _dist_exc:
-            logger.debug("Distributional model skipped for %s: %s", var_name, _dist_exc)
-
-        # --- Baseline (always succeeds) ---
-        if best_forecast is None:
-            fcast, met = fit_baseline(series, n_forecast=max_horizon)
-            met.variable = var_name
-            result.metrics.append(met)
-            best_forecast = fcast
-            best_model_name = met.model_name
-            best_metrics = met
-
-        # --- Burnout refinement ---
-        if enable_burnout and best_forecast is not None and best_model_name == "kalman":
-            burnout_fcast, burnout_met = _burnout_refit(
-                series, fit_kalman, n_forecast=max_horizon
+                for vn in available_vars
             )
-            if (
-                burnout_fcast is not None
-                and not np.isnan(burnout_met.rmse)
-                and (
-                    best_metrics is None
-                    or np.isnan(best_metrics.rmse)
-                    or burnout_met.rmse < best_metrics.rmse
-                )
-            ):
-                best_forecast = burnout_fcast
-                best_model_name = f"{best_model_name}_burnout"
-                best_metrics = burnout_met
+            _raw_results = {r["var_name"]: r for r in _raw_results_list}
+            logger.info("Parallel cascade: %d vars across %d workers", len(available_vars), _n_workers)
+        except ImportError:
+            logger.info("joblib not available -- running cascade sequentially")
+            _raw_results = {
+                vn: _forecast_single_variable(vn, _pre_extracted[vn], **_common_kwargs)
+                for vn in available_vars
+            }
+    else:
+        _raw_results = {
+            vn: _forecast_single_variable(vn, _pre_extracted[vn], **_common_kwargs)
+            for vn in available_vars
+        }
+
+    # ------------------------------------------------------------------
+    # Phase 3: Sequential merge of parallel results into ForecastResult
+    # ------------------------------------------------------------------
+    for var_name in available_vars:
+        raw = _raw_results[var_name]
+        best_forecast = raw["best_forecast"]
+        best_model_name = raw["best_model_name"]
+        best_metrics = raw["best_metrics"]
+
+        # Merge metrics
+        result.metrics.extend(raw["metrics_list"])
+
+        # Merge model flags
+        for flag_key, flag_val in raw["model_flags"].items():
+            if flag_key.startswith("model_failed_"):
+                setattr(result, flag_key, flag_val)
+            elif flag_key.endswith("_error"):
+                setattr(result, flag_key, flag_val)
+
+        # Track first-attempt flags
+        if raw["model_flags"].get("model_failed_kalman") and not kalman_attempted:
+            kalman_attempted = True
+        if raw["model_flags"].get("model_failed_var") and not var_attempted:
+            var_attempted = True
+        if raw["model_flags"].get("model_failed_tree") and not tree_attempted:
+            tree_attempted = True
+
+        # Collect distributional deferrals
+        if raw.get("distributional_item"):
+            _deferred_distributional.append(raw["distributional_item"])
+
+        # Fast path vars already have horizons computed
+        if raw.get("fast_path") and raw.get("horizons"):
+            for label, val in raw["horizons"].items():
+                result.forecasts.setdefault(var_name, {})[label] = val
+            result.model_used[var_name] = best_model_name
+            continue
 
         # ----------------------------------------------------------
         # C1: Horizon-specific model selection.
