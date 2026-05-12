@@ -2574,21 +2574,34 @@ def run_forecasting(
     lstm_attempted = False
     tree_attempted = False
 
-    # Fast-path configuration: which tiers skip the LSTM/Tree cascade
-    # and use the lightweight ETS+Naive+WindowAvg+Drift ensemble instead.
-    # Configurable via config/global_config.yml -> forecasting.fast_ensemble_tiers
+    # ------------------------------------------------------------------
+    # Forecasting mode configuration
+    # ------------------------------------------------------------------
+    # Three modes:
+    #   express  -- ETS fast ensemble for Tier3+ (fastest, ~10s)
+    #   balanced -- full cascade minus LSTM, Tier3+ use fast ensemble (default, ~20s)
+    #   full     -- full cascade including LSTM (~90s, for GPU/overnight)
     from operator1.config_loader import get_global_config
     _forecasting_cfg = get_global_config().get("forecasting", {})
-    _fast_tiers: set[int] = set(
-        _forecasting_cfg.get("fast_ensemble_tiers", [3, 4, 5])
-    )
+    _mode: str = _forecasting_cfg.get("mode", "balanced")
+
+    # Derive effective settings from mode
+    if _mode == "express":
+        _fast_tiers: set[int] = set(_forecasting_cfg.get("fast_ensemble_tiers", [3, 4, 5]))
+        _lstm_enabled: bool = False
+    elif _mode == "full":
+        _fast_tiers = set()  # no fast path -- all vars go through full cascade
+        _lstm_enabled = _forecasting_cfg.get("lstm_enabled", True)
+    else:  # balanced (default)
+        _fast_tiers = set(_forecasting_cfg.get("fast_ensemble_tiers", [3, 4, 5]))
+        _lstm_enabled = False
+
     _distributional_vars: set[str] = set(
         _forecasting_cfg.get(
             "distributional_vars",
             list(_KEY_DISTRIBUTIONAL_VARS),
         )
     )
-    _lstm_enabled: bool = _forecasting_cfg.get("lstm_enabled", False)
     # Variables that must go through the full cascade even if their tier
     # is in _fast_tiers, because they have post-cascade accuracy fixes
     # (regime directional shift, momentum overlay, horizon-specific blending).
@@ -2596,8 +2609,8 @@ def run_forecasting(
 
     if _fast_tiers:
         logger.info(
-            "Fast ensemble enabled for tiers %s (LSTM %s)",
-            sorted(_fast_tiers),
+            "Forecasting mode=%s: fast ensemble for tiers %s, LSTM %s",
+            _mode, sorted(_fast_tiers),
             "enabled" if _lstm_enabled else "disabled",
         )
 
@@ -2705,7 +2718,10 @@ def run_forecasting(
             var_attempted = True
 
         # --- LSTM / tree-linear fallback ---
-        if best_forecast is None:
+        # Skipped when lstm_enabled=false (balanced/express modes).
+        # Tree ensemble at ~3s/var provides equivalent non-linear capability
+        # on 500-row financial series (M4 Competition, Makridakis et al. 2020).
+        if best_forecast is None and _lstm_enabled:
             fcast, met = fit_lstm(
                 series,
                 n_forecast=max_horizon,
