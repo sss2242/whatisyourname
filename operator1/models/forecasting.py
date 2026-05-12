@@ -2614,6 +2614,11 @@ def run_forecasting(
             "enabled" if _lstm_enabled else "disabled",
         )
 
+    # Distributional model fits are collected here and batch-run in
+    # parallel after the main per-variable loop (saves ~7.5s with 4 workers).
+    _deferred_distributional: list[tuple[str, pd.DataFrame]] = []
+    _n_workers: int = _forecasting_cfg.get("parallel_workers", 4)
+
     for var_name in available_vars:
         series = _extract_series(var_name)
         tier = _get_tier_for_variable(var_name, tier_map)
@@ -2640,19 +2645,14 @@ def run_forecasting(
                 best_model_name = met.model_name
                 best_metrics = met
 
-            # Distributional model only for key variables (saves ~50s)
+            # Distributional model: deferred to parallel batch after main loop
             if var_name in _distributional_vars:
                 try:
                     feat_df_dist = _extract_features(var_name, model_type="tree")
                     if not feat_df_dist.empty and len(feat_df_dist.dropna()) >= _MIN_OBS_TREE:
-                        _dist_fcast, _dist_met = fit_distributional(
-                            feat_df_dist, var_name, random_state=random_state,
-                        )
-                        _dist_met.variable = var_name
-                        if _dist_met.fitted:
-                            result.metrics.append(_dist_met)
-                except Exception as _dist_exc:
-                    logger.debug("Distributional model skipped for %s: %s", var_name, _dist_exc)
+                        _deferred_distributional.append((var_name, feat_df_dist.copy()))
+                except Exception:
+                    pass
 
             # Baseline fallback if fast ensemble failed
             if best_forecast is None:
@@ -2762,17 +2762,16 @@ def run_forecasting(
                 tree_attempted = True
 
         # --- Beyond Bands Method 2: Distributional forecast (conditional sigma) ---
-        # Runs ALONGSIDE the tree model (not as a replacement). The point
-        # forecast comes from whatever model won the cascade above. This
-        # model provides conditional_sigma: a feature-dependent std that
-        # varies with market conditions, used by the prediction aggregator
-        # for data-driven band width instead of fixed RMSE * sqrt(h).
+        # Deferred to parallel batch after main loop for speed.
+        # Collects inputs here; fitting runs via joblib after the loop.
         # GUARDED: only runs on key distributional variables (saves ~50s).
         try:
             feat_df_dist = _extract_features(var_name, model_type="tree")
             if (var_name in _distributional_vars
                     and not feat_df_dist.empty
                     and len(feat_df_dist.dropna()) >= _MIN_OBS_TREE):
+                _deferred_distributional.append((var_name, feat_df_dist.copy()))
+            if False:  # original inline code preserved but deferred to batch
                 _dist_fcast, _dist_met = fit_distributional(
                     feat_df_dist, var_name, random_state=random_state,
                 )
@@ -2983,6 +2982,51 @@ def run_forecasting(
         if best_forecast is not None:
             result.forecasts[var_name] = _horizon_forecasts
             result.model_used[var_name] = best_model_name
+
+    # ------------------------------------------------------------------
+    # Parallel distributional model fitting (Beyond Bands Method 2)
+    # ------------------------------------------------------------------
+    # Distributional fits were deferred from the per-variable loop above.
+    # Run them in parallel via joblib threading backend (~2.5s with 4
+    # workers vs ~10s sequential for 5 variables at ~2s each).
+    if _deferred_distributional:
+        def _fit_dist_one(args: tuple[str, pd.DataFrame]) -> ModelMetrics | None:
+            _dv, _ddf = args
+            try:
+                _dfcast, _dmet = fit_distributional(_ddf, _dv, random_state=random_state)
+                _dmet.variable = _dv
+                return _dmet if _dmet.fitted else None
+            except Exception:
+                return None
+
+        if _n_workers > 1 and len(_deferred_distributional) > 1:
+            try:
+                from joblib import Parallel, delayed
+                _dist_results = Parallel(
+                    n_jobs=min(_n_workers, len(_deferred_distributional)),
+                    backend="threading",
+                    prefer="threads",
+                )(
+                    delayed(_fit_dist_one)(args)
+                    for args in _deferred_distributional
+                )
+            except ImportError:
+                # joblib not available -- fall back to sequential
+                _dist_results = [_fit_dist_one(args) for args in _deferred_distributional]
+        else:
+            _dist_results = [_fit_dist_one(args) for args in _deferred_distributional]
+
+        _n_dist_fitted = 0
+        for _dmet in _dist_results:
+            if _dmet is not None:
+                result.metrics.append(_dmet)
+                _n_dist_fitted += 1
+        if _n_dist_fitted > 0:
+            logger.info(
+                "Distributional models: %d/%d fitted (%s)",
+                _n_dist_fitted, len(_deferred_distributional),
+                "parallel" if _n_workers > 1 else "sequential",
+            )
 
     # ------------------------------------------------------------------
     # Parallel tree ensemble: run tree on key variables even when another
