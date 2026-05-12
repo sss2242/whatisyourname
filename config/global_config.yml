@@ -84,5 +84,27 @@ prediction_contract:
   ic_inclusion_threshold: 0.02   # minimum |IC| to include signal in ensemble
   icir_inclusion_threshold: 0.3  # minimum |ICIR| to include signal
 
+# ---------------------------------------------------------------------------
+# Forecasting Fast-Path Configuration
+# ---------------------------------------------------------------------------
+# ETS+Naive+WindowAvg+Drift ensemble replaces the LSTM/Tree cascade for
+# lower-tier variables.  Reduces Stage 4.1 from ~40min to ~13s on CPU.
+# Tier1/2 (survival-critical) always keep their Kalman path unchanged.
+forecasting:
+  # Tiers that use the fast ensemble instead of the LSTM/Tree cascade.
+  # Set to [] to disable fast path and use the original cascade for all.
+  fast_ensemble_tiers: [3, 4, 5]
+  # Enable LSTM for ALL tiers (set true for GPU environments or overnight
+  # batch runs).  When true, fast_ensemble_tiers is ignored.
+  lstm_enabled: false
+  # Only these variables get the distributional model (fit_distributional).
+  # All others skip it for speed (~2s per var, 31 vars -> 5 vars = 50s saved).
+  distributional_vars:
+    - close
+    - return_1d
+    - volatility_21d
+    - revenue
+    - fcf_yield
+
 # Logging
 log_level: INFO
