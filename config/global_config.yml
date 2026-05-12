@@ -96,11 +96,11 @@ prediction_contract:
 # Three modes controlling speed vs model complexity trade-off.
 # Tier1/2 (survival-critical) always keep their Kalman path unchanged.
 forecasting:
-  # Forecasting execution mode:
-  #   express  -- ETS fast ensemble for Tier3+ (~10s, slight accuracy trade)
-  #   balanced -- Full cascade minus LSTM, fast ensemble for Tier3+ (~20s, default)
-  #   full     -- Full cascade including LSTM (~90s, for GPU/overnight)
-  mode: "balanced"
+  # Forecasting execution mode (2 modes):
+  #   fast -- ETS fast ensemble for Tier3+, Kalman for Tier1/2 (~13s)
+  #   full -- Parallel per-variable cascade + batched LSTM + global
+  #           LightGBM (~15-30s, replaces old 40min sequential LSTM)
+  mode: "fast"
   # Number of parallel workers for distributional model fitting.
   # Set to 1 for sequential execution (deterministic results).
   parallel_workers: 4

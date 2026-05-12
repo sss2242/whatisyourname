@@ -23,7 +23,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # Model names that participate in ensemble
-MODEL_NAMES = ["kalman", "garch", "var", "lstm", "tree", "baseline", "transformer"]
+MODEL_NAMES = ["kalman", "garch", "var", "lstm", "tree", "baseline", "transformer", "batched_lstm", "global_lightgbm"]
 N_MODELS = len(MODEL_NAMES)
 
 

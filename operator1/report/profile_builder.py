@@ -864,6 +864,8 @@ def _build_failed_modules_section(
             "var": "VAR",
             "lstm": "LSTM",
             "tree": "RF/GBM/XGB",
+            "batched_lstm": "Batched LSTM",
+            "global_lightgbm": "Global LightGBM",
         }
         # Collect variables that fell through to baseline_zero (all-NaN data)
         model_used = forecast_result.get("model_used", {})
