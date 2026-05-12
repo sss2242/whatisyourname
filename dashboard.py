@@ -96,6 +96,44 @@ state = DashboardState()
 
 
 # ---------------------------------------------------------------------------
+# Global config helpers (read/write global_config.yml from dashboard)
+# ---------------------------------------------------------------------------
+
+def _get_config_value(key: str, subkey: str | None = None, default: str = "") -> str:
+    """Read a value from global_config.yml."""
+    try:
+        from operator1.config_loader import get_global_config
+        cfg = get_global_config()
+        if subkey:
+            return str(cfg.get(key, {}).get(subkey, default))
+        return str(cfg.get(key, default))
+    except Exception:
+        return default
+
+
+def _set_config_value(key: str, subkey: str | None, value: str) -> None:
+    """Write a value to global_config.yml and invalidate cache."""
+    try:
+        import yaml
+        config_path = Path("config/global_config.yml")
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        if subkey:
+            if key not in cfg or not isinstance(cfg[key], dict):
+                cfg[key] = {}
+            cfg[key][subkey] = value
+        else:
+            cfg[key] = value
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(cfg, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        # Invalidate config cache so next pipeline run picks up new value
+        from operator1.config_loader import _cache
+        _cache.pop("global_config", None)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Failed to save config: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Dependency checking
 # ---------------------------------------------------------------------------
 
@@ -918,6 +956,30 @@ def render_analyze():
             ui.switch("Verbose debug logging",
                       value=False,
                       on_change=lambda e: _adv.update({"verbose": e.value}))
+
+            ui.separator().classes("my-2")
+            ui.label("Performance Settings").classes("text-sm font-bold text-gray-300")
+            with ui.row().classes("items-center gap-4"):
+                ui.label("Frequency pipeline").classes("w-40 text-sm")
+                ui.select(
+                    options={
+                        "parallel": "Parallel (fast, 4+ cores)",
+                        "sequential": "Sequential (low memory)",
+                    },
+                    value=_get_config_value("frequency_pipeline", "mode", "parallel"),
+                    on_change=lambda e: _set_config_value("frequency_pipeline", "mode", e.value),
+                ).classes("w-56")
+            with ui.row().classes("items-center gap-4"):
+                ui.label("LLM key rotation").classes("w-40 text-sm")
+                ui.select(
+                    options={
+                        "auto": "Auto-detect (default)",
+                        "per_call": "Per-call (free-tier keys)",
+                        "on_failure": "On-failure (paid keys)",
+                    },
+                    value=_get_config_value("llm_key_rotation", None, "auto"),
+                    on_change=lambda e: _set_config_value("llm_key_rotation", None, e.value),
+                ).classes("w-56")
 
     ui.separator()
 
