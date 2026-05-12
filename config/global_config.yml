@@ -44,6 +44,12 @@ vae_kl_weight: 0.5
 # If left empty, auto-detects based on which API key is available.
 llm_provider: ""
 
+# LLM key rotation strategy for multi-key setups (comma-separated keys in .env):
+#   auto       -- auto-detect: proactive for free-tier models (:free), reactive for paid
+#   per_call   -- rotate to next key after every successful call (best for free-tier keys)
+#   on_failure -- rotate only when a key gets 429/exhausted (best for paid keys)
+llm_key_rotation: "auto"
+
 # LLM model override (optional). Leave empty to use the provider default.
 # Can also be set via the LLM_MODEL environment variable.
 # Use "auto" to let the factory pick the best report-capable model.

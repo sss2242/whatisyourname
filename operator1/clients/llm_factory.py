@@ -381,18 +381,26 @@ def _build_pooled_or_single(
             if fc:
                 fallback_clients.append(fc)
 
-    # Detect free-tier OpenRouter: enable proactive rotation so each
-    # successful call advances to the next key before it gets a 429.
-    # Free keys support ~1 call each -- reactive rotation wastes a
-    # failed request + 5 retries per key transition.
-    _proactive = (
-        provider == "openrouter"
-        and len(primary_clients) > 1
-        and all(
-            ":free" in getattr(c, "_model", "")
-            for c in primary_clients
+    # Determine key rotation strategy from config.
+    # "per_call": proactive -- rotate after every successful call (free-tier keys)
+    # "on_failure": reactive -- rotate only on 429/exhaustion (paid keys)
+    # "auto": auto-detect from model name (:free suffix = proactive)
+    cfg = get_global_config()
+    _rotation_mode = str(cfg.get("llm_key_rotation", "auto")).strip().lower()
+
+    if _rotation_mode == "per_call":
+        _proactive = True
+    elif _rotation_mode == "on_failure":
+        _proactive = False
+    else:  # "auto" -- original auto-detection logic
+        _proactive = (
+            provider == "openrouter"
+            and len(primary_clients) > 1
+            and all(
+                ":free" in getattr(c, "_model", "")
+                for c in primary_clients
+            )
         )
-    )
 
     logger.info(
         "PooledLLMClient: %d %s keys + %d fallback keys%s",
