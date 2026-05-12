@@ -960,6 +960,17 @@ def render_analyze():
             ui.separator().classes("my-2")
             ui.label("Performance Settings").classes("text-sm font-bold text-gray-300")
             with ui.row().classes("items-center gap-4"):
+                ui.label("Forecasting mode").classes("w-40 text-sm")
+                ui.select(
+                    options={
+                        "express": "Express (~13s, ETS fast path)",
+                        "balanced": "Balanced (~20s, no LSTM)",
+                        "full": "Full (~90s, with LSTM)",
+                    },
+                    value=_get_config_value("forecasting", "mode", "balanced"),
+                    on_change=lambda e: _set_config_value("forecasting", "mode", e.value),
+                ).classes("w-56")
+            with ui.row().classes("items-center gap-4"):
                 ui.label("Frequency pipeline").classes("w-40 text-sm")
                 ui.select(
                     options={
