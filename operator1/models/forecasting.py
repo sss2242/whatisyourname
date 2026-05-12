@@ -2821,7 +2821,7 @@ def run_forecasting(
     if _mode in ("fast", "express"):  # express kept as alias for backward compat
         _fast_tiers: set[int] = set(_forecasting_cfg.get("fast_ensemble_tiers", [3, 4, 5]))
         _use_batched_lstm: bool = False
-        _use_global_lgbm: bool = False
+        _use_global_lgbm: bool = True   # ~2-3s, adds cross-variable insights even in fast mode
         _parallel: bool = False
     else:  # full (also catches old "balanced" config values)
         _fast_tiers = set()  # all vars go through cascade
