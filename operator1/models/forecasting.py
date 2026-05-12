@@ -2978,7 +2978,9 @@ def run_forecasting(
             lstm_attempted = True
 
         # --- Tree ensemble on tabular features ---
-        if best_forecast is None:
+        # Skipped when global LightGBM is enabled (replaces 31 per-variable
+        # tree fits with 1 global model, per plan Change 5).
+        if best_forecast is None and not _use_global_lgbm:
             feat_df = _extract_features(var_name, model_type="tree")
             if not feat_df.empty:
                 fcast, met = fit_tree_ensemble(
