@@ -3182,11 +3182,12 @@ def run_forecasting(
                     pass  # graceful fallback: use unadjusted forecasts
 
             # For long horizons (21d, 252d): try tree ensemble as alternative
-            # if the cascade winner was an autoregressive model (Kalman, GARCH, VAR, LSTM)
+            # if the cascade winner was an autoregressive model (Kalman, GARCH, VAR, LSTM).
+            # Skipped when global LightGBM is enabled (it handles cross-variable long-horizon).
             _ar_models = {"kalman", "kalman_per_regime", "kalman_burnout", "kalman_dfm",
                           "garch", "var", "ar1", "lstm", "lstm_fallback_gbm",
                           "lstm_fallback_lr", "ets"}
-            if best_model_name.lower().split("(")[0] in _ar_models:
+            if best_model_name.lower().split("(")[0] in _ar_models and not _use_global_lgbm:
                 feat_df = _extract_features(var_name, model_type="tree")
                 if not feat_df.empty:
                     _lh_fcast, _lh_met = fit_tree_ensemble(
@@ -3334,7 +3335,7 @@ def run_forecasting(
         if "tree" in m or "xgboost" in m or "gbm" in m or "rf" in m
     }
     _any_features = (_get_model_features("tree") or extra_variables)
-    if _any_features and len(_any_features) > 0:
+    if _any_features and len(_any_features) > 0 and not _use_global_lgbm:
         for _ptv in _parallel_tree_vars:
             if _ptv in cache.columns and _ptv not in _tree_already_primary:
                 _pt_feat_df = _extract_features(_ptv, model_type="tree")
