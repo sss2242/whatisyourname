@@ -84,5 +84,34 @@ prediction_contract:
   ic_inclusion_threshold: 0.02   # minimum |IC| to include signal in ensemble
   icir_inclusion_threshold: 0.3  # minimum |ICIR| to include signal
 
+# ---------------------------------------------------------------------------
+# Forecasting Configuration
+# ---------------------------------------------------------------------------
+# Three modes controlling speed vs model complexity trade-off.
+# Tier1/2 (survival-critical) always keep their Kalman path unchanged.
+forecasting:
+  # Forecasting execution mode:
+  #   express  -- ETS fast ensemble for Tier3+ (~10s, slight accuracy trade)
+  #   balanced -- Full cascade minus LSTM, fast ensemble for Tier3+ (~20s, default)
+  #   full     -- Full cascade including LSTM (~90s, for GPU/overnight)
+  mode: "balanced"
+  # Number of parallel workers for distributional model fitting.
+  # Set to 1 for sequential execution (deterministic results).
+  parallel_workers: 4
+  # Tiers that use the fast ensemble (only in express and balanced modes).
+  # Set to [] to disable fast path and use the full cascade for all tiers.
+  fast_ensemble_tiers: [3, 4, 5]
+  # Enable LSTM in the cascade (only effective in full mode).
+  # In express/balanced modes, LSTM is always skipped.
+  lstm_enabled: false
+  # Only these variables get the distributional model (fit_distributional).
+  # All others skip it for speed (~2s per var, 31 vars -> 5 vars = 50s saved).
+  distributional_vars:
+    - close
+    - return_1d
+    - volatility_21d
+    - revenue
+    - fcf_yield
+
 # Logging
 log_level: INFO
