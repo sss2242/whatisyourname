@@ -963,11 +963,10 @@ def render_analyze():
                 ui.label("Forecasting mode").classes("w-40 text-sm")
                 ui.select(
                     options={
-                        "express": "Express (~13s, ETS fast path)",
-                        "balanced": "Balanced (~20s, no LSTM)",
-                        "full": "Full (~90s, with LSTM)",
+                        "fast": "Fast (~13s, ETS ensemble)",
+                        "full": "Full (~30s, parallel + batched LSTM)",
                     },
-                    value=_get_config_value("forecasting", "mode", "balanced"),
+                    value=_get_config_value("forecasting", "mode", "fast"),
                     on_change=lambda e: _set_config_value("forecasting", "mode", e.value),
                 ).classes("w-56")
             with ui.row().classes("items-center gap-4"):
