@@ -3008,7 +3008,9 @@ def run_prediction_aggregation(
                 ):
                     try:
                         _mc_tv = getattr(mc_result, "terminal_values", {})
-                        _mc_paths = _mc_tv.get(horizon_days) or _mc_tv.get(f"{horizon_days}d")
+                        _mc_paths = _mc_tv.get(horizon_days)
+                        if _mc_paths is None:
+                            _mc_paths = _mc_tv.get(f"{horizon_days}d")
                         if _mc_paths is not None and len(_mc_paths) > 100:
                             _mc_arr = np.array(_mc_paths)
                             _mc_base = last_value if last_value and not math.isnan(last_value) else point
@@ -3154,7 +3156,9 @@ def run_prediction_aggregation(
             if mc_result is not None and var_name == "close" and not math.isnan(point):
                 try:
                     _mc_tv = getattr(mc_result, "terminal_values", {})
-                    _mc_paths_cap = _mc_tv.get(horizon_days) or _mc_tv.get(f"{horizon_days}d")
+                    _mc_paths_cap = _mc_tv.get(horizon_days)
+                    if _mc_paths_cap is None:
+                        _mc_paths_cap = _mc_tv.get(f"{horizon_days}d")
                     if _mc_paths_cap is not None and len(_mc_paths_cap) > 100:
                         _mc_arr_cap = np.array(_mc_paths_cap)
                         _mc_base_cap = last_value if last_value and not math.isnan(last_value) else point
@@ -3280,7 +3284,9 @@ def run_prediction_aggregation(
             if (mc_result is not None and var_name == "close"
                     and not math.isnan(point)):
                 _mc_tv = getattr(mc_result, "terminal_values", {})
-                _mc_paths_ep = _mc_tv.get(h_label) or _mc_tv.get(horizon_days)
+                _mc_paths_ep = _mc_tv.get(h_label)
+                if _mc_paths_ep is None:
+                    _mc_paths_ep = _mc_tv.get(horizon_days)
                 if _mc_paths_ep is not None and len(_mc_paths_ep) > 100:
                     _model_ret = (point / last_value - 1.0) if last_value and last_value > 0 else 0.0
                     _ep = _entropy_pooling_scenarios(
