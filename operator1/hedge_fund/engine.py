@@ -687,12 +687,34 @@ def _compute_dcf(
                     cfg.setdefault(_k, _v)
         except Exception:
             pass
-        fcf_latest = extract_latest_value(cashflow_df, "free_cash_flow")
+        # Compute TTM (trailing twelve months) FCF by summing last 4 quarters.
+        # Using a single quarterly value produces 1/4 of the correct annual FCF,
+        # resulting in ~4x undervaluation (e.g., $32/share instead of $130 for AAPL).
+        fcf_latest = None
+        try:
+            n_q = get_hf_weight("data_windows.quarterly_lookback", 8)
+            ocf_series = extract_quarterly_series(cashflow_df, "operating_cash_flow", n_q)
+            capex_series = extract_quarterly_series(cashflow_df, "capex", n_q)
+            if len(ocf_series) >= 2 and len(capex_series) >= 2:
+                common = ocf_series.index.intersection(capex_series.index)
+                if len(common) >= 2:
+                    q_fcf = ocf_series.loc[common] - capex_series.loc[common].abs()
+                    n_periods = min(4, len(q_fcf))
+                    ttm_fcf = float(q_fcf.iloc[-n_periods:].sum())
+                    if n_periods < 4:
+                        ttm_fcf = ttm_fcf * (4 / n_periods)
+                    fcf_latest = ttm_fcf
+                    logger.debug("DCF TTM FCF from %d quarters: %.0f", n_periods, ttm_fcf)
+        except Exception:
+            pass
+
+        # Fallback: single quarter x 4 (annualized)
         if fcf_latest is None:
             ocf = extract_latest_value(cashflow_df, "operating_cash_flow")
             capex = extract_latest_value(cashflow_df, "capex")
             if ocf is not None and capex is not None:
-                fcf_latest = ocf - abs(capex)
+                fcf_latest = (ocf - abs(capex)) * 4
+                logger.debug("DCF fallback: single quarter FCF x4 = %.0f", fcf_latest)
 
         debt = extract_latest_value(balance_df, "total_debt") or 0
         cash_val = extract_latest_value(balance_df, "cash_and_equivalents") or 0
