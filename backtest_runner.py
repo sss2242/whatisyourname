@@ -826,7 +826,8 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     # Financial health
     try:
         from operator1.models.financial_health import compute_financial_health
-        cache, state.fh_result = compute_financial_health(cache, hierarchy_weights=state.weights)
+        _sector = state.target_profile.get("sector", "") if state.target_profile else ""
+        cache, state.fh_result = compute_financial_health(cache, hierarchy_weights=state.weights, sector=_sector)
         logger.info("FH: %.1f (%s)", state.fh_result.latest_composite, state.fh_result.latest_label)
     except Exception as exc:
         logger.warning("FH failed: %s", exc)

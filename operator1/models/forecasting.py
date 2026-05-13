@@ -3318,8 +3318,9 @@ def run_forecasting(
 
             # Also try ETS for medium horizons (5d-21d) if not already the winner
             if best_model_name != "ets":
+                _var_series = cache[var_name].dropna().values
                 _ets_fcast, _ets_met = fit_ets(
-                    series[~np.isnan(series)],
+                    _var_series,
                     n_forecast=max_horizon,
                 )
                 if _ets_fcast is not None and _ets_met.fitted:

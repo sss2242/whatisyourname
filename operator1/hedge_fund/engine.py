@@ -687,12 +687,56 @@ def _compute_dcf(
                     cfg.setdefault(_k, _v)
         except Exception:
             pass
-        fcf_latest = extract_latest_value(cashflow_df, "free_cash_flow")
+        # Compute annualized FCF for DCF valuation.
+        # CompanyFacts API returns OCF and capex on DIFFERENT filing dates
+        # (each XBRL concept has its own period), so they rarely share a row.
+        # Strategy: sum last N quarters of OCF independently, subtract latest
+        # annual capex, then annualize if fewer than 4 quarters available.
+        # Single-quarter FCF produces 4x undervaluation ($32 instead of $130).
+        fcf_latest = None
+        try:
+            n_q = get_hf_weight("data_windows.quarterly_lookback", 8)
+            ocf_series = extract_quarterly_series(cashflow_df, "operating_cash_flow", n_q)
+            capex_series = extract_quarterly_series(cashflow_df, "capex", n_q)
+
+            # Path A: OCF and capex share common quarters (ideal case)
+            if len(ocf_series) >= 2 and len(capex_series) >= 2:
+                common = ocf_series.index.intersection(capex_series.index)
+                if len(common) >= 2:
+                    q_fcf = ocf_series.loc[common] - capex_series.loc[common].abs()
+                    n_periods = min(4, len(q_fcf))
+                    ttm_fcf = float(q_fcf.iloc[-n_periods:].sum())
+                    if n_periods < 4:
+                        ttm_fcf = ttm_fcf * (4 / n_periods)
+                    fcf_latest = ttm_fcf
+                    logger.debug("DCF TTM FCF from %d aligned quarters: %.0f", n_periods, ttm_fcf)
+
+            # Path B: OCF and capex on different rows (CompanyFacts pattern)
+            # Sum OCF quarters independently, subtract latest capex annualized
+            if fcf_latest is None and len(ocf_series) >= 2:
+                n_ocf = min(4, len(ocf_series))
+                ttm_ocf = float(ocf_series.iloc[-n_ocf:].sum())
+                if n_ocf < 4:
+                    ttm_ocf = ttm_ocf * (4 / n_ocf)
+                # Use latest capex (even if from a different quarter) and annualize
+                latest_capex = float(capex_series.iloc[-1]) if len(capex_series) > 0 else 0
+                # Detect if capex is quarterly or annual by magnitude
+                annual_capex = abs(latest_capex) * 4 if abs(latest_capex) < ttm_ocf * 0.5 else abs(latest_capex)
+                fcf_latest = ttm_ocf - annual_capex
+                logger.debug(
+                    "DCF TTM FCF from %d OCF quarters (%.0f) - annualized capex (%.0f) = %.0f",
+                    n_ocf, ttm_ocf, annual_capex, fcf_latest,
+                )
+        except Exception:
+            pass
+
+        # Fallback: single latest values, annualized
         if fcf_latest is None:
             ocf = extract_latest_value(cashflow_df, "operating_cash_flow")
             capex = extract_latest_value(cashflow_df, "capex")
             if ocf is not None and capex is not None:
-                fcf_latest = ocf - abs(capex)
+                fcf_latest = (ocf - abs(capex)) * 4
+                logger.debug("DCF fallback: single quarter FCF x4 = %.0f", fcf_latest)
 
         debt = extract_latest_value(balance_df, "total_debt") or 0
         cash_val = extract_latest_value(balance_df, "cash_and_equivalents") or 0
