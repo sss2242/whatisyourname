@@ -49,7 +49,7 @@ llm_provider: ""
 #   auto       -- auto-detect: proactive for free-tier models (:free), reactive for paid
 #   per_call   -- rotate to next key after every successful call (best for free-tier keys)
 #   on_failure -- rotate only when a key gets 429/exhausted (best for paid keys)
-llm_key_rotation: "auto"
+llm_key_rotation: "per_call"
 
 # LLM model override (optional). Leave empty to use the provider default.
 # Can also be set via the LLM_MODEL environment variable.
