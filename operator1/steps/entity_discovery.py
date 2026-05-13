@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any
@@ -392,24 +393,42 @@ def _resolve_entity_cross_region(
     if entity is not None:
         return entity
 
-    # If not found in the primary region, search other regions
+    # Fix 2: Parallel cross-region search (was sequential 25-client loop).
+    # Uses ThreadPoolExecutor with early termination on first match.
     if all_clients:
-        for client in all_clients:
-            # Skip the primary client (already tried)
-            if hasattr(client, "market_id") and hasattr(primary_client, "market_id"):
-                if client.market_id == primary_client.market_id:
-                    continue
-            try:
-                entity = _resolve_entity(query, group, client, target_country, target_sector)
-                if entity is not None:
-                    logger.info(
-                        "  Cross-region resolve: '%s' found via %s",
-                        query,
-                        getattr(client, "market_name", "unknown"),
-                    )
-                    return entity
-            except Exception:
-                continue
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        primary_market = getattr(primary_client, "market_id", "")
+        other_clients = [
+            c for c in all_clients
+            if getattr(c, "market_id", "") != primary_market
+        ]
+
+        if other_clients:
+            def _try_resolve(client):
+                return _resolve_entity(query, group, client, target_country, target_sector)
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = {
+                    pool.submit(_try_resolve, c): c
+                    for c in other_clients
+                }
+                for future in as_completed(futures):
+                    try:
+                        result = future.result(timeout=10)
+                        if result is not None:
+                            client = futures[future]
+                            logger.info(
+                                "  Cross-region resolve: '%s' found via %s",
+                                query,
+                                getattr(client, "market_name", "unknown"),
+                            )
+                            # Cancel remaining futures (best-effort)
+                            for f in futures:
+                                f.cancel()
+                            return result
+                    except Exception:
+                        continue
 
     return None
 
@@ -470,6 +489,118 @@ def _resolve_entity_direct(
         logger.debug("Direct resolution failed for '%s' via %s: %s", name, market_id, exc)
 
     return None, api_calls
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: Client-side market_id inference (no LLM dependency)
+# ---------------------------------------------------------------------------
+
+# Map well-known company names/keywords to their primary market_id.
+# This eliminates the 25-client brute-force search for common entities.
+_COMPANY_MARKET_MAP: dict[str, str] = {
+    # South Korea (kr_dart)
+    "samsung": "kr_dart", "hyundai": "kr_dart", "lg ": "kr_dart",
+    "sk hynix": "kr_dart", "kia": "kr_dart", "posco": "kr_dart",
+    "naver": "kr_dart", "kakao": "kr_dart", "celltrion": "kr_dart",
+    # Japan (jp_jquants)
+    "toyota": "jp_jquants", "sony": "jp_jquants", "honda": "jp_jquants",
+    "nintendo": "jp_jquants", "softbank": "jp_jquants", "keyence": "jp_jquants",
+    "mitsubishi": "jp_jquants", "hitachi": "jp_jquants", "panasonic": "jp_jquants",
+    "denso": "jp_jquants", "murata": "jp_jquants", "fanuc": "jp_jquants",
+    # Taiwan (tw_mops)
+    "tsmc": "tw_mops", "taiwan semiconductor": "tw_mops", "foxconn": "tw_mops",
+    "hon hai": "tw_mops", "mediatek": "tw_mops", "delta electronics": "tw_mops",
+    "asus": "tw_mops", "acer": "tw_mops", "realtek": "tw_mops",
+    # China (cn_sse)
+    "tencent": "cn_sse", "alibaba": "cn_sse", "baidu": "cn_sse",
+    "jd.com": "cn_sse", "bytedance": "cn_sse", "huawei": "cn_sse",
+    "xiaomi": "cn_sse", "byd": "cn_sse", "nio": "cn_sse",
+    "moutai": "cn_sse", "catl": "cn_sse", "lenovo": "cn_sse",
+    # UK (uk_companies_house)
+    "unilever": "uk_companies_house", "bp": "uk_companies_house",
+    "hsbc": "uk_companies_house", "shell": "uk_companies_house",
+    "astrazeneca": "uk_companies_house", "gsk": "uk_companies_house",
+    "barclays": "uk_companies_house", "rolls-royce": "uk_companies_house",
+    "rio tinto": "uk_companies_house", "vodafone": "uk_companies_house",
+    # Germany (de_esef)
+    "sap": "de_esef", "siemens": "de_esef", "bmw": "de_esef",
+    "volkswagen": "de_esef", "mercedes": "de_esef", "daimler": "de_esef",
+    "basf": "de_esef", "bayer": "de_esef", "adidas": "de_esef",
+    "deutsche bank": "de_esef", "deutsche post": "de_esef", "infineon": "de_esef",
+    # France (fr_esef)
+    "lvmh": "fr_esef", "totalenergies": "fr_esef", "sanofi": "fr_esef",
+    "bnp paribas": "fr_esef", "airbus": "fr_esef", "schneider": "fr_esef",
+    "danone": "fr_esef", "safran": "fr_esef", "thales": "fr_esef",
+    # Brazil (br_cvm)
+    "petrobras": "br_cvm", "vale": "br_cvm", "itau": "br_cvm",
+    "bradesco": "br_cvm", "ambev": "br_cvm", "weg": "br_cvm",
+    # India (in_bse)
+    "reliance": "in_bse", "tata": "in_bse", "infosys": "in_bse",
+    "wipro": "in_bse", "hdfc": "in_bse", "icici": "in_bse",
+    # Switzerland (ch_six)
+    "nestle": "ch_six", "novartis": "ch_six", "roche": "ch_six",
+    "abb": "ch_six", "zurich insurance": "ch_six", "ubs": "ch_six",
+    # Netherlands (nl_esef)
+    "asml": "nl_esef", "philips": "nl_esef", "heineken": "nl_esef",
+    # Sweden (se_esef)
+    "ericsson": "se_esef", "volvo": "se_esef", "spotify": "se_esef",
+}
+
+# Map country codes/names to default market_id
+_COUNTRY_MARKET_MAP: dict[str, str] = {
+    "us": "us_sec_edgar", "united states": "us_sec_edgar", "usa": "us_sec_edgar",
+    "kr": "kr_dart", "south korea": "kr_dart", "korea": "kr_dart",
+    "jp": "jp_jquants", "japan": "jp_jquants",
+    "tw": "tw_mops", "taiwan": "tw_mops",
+    "cn": "cn_sse", "china": "cn_sse",
+    "gb": "uk_companies_house", "uk": "uk_companies_house", "united kingdom": "uk_companies_house",
+    "de": "de_esef", "germany": "de_esef",
+    "fr": "fr_esef", "france": "fr_esef",
+    "br": "br_cvm", "brazil": "br_cvm",
+    "in": "in_bse", "india": "in_bse",
+    "ch": "ch_six", "switzerland": "ch_six",
+    "au": "au_asx", "australia": "au_asx",
+    "ca": "ca_sedar", "canada": "ca_sedar",
+    "hk": "hk_hkex", "hong kong": "hk_hkex",
+    "sg": "sg_sgx", "singapore": "sg_sgx",
+    "sa": "sa_tadawul", "saudi": "sa_tadawul", "saudi arabia": "sa_tadawul",
+    "za": "za_jse", "south africa": "za_jse",
+    "mx": "mx_bmv", "mexico": "mx_bmv",
+    "ae": "ae_dfm", "uae": "ae_dfm",
+    "nl": "nl_esef", "netherlands": "nl_esef",
+    "es": "es_esef", "spain": "es_esef",
+    "it": "it_esef", "italy": "it_esef",
+    "se": "se_esef", "sweden": "se_esef",
+    "cl": "cl_cmf", "chile": "cl_cmf",
+}
+
+
+def _infer_market_id(name: str, target_country: str = "") -> str:
+    """Infer the most likely market_id for an entity from its name.
+
+    Uses a fast heuristic lookup of well-known company names and country
+    keywords. Returns empty string if no confident inference is possible.
+    Falls back to US SEC EDGAR for entities that sound American (most
+    common case for US-centric analyses).
+    """
+    name_lower = name.lower().strip()
+
+    # Check company name map (substring match)
+    for keyword, market_id in _COMPANY_MARKET_MAP.items():
+        if keyword in name_lower:
+            return market_id
+
+    # If target is in US and entity name doesn't match any non-US pattern,
+    # assume US (most entity proposals for US companies are also US-listed)
+    if target_country.upper() in ("US", "USA", "UNITED STATES"):
+        return "us_sec_edgar"
+
+    # Check country keywords in the name itself
+    for keyword, market_id in _COUNTRY_MARKET_MAP.items():
+        if keyword in name_lower:
+            return market_id
+
+    return ""
 
 
 def _build_all_pit_clients(secrets: dict[str, str] | None = None) -> list[EquityProvider]:
@@ -655,8 +786,15 @@ def discover_linked_entities(
 
     # ------------------------------------------------------------------
     # 2. Resolve each proposal via PIT provider search
+    # Fix 3: Wall-clock timeout for entire resolution phase
+    _discovery_start = time.time()
+    _discovery_timeout = cfg.get("entity_discovery_timeout_s", 120)
+    _discovery_timed_out = False
+
     # ------------------------------------------------------------------
     for group in RELATIONSHIP_GROUPS:
+        if _discovery_timed_out:
+            break
         if group in result.linked:
             logger.debug("Group '%s' already resolved from checkpoint", group)
             continue
@@ -666,6 +804,14 @@ def discover_linked_entities(
         group_calls = 0
 
         for item in items:
+            # Fix 3: Wall-clock timeout check
+            if time.time() - _discovery_start > _discovery_timeout:
+                logger.warning(
+                    "Entity discovery wall-clock timeout (%.0fs > %ds) -- stopping",
+                    time.time() - _discovery_start, _discovery_timeout,
+                )
+                _discovery_timed_out = True
+                break
             if group_calls >= budget_per_group:
                 logger.info("Budget exhausted for group '%s'", group)
                 break
@@ -685,6 +831,17 @@ def discover_linked_entities(
 
             if not name:
                 continue
+
+            # Fix 1: Infer market_id when LLM didn't provide one.
+            # This enables Path A (1-2 targeted API calls) instead of
+            # Path B (brute-force 25-wrapper loop).
+            if not _entity_market_id:
+                _entity_market_id = _infer_market_id(name, target_country)
+                if _entity_market_id:
+                    logger.debug(
+                        "  Inferred market_id=%s for '%s'",
+                        _entity_market_id, name,
+                    )
 
             entity = None
 
