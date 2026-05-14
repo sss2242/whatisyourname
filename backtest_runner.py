@@ -889,6 +889,73 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         except Exception:
             pass
 
+        # Fetch financial data for each linked entity (parity with main.py lines 1860-1994)
+        if state.relationships:
+            from operator1.features.derived_variables import compute_derived_variables as _cdv_linked
+            from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
+
+            _all_linked = []
+            _entity_groups = {}
+            for _grp, _ents in state.relationships.items():
+                _ids = []
+                if isinstance(_ents, list):
+                    for _e in _ents:
+                        _eid = ""
+                        if isinstance(_e, dict):
+                            _eid = _e.get("isin", "") or _e.get("ticker", "")
+                        elif hasattr(_e, "isin"):
+                            _eid = _e.isin or getattr(_e, "ticker", "")
+                        if _eid and _eid not in {x.get("id") for x in _all_linked}:
+                            _mkt = _e.get("market_id", "") if isinstance(_e, dict) else getattr(_e, "market_id", "")
+                            _all_linked.append({"id": _eid, "name": _e.get("name", "") if isinstance(_e, dict) else getattr(_e, "name", ""), "group": _grp, "market_id": _mkt})
+                            _ids.append(_eid)
+                _entity_groups[_grp] = _ids
+            _all_linked = _all_linked[:10]
+
+            def _fetch_linked(ent_info):
+                _eid = ent_info["id"]
+                try:
+                    _cl = pit_client
+                    _qt = _cl.get_quotes(_eid)
+                    if not _qt.empty and "date" in _qt.columns:
+                        _qt["date"] = pd.to_datetime(_qt["date"])
+                        _ec = _qt.set_index("date").sort_index()
+                    else:
+                        _ec = pd.DataFrame(index=pd.date_range(cache.index[0], cache.index[-1], freq="B", name="date"))
+                    for _lbl, _sdf in [("inc", _cl.get_income_statement(_eid)), ("bal", _cl.get_balance_sheet(_eid)), ("cf", _cl.get_cashflow_statement(_eid))]:
+                        if _sdf.empty:
+                            continue
+                        _dc = "report_date" if "report_date" in _sdf.columns else "filing_date"
+                        if _dc not in _sdf.columns:
+                            continue
+                        _sdf[_dc] = pd.to_datetime(_sdf[_dc])
+                        _sdf = _sdf.sort_values(_dc).drop_duplicates(subset=[_dc], keep="last")
+                        _nc = [c for c in _sdf.select_dtypes(include=["number"]).columns if c != _dc and "date" not in c.lower()]
+                        if _nc:
+                            _si = _sdf.set_index(_dc)[_nc]
+                            _ci = _ec.index.union(_si.index).sort_values()
+                            _sa = _si.reindex(_ci).ffill().reindex(_ec.index)
+                            _nw = [c for c in _sa.columns if c not in _ec.columns]
+                            if _nw:
+                                _ec = _ec.join(_sa[_nw], how="left")
+                    if "close" in _ec.columns and _ec["close"].notna().sum() > 5:
+                        _ec = _cdv_linked(_ec)
+                    return _eid, _ec
+                except Exception:
+                    return _eid, pd.DataFrame()
+
+            if _all_linked:
+                with _TPE(max_workers=4) as _ex:
+                    _futs = {_ex.submit(_fetch_linked, e): e for e in _all_linked}
+                    for _f in _ac(_futs):
+                        try:
+                            _eid, _ec = _f.result()
+                            if not _ec.empty:
+                                state.linked_caches[_eid] = _ec
+                        except Exception:
+                            pass
+                logger.info("Linked data: %d/%d fetched", len(state.linked_caches), len(_all_linked))
+
         # Graph risk
         try:
             from operator1.models.graph_risk import compute_graph_risk_metrics
@@ -900,6 +967,7 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             state.graph_risk_result = compute_graph_risk_metrics(
                 target_isin=state.target_profile.get("isin", ticker),
                 relationships=rel_dicts, target_cache=cache,
+                linked_caches=state.linked_caches or None,
             )
         except Exception:
             pass

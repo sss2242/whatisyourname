@@ -1405,11 +1405,10 @@ def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
     # --- Cash conversion cycle = DSO + DIO - DPO ---
     # Frequency-aware period days (Richards & Laughlin 1980):
     # At Q: revenue/90, At A: revenue/365, At S: revenue/180
-    # At D/W/M: use 90 (quarterly approximation, may be distorted)
+    # At D/W/M: revenue is daily-interpolated, so use TTM revenue / 365
+    #           to avoid double-division (daily revenue / 90 = sub-daily rate).
     freq = _get_freq()
     _period_days = _PERIOD_DAYS.get(freq, 90)
-    if freq == "D":
-        _period_days = 90  # assume quarterly filing cadence for daily cache
 
     revenue = df.get("revenue")
     receivables = df.get("receivables")
@@ -1421,13 +1420,33 @@ def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
         if revenue is not None and gp is not None:
             cogs = (revenue.astype(float) - gp.astype(float)).clip(lower=eps)
 
-    if revenue is not None:
-        rev_per_day = revenue.astype(float) / float(_period_days)
+    # At daily/weekly/monthly freq, revenue is interpolated (not period totals).
+    # Use TTM revenue (4Q sum = annual total) / 365 for correct DSO/DIO/DPO.
+    _rev_for_ccc = revenue
+    _cogs_for_ccc = cogs
+    _ccc_period = float(_period_days)
+    if freq in ("D", "W", "M"):
+        _ttm_rev = df.get("revenue_ttm_asof")
+        if _ttm_rev is not None and _ttm_rev.notna().any():
+            _rev_for_ccc = _ttm_rev
+            _ccc_period = 365.0
+        else:
+            # Fallback: daily revenue is already a daily rate, don't re-divide
+            _rev_for_ccc = revenue
+            _ccc_period = 1.0
+        # Same for COGS: use revenue_ttm - gross_profit_ttm or scale
+        if _ttm_rev is not None and _ttm_rev.notna().any() and gp is not None:
+            _ttm_gp = df.get("gross_profit")
+            if _ttm_gp is not None:
+                _cogs_for_ccc = (_ttm_rev.astype(float) - _ttm_gp.astype(float) * (_ttm_rev / revenue.where(revenue.abs() > eps)).fillna(1.0)).clip(lower=eps)
+
+    if _rev_for_ccc is not None:
+        rev_per_day = _rev_for_ccc.astype(float) / _ccc_period
         safe_rev_per_day = rev_per_day.where(rev_per_day.abs() > eps)
         if receivables is not None:
             df["dso"] = receivables.astype(float) / safe_rev_per_day
-    if cogs is not None:
-        cogs_per_day = cogs.astype(float) / float(_period_days)
+    if _cogs_for_ccc is not None:
+        cogs_per_day = _cogs_for_ccc.astype(float) / _ccc_period
         safe_cogs_per_day = cogs_per_day.where(cogs_per_day.abs() > eps)
         if inventory is not None:
             df["dio"] = inventory.astype(float) / safe_cogs_per_day

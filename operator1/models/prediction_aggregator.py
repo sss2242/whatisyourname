@@ -3337,6 +3337,35 @@ def run_prediction_aggregation(
     result.variables_predicted = sorted(result.predictions.keys())
 
     # ------------------------------------------------------------------
+    # OHLC consistency constraint: ensure high >= low for all horizons
+    # ------------------------------------------------------------------
+    # The forecasting cascade predicts high and low as independent variables.
+    # When ensemble weights diverge, aggregated high can be < aggregated low.
+    # Fix: enforce high >= max(open, close) and low <= min(open, close).
+    for _ohlc_h in ["1d", "5d", "21d", "252d"]:
+        _h = aggregated.get("high", {}).get(_ohlc_h)
+        _l = aggregated.get("low", {}).get(_ohlc_h)
+        _c = aggregated.get("close", {}).get(_ohlc_h)
+        _o = aggregated.get("open", {}).get(_ohlc_h)
+        _h_val = getattr(_h, "point_forecast", None) if _h else None
+        _l_val = getattr(_l, "point_forecast", None) if _l else None
+        _c_val = getattr(_c, "point_forecast", None) if _c else None
+        _o_val = getattr(_o, "point_forecast", None) if _o else None
+        if _h_val is not None and _l_val is not None and _l_val > _h_val:
+            _h.point_forecast, _l.point_forecast = _l_val, _h_val
+            logger.warning("OHLC fix: swapped high/low at %s (was h=%.2f < l=%.2f)", _ohlc_h, _h_val, _l_val)
+        # Enforce high >= max(open, close)
+        if _h and _c_val is not None and _o_val is not None:
+            _h_now = getattr(_h, "point_forecast", None)
+            if _h_now is not None:
+                _h.point_forecast = max(_h_now, _c_val, _o_val)
+        # Enforce low <= min(open, close)
+        if _l and _c_val is not None and _o_val is not None:
+            _l_now = getattr(_l, "point_forecast", None)
+            if _l_now is not None:
+                _l.point_forecast = min(_l_now, _c_val, _o_val)
+
+    # ------------------------------------------------------------------
     # Technical Alpha mask
     # ------------------------------------------------------------------
     result.technical_alpha = apply_technical_alpha_mask(cache, aggregated)
