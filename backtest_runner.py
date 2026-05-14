@@ -148,6 +148,12 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
                     company_name = state.company
                     identifier = state.company
 
+                # Recover raw DataFrames (used by section 1.4a cache build)
+                income_df = getattr(state, "income_df", None) or pd.DataFrame()
+                balance_df = getattr(state, "balance_df", None) or pd.DataFrame()
+                cashflow_df = getattr(state, "cashflow_df", None) or pd.DataFrame()
+                quotes_df = getattr(state, "quotes_df", None) or pd.DataFrame()
+
                 # Rebuild _entity_groups from state.relationships
                 _entity_groups = {}
                 if state.relationships:
