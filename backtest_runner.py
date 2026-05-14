@@ -1002,9 +1002,12 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         # Game theory
         try:
             from operator1.models.game_theory import analyze_competitive_dynamics
+            _competitor_caches = {eid: state.linked_caches[eid]
+                                  for eid in _entity_groups.get("competitors", [])
+                                  if eid in (state.linked_caches or {})}
             state.game_theory_result = analyze_competitive_dynamics(
                 target_cache=cache, target_name=state.target_profile.get("name", "target"),
-                competitor_caches=state.linked_caches or None,
+                competitor_caches=_competitor_caches or None,
             )
         except Exception:
             pass
@@ -1082,7 +1085,11 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     if state.linked_caches:
         try:
             from operator1.features.peer_ranking import compute_peer_ranking
-            cache, pr = compute_peer_ranking(cache, linked_caches=state.linked_caches)
+            _peer_caches = {eid: state.linked_caches[eid]
+                           for eid in _entity_groups.get("competitors", [])
+                           if eid in state.linked_caches} if '_entity_groups' in dir() else {}
+            cache, pr = compute_peer_ranking(
+                cache, linked_caches=_peer_caches if _peer_caches else state.linked_caches)
             state.peer_ranking_result = {
                 "n_peers": pr.n_peers, "n_variables_ranked": pr.n_variables_ranked,
                 "latest_composite_rank": pr.latest_composite_rank,
@@ -1102,8 +1109,11 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     _t_17a = time.time()
     try:
         from operator1.analysis.adaptive_thresholds import compute_adaptive_thresholds, threshold_set_to_survival_dict
+        _competitor_caches_for_thresh = {eid: state.linked_caches[eid]
+                                       for eid in _entity_groups.get("competitors", [])
+                                       if eid in (state.linked_caches or {})} if '_entity_groups' in dir() else {}
         state.adaptive_thresholds = compute_adaptive_thresholds(
-            cache, linked_caches=state.linked_caches or None,
+            cache, linked_caches=_competitor_caches_for_thresh or None,
             fh_composite_scores=cache.get("fh_composite_score"),
         )
         if state.adaptive_thresholds.adapted:

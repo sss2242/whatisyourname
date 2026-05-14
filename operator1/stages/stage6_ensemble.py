@@ -237,9 +237,10 @@ def run_6_4_dtw(state: PipelineState) -> None:
             if state.catalyst_result is not None and getattr(state.catalyst_result, "available", False)
             else None
         )
+        _dtw_peer_caches = state.get_group_caches("competitors") if hasattr(state, "get_group_caches") else (state.linked_caches or {})
         state.dtw_result = find_historical_analogs(
             state.cache, variables=_dtw_vars,
-            linked_caches=state.linked_caches if state.linked_caches else None,
+            linked_caches=_dtw_peer_caches or None,
             catalyst_score=_catalyst,
         )
         logger.info("DTW analogs complete")

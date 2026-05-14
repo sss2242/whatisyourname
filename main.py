@@ -1845,6 +1845,10 @@ Non-interactive examples:
         # Game theory
         try:
             from operator1.models.game_theory import analyze_competitive_dynamics
+            # Note: _entity_groups is built later in Step 5f. At this point
+            # linked_caches is empty (populated by Step 5f), so game_theory
+            # gets an empty dict. After Step 5f, game_theory is NOT re-run
+            # with filtered caches -- that happens in backtest_runner only.
             game_theory_result = analyze_competitive_dynamics(
                 target_cache=cache,
                 target_name=target_profile.get("name", "target"),
@@ -2070,6 +2074,30 @@ Non-interactive examples:
                 except Exception as exc:
                     logger.debug("Ownership contagion skipped: %s", exc)
 
+            # Re-run game_theory with actual competitor financial data.
+            # The initial run at Step 5e has empty linked_caches (data not
+            # yet fetched). Now that linked_caches are populated, re-run
+            # with competitor-only caches for accurate market structure.
+            try:
+                _competitor_caches = {eid: linked_caches[eid]
+                                     for eid in _entity_groups.get("competitors", [])
+                                     if eid in linked_caches}
+                if _competitor_caches:
+                    from operator1.models.game_theory import analyze_competitive_dynamics
+                    game_theory_result = analyze_competitive_dynamics(
+                        target_cache=cache,
+                        target_name=target_profile.get("name", "target"),
+                        competitor_caches=_competitor_caches,
+                    )
+                    logger.info(
+                        "Game theory re-run with %d competitors: %s, pressure=%.3f",
+                        len(_competitor_caches),
+                        game_theory_result.market_structure,
+                        game_theory_result.competitive_pressure,
+                    )
+            except Exception as exc:
+                logger.debug("Game theory re-run failed: %s", exc)
+
             # Step 5g: Compute linked aggregates
             if linked_caches:
                 try:
@@ -2166,8 +2194,11 @@ Non-interactive examples:
     if linked_caches:
         try:
             from operator1.features.peer_ranking import compute_peer_ranking
+            _peer_caches = {eid: linked_caches[eid]
+                           for eid in _entity_groups.get("competitors", [])
+                           if eid in linked_caches} if linked_caches else {}
             cache, _pr_result = compute_peer_ranking(
-                cache, linked_caches=linked_caches,
+                cache, linked_caches=_peer_caches if _peer_caches else linked_caches,
             )
             peer_ranking_result = {
                 "n_peers": _pr_result.n_peers,
@@ -2343,9 +2374,12 @@ Non-interactive examples:
             threshold_set_to_survival_dict,
             threshold_set_to_mc_dict,
         )
+        _competitor_caches_for_thresh = {eid: linked_caches[eid]
+                                       for eid in _entity_groups.get("competitors", [])
+                                       if eid in linked_caches} if linked_caches else {}
         _adaptive_thresholds = compute_adaptive_thresholds(
             cache,
-            linked_caches=linked_caches if linked_caches else None,
+            linked_caches=_competitor_caches_for_thresh or None,
             regime_detector=None,  # HMM not yet fitted; will be used in Step 6
             fh_composite_scores=(
                 cache["fh_composite_score"]
