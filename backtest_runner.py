@@ -74,7 +74,7 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     """Fetch data, build cache, compute features, survival, linked entities.
 
     When substage is "all", runs everything (original behavior).
-    When substage is "1.1" through "1.6", runs only that portion and saves
+    When substage is "1.1" through "1.8b", runs only that portion and saves
     a checkpoint so the next sub-stage can resume from disk.
 
     Sub-stages:
@@ -84,7 +84,8 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         1.4a -- Cache build (OHLCV spine, merge, benchmark, IV, cross-asset, options)
         1.4b -- Macro + risk (macro fetch, quadrant, conflict, buying power, pre-ratios)
         1.5  -- Estimation + SIX proxies + derived variables + survival + FH
-        1.6  -- Entity discovery + graph risk + sentiment + catalysts
+        1.6a -- Entity discovery (LLM entities, GLEIF corporate structure)
+        1.6b -- Entity data fetch + graph risk + game theory + contagion + sentiment
         1.7  -- Adaptive calibration (thresholds, model params, windows, signal IC)
         1.8a -- Regime detection + enriched timeline (HMM/GMM/PELT/BCP/ChangeFinder)
         1.8b -- Finalization (linked conflict, aggregates, peer ranking, behavioral, normalization)
@@ -2353,7 +2354,11 @@ Examples:
     #   Supports sub-stage specs: 3.1, 4.1, 5.4, 6.11, 7.4, etc.
     # Stage 3: Profile build + prediction extraction (backtest-specific)
     # Stage 1 sub-stage IDs
-    _STAGE1_SUBSTAGES = {"1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.6a", "1.6b", "1.7", "1.8"}
+    _STAGE1_SUBSTAGES = {
+        "1.1", "1.2", "1.3", "1.4", "1.4a", "1.4b",
+        "1.5", "1.6", "1.6a", "1.6b",
+        "1.7", "1.8", "1.8a", "1.8b",
+    }
 
     if args.stage == "all":
         stages = ["1", "2", "3"]
@@ -2373,12 +2378,16 @@ Examples:
         "1.2": lambda s: run_stage1(s, substage="1.2"),
         "1.3": lambda s: run_stage1(s, substage="1.3"),
         "1.4": lambda s: run_stage1(s, substage="1.4"),
+        "1.4a": lambda s: run_stage1(s, substage="1.4a"),
+        "1.4b": lambda s: run_stage1(s, substage="1.4b"),
         "1.5": lambda s: run_stage1(s, substage="1.5"),
         "1.6": lambda s: run_stage1(s, substage="1.6"),
         "1.6a": lambda s: run_stage1(s, substage="1.6a"),
         "1.6b": lambda s: run_stage1(s, substage="1.6b"),
         "1.7": lambda s: run_stage1(s, substage="1.7"),
         "1.8": lambda s: run_stage1(s, substage="1.8"),
+        "1.8a": lambda s: run_stage1(s, substage="1.8a"),
+        "1.8b": lambda s: run_stage1(s, substage="1.8b"),
         "2": lambda s: run_stage2(s, "all"),
         "3": lambda s: run_stage3(s),
     }
@@ -2390,11 +2399,15 @@ Examples:
         "1.3": "1.2",
         "1.4": "1.3",
         "1.5": "1.4",
+        "1.4a": "1.3",
+        "1.4b": "1.4a",
         "1.6": "1.5",
         "1.6a": "1.5",
         "1.6b": "1.6a",
         "1.7": "1.6b",
         "1.8": "1.7",
+        "1.8a": "1.7",
+        "1.8b": "1.8a",
         "2": "1",   # temporal models depend on Stage 1 (data fetch)
         "3": None,  # profile build loads latest checkpoint dynamically
     }

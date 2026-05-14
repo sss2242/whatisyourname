@@ -35,7 +35,7 @@ ALL_STAGES = [
     ("1.4a", "Cache Build (OHLCV spine, merge, benchmark, IV, cross-asset, options)"),
     ("1.4b", "Macro + Risk (macro fetch, quadrant, conflict, buying power, pre-ratios)"),
     ("1.5", "Estimation + Derived Variables + Survival (SIX proxies, estimation, features, FH)"),
-    ("1.6a", "Entity Discovery (LLM entities, GLEIF, graph risk, game theory)"),
+    ("1.6a", "Entity Discovery (LLM entities, GLEIF corporate structure)"),
     ("1.6b", "Entity Data Fetch + Contagion + Sentiment"),
     ("1.7", "Adaptive Calibration (thresholds, model params, windows, signal IC)"),
     ("1.8a", "Regime Detection + Timeline (HMM/GMM/PELT/BCP, ChangeFinder, enriched timeline)"),
@@ -144,15 +144,17 @@ def run_single_stage(
     """
     cmd = [sys.executable, "backtest_runner.py"]
 
-    if stage_id == "1":
-        # Stage 1 needs market/company/end-date
+    if stage_id == "1" or stage_id.startswith("1."):
+        # Stage 1 (full or sub-stage) needs market/company/end-date
         cmd.extend([
-            "--stage", "1",
+            "--stage", stage_id,
             "--market", market,
             "--company", company,
             "--end-date", end_date,
             "--years", str(years),
         ])
+        if run_dir:
+            cmd.extend(["--run-dir", run_dir])
     elif stage_id == "3:profile":
         # Stage 3 (profile build)
         cmd.extend(["--stage", "3", "--run-dir", run_dir])
