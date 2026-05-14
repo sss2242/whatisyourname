@@ -28,14 +28,15 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 ALL_STAGES = [
-    # Backtest Stage 1: Data fetch + cache build + features (8 sub-stages)
+    # Backtest Stage 1: Data fetch + cache build + features (9 sub-stages)
     ("1.1", "Profile + Company Search (PIT client, SEC EDGAR profile)"),
     ("1.2", "Financial Statements (CompanyFacts API: income, balance, cashflow)"),
     ("1.3", "OHLCV + Holders + Segments (yfinance, holders, product segments)"),
     ("1.4a", "Cache Build (OHLCV spine, merge, benchmark, IV, cross-asset, options)"),
     ("1.4b", "Macro + Risk (macro fetch, quadrant, conflict, buying power, pre-ratios)"),
     ("1.5", "Estimation + Derived Variables + Survival (SIX proxies, estimation, features, FH)"),
-    ("1.6", "Entity Discovery + Sentiment (LLM entities, graph risk, sentiment)"),
+    ("1.6a", "Entity Discovery (LLM entities, GLEIF, graph risk, game theory)"),
+    ("1.6b", "Entity Data Fetch + Contagion + Sentiment"),
     ("1.7", "Adaptive Calibration (thresholds, model params, windows, signal IC)"),
     ("1.8a", "Regime Detection + Timeline (HMM/GMM/PELT/BCP, ChangeFinder, enriched timeline)"),
     ("1.8b", "Finalization (linked conflict, aggregates, peer ranking, behavioral, normalization)"),

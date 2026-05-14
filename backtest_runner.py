@@ -889,6 +889,15 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         except Exception:
             pass
 
+    # -- CHECKPOINT 1.6a: Entity discovery + GLEIF + initial graph/game --
+    state.cache = cache
+    state.save("1.6a")
+    logger.info("Checkpoint 1.6a saved (entity discovery)")
+    if substage == "1.6a":
+        return
+
+    # -- SUB-STAGE 1.6b: Entity data fetch + contagion + aggregates --
+    if state._llm_client is not None:
         # Fetch financial data for each linked entity (parity with main.py lines 1860-1994)
         if state.relationships:
             from operator1.features.derived_variables import compute_derived_variables as _cdv_linked
@@ -1082,11 +1091,11 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         except Exception:
             pass
 
-    # -- CHECKPOINT 1.6: Entity discovery + sentiment complete --
+    # -- CHECKPOINT 1.6b: Entity data fetch + contagion + sentiment complete --
     state.cache = cache
-    state.save("1.6")
-    logger.info("Checkpoint 1.6 saved (entities + sentiment)")
-    if substage == "1.6":
+    state.save("1.6b")
+    logger.info("Checkpoint 1.6b saved (entity data + contagion + sentiment)")
+    if substage in ("1.6", "1.6b"):
         return
 
     # Adaptive thresholds
@@ -2344,7 +2353,7 @@ Examples:
     #   Supports sub-stage specs: 3.1, 4.1, 5.4, 6.11, 7.4, etc.
     # Stage 3: Profile build + prediction extraction (backtest-specific)
     # Stage 1 sub-stage IDs
-    _STAGE1_SUBSTAGES = {"1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8"}
+    _STAGE1_SUBSTAGES = {"1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.6a", "1.6b", "1.7", "1.8"}
 
     if args.stage == "all":
         stages = ["1", "2", "3"]
@@ -2366,6 +2375,8 @@ Examples:
         "1.4": lambda s: run_stage1(s, substage="1.4"),
         "1.5": lambda s: run_stage1(s, substage="1.5"),
         "1.6": lambda s: run_stage1(s, substage="1.6"),
+        "1.6a": lambda s: run_stage1(s, substage="1.6a"),
+        "1.6b": lambda s: run_stage1(s, substage="1.6b"),
         "1.7": lambda s: run_stage1(s, substage="1.7"),
         "1.8": lambda s: run_stage1(s, substage="1.8"),
         "2": lambda s: run_stage2(s, "all"),
@@ -2380,7 +2391,9 @@ Examples:
         "1.4": "1.3",
         "1.5": "1.4",
         "1.6": "1.5",
-        "1.7": "1.6",
+        "1.6a": "1.5",
+        "1.6b": "1.6a",
+        "1.7": "1.6b",
         "1.8": "1.7",
         "2": "1",   # temporal models depend on Stage 1 (data fetch)
         "3": None,  # profile build loads latest checkpoint dynamically
