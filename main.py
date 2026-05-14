@@ -1862,15 +1862,21 @@ Non-interactive examples:
             logger.info("")
             logger.info("Step 5f: Fetching linked entity data...")
 
-            _MAX_LINKED_ENTITIES = 10  # cap to stay within API budgets
+            # Per-group entity fetch caps from config (replaces flat _MAX=10)
+            from operator1.config_loader import get_global_config as _ggc
+            _fetch_caps = _ggc().get("entity_fetch_caps", {})
+            _default_cap = _fetch_caps.get("_default", 2)
 
-            # Flatten all entities from discovery result
             _all_linked: list[dict] = []
             _entity_groups: dict[str, list[str]] = {}
             for group_name, group_entities in relationships.items():
+                _cap = _fetch_caps.get(group_name, _default_cap)
                 group_ids: list[str] = []
                 if isinstance(group_entities, list):
+                    _added = 0
                     for ent in group_entities:
+                        if _added >= _cap:
+                            break
                         ent_id = ""
                         if hasattr(ent, "isin") and ent.isin:
                             ent_id = ent.isin
@@ -1879,7 +1885,6 @@ Non-interactive examples:
                         elif isinstance(ent, dict):
                             ent_id = ent.get("isin", "") or ent.get("ticker", "")
                         if ent_id and ent_id not in {e.get("id") for e in _all_linked}:
-                            # Extract market_id for cross-region data fetch
                             _ent_market_id = ""
                             if hasattr(ent, "market_id"):
                                 _ent_market_id = ent.market_id
@@ -1892,10 +1897,11 @@ Non-interactive examples:
                                 "market_id": _ent_market_id,
                             })
                             group_ids.append(ent_id)
+                            _added += 1
                 _entity_groups[group_name] = group_ids
 
-            # Cap total entities
-            _all_linked = _all_linked[:_MAX_LINKED_ENTITIES]
+            logger.info("Entity fetch: %d entities across %d groups (per-group caps)",
+                        len(_all_linked), sum(1 for ids in _entity_groups.values() if ids))
 
             def _fetch_linked_entity(ent_info: dict) -> tuple[str, pd.DataFrame]:
                 """Fetch and build daily cache for one linked entity."""

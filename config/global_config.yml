@@ -25,6 +25,20 @@ entity_discovery_timeout_s: 120  # wall-clock timeout for entity resolution (sec
 # primary market (much faster, works for most US/EU companies).
 cross_region_discovery: false
 
+# Per-group entity fetch caps (max entities to download financial data for).
+# Replaces the old flat _MAX_LINKED_ENTITIES=10 global cap.
+# Each group gets its own budget so competitors don't crowd out suppliers.
+entity_fetch_caps:
+  competitors: 5         # peer ranking + game theory
+  suppliers: 3           # supply chain risk + contagion
+  customers: 3           # revenue exposure
+  financial_institutions: 2  # credit risk + contagion
+  parent_companies: 1    # GLEIF parent
+  subsidiaries: 0        # skip (no PIT data for subsidiaries)
+  logistics: 1           # supply chain
+  regulators: 0          # skip (no financial data)
+  _default: 2            # for any unlisted group
+
 # Cache rebuild control
 # Set to true to force re-fetching all data even when caches exist.
 FORCE_REBUILD: false

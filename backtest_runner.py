@@ -889,6 +889,100 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         except Exception:
             pass
 
+    # -- CHECKPOINT 1.6a: Entity discovery + GLEIF + initial graph/game --
+    state.cache = cache
+    state.save("1.6a")
+    logger.info("Checkpoint 1.6a saved (entity discovery)")
+    if substage == "1.6a":
+        return
+
+    # -- SUB-STAGE 1.6b: Entity data fetch + contagion + aggregates --
+    if state._llm_client is not None:
+        # Fetch financial data for each linked entity (parity with main.py lines 1860-1994)
+        if state.relationships:
+            from operator1.features.derived_variables import compute_derived_variables as _cdv_linked
+            from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
+
+            # Per-group entity fetch caps from config
+            from operator1.config_loader import get_global_config as _ggc
+            _fetch_caps = _ggc().get("entity_fetch_caps", {})
+            _default_cap = _fetch_caps.get("_default", 2)
+
+            _all_linked = []
+            _entity_groups = {}
+            for _grp, _ents in state.relationships.items():
+                _cap = _fetch_caps.get(_grp, _default_cap)
+                _ids = []
+                _added = 0
+                if isinstance(_ents, list):
+                    for _e in _ents:
+                        if _added >= _cap:
+                            break
+                        _eid = ""
+                        if isinstance(_e, dict):
+                            _eid = _e.get("isin", "") or _e.get("ticker", "")
+                        elif hasattr(_e, "isin"):
+                            _eid = _e.isin or getattr(_e, "ticker", "")
+                        if _eid and _eid not in {x.get("id") for x in _all_linked}:
+                            _mkt = _e.get("market_id", "") if isinstance(_e, dict) else getattr(_e, "market_id", "")
+                            _all_linked.append({"id": _eid, "name": _e.get("name", "") if isinstance(_e, dict) else getattr(_e, "name", ""), "group": _grp, "market_id": _mkt})
+                            _ids.append(_eid)
+                            _added += 1
+                _entity_groups[_grp] = _ids
+            logger.info("Entity fetch: %d entities (per-group caps)", len(_all_linked))
+
+            def _fetch_linked(ent_info):
+                _eid = ent_info["id"]
+                try:
+                    # Cross-region routing: use entity's market client if different
+                    _cl = pit_client
+                    _mkt = ent_info.get("market_id", "")
+                    if _mkt and _mkt != state.market_id:
+                        try:
+                            from operator1.clients.equity_provider import create_pit_client as _cpc
+                            _cl = _cpc(_mkt, state._secrets)
+                        except Exception:
+                            pass  # fall back to target's client
+                    _qt = _cl.get_quotes(_eid)
+                    if not _qt.empty and "date" in _qt.columns:
+                        _qt["date"] = pd.to_datetime(_qt["date"])
+                        _ec = _qt.set_index("date").sort_index()
+                    else:
+                        _ec = pd.DataFrame(index=pd.date_range(cache.index[0], cache.index[-1], freq="B", name="date"))
+                    for _lbl, _sdf in [("inc", _cl.get_income_statement(_eid)), ("bal", _cl.get_balance_sheet(_eid)), ("cf", _cl.get_cashflow_statement(_eid))]:
+                        if _sdf.empty:
+                            continue
+                        _dc = "report_date" if "report_date" in _sdf.columns else "filing_date"
+                        if _dc not in _sdf.columns:
+                            continue
+                        _sdf[_dc] = pd.to_datetime(_sdf[_dc])
+                        _sdf = _sdf.sort_values(_dc).drop_duplicates(subset=[_dc], keep="last")
+                        _nc = [c for c in _sdf.select_dtypes(include=["number"]).columns if c != _dc and "date" not in c.lower()]
+                        if _nc:
+                            _si = _sdf.set_index(_dc)[_nc]
+                            _ci = _ec.index.union(_si.index).sort_values()
+                            _sa = _si.reindex(_ci).ffill().reindex(_ec.index)
+                            _nw = [c for c in _sa.columns if c not in _ec.columns]
+                            if _nw:
+                                _ec = _ec.join(_sa[_nw], how="left")
+                    if "close" in _ec.columns and _ec["close"].notna().sum() > 5:
+                        _ec = _cdv_linked(_ec)
+                    return _eid, _ec
+                except Exception:
+                    return _eid, pd.DataFrame()
+
+            if _all_linked:
+                with _TPE(max_workers=4) as _ex:
+                    _futs = {_ex.submit(_fetch_linked, e): e for e in _all_linked}
+                    for _f in _ac(_futs):
+                        try:
+                            _eid, _ec = _f.result()
+                            if not _ec.empty:
+                                state.linked_caches[_eid] = _ec
+                        except Exception:
+                            pass
+                logger.info("Linked data: %d/%d fetched", len(state.linked_caches), len(_all_linked))
+
         # Graph risk
         try:
             from operator1.models.graph_risk import compute_graph_risk_metrics
@@ -900,6 +994,7 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             state.graph_risk_result = compute_graph_risk_metrics(
                 target_isin=state.target_profile.get("isin", ticker),
                 relationships=rel_dicts, target_cache=cache,
+                linked_caches=state.linked_caches or None,
             )
         except Exception:
             pass
@@ -913,6 +1008,41 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             )
         except Exception:
             pass
+
+        # Ownership contagion (parity with main.py lines 2014-2065)
+        if state.target_holders and state.linked_caches:
+            try:
+                _comp_holders: dict[str, list] = {}
+                _comp_ids = _entity_groups.get("competitors", []) if '_entity_groups' in dir() else []
+                for _cid in _comp_ids[:5]:
+                    try:
+                        _ch = pit_client.get_holders(_cid)
+                        if _ch:
+                            _comp_holders[_cid] = _ch
+                    except Exception:
+                        pass
+                from operator1.models.ownership_contagion import (
+                    compute_ownership_contagion, inject_contagion_into_cache,
+                    get_ownership_edge_weights,
+                )
+                state.contagion_result = compute_ownership_contagion(
+                    target_holders=state.target_holders,
+                    competitor_holders=_comp_holders, cache=cache,
+                )
+                if state.contagion_result and state.contagion_result.available:
+                    cache = inject_contagion_into_cache(cache, state.contagion_result)
+                    # Re-run graph risk with ownership edge weights
+                    _ow = get_ownership_edge_weights(state.contagion_result)
+                    if _ow and state.graph_risk_result is not None:
+                        state.graph_risk_result = compute_graph_risk_metrics(
+                            target_isin=state.target_profile.get("isin", ticker),
+                            relationships=rel_dicts, edge_weights=_ow,
+                            target_cache=cache, linked_caches=state.linked_caches or None,
+                        )
+                    logger.info("Ownership contagion: MHHI=%.3f, crowding=%.3f",
+                                state.contagion_result.mhhi_delta, state.contagion_result.crowding_score)
+            except Exception as exc:
+                logger.debug("Ownership contagion skipped: %s", exc)
 
     # News sentiment
     try:
@@ -961,11 +1091,11 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         except Exception:
             pass
 
-    # -- CHECKPOINT 1.6: Entity discovery + sentiment complete --
+    # -- CHECKPOINT 1.6b: Entity data fetch + contagion + sentiment complete --
     state.cache = cache
-    state.save("1.6")
-    logger.info("Checkpoint 1.6 saved (entities + sentiment)")
-    if substage == "1.6":
+    state.save("1.6b")
+    logger.info("Checkpoint 1.6b saved (entity data + contagion + sentiment)")
+    if substage in ("1.6", "1.6b"):
         return
 
     # Adaptive thresholds
@@ -2223,7 +2353,7 @@ Examples:
     #   Supports sub-stage specs: 3.1, 4.1, 5.4, 6.11, 7.4, etc.
     # Stage 3: Profile build + prediction extraction (backtest-specific)
     # Stage 1 sub-stage IDs
-    _STAGE1_SUBSTAGES = {"1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8"}
+    _STAGE1_SUBSTAGES = {"1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.6a", "1.6b", "1.7", "1.8"}
 
     if args.stage == "all":
         stages = ["1", "2", "3"]
@@ -2245,6 +2375,8 @@ Examples:
         "1.4": lambda s: run_stage1(s, substage="1.4"),
         "1.5": lambda s: run_stage1(s, substage="1.5"),
         "1.6": lambda s: run_stage1(s, substage="1.6"),
+        "1.6a": lambda s: run_stage1(s, substage="1.6a"),
+        "1.6b": lambda s: run_stage1(s, substage="1.6b"),
         "1.7": lambda s: run_stage1(s, substage="1.7"),
         "1.8": lambda s: run_stage1(s, substage="1.8"),
         "2": lambda s: run_stage2(s, "all"),
@@ -2259,7 +2391,9 @@ Examples:
         "1.4": "1.3",
         "1.5": "1.4",
         "1.6": "1.5",
-        "1.7": "1.6",
+        "1.6a": "1.5",
+        "1.6b": "1.6a",
+        "1.7": "1.6b",
         "1.8": "1.7",
         "2": "1",   # temporal models depend on Stage 1 (data fetch)
         "3": None,  # profile build loads latest checkpoint dynamically

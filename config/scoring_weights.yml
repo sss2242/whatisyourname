@@ -407,3 +407,27 @@ recursive_aggregator:
   max_days_forward: 21
   confidence_decay_rate: 0.05
   regime_tracking: true
+
+# --- Mean-reversion dampener for long-horizon predictions ---
+# After strong positive years (trailing 12m > threshold), shrinks 21d/252d
+# forecasts toward a sector-aware long-run anchor (DeBondt & Thaler 1985).
+# Asymmetric: does NOT shrink after drawdowns (recovery rallies are valid).
+mean_reversion:
+  enabled: true
+  trailing_return_threshold: 0.20    # only shrink when trailing 12m > 20%
+  max_shrinkage: 0.50                # max 50% blend toward anchor
+  shrinkage_rate: 2.0                # shrinkage = min(max, excess * rate)
+  anchor_return_annual: 0.08         # default long-run equity premium (8%/yr)
+  min_horizon_days: 21               # only apply to 21d+ horizons
+  sector_premiums:
+    technology: 0.12
+    communication_services: 0.11
+    healthcare: 0.10
+    consumer_discretionary: 0.10
+    financial_services: 0.09
+    industrials: 0.09
+    energy: 0.08
+    consumer_staples: 0.07
+    real_estate: 0.07
+    utilities: 0.06
+    materials: 0.08
