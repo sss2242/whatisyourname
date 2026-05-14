@@ -1434,11 +1434,12 @@ def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
             # Fallback: daily revenue is already a daily rate, don't re-divide
             _rev_for_ccc = revenue
             _ccc_period = 1.0
-        # Same for COGS: use revenue_ttm - gross_profit_ttm or scale
-        if _ttm_rev is not None and _ttm_rev.notna().any() and gp is not None:
-            _ttm_gp = df.get("gross_profit")
-            if _ttm_gp is not None:
-                _cogs_for_ccc = (_ttm_rev.astype(float) - _ttm_gp.astype(float) * (_ttm_rev / revenue.where(revenue.abs() > eps)).fillna(1.0)).clip(lower=eps)
+        # COGS_ttm via gross margin ratio: COGS = Rev * (1 - GM%)
+        # Simpler and more robust than scaling daily GP by TTM/daily ratio
+        if _ttm_rev is not None and _ttm_rev.notna().any() and revenue is not None and gp is not None:
+            _gm = (gp.astype(float) / revenue.astype(float).where(revenue.abs() > eps)).fillna(0.5)
+            _gm_smooth = _gm.rolling(63, min_periods=1).median()  # smooth quarterly jumps
+            _cogs_for_ccc = (_ttm_rev.astype(float) * (1.0 - _gm_smooth)).clip(lower=eps)
 
     if _rev_for_ccc is not None:
         rev_per_day = _rev_for_ccc.astype(float) / _ccc_period

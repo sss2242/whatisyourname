@@ -915,7 +915,15 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             def _fetch_linked(ent_info):
                 _eid = ent_info["id"]
                 try:
+                    # Cross-region routing: use entity's market client if different
                     _cl = pit_client
+                    _mkt = ent_info.get("market_id", "")
+                    if _mkt and _mkt != state.market_id:
+                        try:
+                            from operator1.clients.equity_provider import create_pit_client as _cpc
+                            _cl = _cpc(_mkt, state._secrets)
+                        except Exception:
+                            pass  # fall back to target's client
                     _qt = _cl.get_quotes(_eid)
                     if not _qt.empty and "date" in _qt.columns:
                         _qt["date"] = pd.to_datetime(_qt["date"])
@@ -981,6 +989,41 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             )
         except Exception:
             pass
+
+        # Ownership contagion (parity with main.py lines 2014-2065)
+        if state.target_holders and state.linked_caches:
+            try:
+                _comp_holders: dict[str, list] = {}
+                _comp_ids = _entity_groups.get("competitors", []) if '_entity_groups' in dir() else []
+                for _cid in _comp_ids[:5]:
+                    try:
+                        _ch = pit_client.get_holders(_cid)
+                        if _ch:
+                            _comp_holders[_cid] = _ch
+                    except Exception:
+                        pass
+                from operator1.models.ownership_contagion import (
+                    compute_ownership_contagion, inject_contagion_into_cache,
+                    get_ownership_edge_weights,
+                )
+                state.contagion_result = compute_ownership_contagion(
+                    target_holders=state.target_holders,
+                    competitor_holders=_comp_holders, cache=cache,
+                )
+                if state.contagion_result and state.contagion_result.available:
+                    cache = inject_contagion_into_cache(cache, state.contagion_result)
+                    # Re-run graph risk with ownership edge weights
+                    _ow = get_ownership_edge_weights(state.contagion_result)
+                    if _ow and state.graph_risk_result is not None:
+                        state.graph_risk_result = compute_graph_risk_metrics(
+                            target_isin=state.target_profile.get("isin", ticker),
+                            relationships=rel_dicts, edge_weights=_ow,
+                            target_cache=cache, linked_caches=state.linked_caches or None,
+                        )
+                    logger.info("Ownership contagion: MHHI=%.3f, crowding=%.3f",
+                                state.contagion_result.mhhi_delta, state.contagion_result.crowding_score)
+            except Exception as exc:
+                logger.debug("Ownership contagion skipped: %s", exc)
 
     # News sentiment
     try:
