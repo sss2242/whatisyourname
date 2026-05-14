@@ -115,7 +115,7 @@ forecasting:
   #   fast -- ETS fast ensemble for Tier3+, Kalman for Tier1/2 (~13s)
   #   full -- Parallel per-variable cascade + batched LSTM + global
   #           LightGBM (~15-30s, replaces old 40min sequential LSTM)
-  mode: "fast"
+  mode: "full"
   # Number of parallel workers for distributional model fitting.
   # Set to 1 for sequential execution (deterministic results).
   parallel_workers: 4
@@ -124,7 +124,7 @@ forecasting:
   fast_ensemble_tiers: [3, 4, 5]
   # Enable LSTM in the cascade (only effective in full mode).
   # In express/balanced modes, LSTM is always skipped.
-  lstm_enabled: false
+  lstm_enabled: true
   # Only these variables get the distributional model (fit_distributional).
   # All others skip it for speed (~2s per var, 31 vars -> 5 vars = 50s saved).
   distributional_vars:
