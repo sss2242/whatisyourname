@@ -164,6 +164,42 @@ class PipelineState:
         self._pit_client: Any = None
 
     # ------------------------------------------------------------------
+    # Group-filtered cache access
+    # ------------------------------------------------------------------
+
+    def get_group_caches(self, group: str) -> dict[str, "pd.DataFrame"]:
+        """Return linked_caches filtered to a specific relationship group.
+
+        Uses ``self.relationships`` to identify which entity IDs belong
+        to the requested group, then returns only those entries from
+        ``self.linked_caches``.
+
+        Parameters
+        ----------
+        group:
+            Relationship group name (e.g. ``"competitors"``, ``"suppliers"``).
+
+        Returns
+        -------
+        dict
+            Subset of ``linked_caches`` containing only entities from
+            the specified group.  Empty dict if no matches.
+        """
+        if not self.linked_caches or not self.relationships:
+            return {}
+        group_entities = self.relationships.get(group, [])
+        group_ids: set[str] = set()
+        for ent in group_entities:
+            eid = ""
+            if isinstance(ent, dict):
+                eid = ent.get("isin", "") or ent.get("ticker", "")
+            elif hasattr(ent, "isin"):
+                eid = ent.isin or getattr(ent, "ticker", "")
+            if eid:
+                group_ids.add(eid)
+        return {eid: self.linked_caches[eid] for eid in group_ids if eid in self.linked_caches}
+
+    # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
 
