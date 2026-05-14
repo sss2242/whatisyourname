@@ -894,12 +894,21 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             from operator1.features.derived_variables import compute_derived_variables as _cdv_linked
             from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
 
+            # Per-group entity fetch caps from config
+            from operator1.config_loader import get_global_config as _ggc
+            _fetch_caps = _ggc().get("entity_fetch_caps", {})
+            _default_cap = _fetch_caps.get("_default", 2)
+
             _all_linked = []
             _entity_groups = {}
             for _grp, _ents in state.relationships.items():
+                _cap = _fetch_caps.get(_grp, _default_cap)
                 _ids = []
+                _added = 0
                 if isinstance(_ents, list):
                     for _e in _ents:
+                        if _added >= _cap:
+                            break
                         _eid = ""
                         if isinstance(_e, dict):
                             _eid = _e.get("isin", "") or _e.get("ticker", "")
@@ -909,8 +918,9 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
                             _mkt = _e.get("market_id", "") if isinstance(_e, dict) else getattr(_e, "market_id", "")
                             _all_linked.append({"id": _eid, "name": _e.get("name", "") if isinstance(_e, dict) else getattr(_e, "name", ""), "group": _grp, "market_id": _mkt})
                             _ids.append(_eid)
+                            _added += 1
                 _entity_groups[_grp] = _ids
-            _all_linked = _all_linked[:10]
+            logger.info("Entity fetch: %d entities (per-group caps)", len(_all_linked))
 
             def _fetch_linked(ent_info):
                 _eid = ent_info["id"]
