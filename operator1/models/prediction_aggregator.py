@@ -2544,6 +2544,7 @@ def run_prediction_aggregation(
     walk_forward_result: Any | None = None,
     feature_selection_result: Any | None = None,
     event_calendar_result: Any | None = None,
+    sector: str = "",
 ) -> PredictionAggregatorResult:
     """Run the full prediction aggregation pipeline.
 
@@ -3371,9 +3372,7 @@ def run_prediction_aggregation(
                 _shrinkage = min(_mr_max_shrinkage, _excess * _mr_rate)
 
                 # Sector-aware anchor (refinement #2)
-                _sector = ""
-                if hasattr(cache, "attrs"):
-                    _sector = cache.attrs.get("sector", "")
+                _sector = sector  # from function parameter
                 _mr_anchor = _mr_sector_premiums.get(_sector.lower().replace(" ", "_"), _mr_anchor_default)
 
                 for _h_label, _h_days in [("21d", 21), ("252d", 252)]:

@@ -1425,6 +1425,7 @@ def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
     _rev_for_ccc = revenue
     _cogs_for_ccc = cogs
     _ccc_period = float(_period_days)
+    _cogs_period = float(_period_days)  # separate period for COGS (may differ from rev)
     if freq in ("D", "W", "M"):
         _ttm_rev = df.get("revenue_ttm_asof")
         if _ttm_rev is not None and _ttm_rev.notna().any():
@@ -1440,6 +1441,10 @@ def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
             _gm = (gp.astype(float) / revenue.astype(float).where(revenue.abs() > eps)).fillna(0.5)
             _gm_smooth = _gm.rolling(63, min_periods=1).median()  # smooth quarterly jumps
             _cogs_for_ccc = (_ttm_rev.astype(float) * (1.0 - _gm_smooth)).clip(lower=eps)
+            _cogs_period = 365.0
+        else:
+            # gp is None: COGS is daily-interpolated, don't re-divide
+            _cogs_period = 1.0
 
     if _rev_for_ccc is not None:
         rev_per_day = _rev_for_ccc.astype(float) / _ccc_period
@@ -1447,7 +1452,7 @@ def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
         if receivables is not None:
             df["dso"] = receivables.astype(float) / safe_rev_per_day
     if _cogs_for_ccc is not None:
-        cogs_per_day = _cogs_for_ccc.astype(float) / _ccc_period
+        cogs_per_day = _cogs_for_ccc.astype(float) / _cogs_period
         safe_cogs_per_day = cogs_per_day.where(cogs_per_day.abs() > eps)
         if inventory is not None:
             df["dio"] = inventory.astype(float) / safe_cogs_per_day

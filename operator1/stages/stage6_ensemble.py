@@ -270,6 +270,7 @@ def run_6_5_aggregation(state: PipelineState) -> None:
             walk_forward_result=state.walk_forward_result,
             feature_selection_result=getattr(state, "feature_selection_result", None),
             event_calendar_result=getattr(state, "event_calendar_result", None),
+            sector=state.target_profile.get("sector", "") if state.target_profile else "",
         )
         logger.info("Predictions aggregated")
     except Exception as exc:
