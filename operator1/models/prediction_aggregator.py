@@ -3337,6 +3337,86 @@ def run_prediction_aggregation(
     result.variables_predicted = sorted(result.predictions.keys())
 
     # ------------------------------------------------------------------
+    # Mean-reversion shrinkage for long-horizon forecasts
+    # ------------------------------------------------------------------
+    # After strong POSITIVE years (trailing 12m > 20%), shrink 21d/252d
+    # forecasts toward a sector-aware long-run anchor (DeBondt & Thaler 1985).
+    # Asymmetric: does NOT shrink after drawdowns -- recovery rallies are valid.
+    try:
+        from operator1.scoring_weights import get_weight as _mr_gw
+        _mr_enabled = _mr_gw("mean_reversion.enabled", True)
+        _mr_threshold = float(_mr_gw("mean_reversion.trailing_return_threshold", 0.20))
+        _mr_max_shrinkage = float(_mr_gw("mean_reversion.max_shrinkage", 0.50))
+        _mr_rate = float(_mr_gw("mean_reversion.shrinkage_rate", 2.0))
+        _mr_anchor_default = float(_mr_gw("mean_reversion.anchor_return_annual", 0.08))
+        _mr_min_horizon = int(_mr_gw("mean_reversion.min_horizon_days", 21))
+
+        # Sector-aware anchor premiums
+        _mr_sector_premiums = _mr_gw("mean_reversion.sector_premiums", {
+            "technology": 0.12, "communication_services": 0.11,
+            "healthcare": 0.10, "consumer_discretionary": 0.10,
+            "financial_services": 0.09, "industrials": 0.09,
+            "energy": 0.08, "consumer_staples": 0.07,
+            "real_estate": 0.07, "utilities": 0.06, "materials": 0.08,
+        })
+
+        if _mr_enabled and "close" in cache.columns and cache["close"].notna().sum() >= 252:
+            _last_close = float(cache["close"].dropna().iloc[-1])
+            _close_252_ago = float(cache["close"].dropna().iloc[-252])
+            _trailing_12m = (_last_close / _close_252_ago) - 1.0 if _close_252_ago > 0 else 0.0
+
+            # Asymmetric: only shrink POSITIVE momentum (refinement #1)
+            if _trailing_12m > _mr_threshold:
+                _excess = _trailing_12m - _mr_threshold
+                _shrinkage = min(_mr_max_shrinkage, _excess * _mr_rate)
+
+                # Sector-aware anchor (refinement #2)
+                _sector = ""
+                if hasattr(cache, "attrs"):
+                    _sector = cache.attrs.get("sector", "")
+                _mr_anchor = _mr_sector_premiums.get(_sector.lower().replace(" ", "_"), _mr_anchor_default)
+
+                for _h_label, _h_days in [("21d", 21), ("252d", 252)]:
+                    if _h_days < _mr_min_horizon:
+                        continue
+
+                    # Adjust close prediction
+                    _c_pred = aggregated.get("close", {}).get(_h_label)
+                    if _c_pred is not None:
+                        _pf = getattr(_c_pred, "point_forecast", None)
+                        if _pf is not None and _last_close > 0:
+                            _pred_ret = (_pf / _last_close) - 1.0
+                            _anchor_ret = _mr_anchor * (_h_days / 252.0)
+                            _adj_ret = (1.0 - _shrinkage) * _pred_ret + _shrinkage * _anchor_ret
+                            _c_pred.point_forecast = _last_close * (1.0 + _adj_ret)
+
+                            # CI width propagation (refinement #3)
+                            _ci_scale = 1.0 - _shrinkage * 0.3
+                            if hasattr(_c_pred, "lower_ci") and _c_pred.lower_ci is not None:
+                                _mid = _c_pred.point_forecast
+                                _c_pred.lower_ci = _mid - (_mid - _c_pred.lower_ci) * _ci_scale
+                            if hasattr(_c_pred, "upper_ci") and _c_pred.upper_ci is not None:
+                                _mid = _c_pred.point_forecast
+                                _c_pred.upper_ci = _mid + (_c_pred.upper_ci - _mid) * _ci_scale
+
+                            logger.info(
+                                "Mean-reversion shrinkage at %s: trailing=%.1f%%, shrinkage=%.2f, "
+                                "anchor=%.1f%%, pred=%.1f%%->%.1f%%",
+                                _h_label, _trailing_12m * 100, _shrinkage,
+                                _mr_anchor * 100, _pred_ret * 100, _adj_ret * 100,
+                            )
+
+                    # Adjust return_1d for consistency (refinement #4)
+                    _r_pred = aggregated.get("return_1d", {}).get(_h_label)
+                    if _r_pred is not None:
+                        _rpf = getattr(_r_pred, "point_forecast", None)
+                        if _rpf is not None:
+                            _anchor_daily = _mr_anchor / 252.0
+                            _r_pred.point_forecast = (1.0 - _shrinkage) * _rpf + _shrinkage * _anchor_daily
+    except Exception as _mr_exc:
+        logger.debug("Mean-reversion shrinkage skipped: %s", _mr_exc)
+
+    # ------------------------------------------------------------------
     # OHLC consistency constraint: ensure high >= low for all horizons
     # ------------------------------------------------------------------
     # The forecasting cascade predicts high and low as independent variables.
