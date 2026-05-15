@@ -1180,6 +1180,51 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             except Exception:
                 pass
 
+        # LLM concept resolution: fill missing critical fields via LLM
+        # (Tier 3 fallback -- after CompanyFacts + keyword auto-discovery)
+        if state._llm_client is not None and state.market_id == "us_sec_edgar":
+            try:
+                _still_missing = [
+                    f for f in ("goodwill", "intangible_assets", "rd_expenses")
+                    if f not in cache.columns or cache[f].isna().all()
+                ]
+                if _still_missing:
+                    from operator1.clients.canonical_translator import resolve_unmapped_concepts_llm
+                    _llm_map = resolve_unmapped_concepts_llm(_still_missing, state._llm_client)
+                    if _llm_map:
+                        import requests as _req
+                        _cik = state.target_profile.get("cik", "")
+                        _cik_padded = str(_cik).zfill(10) if _cik else ""
+                        if _cik_padded:
+                            _headers = {"User-Agent": "Operator1/1.0", "Accept": "application/json"}
+                            try:
+                                _facts_resp = _req.get(
+                                    f"https://data.sec.gov/api/xbrl/companyfacts/CIK{_cik_padded}.json",
+                                    headers=_headers, timeout=30,
+                                )
+                                if _facts_resp.status_code == 200:
+                                    _usgaap = _facts_resp.json().get("facts", {}).get("us-gaap", {})
+                                    for _field, _concept in _llm_map.items():
+                                        if not _concept or (_field in cache.columns and not cache[_field].isna().all()):
+                                            continue
+                                        _cdata = _usgaap.get(_concept, {})
+                                        _entries = _cdata.get("units", {}).get("USD", [])
+                                        _rows = []
+                                        for _e in _entries:
+                                            if _e.get("form") in ("10-K", "10-Q") and _e.get("val") is not None and _e.get("end"):
+                                                _rows.append({"date": pd.Timestamp(_e["end"]), "value": float(_e["val"])})
+                                        if _rows:
+                                            _fdf = pd.DataFrame(_rows).drop_duplicates(subset=["date"], keep="last").set_index("date").sort_index()
+                                            _ci = cache.index.union(_fdf.index).sort_values()
+                                            _aligned = _fdf["value"].reindex(_ci).ffill().reindex(cache.index)
+                                            if _aligned.notna().sum() > 0:
+                                                cache[_field] = _aligned
+                                                logger.info("LLM concept resolution filled '%s' from '%s': %d vals", _field, _concept, _aligned.notna().sum())
+                            except Exception:
+                                pass
+            except Exception as exc:
+                logger.debug("LLM concept resolution failed: %s", exc)
+
         # -- CHECKPOINT 1.6b: Entity data fetch + contagion + sentiment complete --
         state.cache = cache
         state.save("1.6b")
