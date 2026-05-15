@@ -100,6 +100,7 @@ ESTIMABLE_VARIABLES: tuple[str, ...] = (
     "cash_and_equivalents", "short_term_debt", "long_term_debt",
     "receivables",
     "operating_cash_flow", "capex",
+    "rd_expenses", "goodwill", "intangible_assets",
     # Derived variables
     "total_debt_asof", "net_debt",
     "free_cash_flow", "free_cash_flow_ttm_asof",
@@ -809,6 +810,23 @@ def run_estimation(
     logger.info("Running Phase 1: Deterministic identity fill ...")
     p1_result = run_pass1_identity_fill(result)
     coverage.pass1_fills = p1_result.fills
+
+    # ------------------------------------------------------------------
+    # Phase 1b: Zero-defaults for balance sheet items that companies
+    # legitimately don't have.  "Not reported" = "not applicable" for
+    # these fields (e.g., goodwill=0 means no acquisitions).
+    # ------------------------------------------------------------------
+    _ZERO_DEFAULT_FIELDS = {
+        "goodwill", "intangible_assets", "inventory",
+        "dividends_paid", "stock_buybacks",
+    }
+    _n_zeroed = 0
+    for _zf in _ZERO_DEFAULT_FIELDS:
+        if _zf not in result.columns or result[_zf].isna().all():
+            result[_zf] = 0.0
+            _n_zeroed += 1
+    if _n_zeroed > 0:
+        logger.info("Zero-default: %d fields set to 0 (not reported = not applicable)", _n_zeroed)
 
     # ------------------------------------------------------------------
     # Build tier membership for weighting
