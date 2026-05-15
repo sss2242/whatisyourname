@@ -217,8 +217,17 @@ def _compute_returns_and_risk(df: pd.DataFrame) -> pd.DataFrame:
     df["is_missing_log_return_1d"] = df["log_return_1d"].isna().astype(int)
 
     # Rolling 21-day volatility (std of daily returns)
+    # Multi-period returns (used by signal IC, HF position, prediction aggregator)
+    df["return_5d"] = close.pct_change(5)
+    df["is_missing_return_5d"] = df["return_5d"].isna().astype(int)
+    df["return_21d"] = close.pct_change(21)
+    df["is_missing_return_21d"] = df["return_21d"].isna().astype(int)
+
     df["volatility_21d"] = df["return_1d"].rolling(window=21, min_periods=5).std()
     df["is_missing_volatility_21d"] = df["volatility_21d"].isna().astype(int)
+
+    df["volatility_63d"] = df["return_1d"].rolling(window=63, min_periods=10).std()
+    df["is_missing_volatility_63d"] = df["volatility_63d"].isna().astype(int)
 
     # EWMA volatility (RiskMetrics, JP Morgan 1996): gives more weight to
     # recent observations, adapting faster to regime changes than simple
