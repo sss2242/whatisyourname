@@ -149,10 +149,16 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
                     identifier = state.company
 
                 # Recover raw DataFrames (used by section 1.4a cache build)
-                income_df = getattr(state, "income_df", None) or pd.DataFrame()
-                balance_df = getattr(state, "balance_df", None) or pd.DataFrame()
-                cashflow_df = getattr(state, "cashflow_df", None) or pd.DataFrame()
-                quotes_df = getattr(state, "quotes_df", None) or pd.DataFrame()
+                # NOTE: Cannot use `df or pd.DataFrame()` because pandas raises
+                # "truth value of a DataFrame is ambiguous". Use explicit None check.
+                _inc = getattr(state, "income_df", None)
+                income_df = _inc if isinstance(_inc, pd.DataFrame) else pd.DataFrame()
+                _bal = getattr(state, "balance_df", None)
+                balance_df = _bal if isinstance(_bal, pd.DataFrame) else pd.DataFrame()
+                _cf = getattr(state, "cashflow_df", None)
+                cashflow_df = _cf if isinstance(_cf, pd.DataFrame) else pd.DataFrame()
+                _qt = getattr(state, "quotes_df", None)
+                quotes_df = _qt if isinstance(_qt, pd.DataFrame) else pd.DataFrame()
 
                 # Rebuild _entity_groups from state.relationships
                 _entity_groups = {}
@@ -1406,6 +1412,9 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
                 logger.debug("Ownership contagion skipped: %s", exc)
 
         # Save segment result for Stage 3 profile injection
+        # Recover _seg_result from state if loaded from checkpoint (1.3 sets it)
+        if '_seg_result' not in dir():
+            _seg_result = getattr(state, 'seg_result', {}) or {}
         state.seg_result = _seg_result
 
         # Product segment metrics (for _extra_vars + MC concentration risk)

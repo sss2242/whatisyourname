@@ -692,11 +692,25 @@ def _constrained_point_forecast(
         _lc = last_close if not math.isnan(last_close) and last_close > 0 else raw_forecast
         _mom = momentum_5d if not math.isnan(momentum_5d) else 0.0
 
+        # Band asymmetry: if upper band is wider than lower, the
+        # distribution is right-skewed (more upside probability mass).
+        # Nudge the point forecast toward the wider side.
+        _upper_w = upper_bound - raw_forecast
+        _lower_w = raw_forecast - lower_bound
+        _band_total = _upper_w + _lower_w
+        _skew_target = raw_forecast
+        if _band_total > 0:
+            _skew_ratio = (_upper_w - _lower_w) / _band_total
+            # Shift target by 10% of band width in the skew direction
+            _skew_target = raw_forecast + _skew_ratio * _band_total * 0.10
+        _skew_weight = 0.10  # light influence -- don't overwhelm model forecast
+
         def _objective(x):
             model_loss = (x - raw_forecast) ** 2
             momentum_loss = -(x - _lc) * _mom * mom_weight
             mean_rev = (x - _lc) ** 2 * mr_weight
-            return model_loss + momentum_loss + mean_rev
+            skew_loss = (x - _skew_target) ** 2 * _skew_weight
+            return model_loss + momentum_loss + mean_rev + skew_loss
 
         result = minimize_scalar(
             _objective, bounds=(lower_bound, upper_bound), method="bounded",
@@ -1225,6 +1239,65 @@ def compute_confidence_score(
     confidence = math.sqrt(model_quality * surv_prob)
 
     return max(0.0, min(1.0, confidence))
+
+
+def _band_derived_confidence(
+    point: float,
+    lower: float,
+    upper: float,
+    last_value: float,
+    horizon_days: int,
+) -> float:
+    """Derive confidence from conformal band width relative to price scale.
+
+    When bands are tight relative to the expected random-walk width at this
+    horizon, the prediction is high-confidence.  When bands are wider than
+    expected, confidence drops.  This is independent of survival probability
+    and purely reflects the calibrated prediction interval quality.
+
+    Returns a score in [0, 1].
+    """
+    if (
+        math.isnan(point)
+        or math.isnan(lower)
+        or math.isnan(upper)
+        or last_value is None
+        or last_value <= 0
+    ):
+        return 0.5  # neutral default when bands unavailable
+
+    band_width = upper - lower
+    if band_width <= 0:
+        return 0.5
+
+    # Relative width: band_width / last_value
+    rel_width = band_width / last_value
+
+    # Expected width at this horizon.  Use a generous baseline that
+    # accounts for typical stock volatility (~1.5-2.0% daily) plus the
+    # natural band widening from conformal calibration.  The idea is:
+    # if the actual band is NARROWER than this, we're confident; if
+    # wider, less so.  The baseline scales as sqrt(T) (random walk).
+    expected_width = 0.04 * math.sqrt(max(horizon_days, 1))
+
+    # Confidence: how narrow are bands vs expected?
+    # ratio < 1.0 = narrower than expected = high confidence
+    # ratio > 1.0 = wider than expected = low confidence
+    ratio = rel_width / max(expected_width, 1e-6)
+    # Use a softer decay so confidence doesn't collapse too quickly
+    confidence = 1.0 / (1.0 + ratio)  # hyperbolic decay: 0.5 at ratio=1
+    return max(0.0, min(1.0, confidence))
+
+
+# Horizon-dependent blend weights for band vs MC confidence.
+# At short horizons, bands (from 441 forward-pass residuals) are the
+# most reliable signal.  At long horizons, MC survival risk matters more.
+_BAND_CONFIDENCE_WEIGHT: dict[int, float] = {
+    1: 0.60,
+    5: 0.40,
+    21: 0.20,
+    252: 0.10,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -3201,10 +3274,18 @@ def run_prediction_aggregation(
                 # the analog influence as causal_adjustment for
                 # transparency.
 
-            # Confidence score.
-            confidence = compute_confidence_score(
+            # Confidence score: blend band-derived + MC-based confidence.
+            # Band confidence reflects calibrated interval quality (tight bands
+            # = high confidence).  MC confidence reflects survival risk.
+            # At short horizons bands dominate; at long horizons MC dominates.
+            _base_confidence = compute_confidence_score(
                 var_rmse, rmse_reference, surv_prob,
             )
+            _band_conf = _band_derived_confidence(
+                point, lower, upper, last_value, horizon_days,
+            )
+            _w_band = _BAND_CONFIDENCE_WEIGHT.get(horizon_days, 0.30)
+            confidence = _w_band * _band_conf + (1.0 - _w_band) * _base_confidence
 
             # P2: Sanity clamp for price-level predictions (close, open, high).
             # Level-based models (XGBoost, tree) can extrapolate wildly beyond
