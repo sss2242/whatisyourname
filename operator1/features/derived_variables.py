@@ -226,6 +226,12 @@ def _compute_returns_and_risk(df: pd.DataFrame) -> pd.DataFrame:
     df["volatility_ewma_21d"] = df["return_1d"].ewm(span=21, min_periods=5).std()
     df["is_missing_volatility_ewma_21d"] = df["volatility_ewma_21d"].isna().astype(int)
 
+    # IV-RV spread: implied volatility minus realized (computed here because
+    # volatility_21d is now available; was previously attempted at Step 4.bench.1
+    # before derived vars existed, so it was always NaN -- fix for M2).
+    if "iv30" in df.columns and df["iv30"].notna().any():
+        df["iv_rv_spread"] = df["iv30"] - df["volatility_21d"]
+
     # Rolling 252-day max drawdown
     rolling_max = close.rolling(window=252, min_periods=1).max()
     drawdown = (close - rolling_max) / rolling_max
