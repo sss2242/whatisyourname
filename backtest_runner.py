@@ -509,6 +509,12 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             "receivables": ["AccountsReceivableNetCurrent"],
             "inventory": ["InventoryNet"],
             "payables": ["AccountsPayableCurrent"],
+            "goodwill": ["Goodwill"],
+            "intangible_assets": [
+                "IntangibleAssetsNetExcludingGoodwill",
+                "FiniteLivedIntangibleAssetsNet",
+                "IndefiniteLivedIntangibleAssetsExcludingGoodwill",
+            ],
             "shares_outstanding": [
                 "EntityCommonStockSharesOutstanding",
                 "CommonStockSharesOutstanding",
@@ -543,6 +549,10 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
                 "InterestExpense",
                 "InterestExpenseDebt",
                 "InterestPaid",
+            ],
+            "rd_expenses": [
+                "ResearchAndDevelopmentExpense",
+                "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
             ],
         }
         _all_critical_fields = {**_critical_balance_fields, **_critical_income_fields}
