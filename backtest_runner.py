@@ -1469,6 +1469,22 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
         except Exception:
             pass
 
+        # Build USS controller (parity with main.py Step 5-USS)
+        try:
+            from operator1.analysis.survival_regime_controller import SurvivalRegimeController
+            state.survival_controller = SurvivalRegimeController.from_cache(cache)
+            if state.survival_controller is not None:
+                if not state.survival_controller.early_warning.empty:
+                    cache["early_warning_score"] = state.survival_controller.early_warning
+                logger.info(
+                    "USS controller: regime=%s, survival=%s, frozen=%d vars",
+                    state.survival_controller.current_regime,
+                    state.survival_controller.is_survival,
+                    len(state.survival_controller.get_frozen_variables()),
+                )
+        except Exception as exc:
+            logger.warning("USS controller failed: %s", exc)
+
         state.cache = cache
         state.save("1.8")
         state.save("1")  # backward compat
@@ -2034,6 +2050,30 @@ def run_stage3(state: PipelineState) -> None:
             }
         except Exception:
             profile["position_signal"] = {"available": False}
+
+        # ---------------------------------------------------------------
+        # Fix C1: PID controller in profile (forward_pass has pid_summary)
+        # ---------------------------------------------------------------
+        if state.forward_pass_result is not None:
+            _fp = state.forward_pass_result
+            _pid = getattr(_fp, "pid_summary", None)
+            if _pid and isinstance(_pid, dict):
+                profile["pid_controller"] = {"available": True, **_pid}
+
+        # ---------------------------------------------------------------
+        # Fix H4: model_metrics.best_model_per_variable (metrics is a list)
+        # ---------------------------------------------------------------
+        if state.forecast_result is not None:
+            _metrics = getattr(state.forecast_result, "metrics", None)
+            if isinstance(_metrics, list) and _metrics:
+                _best = {}
+                for _mm in _metrics:
+                    _var = getattr(_mm, "variable", "")
+                    _model = getattr(_mm, "model_name", "unknown")
+                    if _var and _var not in _best:
+                        _best[_var] = _model
+                profile.setdefault("model_metrics", {})["best_model_per_variable"] = _best
+                profile["model_metrics"]["available"] = True
 
         profile = _sanitize(profile)
         with open(profile_path, "w") as f:

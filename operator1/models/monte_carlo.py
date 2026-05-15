@@ -245,7 +245,12 @@ def get_sector_aware_thresholds(
     thresholds = dict(base_thresholds or DEFAULT_SURVIVAL_THRESHOLDS)
     if not sector:
         return thresholds
-    sector_lower = sector.lower().strip()
+    # Normalize SIC labels (e.g., "Electronic Computers" -> "technology")
+    try:
+        from operator1.sector_mapper import normalize_sector
+        sector_lower = normalize_sector(sector)
+    except ImportError:
+        sector_lower = sector.lower().strip()
     for sector_key, overrides in SECTOR_SURVIVAL_OVERRIDES.items():
         if sector_key in sector_lower:
             thresholds.update(overrides)

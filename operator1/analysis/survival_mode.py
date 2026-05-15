@@ -110,7 +110,12 @@ def compute_company_survival_flag(
     if sector:
         try:
             from operator1.scoring_weights import get_weight
-            _sector_key = sector.lower().replace(" ", "_").replace("&", "and")
+            # Normalize SIC labels (e.g., "Electronic Computers" -> "technology")
+            try:
+                from operator1.sector_mapper import normalize_sector
+                _sector_key = normalize_sector(sector).replace(" ", "_").replace("&", "and")
+            except ImportError:
+                _sector_key = sector.lower().replace(" ", "_").replace("&", "and")
             _overrides = get_weight(f"survival_thresholds.sector_overrides.{_sector_key}", {})
             if isinstance(_overrides, dict):
                 for k, v in _overrides.items():

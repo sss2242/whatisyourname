@@ -250,6 +250,9 @@ def _compute_solvency(df: pd.DataFrame) -> pd.DataFrame:
     st_debt = df.get("short_term_debt", pd.Series(np.nan, index=df.index))
     lt_debt = df.get("long_term_debt", pd.Series(np.nan, index=df.index))
     df["total_debt_asof"] = st_debt.fillna(0) + lt_debt.fillna(0)
+    # Alias: some downstream modules look for "total_debt" not "total_debt_asof"
+    if "total_debt" not in df.columns:
+        df["total_debt"] = df["total_debt_asof"]
     # Mark missing only when *both* components are null
     df["is_missing_total_debt_asof"] = (st_debt.isna() & lt_debt.isna()).astype(int)
 

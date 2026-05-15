@@ -1192,7 +1192,13 @@ def compute_financial_health(
             "gross_margin_gate": 0.25,
         },
     }
-    sector_lower = sector.lower().strip() if sector else ""
+    # Normalize sector label (SIC "Electronic Computers" -> "technology")
+    # so that sector-aware floors match correctly.
+    try:
+        from operator1.sector_mapper import normalize_sector
+        sector_lower = normalize_sector(sector) if sector else ""
+    except ImportError:
+        sector_lower = sector.lower().strip() if sector else ""
     _sector_config = None
     for _sk, _sv in _SECTOR_FLOORS.items():
         if _sk in sector_lower:

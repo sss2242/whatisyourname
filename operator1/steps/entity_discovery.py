@@ -932,6 +932,40 @@ def discover_linked_entities(
 
     # Summary
     total = sum(len(v) for v in result.linked.values())
+
+    # ---------------------------------------------------------------
+    # Fallback: if LLM returned 0 entities, try PIT client peers
+    # (SEC EDGAR SIC-based peer list, or wrapper get_peers()).
+    # This ensures graph risk, game theory, and peer ranking have
+    # at least some competitor data even when LLM is unavailable.
+    # ---------------------------------------------------------------
+    if total == 0:
+        logger.warning("LLM entity discovery returned 0 entities -- trying PIT peer fallback")
+        try:
+            _ticker = target_profile.get("ticker", "")
+            _cik = target_profile.get("cik", _ticker)
+            if pit_client is not None and hasattr(pit_client, "get_peers"):
+                _peers = pit_client.get_peers(_cik)
+                if _peers:
+                    from operator1.steps.entity_discovery import LinkedEntity
+                    _competitor_entities = []
+                    for _p in _peers[:5]:
+                        _competitor_entities.append(LinkedEntity(
+                            isin="",
+                            ticker=str(_p),
+                            name=str(_p),
+                            country=target_profile.get("country", ""),
+                            sector=target_profile.get("sector", ""),
+                            relationship_group="competitors",
+                            match_score=70,
+                        ))
+                    if _competitor_entities:
+                        result.linked["competitors"] = _competitor_entities
+                        total = len(_competitor_entities)
+                        logger.info("PIT peer fallback: %d competitors found from SIC peers", total)
+        except Exception as _peer_exc:
+            logger.debug("PIT peer fallback failed: %s", _peer_exc)
+
     logger.info(
         "Discovery complete: %d entities across %d groups, %d search calls, %d dropped",
         total,
