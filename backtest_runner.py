@@ -114,1288 +114,1356 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
     pit_client = create_pit_client(state.market_id, state._secrets)
     state._pit_client = pit_client
 
+    # ---------------------------------------------------------------
+    # Fast-path: skip prior sub-stages by loading dependency checkpoint
+    # ---------------------------------------------------------------
+    from pathlib import Path as _Path
+    _SUBSTAGE_ORDER = [
+        "1.1", "1.2", "1.3", "1.4a", "1.4b", "1.5",
+        "1.6a", "1.6b", "1.7", "1.8a", "1.8b",
+    ]
+    _skip: set = set()
+
+    if substage != "all" and substage in _SUBSTAGE_ORDER:
+        _idx = _SUBSTAGE_ORDER.index(substage)
+        if _idx > 0:
+            _dep = _SUBSTAGE_ORDER[_idx - 1]
+            _dep_pkl = _Path(state.output_dir) / f"state_{_dep}.pkl"
+            if _dep_pkl.exists():
+                logger.info(
+                    "Fast-path: loading checkpoint %r, skipping to %r",
+                    _dep, substage,
+                )
+                state.load_checkpoint(_dep)
+                _skip = set(_SUBSTAGE_ORDER[:_idx])
+
+                # Recover local variables from loaded state
+                cache = state.cache
+                if state.target_profile:
+                    ticker = state.target_profile.get("ticker", state.company)
+                    company_name = state.target_profile.get("name", ticker)
+                    identifier = state.target_profile.get("cik", ticker)
+                else:
+                    ticker = state.company
+                    company_name = state.company
+                    identifier = state.company
+
+                # Recover raw DataFrames (used by section 1.4a cache build)
+                income_df = getattr(state, "income_df", None) or pd.DataFrame()
+                balance_df = getattr(state, "balance_df", None) or pd.DataFrame()
+                cashflow_df = getattr(state, "cashflow_df", None) or pd.DataFrame()
+                quotes_df = getattr(state, "quotes_df", None) or pd.DataFrame()
+
+                # Rebuild _entity_groups from state.relationships
+                _entity_groups = {}
+                if state.relationships:
+                    for _grp, _ents in state.relationships.items():
+                        _ids = []
+                        if isinstance(_ents, list):
+                            for _e in _ents:
+                                _eid = ""
+                                if isinstance(_e, dict):
+                                    _eid = _e.get("isin", "") or _e.get("ticker", "")
+                                elif hasattr(_e, "isin"):
+                                    _eid = _e.isin or getattr(_e, "ticker", "")
+                                if _eid:
+                                    _ids.append(_eid)
+                        _entity_groups[_grp] = _ids
+
+
     # Search company
-    results = pit_client.search_company(state.company)
-    if not results:
-        results = pit_client.list_companies(query=state.company)
-    if results:
-        company_info = results[0]
-        logger.info("Company: %s (%s)", company_info.get("name"), company_info.get("ticker"))
-    else:
-        company_info = {"ticker": state.company, "name": state.company}
+    if "1.1" not in _skip:
+        results = pit_client.search_company(state.company)
+        if not results:
+            results = pit_client.list_companies(query=state.company)
+        if results:
+            company_info = results[0]
+            logger.info("Company: %s (%s)", company_info.get("name"), company_info.get("ticker"))
+        else:
+            company_info = {"ticker": state.company, "name": state.company}
 
-    ticker = company_info.get("ticker", "") or company_info.get("identifier", "")
-    company_name = company_info.get("name", ticker)
-    identifier = company_info.get("cik") or ticker or company_info.get("identifier", "")
+        ticker = company_info.get("ticker", "") or company_info.get("identifier", "")
+        company_name = company_info.get("name", ticker)
+        identifier = company_info.get("cik") or ticker or company_info.get("identifier", "")
 
-    # Profile
-    try:
-        state.target_profile = pit_client.get_profile(identifier)
-        state.target_profile.setdefault("name", company_name)
-        state.target_profile.setdefault("ticker", ticker)
-        state.target_profile.setdefault("country", market_info.country_code)
-        state.target_profile.setdefault("market_id", state.market_id)
-        state.target_profile.setdefault("pit_api", market_info.pit_api_name)
-    except Exception as exc:
-        logger.warning("Profile fetch failed: %s", exc)
-        state.target_profile = {
-            "name": company_name, "ticker": ticker,
-            "country": market_info.country_code, "market_id": state.market_id,
-        }
+        # Profile
+        try:
+            state.target_profile = pit_client.get_profile(identifier)
+            state.target_profile.setdefault("name", company_name)
+            state.target_profile.setdefault("ticker", ticker)
+            state.target_profile.setdefault("country", market_info.country_code)
+            state.target_profile.setdefault("market_id", state.market_id)
+            state.target_profile.setdefault("pit_api", market_info.pit_api_name)
+        except Exception as exc:
+            logger.warning("Profile fetch failed: %s", exc)
+            state.target_profile = {
+                "name": company_name, "ticker": ticker,
+                "country": market_info.country_code, "market_id": state.market_id,
+            }
 
-    # Supplement enrichment
-    try:
-        from operator1.clients.supplement import enrich_profile
-        state.target_profile = enrich_profile(
-            market_id=state.market_id, ticker=ticker,
-            existing_profile=state.target_profile,
-        )
-    except Exception as exc:
-        logger.debug("Supplement skipped: %s", exc)
+        # Supplement enrichment
+        try:
+            from operator1.clients.supplement import enrich_profile
+            state.target_profile = enrich_profile(
+                market_id=state.market_id, ticker=ticker,
+                existing_profile=state.target_profile,
+            )
+        except Exception as exc:
+            logger.debug("Supplement skipped: %s", exc)
 
-    # -- CHECKPOINT 1.1: Profile + company search complete --
-    state.save("1.1")
-    logger.info("Checkpoint 1.1 saved (profile + company search)")
+        # -- CHECKPOINT 1.1: Profile + company search complete --
+        state.save("1.1")
+        logger.info("Checkpoint 1.1 saved (profile + company search)")
     if substage == "1.1":
         return
 
     # Fetch financial data (parallel) -- each download is a separate network call
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    if "1.2" not in _skip:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    income_df = balance_df = cashflow_df = quotes_df = pd.DataFrame()
-    tasks = {
-        "income": pit_client.get_income_statement,
-        "balance": pit_client.get_balance_sheet,
-        "cashflow": pit_client.get_cashflow_statement,
-        "quotes": pit_client.get_quotes,
-    }
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = {ex.submit(fn, identifier): lbl for lbl, fn in tasks.items()}
-        for fut in as_completed(futures):
-            lbl = futures[fut]
-            try:
-                r = fut.result()
-                if lbl == "income": income_df = r
-                elif lbl == "balance": balance_df = r
-                elif lbl == "cashflow": cashflow_df = r
-                elif lbl == "quotes": quotes_df = r
-                logger.info("%s: %d rows", lbl.capitalize(), len(r))
-            except Exception as exc:
-                logger.warning("%s failed: %s", lbl, exc)
+        income_df = balance_df = cashflow_df = quotes_df = pd.DataFrame()
+        tasks = {
+            "income": pit_client.get_income_statement,
+            "balance": pit_client.get_balance_sheet,
+            "cashflow": pit_client.get_cashflow_statement,
+            "quotes": pit_client.get_quotes,
+        }
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futures = {ex.submit(fn, identifier): lbl for lbl, fn in tasks.items()}
+            for fut in as_completed(futures):
+                lbl = futures[fut]
+                try:
+                    r = fut.result()
+                    if lbl == "income": income_df = r
+                    elif lbl == "balance": balance_df = r
+                    elif lbl == "cashflow": cashflow_df = r
+                    elif lbl == "quotes": quotes_df = r
+                    logger.info("%s: %d rows", lbl.capitalize(), len(r))
+                except Exception as exc:
+                    logger.warning("%s failed: %s", lbl, exc)
 
-    # Data reconciliation
-    try:
-        from operator1.quality.data_reconciliation import reconcile_financial_data
-        income_df, balance_df, cashflow_df, _ = reconcile_financial_data(
-            income_df, balance_df, cashflow_df
-        )
-    except Exception as exc:
-        logger.warning("Reconciliation failed: %s", exc)
+        # Data reconciliation
+        try:
+            from operator1.quality.data_reconciliation import reconcile_financial_data
+            income_df, balance_df, cashflow_df, _ = reconcile_financial_data(
+                income_df, balance_df, cashflow_df
+            )
+        except Exception as exc:
+            logger.warning("Reconciliation failed: %s", exc)
 
-    # Pivot to wide
-    try:
-        from operator1.clients.canonical_translator import pivot_to_canonical_wide
-        for label, stmt_df in [("income", income_df), ("balance", balance_df), ("cashflow", cashflow_df)]:
-            if stmt_df.empty:
-                continue
-            if "canonical_name" in stmt_df.columns and "value" in stmt_df.columns:
-                wide = pivot_to_canonical_wide(stmt_df, date_col="report_date")
-                if not wide.empty:
-                    if "filing_date" in stmt_df.columns:
-                        fd = (stmt_df.dropna(subset=["filing_date", "report_date"])
-                              .sort_values("filing_date")
-                              .drop_duplicates(subset=["report_date"], keep="last")
-                              [["report_date", "filing_date"]])
-                        wide = wide.merge(fd, on="report_date", how="left")
-                    if label == "income": income_df = wide
-                    elif label == "balance": balance_df = wide
-                    else: cashflow_df = wide
-                    logger.info("Pivoted %s: %d x %d", label, len(wide), len(wide.columns))
-    except Exception as exc:
-        logger.warning("Pivot failed: %s", exc)
+        # Pivot to wide
+        try:
+            from operator1.clients.canonical_translator import pivot_to_canonical_wide
+            for label, stmt_df in [("income", income_df), ("balance", balance_df), ("cashflow", cashflow_df)]:
+                if stmt_df.empty:
+                    continue
+                if "canonical_name" in stmt_df.columns and "value" in stmt_df.columns:
+                    wide = pivot_to_canonical_wide(stmt_df, date_col="report_date")
+                    if not wide.empty:
+                        if "filing_date" in stmt_df.columns:
+                            fd = (stmt_df.dropna(subset=["filing_date", "report_date"])
+                                  .sort_values("filing_date")
+                                  .drop_duplicates(subset=["report_date"], keep="last")
+                                  [["report_date", "filing_date"]])
+                            wide = wide.merge(fd, on="report_date", how="left")
+                        if label == "income": income_df = wide
+                        elif label == "balance": balance_df = wide
+                        else: cashflow_df = wide
+                        logger.info("Pivoted %s: %d x %d", label, len(wide), len(wide.columns))
+        except Exception as exc:
+            logger.warning("Pivot failed: %s", exc)
 
-    # Frequency separation: resolve mixed annual+quarterly statement data.
-    # Mirrors main.py Step 3d -- prevents annual totals from being
-    # distributed over quarterly windows (F5 bug).
-    try:
-        from operator1.clients.frequency_separator import (
-            separate_by_period_type,
-            build_highest_frequency_statement,
-        )
-        for label, stmt_ref in [("income", "income_df"), ("balance", "balance_df"), ("cashflow", "cashflow_df")]:
-            stmt = locals()[stmt_ref]
-            if stmt.empty:
-                continue
-            freq_groups = separate_by_period_type(stmt, market_id=state.market_id)
-            if len(freq_groups) > 1:
-                logger.info(
-                    "Mixed-frequency %s: %s",
-                    label, {k: len(v) for k, v in freq_groups.items()},
-                )
-                reconciled = build_highest_frequency_statement(freq_groups)
-                if not reconciled.empty:
-                    if label == "income":
-                        income_df = reconciled
-                    elif label == "balance":
-                        balance_df = reconciled
-                    else:
-                        cashflow_df = reconciled
-    except Exception as exc:
-        logger.warning("Frequency separation failed: %s", exc)
+        # Frequency separation: resolve mixed annual+quarterly statement data.
+        # Mirrors main.py Step 3d -- prevents annual totals from being
+        # distributed over quarterly windows (F5 bug).
+        try:
+            from operator1.clients.frequency_separator import (
+                separate_by_period_type,
+                build_highest_frequency_statement,
+            )
+            for label, stmt_ref in [("income", "income_df"), ("balance", "balance_df"), ("cashflow", "cashflow_df")]:
+                stmt = locals()[stmt_ref]
+                if stmt.empty:
+                    continue
+                freq_groups = separate_by_period_type(stmt, market_id=state.market_id)
+                if len(freq_groups) > 1:
+                    logger.info(
+                        "Mixed-frequency %s: %s",
+                        label, {k: len(v) for k, v in freq_groups.items()},
+                    )
+                    reconciled = build_highest_frequency_statement(freq_groups)
+                    if not reconciled.empty:
+                        if label == "income":
+                            income_df = reconciled
+                        elif label == "balance":
+                            balance_df = reconciled
+                        else:
+                            cashflow_df = reconciled
+        except Exception as exc:
+            logger.warning("Frequency separation failed: %s", exc)
 
-    # Save raw statement DataFrames for multi-frequency Q/A direct construction
-    state.income_df = income_df
-    state.balance_df = balance_df
-    state.cashflow_df = cashflow_df
-    state.quotes_df = quotes_df
+        # Save raw statement DataFrames for multi-frequency Q/A direct construction
+        state.income_df = income_df
+        state.balance_df = balance_df
+        state.cashflow_df = cashflow_df
+        state.quotes_df = quotes_df
 
-    # Label source filing frequencies (A/Q/S) for frequency-first pipeline
-    try:
-        from operator1.features.frequency_resampler import detect_all_filing_frequencies
-        state.source_frequencies = detect_all_filing_frequencies(
-            income_df=income_df, balance_df=balance_df, cashflow_df=cashflow_df,
-        )
-        logger.info("Source frequencies: %s", state.source_frequencies)
-    except Exception as exc:
-        logger.debug("Frequency labeling skipped: %s", exc)
+        # Label source filing frequencies (A/Q/S) for frequency-first pipeline
+        try:
+            from operator1.features.frequency_resampler import detect_all_filing_frequencies
+            state.source_frequencies = detect_all_filing_frequencies(
+                income_df=income_df, balance_df=balance_df, cashflow_df=cashflow_df,
+            )
+            logger.info("Source frequencies: %s", state.source_frequencies)
+        except Exception as exc:
+            logger.debug("Frequency labeling skipped: %s", exc)
 
-    # -- CHECKPOINT 1.2: Financial statements fetched --
-    state.save("1.2")
-    logger.info("Checkpoint 1.2 saved (financial statements)")
+        # -- CHECKPOINT 1.2: Financial statements fetched --
+        state.save("1.2")
+        logger.info("Checkpoint 1.2 saved (financial statements)")
     if substage == "1.2":
         return
 
     # OHLCV fallback + holders + segments
-    state.ohlcv_source_label = market_info.pit_api_name
-    if quotes_df.empty and ticker:
+    if "1.3" not in _skip:
+        state.ohlcv_source_label = market_info.pit_api_name
+        if quotes_df.empty and ticker:
+            try:
+                from operator1.clients.ohlcv_provider import fetch_ohlcv
+                quotes_df = fetch_ohlcv(ticker, market_id=state.market_id)
+                if not quotes_df.empty:
+                    state.ohlcv_source_label = "yfinance"
+                    logger.info("OHLCV from yfinance: %d rows", len(quotes_df))
+            except Exception as exc:
+                logger.warning("OHLCV fallback failed: %s", exc)
+
+        # Holders
         try:
-            from operator1.clients.ohlcv_provider import fetch_ohlcv
-            quotes_df = fetch_ohlcv(ticker, market_id=state.market_id)
-            if not quotes_df.empty:
-                state.ohlcv_source_label = "yfinance"
-                logger.info("OHLCV from yfinance: %d rows", len(quotes_df))
+            if hasattr(pit_client, "get_holders"):
+                state.target_holders = pit_client.get_holders(identifier) or []
+        except Exception:
+            pass
+        try:
+            if hasattr(pit_client, "get_insider_transactions"):
+                state.target_insiders = pit_client.get_insider_transactions(identifier) or []
+        except Exception:
+            pass
+
+        # Product segment extraction
+        _seg_result: dict = {}
+        try:
+            if hasattr(pit_client, "extract_segment_data"):
+                _seg_result = pit_client.extract_segment_data(identifier) or {}
+                if _seg_result.get("n_segments", 0) >= 2:
+                    logger.info("Segments: %d segments extracted", _seg_result["n_segments"])
         except Exception as exc:
-            logger.warning("OHLCV fallback failed: %s", exc)
+            logger.debug("Segment extraction skipped: %s", exc)
 
-    # Holders
-    try:
-        if hasattr(pit_client, "get_holders"):
-            state.target_holders = pit_client.get_holders(identifier) or []
-    except Exception:
-        pass
-    try:
-        if hasattr(pit_client, "get_insider_transactions"):
-            state.target_insiders = pit_client.get_insider_transactions(identifier) or []
-    except Exception:
-        pass
-
-    # Product segment extraction
-    _seg_result: dict = {}
-    try:
-        if hasattr(pit_client, "extract_segment_data"):
-            _seg_result = pit_client.extract_segment_data(identifier) or {}
-            if _seg_result.get("n_segments", 0) >= 2:
-                logger.info("Segments: %d segments extracted", _seg_result["n_segments"])
-    except Exception as exc:
-        logger.debug("Segment extraction skipped: %s", exc)
-
-    # -- CHECKPOINT 1.3: OHLCV + holders + segments complete --
-    state.quotes_df = quotes_df
-    state.save("1.3")
-    logger.info("Checkpoint 1.3 saved (OHLCV + holders + segments)")
+        # -- CHECKPOINT 1.3: OHLCV + holders + segments complete --
+        state.quotes_df = quotes_df
+        state.save("1.3")
+        logger.info("Checkpoint 1.3 saved (OHLCV + holders + segments)")
     if substage == "1.3":
         return
 
     # Build cache
-    if not quotes_df.empty:
-        if "date" in quotes_df.columns:
-            quotes_df["date"] = pd.to_datetime(quotes_df["date"])
-            cache = quotes_df.set_index("date").sort_index()
-        elif quotes_df.index.name == "date" or hasattr(quotes_df.index, "date"):
-            cache = quotes_df.sort_index()
+    if "1.4a" not in _skip:
+        if not quotes_df.empty:
+            if "date" in quotes_df.columns:
+                quotes_df["date"] = pd.to_datetime(quotes_df["date"])
+                cache = quotes_df.set_index("date").sort_index()
+            elif quotes_df.index.name == "date" or hasattr(quotes_df.index, "date"):
+                cache = quotes_df.sort_index()
+            else:
+                cache = quotes_df.copy()
         else:
-            cache = quotes_df.copy()
-    else:
-        idx = pd.date_range(start_dt, end_dt, freq="B", name="date")
-        cache = pd.DataFrame(index=idx)
+            idx = pd.date_range(start_dt, end_dt, freq="B", name="date")
+            cache = pd.DataFrame(index=idx)
 
-    # Benchmark returns for beta_252d
-    try:
-        from operator1.clients.ohlcv_provider import fetch_benchmark_returns
-        _bench = fetch_benchmark_returns(state.market_id, years=int(state.years))
-        if not _bench.empty:
-            cache["benchmark_return_1d"] = _bench.reindex(cache.index, method="ffill")
-            logger.info("Benchmark returns merged for beta_252d")
-    except Exception as exc:
-        logger.debug("Benchmark fetch skipped: %s", exc)
-
-    # Fix 10: Implied volatility (IV-RV spread)
-    try:
-        from operator1.clients.ohlcv_provider import fetch_implied_volatility
-        _iv_series = fetch_implied_volatility(ticker)
-        if not _iv_series.empty:
-            _iv_val = float(_iv_series.iloc[0])
-            cache["iv30"] = _iv_val
-            if "volatility_21d" in cache.columns:
-                _rv = cache["volatility_21d"].iloc[-1] if cache["volatility_21d"].notna().any() else 0.0
-                cache["iv_rv_spread"] = _iv_val - float(_rv)
-    except Exception:
-        pass
-
-    # Fix 10: Sector leading indicators
-    try:
-        from operator1.clients.ohlcv_provider import fetch_sector_leading_indicators
-        _sector = state.target_profile.get("sector", "")
-        _leader_df = fetch_sector_leading_indicators(_sector, years=int(state.years))
-        if not _leader_df.empty:
-            _leader_aligned = _leader_df.reindex(cache.index, method="ffill")
-            for _ldr_col in _leader_aligned.columns:
-                _col_name = f"sector_leader_{_ldr_col}"
-                if _col_name not in cache.columns:
-                    cache[_col_name] = _leader_aligned[_ldr_col]
-    except Exception:
-        pass
-
-    # Cross-asset sector rotation signals (Gap 3)
-    try:
-        from operator1.features.cross_asset_signals import compute_cross_asset_signals
-        cache, _ca_result = compute_cross_asset_signals(
-            cache, sector=state.target_profile.get("sector", ""),
-        )
-        if _ca_result and _ca_result.available:
-            state.cross_asset_result = _ca_result
-            logger.info("Cross-asset signals: rank=%s, disp=%s",
-                        _ca_result.sector_rank_12m or "N/A",
-                        f"{_ca_result.sector_dispersion:.5f}" if _ca_result.sector_dispersion else "N/A")
-    except Exception:
-        pass
-    # Options-derived forward-looking signals (Gap 1)
-    try:
-        from operator1.features.options_signals import compute_options_signals
-        cache, _opt_result = compute_options_signals(
-            cache, ticker=ticker, market_id=state.market_id,
-        )
-        if _opt_result and _opt_result.available:
-            state.options_signal_result = _opt_result
-            logger.info(
-                "Options signals: PCR=%.2f, RR25d=%s",
-                _opt_result.put_call_ratio or 0,
-                f"{_opt_result.risk_reversal_25d:.4f}" if _opt_result.risk_reversal_25d is not None else "N/A",
-            )
-    except Exception:
-        pass
-
-    # Merge statements
-    try:
-        from operator1.estimation.frequency_interpolator import interpolate_statement_to_daily
-        _use_interp = True
-    except ImportError:
-        _use_interp = False
-
-    _merged_cols = set(cache.columns)
-    for label, stmt_df in [("income", income_df), ("balance", balance_df), ("cashflow", cashflow_df)]:
-        if stmt_df.empty:
-            continue
+        # Benchmark returns for beta_252d
         try:
-            for dc in ("report_date", "filing_date"):
-                if dc in stmt_df.columns:
-                    date_col = dc
-                    break
-            else:
-                continue
-            stmt_df[date_col] = pd.to_datetime(stmt_df[date_col])
-            stmt_df = stmt_df.sort_values(date_col).drop_duplicates(subset=[date_col], keep="last")
-            ncols = [c for c in stmt_df.select_dtypes(include=["number"]).columns
-                     if c != date_col and "date" not in c.lower()]
-            if not ncols:
-                continue
-            si = stmt_df.set_index(date_col)[ncols]
-            if _use_interp and len(si) >= 2:
-                sa, _ = interpolate_statement_to_daily(si, daily_index=cache.index, market_id=state.market_id)
-            else:
-                ci = cache.index.union(si.index).sort_values()
-                sa = si.reindex(ci).ffill().reindex(cache.index)
-            new = [c for c in sa.columns if c not in _merged_cols]
-            if new:
-                cache = cache.join(sa[new], how="left")
-                _merged_cols.update(new)
-            logger.info("Merged %s: %d new cols", label, len(new))
+            from operator1.clients.ohlcv_provider import fetch_benchmark_returns
+            _bench = fetch_benchmark_returns(state.market_id, years=int(state.years))
+            if not _bench.empty:
+                cache["benchmark_return_1d"] = _bench.reindex(cache.index, method="ffill")
+                logger.info("Benchmark returns merged for beta_252d")
         except Exception as exc:
-            logger.warning("Merge %s failed: %s", label, exc)
+            logger.debug("Benchmark fetch skipped: %s", exc)
 
-    # --- CompanyFacts fallback for missing critical balance sheet fields ---
-    # edgartools XBRL extraction sometimes returns incomplete data due to
-    # SEC rate limiting (429 responses) during concurrent ThreadPoolExecutor
-    # calls. When critical balance sheet fields are missing, fill them from
-    # the SEC CompanyFacts API which provides ALL reported XBRL facts.
-    _critical_balance_fields = {
-        "current_assets": ["AssetsCurrent"],
-        "current_liabilities": ["LiabilitiesCurrent"],
-        "cash_and_equivalents": [
-            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
-            "CashAndCashEquivalentsAtCarryingValue",
-            "CashAndCashEquivalents",
-        ],
-        "total_liabilities": ["Liabilities"],
-        "retained_earnings": ["RetainedEarningsAccumulatedDeficit"],
-        "short_term_debt": ["ShortTermBorrowings", "DebtCurrent", "CommercialPaper"],
-        "receivables": ["AccountsReceivableNetCurrent"],
-        "inventory": ["InventoryNet"],
-        "payables": ["AccountsPayableCurrent"],
-        "shares_outstanding": [
-            "EntityCommonStockSharesOutstanding",
-            "CommonStockSharesOutstanding",
-            "WeightedAverageNumberOfShareOutstandingBasicAndDiluted",
-            "WeightedAverageNumberOfDilutedSharesOutstanding",
-        ],
-    }
-    # P2/P3/P9: Extend CompanyFacts fallback to income statement fields.
-    # Missing net_income/EPS disables PE anchor, full Piotroski, and HF
-    # valuation tier. These are the highest-impact fields for prediction
-    # accuracy improvement.
-    _critical_income_fields = {
-        "net_income": [
-            "NetIncomeLoss",
-            "ProfitLoss",
-            "NetIncomeLossAvailableToCommonStockholdersBasic",
-        ],
-        "eps_diluted": [
-            "EarningsPerShareDiluted",
-            "EarningsPerShareBasic",
-        ],
-        "operating_income": [
-            "OperatingIncomeLoss",
-            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
-        ],
-        "gross_profit": ["GrossProfit"],
-        "ebit": [
-            "OperatingIncomeLoss",
-            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
-        ],
-        "interest_expense": [
-            "InterestExpense",
-            "InterestExpenseDebt",
-            "InterestPaid",
-        ],
-    }
-    _all_critical_fields = {**_critical_balance_fields, **_critical_income_fields}
-    _missing_critical = [f for f in _all_critical_fields if f not in cache.columns
-                         or (f in cache.columns and cache[f].isna().all())]
-    if _missing_critical and state.market_id == "us_sec_edgar":
+        # Fix 10: Implied volatility (IV-RV spread)
         try:
-            import requests as _req
-            _cik = state.target_profile.get("cik", "")
-            if not _cik:
-                _cik = pit_client._resolve_cik_fallback(identifier)
-            _cik_padded = str(_cik).zfill(10)
-            _headers = {"User-Agent": pit_client._user_agent, "Accept": "application/json"}
-            _facts_resp = _req.get(
-                f"https://data.sec.gov/api/xbrl/companyfacts/CIK{_cik_padded}.json",
-                headers=_headers, timeout=30,
+            from operator1.clients.ohlcv_provider import fetch_implied_volatility
+            _iv_series = fetch_implied_volatility(ticker)
+            if not _iv_series.empty:
+                _iv_val = float(_iv_series.iloc[0])
+                cache["iv30"] = _iv_val
+                if "volatility_21d" in cache.columns:
+                    _rv = cache["volatility_21d"].iloc[-1] if cache["volatility_21d"].notna().any() else 0.0
+                    cache["iv_rv_spread"] = _iv_val - float(_rv)
+        except Exception:
+            pass
+
+        # Fix 10: Sector leading indicators
+        try:
+            from operator1.clients.ohlcv_provider import fetch_sector_leading_indicators
+            _sector = state.target_profile.get("sector", "")
+            _leader_df = fetch_sector_leading_indicators(_sector, years=int(state.years))
+            if not _leader_df.empty:
+                _leader_aligned = _leader_df.reindex(cache.index, method="ffill")
+                for _ldr_col in _leader_aligned.columns:
+                    _col_name = f"sector_leader_{_ldr_col}"
+                    if _col_name not in cache.columns:
+                        cache[_col_name] = _leader_aligned[_ldr_col]
+        except Exception:
+            pass
+
+        # Cross-asset sector rotation signals (Gap 3)
+        try:
+            from operator1.features.cross_asset_signals import compute_cross_asset_signals
+            cache, _ca_result = compute_cross_asset_signals(
+                cache, sector=state.target_profile.get("sector", ""),
             )
-            if _facts_resp.status_code == 200:
-                _usgaap = _facts_resp.json().get("facts", {}).get("us-gaap", {})
-                _dei = _facts_resp.json().get("facts", {}).get("dei", {})
-                _filled = 0
-                for _field, _concepts in _all_critical_fields.items():
-                    if _field in cache.columns and not cache[_field].isna().all():
-                        continue
-                    for _concept in _concepts:
-                        # shares_outstanding concepts live in DEI namespace;
-                        # check DEI first, then us-gaap
-                        _cdata = _dei.get(_concept, {}) or _usgaap.get(_concept, {})
-                        # Field-specific unit keys
-                        _unit_key = "USD/shares" if _field in ("eps_diluted",) else (
-                            "shares" if _field == "shares_outstanding" else "USD"
-                        )
-                        _entries = _cdata.get("units", {}).get(_unit_key, [])
-                        if not _entries and _unit_key == "USD/shares":
-                            _entries = _cdata.get("units", {}).get("USD", [])
-                        if not _entries:
-                            continue
-                        # Build a Series from filing data, aligned to report_date
-                        _rows = []
-                        for _e in _entries:
-                            if _e.get("form") in ("10-K", "10-Q") and _e.get("val") is not None and _e.get("end"):
-                                _rows.append({"date": pd.Timestamp(_e["end"]), "value": float(_e["val"])})
-                        if _rows:
-                            _fdf = pd.DataFrame(_rows).drop_duplicates(subset=["date"], keep="last").set_index("date").sort_index()
-                            # Forward-fill to daily index
-                            _ci = cache.index.union(_fdf.index).sort_values()
-                            _aligned = _fdf["value"].reindex(_ci).ffill().reindex(cache.index)
-                            if _aligned.notna().sum() > 0:
-                                cache[_field] = _aligned
-                                _filled += 1
-                                logger.info("CompanyFacts filled '%s' from %s: %d non-NaN days",
-                                           _field, _concept, _aligned.notna().sum())
-                            break  # stop trying alternative concepts
-                # P10: Auto-discovery of company-specific XBRL concepts.
-                # When explicit concept names don't match, scan ALL us-gaap
-                # concepts for substring matches. This catches non-standard
-                # filers like Apple who use extended taxonomy entries.
-                if _filled < len(_missing_critical):
-                    _KEYWORD_MAP = {
-                        "net_income": ["NetIncome", "ProfitLoss", "NetEarnings"],
-                        "gross_profit": ["GrossProfit", "GrossMargin"],
-                        "operating_income": ["OperatingIncome", "OperatingProfit"],
-                        "interest_expense": ["InterestExpense", "InterestCost"],
-                        "eps_diluted": ["EarningsPerShare"],
-                        "current_assets": ["AssetsCurrent"],
-                        "current_liabilities": ["LiabilitiesCurrent"],
-                        "cash_and_equivalents": ["CashAndCashEquivalent", "CashCashEquivalent"],
-                    }
-                    _still_missing = [
-                        f for f in _all_critical_fields
-                        if (f not in cache.columns or cache[f].isna().all())
-                        and f in _KEYWORD_MAP
-                    ]
-                    for _field in _still_missing:
-                        _keywords = _KEYWORD_MAP[_field]
-                        # Search all us-gaap concepts for keyword matches
-                        for _concept_name, _cdata in _usgaap.items():
-                            if any(kw.lower() in _concept_name.lower() for kw in _keywords):
-                                _unit_key = "USD/shares" if _field == "eps_diluted" else "USD"
-                                _entries = _cdata.get("units", {}).get(_unit_key, [])
-                                if not _entries and _unit_key == "USD/shares":
-                                    _entries = _cdata.get("units", {}).get("USD", [])
-                                _rows = []
-                                for _e in _entries:
-                                    if _e.get("form") in ("10-K", "10-Q") and _e.get("val") is not None and _e.get("end"):
-                                        _rows.append({"date": pd.Timestamp(_e["end"]), "value": float(_e["val"])})
-                                if _rows:
-                                    _fdf = pd.DataFrame(_rows).drop_duplicates(subset=["date"], keep="last").set_index("date").sort_index()
-                                    _ci = cache.index.union(_fdf.index).sort_values()
-                                    _aligned = _fdf["value"].reindex(_ci).ffill().reindex(cache.index)
-                                    if _aligned.notna().sum() > 0:
-                                        cache[_field] = _aligned
-                                        _filled += 1
-                                        logger.info("Auto-discovered '%s' from concept '%s': %d non-NaN days",
-                                                   _field, _concept_name, _aligned.notna().sum())
-                                        break  # found a match, stop searching
+            if _ca_result and _ca_result.available:
+                state.cross_asset_result = _ca_result
+                logger.info("Cross-asset signals: rank=%s, disp=%s",
+                            _ca_result.sector_rank_12m or "N/A",
+                            f"{_ca_result.sector_dispersion:.5f}" if _ca_result.sector_dispersion else "N/A")
+        except Exception:
+            pass
+        # Options-derived forward-looking signals (Gap 1)
+        try:
+            from operator1.features.options_signals import compute_options_signals
+            cache, _opt_result = compute_options_signals(
+                cache, ticker=ticker, market_id=state.market_id,
+            )
+            if _opt_result and _opt_result.available:
+                state.options_signal_result = _opt_result
+                logger.info(
+                    "Options signals: PCR=%.2f, RR25d=%s",
+                    _opt_result.put_call_ratio or 0,
+                    f"{_opt_result.risk_reversal_25d:.4f}" if _opt_result.risk_reversal_25d is not None else "N/A",
+                )
+        except Exception:
+            pass
 
-                if _filled > 0:
-                    logger.info("CompanyFacts fallback: filled %d/%d missing critical fields", _filled, len(_missing_critical))
-        except Exception as exc:
-            logger.debug("CompanyFacts fallback failed: %s", exc)
+        # Merge statements
+        try:
+            from operator1.estimation.frequency_interpolator import interpolate_statement_to_daily
+            _use_interp = True
+        except ImportError:
+            _use_interp = False
 
-    # Backtest date filter
-    bt_end = pd.Timestamp(end_dt)
-    bt_start = bt_end - pd.Timedelta(days=int(state.years * 365))
-    cache = cache[(cache.index >= bt_start) & (cache.index <= bt_end)]
-    logger.info("Cache after backtest filter: %d rows x %d cols", len(cache), len(cache.columns))
-
-    # -- Inject shares_outstanding from profile if missing from cache --
-    # shares_outstanding lives in the profile dict (from edgartools
-    # company.shares_outstanding or yfinance info) but is NOT in any
-    # financial statement DataFrame. Without it, market_cap, PE, EV,
-    # fcf_yield, and the cash adequacy survival floor all break.
-    if ("shares_outstanding" not in cache.columns
-            or cache.get("shares_outstanding") is None
-            or (cache["shares_outstanding"].isna().all() if "shares_outstanding" in cache.columns else True)):
-        _shares = state.target_profile.get("shares_outstanding")
-        if _shares is not None:
+        _merged_cols = set(cache.columns)
+        for label, stmt_df in [("income", income_df), ("balance", balance_df), ("cashflow", cashflow_df)]:
+            if stmt_df.empty:
+                continue
             try:
-                _shares_val = float(_shares)
-                if _shares_val > 0:
-                    cache["shares_outstanding"] = _shares_val
-                    logger.info(
-                        "Injected shares_outstanding from profile: %.0f",
-                        _shares_val,
-                    )
-            except (TypeError, ValueError):
-                pass
+                for dc in ("report_date", "filing_date"):
+                    if dc in stmt_df.columns:
+                        date_col = dc
+                        break
+                else:
+                    continue
+                stmt_df[date_col] = pd.to_datetime(stmt_df[date_col])
+                stmt_df = stmt_df.sort_values(date_col).drop_duplicates(subset=[date_col], keep="last")
+                ncols = [c for c in stmt_df.select_dtypes(include=["number"]).columns
+                         if c != date_col and "date" not in c.lower()]
+                if not ncols:
+                    continue
+                si = stmt_df.set_index(date_col)[ncols]
+                if _use_interp and len(si) >= 2:
+                    sa, _ = interpolate_statement_to_daily(si, daily_index=cache.index, market_id=state.market_id)
+                else:
+                    ci = cache.index.union(si.index).sort_values()
+                    sa = si.reindex(ci).ffill().reindex(cache.index)
+                new = [c for c in sa.columns if c not in _merged_cols]
+                if new:
+                    cache = cache.join(sa[new], how="left")
+                    _merged_cols.update(new)
+                logger.info("Merged %s: %d new cols", label, len(new))
+            except Exception as exc:
+                logger.warning("Merge %s failed: %s", label, exc)
 
-    # Compute market_cap from close * shares_outstanding if not already present
-    if ("close" in cache.columns
-            and "shares_outstanding" in cache.columns
-            and cache["shares_outstanding"].notna().any()):
-        if "market_cap" not in cache.columns or cache["market_cap"].isna().all():
-            cache["market_cap"] = cache["close"] * cache["shares_outstanding"]
-            logger.info(
-                "Computed market_cap: latest=%.0f",
-                cache["market_cap"].dropna().iloc[-1] if cache["market_cap"].notna().any() else 0,
-            )
+        # --- CompanyFacts fallback for missing critical balance sheet fields ---
+        # edgartools XBRL extraction sometimes returns incomplete data due to
+        # SEC rate limiting (429 responses) during concurrent ThreadPoolExecutor
+        # calls. When critical balance sheet fields are missing, fill them from
+        # the SEC CompanyFacts API which provides ALL reported XBRL facts.
+        _critical_balance_fields = {
+            "current_assets": ["AssetsCurrent"],
+            "current_liabilities": ["LiabilitiesCurrent"],
+            "cash_and_equivalents": [
+                "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+                "CashAndCashEquivalentsAtCarryingValue",
+                "CashAndCashEquivalents",
+            ],
+            "total_liabilities": ["Liabilities"],
+            "retained_earnings": ["RetainedEarningsAccumulatedDeficit"],
+            "short_term_debt": ["ShortTermBorrowings", "DebtCurrent", "CommercialPaper"],
+            "receivables": ["AccountsReceivableNetCurrent"],
+            "inventory": ["InventoryNet"],
+            "payables": ["AccountsPayableCurrent"],
+            "shares_outstanding": [
+                "EntityCommonStockSharesOutstanding",
+                "CommonStockSharesOutstanding",
+                "WeightedAverageNumberOfShareOutstandingBasicAndDiluted",
+                "WeightedAverageNumberOfDilutedSharesOutstanding",
+            ],
+        }
+        # P2/P3/P9: Extend CompanyFacts fallback to income statement fields.
+        # Missing net_income/EPS disables PE anchor, full Piotroski, and HF
+        # valuation tier. These are the highest-impact fields for prediction
+        # accuracy improvement.
+        _critical_income_fields = {
+            "net_income": [
+                "NetIncomeLoss",
+                "ProfitLoss",
+                "NetIncomeLossAvailableToCommonStockholdersBasic",
+            ],
+            "eps_diluted": [
+                "EarningsPerShareDiluted",
+                "EarningsPerShareBasic",
+            ],
+            "operating_income": [
+                "OperatingIncomeLoss",
+                "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+            ],
+            "gross_profit": ["GrossProfit"],
+            "ebit": [
+                "OperatingIncomeLoss",
+                "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+            ],
+            "interest_expense": [
+                "InterestExpense",
+                "InterestExpenseDebt",
+                "InterestPaid",
+            ],
+        }
+        _all_critical_fields = {**_critical_balance_fields, **_critical_income_fields}
+        _missing_critical = [f for f in _all_critical_fields if f not in cache.columns
+                             or (f in cache.columns and cache[f].isna().all())]
+        if _missing_critical and state.market_id == "us_sec_edgar":
+            try:
+                import requests as _req
+                _cik = state.target_profile.get("cik", "")
+                if not _cik:
+                    _cik = pit_client._resolve_cik_fallback(identifier)
+                _cik_padded = str(_cik).zfill(10)
+                _headers = {"User-Agent": pit_client._user_agent, "Accept": "application/json"}
+                _facts_resp = _req.get(
+                    f"https://data.sec.gov/api/xbrl/companyfacts/CIK{_cik_padded}.json",
+                    headers=_headers, timeout=30,
+                )
+                if _facts_resp.status_code == 200:
+                    _usgaap = _facts_resp.json().get("facts", {}).get("us-gaap", {})
+                    _dei = _facts_resp.json().get("facts", {}).get("dei", {})
+                    _filled = 0
+                    for _field, _concepts in _all_critical_fields.items():
+                        if _field in cache.columns and not cache[_field].isna().all():
+                            continue
+                        for _concept in _concepts:
+                            # shares_outstanding concepts live in DEI namespace;
+                            # check DEI first, then us-gaap
+                            _cdata = _dei.get(_concept, {}) or _usgaap.get(_concept, {})
+                            # Field-specific unit keys
+                            _unit_key = "USD/shares" if _field in ("eps_diluted",) else (
+                                "shares" if _field == "shares_outstanding" else "USD"
+                            )
+                            _entries = _cdata.get("units", {}).get(_unit_key, [])
+                            if not _entries and _unit_key == "USD/shares":
+                                _entries = _cdata.get("units", {}).get("USD", [])
+                            if not _entries:
+                                continue
+                            # Build a Series from filing data, aligned to report_date
+                            _rows = []
+                            for _e in _entries:
+                                if _e.get("form") in ("10-K", "10-Q") and _e.get("val") is not None and _e.get("end"):
+                                    _rows.append({"date": pd.Timestamp(_e["end"]), "value": float(_e["val"])})
+                            if _rows:
+                                _fdf = pd.DataFrame(_rows).drop_duplicates(subset=["date"], keep="last").set_index("date").sort_index()
+                                # Forward-fill to daily index
+                                _ci = cache.index.union(_fdf.index).sort_values()
+                                _aligned = _fdf["value"].reindex(_ci).ffill().reindex(cache.index)
+                                if _aligned.notna().sum() > 0:
+                                    cache[_field] = _aligned
+                                    _filled += 1
+                                    logger.info("CompanyFacts filled '%s' from %s: %d non-NaN days",
+                                               _field, _concept, _aligned.notna().sum())
+                                break  # stop trying alternative concepts
+                    # P10: Auto-discovery of company-specific XBRL concepts.
+                    # When explicit concept names don't match, scan ALL us-gaap
+                    # concepts for substring matches. This catches non-standard
+                    # filers like Apple who use extended taxonomy entries.
+                    if _filled < len(_missing_critical):
+                        _KEYWORD_MAP = {
+                            "net_income": ["NetIncome", "ProfitLoss", "NetEarnings"],
+                            "gross_profit": ["GrossProfit", "GrossMargin"],
+                            "operating_income": ["OperatingIncome", "OperatingProfit"],
+                            "interest_expense": ["InterestExpense", "InterestCost"],
+                            "eps_diluted": ["EarningsPerShare"],
+                            "current_assets": ["AssetsCurrent"],
+                            "current_liabilities": ["LiabilitiesCurrent"],
+                            "cash_and_equivalents": ["CashAndCashEquivalent", "CashCashEquivalent"],
+                        }
+                        _still_missing = [
+                            f for f in _all_critical_fields
+                            if (f not in cache.columns or cache[f].isna().all())
+                            and f in _KEYWORD_MAP
+                        ]
+                        for _field in _still_missing:
+                            _keywords = _KEYWORD_MAP[_field]
+                            # Search all us-gaap concepts for keyword matches
+                            for _concept_name, _cdata in _usgaap.items():
+                                if any(kw.lower() in _concept_name.lower() for kw in _keywords):
+                                    _unit_key = "USD/shares" if _field == "eps_diluted" else "USD"
+                                    _entries = _cdata.get("units", {}).get(_unit_key, [])
+                                    if not _entries and _unit_key == "USD/shares":
+                                        _entries = _cdata.get("units", {}).get("USD", [])
+                                    _rows = []
+                                    for _e in _entries:
+                                        if _e.get("form") in ("10-K", "10-Q") and _e.get("val") is not None and _e.get("end"):
+                                            _rows.append({"date": pd.Timestamp(_e["end"]), "value": float(_e["val"])})
+                                    if _rows:
+                                        _fdf = pd.DataFrame(_rows).drop_duplicates(subset=["date"], keep="last").set_index("date").sort_index()
+                                        _ci = cache.index.union(_fdf.index).sort_values()
+                                        _aligned = _fdf["value"].reindex(_ci).ffill().reindex(cache.index)
+                                        if _aligned.notna().sum() > 0:
+                                            cache[_field] = _aligned
+                                            _filled += 1
+                                            logger.info("Auto-discovered '%s' from concept '%s': %d non-NaN days",
+                                                       _field, _concept_name, _aligned.notna().sum())
+                                            break  # found a match, stop searching
 
-    # -- CHECKPOINT 1.4a: Cache built (OHLCV + statements merged) --
-    state.cache = cache
-    state.save("1.4a")
-    logger.info("Checkpoint 1.4a saved (cache built, pre-macro)")
+                    if _filled > 0:
+                        logger.info("CompanyFacts fallback: filled %d/%d missing critical fields", _filled, len(_missing_critical))
+            except Exception as exc:
+                logger.debug("CompanyFacts fallback failed: %s", exc)
+
+        # Backtest date filter
+        bt_end = pd.Timestamp(end_dt)
+        bt_start = bt_end - pd.Timedelta(days=int(state.years * 365))
+        cache = cache[(cache.index >= bt_start) & (cache.index <= bt_end)]
+        logger.info("Cache after backtest filter: %d rows x %d cols", len(cache), len(cache.columns))
+
+        # -- Inject shares_outstanding from profile if missing from cache --
+        # shares_outstanding lives in the profile dict (from edgartools
+        # company.shares_outstanding or yfinance info) but is NOT in any
+        # financial statement DataFrame. Without it, market_cap, PE, EV,
+        # fcf_yield, and the cash adequacy survival floor all break.
+        if ("shares_outstanding" not in cache.columns
+                or cache.get("shares_outstanding") is None
+                or (cache["shares_outstanding"].isna().all() if "shares_outstanding" in cache.columns else True)):
+            _shares = state.target_profile.get("shares_outstanding")
+            if _shares is not None:
+                try:
+                    _shares_val = float(_shares)
+                    if _shares_val > 0:
+                        cache["shares_outstanding"] = _shares_val
+                        logger.info(
+                            "Injected shares_outstanding from profile: %.0f",
+                            _shares_val,
+                        )
+                except (TypeError, ValueError):
+                    pass
+
+        # Compute market_cap from close * shares_outstanding if not already present
+        if ("close" in cache.columns
+                and "shares_outstanding" in cache.columns
+                and cache["shares_outstanding"].notna().any()):
+            if "market_cap" not in cache.columns or cache["market_cap"].isna().all():
+                cache["market_cap"] = cache["close"] * cache["shares_outstanding"]
+                logger.info(
+                    "Computed market_cap: latest=%.0f",
+                    cache["market_cap"].dropna().iloc[-1] if cache["market_cap"].notna().any() else 0,
+                )
+
+        # -- CHECKPOINT 1.4a: Cache built (OHLCV + statements merged) --
+        state.cache = cache
+        state.save("1.4a")
+        logger.info("Checkpoint 1.4a saved (cache built, pre-macro)")
     if substage == "1.4a":
         return
 
     # Macro data
-    macro_api_info = get_macro_api_for_market(state.market_id)
-    if macro_api_info:
-        try:
-            from operator1.clients.macro_provider import fetch_macro
-            state.macro_data = fetch_macro(market_info.country_code, secrets=state._secrets, years=int(state.years))
-            if state.macro_data:
-                logger.info("Macro: %d indicators", len(state.macro_data))
-        except Exception as exc:
-            logger.warning("Macro fetch failed: %s", exc)
+    if "1.4b" not in _skip:
+        macro_api_info = get_macro_api_for_market(state.market_id)
+        if macro_api_info:
+            try:
+                from operator1.clients.macro_provider import fetch_macro
+                state.macro_data = fetch_macro(market_info.country_code, secrets=state._secrets, years=int(state.years))
+                if state.macro_data:
+                    logger.info("Macro: %d indicators", len(state.macro_data))
+            except Exception as exc:
+                logger.warning("Macro fetch failed: %s", exc)
 
-    if state.macro_data:
+        if state.macro_data:
+            try:
+                from operator1.steps.macro_mapping import fetch_macro_data
+                state.macro_dataset = fetch_macro_data(country_iso2=market_info.country_code, macro_raw=state.macro_data)
+            except Exception:
+                pass
+            try:
+                from operator1.features.macro_quadrant import compute_macro_quadrant
+                cache, state.macro_quadrant_result = compute_macro_quadrant(cache, macro_data=state.macro_dataset)
+            except Exception:
+                pass
+
+        # Conflict risk
         try:
-            from operator1.steps.macro_mapping import fetch_macro_data
-            state.macro_dataset = fetch_macro_data(country_iso2=market_info.country_code, macro_raw=state.macro_data)
+            from operator1.features.conflict_risk import assess_conflict_risk, inject_conflict_risk_into_cache
+            state.conflict_result = assess_conflict_risk(country_iso2=market_info.country_code, company_name=company_name)
+            cache = inject_conflict_risk_into_cache(cache, state.conflict_result)
         except Exception:
             pass
+
+        # Market buying power
         try:
-            from operator1.features.macro_quadrant import compute_macro_quadrant
-            cache, state.macro_quadrant_result = compute_macro_quadrant(cache, macro_data=state.macro_dataset)
+            from operator1.features.market_buying_power import compute_market_buying_power
+            cache, state.buying_power_result = compute_market_buying_power(
+                cache, sector=state.target_profile.get("sector"),
+                country_iso2=market_info.country_code, macro_data=state.macro_data,
+            )
         except Exception:
             pass
 
-    # Conflict risk
-    try:
-        from operator1.features.conflict_risk import assess_conflict_risk, inject_conflict_risk_into_cache
-        state.conflict_result = assess_conflict_risk(country_iso2=market_info.country_code, company_name=company_name)
-        cache = inject_conflict_risk_into_cache(cache, state.conflict_result)
-    except Exception:
-        pass
+        # Pre-estimation ratios
+        try:
+            from operator1.constants import EPSILON
+            _pre_ratios = {
+                "current_ratio": ("current_assets", "current_liabilities"),
+                "interest_coverage": ("ebit", "interest_expense"),
+                "cash_ratio": ("cash_and_equivalents", "current_liabilities"),
+                "gross_margin": ("gross_profit", "revenue"),
+                "net_margin": ("net_income", "revenue"),
+            }
+            for rn, (nc, dc) in _pre_ratios.items():
+                if rn not in cache.columns and nc in cache.columns and dc in cache.columns:
+                    _den = cache[dc].astype(float).where(cache[dc].astype(float).abs() > EPSILON)
+                    cache[rn] = cache[nc].astype(float) / _den
+        except Exception:
+            pass
 
-    # Market buying power
-    try:
-        from operator1.features.market_buying_power import compute_market_buying_power
-        cache, state.buying_power_result = compute_market_buying_power(
-            cache, sector=state.target_profile.get("sector"),
-            country_iso2=market_info.country_code, macro_data=state.macro_data,
-        )
-    except Exception:
-        pass
-
-    # Pre-estimation ratios
-    try:
-        from operator1.constants import EPSILON
-        _pre_ratios = {
-            "current_ratio": ("current_assets", "current_liabilities"),
-            "interest_coverage": ("ebit", "interest_expense"),
-            "cash_ratio": ("cash_and_equivalents", "current_liabilities"),
-            "gross_margin": ("gross_profit", "revenue"),
-            "net_margin": ("net_income", "revenue"),
-        }
-        for rn, (nc, dc) in _pre_ratios.items():
-            if rn not in cache.columns and nc in cache.columns and dc in cache.columns:
-                _den = cache[dc].astype(float).where(cache[dc].astype(float).abs() > EPSILON)
-                cache[rn] = cache[nc].astype(float) / _den
-    except Exception:
-        pass
-
-    # -- CHECKPOINT 1.4: Cache built + macro + conflict + pre-ratios --
-    state.cache = cache
-    state.save("1.4")
-    state.save("1.4b")  # alias for clarity
-    logger.info("Checkpoint 1.4 saved (cache + macro + conflict)")
+        # -- CHECKPOINT 1.4: Cache built + macro + conflict + pre-ratios --
+        state.cache = cache
+        state.save("1.4")
+        state.save("1.4b")  # alias for clarity
+        logger.info("Checkpoint 1.4 saved (cache + macro + conflict)")
     if substage in ("1.4", "1.4b"):
         return
 
     # Estimation
-    # SIX proxy computation (Switzerland only -- must run BEFORE estimation)
-    if state.market_id == "ch_six":
-        try:
-            from operator1.features.six_derived_proxies import (
-                compute_six_proxies, seed_canonical_columns,
-            )
-            state.six_proxy_result = compute_six_proxies(cache, state.target_profile)
-            if state.six_proxy_result.computed:
-                seed_canonical_columns(cache, state.target_profile, state.six_proxy_result)
-                logger.info(
-                    "SIX proxies: %d columns, yield=%.2f%%",
-                    state.six_proxy_result.n_proxies,
-                    (state.six_proxy_result.dividend_yield or 0) * 100,
+    if "1.5" not in _skip:
+        # SIX proxy computation (Switzerland only -- must run BEFORE estimation)
+        if state.market_id == "ch_six":
+            try:
+                from operator1.features.six_derived_proxies import (
+                    compute_six_proxies, seed_canonical_columns,
                 )
+                state.six_proxy_result = compute_six_proxies(cache, state.target_profile)
+                if state.six_proxy_result.computed:
+                    seed_canonical_columns(cache, state.target_profile, state.six_proxy_result)
+                    logger.info(
+                        "SIX proxies: %d columns, yield=%.2f%%",
+                        state.six_proxy_result.n_proxies,
+                        (state.six_proxy_result.dividend_yield or 0) * 100,
+                    )
+            except Exception as exc:
+                logger.warning("SIX proxy computation failed: %s", exc)
+
+        try:
+            from operator1.estimation.estimator import run_estimation
+            from operator1.config_loader import load_config
+            cfg = load_config("global_config")
+            cache, state.estimation_coverage = run_estimation(cache, imputer_method=cfg.get("estimation_imputer", "bayesian_ridge"))
+            logger.info("Estimation complete")
         except Exception as exc:
-            logger.warning("SIX proxy computation failed: %s", exc)
+            logger.warning("Estimation failed: %s", exc)
 
-    try:
-        from operator1.estimation.estimator import run_estimation
-        from operator1.config_loader import load_config
-        cfg = load_config("global_config")
-        cache, state.estimation_coverage = run_estimation(cache, imputer_method=cfg.get("estimation_imputer", "bayesian_ridge"))
-        logger.info("Estimation complete")
-    except Exception as exc:
-        logger.warning("Estimation failed: %s", exc)
-
-    # Filing calendar
-    try:
-        from operator1.features.filing_calendar import analyze_filing_calendar
-        state.filing_calendar_result = analyze_filing_calendar(cache, market_id=state.market_id)
-    except Exception:
-        pass
-
-    # Event calendar features (Gap 4)
-    try:
-        from operator1.features.event_calendar import compute_event_calendar_features
-        from datetime import datetime as _dt
-        _ref = _dt.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None
-        cache, _evt_result = compute_event_calendar_features(
-            cache, ticker=ticker, filing_calendar_result=state.filing_calendar_result,
-            reference_date=_ref,
-        )
-        if _evt_result and _evt_result.available:
-            state.event_calendar_result = _evt_result
-    except Exception:
-        pass
-
-    # Derived variables
-    try:
-        from operator1.features.derived_variables import compute_derived_variables
-        cache = compute_derived_variables(cache)
-        logger.info("Features: %d cols", len(cache.columns))
-    except Exception as exc:
-        logger.warning("Features failed: %s", exc)
-
-    # Private company proxies
-    try:
-        from operator1.features.private_company_proxies import is_private_company, compute_private_company_proxies, resolve_proxies
-        state.is_private = is_private_company(cache)
-        if state.is_private:
-            cache = compute_private_company_proxies(cache)
-            cache = resolve_proxies(cache)
-    except Exception:
-        pass
-
-    # Institutional flow
-    try:
-        from operator1.features.institutional_flow import compute_institutional_flow
-        cache = compute_institutional_flow(cache, insider_transactions=state.target_insiders)
-    except Exception:
-        pass
-
-    # (Estimation + features done, continuing to survival...)
-
-    # Survival mode
-    from operator1.analysis.survival_mode import compute_company_survival_flag, compute_survival_probability
-    from operator1.analysis.hierarchy_weights import compute_hierarchy_weights
-    state.weights = {f"tier{i}": 20.0 for i in range(1, 6)}
-    try:
-        cache["company_survival_mode_flag"] = compute_company_survival_flag(
-            cache, sector=state.target_profile.get("sector", ""))
-        cache["survival_probability"] = compute_survival_probability(cache)
+        # Filing calendar
         try:
-            from operator1.analysis.survival_mode import compute_cox_survival_score
-            cox = compute_cox_survival_score(cache)
-            if cox.notna().any():
-                cache["cox_survival_score"] = cox
-                sig = cache["survival_probability"]
-                cache["survival_probability"] = 0.4 * sig + 0.6 * cox.fillna(sig)
+            from operator1.features.filing_calendar import analyze_filing_calendar
+            state.filing_calendar_result = analyze_filing_calendar(cache, market_id=state.market_id)
         except Exception:
             pass
-        # Gradient-based early warning: deterioration velocity
+
+        # Event calendar features (Gap 4)
         try:
-            from operator1.analysis.survival_mode import compute_survival_velocity
-            _vel_flag, _vel_rate = compute_survival_velocity(cache)
-            cache["survival_velocity_flag"] = _vel_flag
-            cache["survival_deterioration_rate"] = _vel_rate
+            from operator1.features.event_calendar import compute_event_calendar_features
+            from datetime import datetime as _dt
+            _ref = _dt.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None
+            cache, _evt_result = compute_event_calendar_features(
+                cache, ticker=ticker, filing_calendar_result=state.filing_calendar_result,
+                reference_date=_ref,
+            )
+            if _evt_result and _evt_result.available:
+                state.event_calendar_result = _evt_result
         except Exception:
             pass
-        # Survival uncertainty bands (bootstrap P10/P90)
+
+        # Derived variables
         try:
-            from operator1.analysis.survival_mode import compute_survival_uncertainty
-            _p10, _p90, _unc = compute_survival_uncertainty(cache, probability=cache.get("survival_probability"))
-            cache["survival_probability_p10"] = _p10
-            cache["survival_probability_p90"] = _p90
-            cache["survival_uncertainty"] = _unc
+            from operator1.features.derived_variables import compute_derived_variables
+            cache = compute_derived_variables(cache)
+            logger.info("Features: %d cols", len(cache.columns))
+        except Exception as exc:
+            logger.warning("Features failed: %s", exc)
+
+        # Private company proxies
+        try:
+            from operator1.features.private_company_proxies import is_private_company, compute_private_company_proxies, resolve_proxies
+            state.is_private = is_private_company(cache)
+            if state.is_private:
+                cache = compute_private_company_proxies(cache)
+                cache = resolve_proxies(cache)
         except Exception:
             pass
-        cache = compute_hierarchy_weights(cache)
-        for i in range(1, 6):
-            col = f"hierarchy_tier{i}_weight"
-            if col in cache.columns:
-                state.weights[f"tier{i}"] = float(cache[col].iloc[-1])
-        logger.info("Survival: %d flagged days", cache["company_survival_mode_flag"].sum())
-    except Exception as exc:
-        logger.warning("Survival failed: %s", exc)
 
-    # Fuzzy protection
-    try:
-        from operator1.analysis.fuzzy_protection import compute_fuzzy_protection
-        gdp_val = None
-        if state.macro_data and state.macro_data.get("gdp") is not None:
-            gs = state.macro_data["gdp"]
-            if not gs.empty:
-                gdp_val = float(gs.dropna().iloc[-1])
-        cache = compute_fuzzy_protection(cache, sector=state.target_profile.get("sector"), gdp=gdp_val)
-        state.fuzzy_result = {
-            "mean_degree": float(cache["fuzzy_protection_degree"].mean()),
-            "sector_score": float(cache["fuzzy_sector_score"].iloc[0]),
-            "latest_label": cache["fuzzy_protection_label"].iloc[-1],
-        }
-    except Exception:
-        pass
+        # Institutional flow
+        try:
+            from operator1.features.institutional_flow import compute_institutional_flow
+            cache = compute_institutional_flow(cache, insider_transactions=state.target_insiders)
+        except Exception:
+            pass
 
-    # Financial health
-    try:
-        from operator1.models.financial_health import compute_financial_health
-        _sector = state.target_profile.get("sector", "") if state.target_profile else ""
-        cache, state.fh_result = compute_financial_health(cache, hierarchy_weights=state.weights, sector=_sector)
-        logger.info("FH: %.1f (%s)", state.fh_result.latest_composite, state.fh_result.latest_label)
-    except Exception as exc:
-        logger.warning("FH failed: %s", exc)
+        # (Estimation + features done, continuing to survival...)
 
-    # Vanity
-    try:
-        from operator1.analysis.vanity import compute_vanity_score
-        cache = compute_vanity_score(cache)
-    except Exception:
-        pass
+        # Survival mode
+        from operator1.analysis.survival_mode import compute_company_survival_flag, compute_survival_probability
+        from operator1.analysis.hierarchy_weights import compute_hierarchy_weights
+        state.weights = {f"tier{i}": 20.0 for i in range(1, 6)}
+        try:
+            cache["company_survival_mode_flag"] = compute_company_survival_flag(
+                cache, sector=state.target_profile.get("sector", ""))
+            cache["survival_probability"] = compute_survival_probability(cache)
+            try:
+                from operator1.analysis.survival_mode import compute_cox_survival_score
+                cox = compute_cox_survival_score(cache)
+                if cox.notna().any():
+                    cache["cox_survival_score"] = cox
+                    sig = cache["survival_probability"]
+                    cache["survival_probability"] = 0.4 * sig + 0.6 * cox.fillna(sig)
+            except Exception:
+                pass
+            # Gradient-based early warning: deterioration velocity
+            try:
+                from operator1.analysis.survival_mode import compute_survival_velocity
+                _vel_flag, _vel_rate = compute_survival_velocity(cache)
+                cache["survival_velocity_flag"] = _vel_flag
+                cache["survival_deterioration_rate"] = _vel_rate
+            except Exception:
+                pass
+            # Survival uncertainty bands (bootstrap P10/P90)
+            try:
+                from operator1.analysis.survival_mode import compute_survival_uncertainty
+                _p10, _p90, _unc = compute_survival_uncertainty(cache, probability=cache.get("survival_probability"))
+                cache["survival_probability_p10"] = _p10
+                cache["survival_probability_p90"] = _p90
+                cache["survival_uncertainty"] = _unc
+            except Exception:
+                pass
+            cache = compute_hierarchy_weights(cache)
+            for i in range(1, 6):
+                col = f"hierarchy_tier{i}_weight"
+                if col in cache.columns:
+                    state.weights[f"tier{i}"] = float(cache[col].iloc[-1])
+            logger.info("Survival: %d flagged days", cache["company_survival_mode_flag"].sum())
+        except Exception as exc:
+            logger.warning("Survival failed: %s", exc)
 
-    # -- CHECKPOINT 1.5: Derived vars + survival + FH + vanity complete --
-    state.cache = cache
-    state.save("1.5")
-    logger.info("Checkpoint 1.5 saved (features + survival + health)")
+        # Fuzzy protection
+        try:
+            from operator1.analysis.fuzzy_protection import compute_fuzzy_protection
+            gdp_val = None
+            if state.macro_data and state.macro_data.get("gdp") is not None:
+                gs = state.macro_data["gdp"]
+                if not gs.empty:
+                    gdp_val = float(gs.dropna().iloc[-1])
+            cache = compute_fuzzy_protection(cache, sector=state.target_profile.get("sector"), gdp=gdp_val)
+            state.fuzzy_result = {
+                "mean_degree": float(cache["fuzzy_protection_degree"].mean()),
+                "sector_score": float(cache["fuzzy_sector_score"].iloc[0]),
+                "latest_label": cache["fuzzy_protection_label"].iloc[-1],
+            }
+        except Exception:
+            pass
+
+        # Financial health
+        try:
+            from operator1.models.financial_health import compute_financial_health
+            _sector = state.target_profile.get("sector", "") if state.target_profile else ""
+            cache, state.fh_result = compute_financial_health(cache, hierarchy_weights=state.weights, sector=_sector)
+            logger.info("FH: %.1f (%s)", state.fh_result.latest_composite, state.fh_result.latest_label)
+        except Exception as exc:
+            logger.warning("FH failed: %s", exc)
+
+        # Vanity
+        try:
+            from operator1.analysis.vanity import compute_vanity_score
+            cache = compute_vanity_score(cache)
+        except Exception:
+            pass
+
+        # -- CHECKPOINT 1.5: Derived vars + survival + FH + vanity complete --
+        state.cache = cache
+        state.save("1.5")
+        logger.info("Checkpoint 1.5 saved (features + survival + health)")
     if substage == "1.5":
         return
 
     # LLM client for entity discovery
-    from operator1.clients.llm_factory import create_llm_client
-    state._llm_client = create_llm_client(state._secrets)
+    if "1.6a" not in _skip:
+        from operator1.clients.llm_factory import create_llm_client
+        state._llm_client = create_llm_client(state._secrets)
 
-    # Entity discovery + linked entity fetch
-    if state._llm_client is not None:
-        try:
-            from operator1.steps.entity_discovery import discover_linked_entities
-            discovery_result = discover_linked_entities(
-                target_profile=state.target_profile,
-                llm_client=state._llm_client,
-                pit_client=pit_client,
-                secrets=state._secrets,
-            )
-            if hasattr(discovery_result, "linked"):
-                state.relationships = discovery_result.linked
-            elif isinstance(discovery_result, dict):
-                state.relationships = discovery_result
-            logger.info("Linked entities: %d", sum(len(v) for v in state.relationships.values() if isinstance(v, list)))
-        except Exception as exc:
-            logger.warning("Entity discovery failed: %s", exc)
+        # Entity discovery + linked entity fetch
+        if state._llm_client is not None:
+            try:
+                from operator1.steps.entity_discovery import discover_linked_entities
+                discovery_result = discover_linked_entities(
+                    target_profile=state.target_profile,
+                    llm_client=state._llm_client,
+                    pit_client=pit_client,
+                    secrets=state._secrets,
+                )
+                if hasattr(discovery_result, "linked"):
+                    state.relationships = discovery_result.linked
+                elif isinstance(discovery_result, dict):
+                    state.relationships = discovery_result
+                logger.info("Linked entities: %d", sum(len(v) for v in state.relationships.values() if isinstance(v, list)))
+            except Exception as exc:
+                logger.warning("Entity discovery failed: %s", exc)
 
-        # GLEIF
-        try:
-            from operator1.clients.gleif import fetch_corporate_structure
-            gleif_id = state.target_profile.get("lei") or state.target_profile.get("name") or company_name
-            cs = fetch_corporate_structure(gleif_id)
-            if cs.available:
-                parents = []
-                for p in [cs.ultimate_parent, cs.direct_parent]:
-                    if p:
-                        parents.append({"name": p.name, "country": p.country, "lei": p.lei,
-                                        "relationship": p.relationship, "relationship_group": "parent_companies"})
-                if parents:
-                    state.relationships["parent_companies"] = parents
-                subs = [{"name": s.name, "country": s.country, "lei": s.lei,
-                         "relationship": "subsidiary", "relationship_group": "subsidiaries"}
-                        for s in cs.subsidiaries[:15]]
-                if subs:
-                    state.relationships["subsidiaries"] = subs
-        except Exception:
-            pass
+            # GLEIF
+            try:
+                from operator1.clients.gleif import fetch_corporate_structure
+                gleif_id = state.target_profile.get("lei") or state.target_profile.get("name") or company_name
+                cs = fetch_corporate_structure(gleif_id)
+                if cs.available:
+                    parents = []
+                    for p in [cs.ultimate_parent, cs.direct_parent]:
+                        if p:
+                            parents.append({"name": p.name, "country": p.country, "lei": p.lei,
+                                            "relationship": p.relationship, "relationship_group": "parent_companies"})
+                    if parents:
+                        state.relationships["parent_companies"] = parents
+                    subs = [{"name": s.name, "country": s.country, "lei": s.lei,
+                             "relationship": "subsidiary", "relationship_group": "subsidiaries"}
+                            for s in cs.subsidiaries[:15]]
+                    if subs:
+                        state.relationships["subsidiaries"] = subs
+            except Exception:
+                pass
 
-    # -- CHECKPOINT 1.6a: Entity discovery + GLEIF + initial graph/game --
-    state.cache = cache
-    state.save("1.6a")
-    logger.info("Checkpoint 1.6a saved (entity discovery)")
+        # -- CHECKPOINT 1.6a: Entity discovery + GLEIF + initial graph/game --
+        state.cache = cache
+        state.save("1.6a")
+        logger.info("Checkpoint 1.6a saved (entity discovery)")
     if substage == "1.6a":
         return
 
     # -- SUB-STAGE 1.6b: Entity data fetch + contagion + aggregates --
-    if state._llm_client is not None:
-        # Fetch financial data for each linked entity (parity with main.py lines 1860-1994)
-        if state.relationships:
-            from operator1.features.derived_variables import compute_derived_variables as _cdv_linked
-            from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
+    if "1.6b" not in _skip:
+        if state._llm_client is not None:
+            # Fetch financial data for each linked entity (parity with main.py lines 1860-1994)
+            if state.relationships:
+                from operator1.features.derived_variables import compute_derived_variables as _cdv_linked
+                from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
 
-            # Per-group entity fetch caps from config
-            from operator1.config_loader import get_global_config as _ggc
-            _fetch_caps = _ggc().get("entity_fetch_caps", {})
-            _default_cap = _fetch_caps.get("_default", 2)
+                # Per-group entity fetch caps from config
+                from operator1.config_loader import get_global_config as _ggc
+                _fetch_caps = _ggc().get("entity_fetch_caps", {})
+                _default_cap = _fetch_caps.get("_default", 2)
 
-            _all_linked = []
-            _entity_groups = {}
-            for _grp, _ents in state.relationships.items():
-                _cap = _fetch_caps.get(_grp, _default_cap)
-                _ids = []
-                _added = 0
-                if isinstance(_ents, list):
-                    for _e in _ents:
-                        if _added >= _cap:
-                            break
-                        _eid = ""
-                        if isinstance(_e, dict):
-                            _eid = _e.get("isin", "") or _e.get("ticker", "")
-                        elif hasattr(_e, "isin"):
-                            _eid = _e.isin or getattr(_e, "ticker", "")
-                        if _eid and _eid not in {x.get("id") for x in _all_linked}:
-                            _mkt = _e.get("market_id", "") if isinstance(_e, dict) else getattr(_e, "market_id", "")
-                            _all_linked.append({"id": _eid, "name": _e.get("name", "") if isinstance(_e, dict) else getattr(_e, "name", ""), "group": _grp, "market_id": _mkt})
-                            _ids.append(_eid)
-                            _added += 1
-                _entity_groups[_grp] = _ids
-            logger.info("Entity fetch: %d entities (per-group caps)", len(_all_linked))
+                _all_linked = []
+                _entity_groups = {}
+                for _grp, _ents in state.relationships.items():
+                    _cap = _fetch_caps.get(_grp, _default_cap)
+                    _ids = []
+                    _added = 0
+                    if isinstance(_ents, list):
+                        for _e in _ents:
+                            if _added >= _cap:
+                                break
+                            _eid = ""
+                            if isinstance(_e, dict):
+                                _eid = _e.get("isin", "") or _e.get("ticker", "")
+                            elif hasattr(_e, "isin"):
+                                _eid = _e.isin or getattr(_e, "ticker", "")
+                            if _eid and _eid not in {x.get("id") for x in _all_linked}:
+                                _mkt = _e.get("market_id", "") if isinstance(_e, dict) else getattr(_e, "market_id", "")
+                                _all_linked.append({"id": _eid, "name": _e.get("name", "") if isinstance(_e, dict) else getattr(_e, "name", ""), "group": _grp, "market_id": _mkt})
+                                _ids.append(_eid)
+                                _added += 1
+                    _entity_groups[_grp] = _ids
+                logger.info("Entity fetch: %d entities (per-group caps)", len(_all_linked))
 
-            def _fetch_linked(ent_info):
-                _eid = ent_info["id"]
+                def _fetch_linked(ent_info):
+                    _eid = ent_info["id"]
+                    try:
+                        # Cross-region routing: use entity's market client if different
+                        _cl = pit_client
+                        _mkt = ent_info.get("market_id", "")
+                        if _mkt and _mkt != state.market_id:
+                            try:
+                                from operator1.clients.equity_provider import create_pit_client as _cpc
+                                _cl = _cpc(_mkt, state._secrets)
+                            except Exception:
+                                pass  # fall back to target's client
+                        _qt = _cl.get_quotes(_eid)
+                        if not _qt.empty and "date" in _qt.columns:
+                            _qt["date"] = pd.to_datetime(_qt["date"])
+                            _ec = _qt.set_index("date").sort_index()
+                        else:
+                            _ec = pd.DataFrame(index=pd.date_range(cache.index[0], cache.index[-1], freq="B", name="date"))
+                        for _lbl, _sdf in [("inc", _cl.get_income_statement(_eid)), ("bal", _cl.get_balance_sheet(_eid)), ("cf", _cl.get_cashflow_statement(_eid))]:
+                            if _sdf.empty:
+                                continue
+                            _dc = "report_date" if "report_date" in _sdf.columns else "filing_date"
+                            if _dc not in _sdf.columns:
+                                continue
+                            _sdf[_dc] = pd.to_datetime(_sdf[_dc])
+                            _sdf = _sdf.sort_values(_dc).drop_duplicates(subset=[_dc], keep="last")
+                            _nc = [c for c in _sdf.select_dtypes(include=["number"]).columns if c != _dc and "date" not in c.lower()]
+                            if _nc:
+                                _si = _sdf.set_index(_dc)[_nc]
+                                _ci = _ec.index.union(_si.index).sort_values()
+                                _sa = _si.reindex(_ci).ffill().reindex(_ec.index)
+                                _nw = [c for c in _sa.columns if c not in _ec.columns]
+                                if _nw:
+                                    _ec = _ec.join(_sa[_nw], how="left")
+                        if "close" in _ec.columns and _ec["close"].notna().sum() > 5:
+                            _ec = _cdv_linked(_ec)
+                        return _eid, _ec
+                    except Exception:
+                        return _eid, pd.DataFrame()
+
+                if _all_linked:
+                    with _TPE(max_workers=4) as _ex:
+                        _futs = {_ex.submit(_fetch_linked, e): e for e in _all_linked}
+                        for _f in _ac(_futs):
+                            try:
+                                _eid, _ec = _f.result()
+                                if not _ec.empty:
+                                    state.linked_caches[_eid] = _ec
+                            except Exception:
+                                pass
+                    logger.info("Linked data: %d/%d fetched", len(state.linked_caches), len(_all_linked))
+
+            # Graph risk
+            try:
+                from operator1.models.graph_risk import compute_graph_risk_metrics
+                from dataclasses import asdict
+                rel_dicts = {}
+                for grp, ents in state.relationships.items():
+                    if isinstance(ents, list):
+                        rel_dicts[grp] = [asdict(e) if hasattr(e, "__dataclass_fields__") else e for e in ents]
+                state.graph_risk_result = compute_graph_risk_metrics(
+                    target_isin=state.target_profile.get("isin", ticker),
+                    relationships=rel_dicts, target_cache=cache,
+                    linked_caches=state.linked_caches or None,
+                )
+            except Exception:
+                pass
+
+            # Game theory
+            try:
+                from operator1.models.game_theory import analyze_competitive_dynamics
+                _competitor_caches = {eid: state.linked_caches[eid]
+                                      for eid in _entity_groups.get("competitors", [])
+                                      if eid in (state.linked_caches or {})} if '_entity_groups' in dir() else {}
+                state.game_theory_result = analyze_competitive_dynamics(
+                    target_cache=cache, target_name=state.target_profile.get("name", "target"),
+                    competitor_caches=_competitor_caches or None,
+                )
+            except Exception:
+                pass
+
+            # Ownership contagion (parity with main.py lines 2014-2065)
+            if state.target_holders and state.linked_caches:
                 try:
-                    # Cross-region routing: use entity's market client if different
-                    _cl = pit_client
-                    _mkt = ent_info.get("market_id", "")
-                    if _mkt and _mkt != state.market_id:
+                    _comp_holders: dict[str, list] = {}
+                    _comp_ids = _entity_groups.get("competitors", []) if '_entity_groups' in dir() else []
+                    for _cid in _comp_ids[:5]:
                         try:
-                            from operator1.clients.equity_provider import create_pit_client as _cpc
-                            _cl = _cpc(_mkt, state._secrets)
-                        except Exception:
-                            pass  # fall back to target's client
-                    _qt = _cl.get_quotes(_eid)
-                    if not _qt.empty and "date" in _qt.columns:
-                        _qt["date"] = pd.to_datetime(_qt["date"])
-                        _ec = _qt.set_index("date").sort_index()
-                    else:
-                        _ec = pd.DataFrame(index=pd.date_range(cache.index[0], cache.index[-1], freq="B", name="date"))
-                    for _lbl, _sdf in [("inc", _cl.get_income_statement(_eid)), ("bal", _cl.get_balance_sheet(_eid)), ("cf", _cl.get_cashflow_statement(_eid))]:
-                        if _sdf.empty:
-                            continue
-                        _dc = "report_date" if "report_date" in _sdf.columns else "filing_date"
-                        if _dc not in _sdf.columns:
-                            continue
-                        _sdf[_dc] = pd.to_datetime(_sdf[_dc])
-                        _sdf = _sdf.sort_values(_dc).drop_duplicates(subset=[_dc], keep="last")
-                        _nc = [c for c in _sdf.select_dtypes(include=["number"]).columns if c != _dc and "date" not in c.lower()]
-                        if _nc:
-                            _si = _sdf.set_index(_dc)[_nc]
-                            _ci = _ec.index.union(_si.index).sort_values()
-                            _sa = _si.reindex(_ci).ffill().reindex(_ec.index)
-                            _nw = [c for c in _sa.columns if c not in _ec.columns]
-                            if _nw:
-                                _ec = _ec.join(_sa[_nw], how="left")
-                    if "close" in _ec.columns and _ec["close"].notna().sum() > 5:
-                        _ec = _cdv_linked(_ec)
-                    return _eid, _ec
-                except Exception:
-                    return _eid, pd.DataFrame()
-
-            if _all_linked:
-                with _TPE(max_workers=4) as _ex:
-                    _futs = {_ex.submit(_fetch_linked, e): e for e in _all_linked}
-                    for _f in _ac(_futs):
-                        try:
-                            _eid, _ec = _f.result()
-                            if not _ec.empty:
-                                state.linked_caches[_eid] = _ec
+                            _ch = pit_client.get_holders(_cid)
+                            if _ch:
+                                _comp_holders[_cid] = _ch
                         except Exception:
                             pass
-                logger.info("Linked data: %d/%d fetched", len(state.linked_caches), len(_all_linked))
+                    from operator1.models.ownership_contagion import (
+                        compute_ownership_contagion, inject_contagion_into_cache,
+                        get_ownership_edge_weights,
+                    )
+                    state.contagion_result = compute_ownership_contagion(
+                        target_holders=state.target_holders,
+                        competitor_holders=_comp_holders, cache=cache,
+                    )
+                    if state.contagion_result and state.contagion_result.available:
+                        cache = inject_contagion_into_cache(cache, state.contagion_result)
+                        # Re-run graph risk with ownership edge weights
+                        _ow = get_ownership_edge_weights(state.contagion_result)
+                        if _ow and state.graph_risk_result is not None:
+                            state.graph_risk_result = compute_graph_risk_metrics(
+                                target_isin=state.target_profile.get("isin", ticker),
+                                relationships=rel_dicts, edge_weights=_ow,
+                                target_cache=cache, linked_caches=state.linked_caches or None,
+                            )
+                        logger.info("Ownership contagion: MHHI=%.3f, crowding=%.3f",
+                                    state.contagion_result.mhhi_delta, state.contagion_result.crowding_score)
+                except Exception as exc:
+                    logger.debug("Ownership contagion skipped: %s", exc)
 
-        # Graph risk
+        # News sentiment
         try:
-            from operator1.models.graph_risk import compute_graph_risk_metrics
-            from dataclasses import asdict
-            rel_dicts = {}
-            for grp, ents in state.relationships.items():
-                if isinstance(ents, list):
-                    rel_dicts[grp] = [asdict(e) if hasattr(e, "__dataclass_fields__") else e for e in ents]
-            state.graph_risk_result = compute_graph_risk_metrics(
-                target_isin=state.target_profile.get("isin", ticker),
-                relationships=rel_dicts, target_cache=cache,
-                linked_caches=state.linked_caches or None,
+            from operator1.features.news_sentiment import compute_news_sentiment
+            cache, _sr = compute_news_sentiment(
+                cache, llm_client=state._llm_client, symbol=ticker,
+                market_id=state.market_id, company_name=company_name,
             )
+            if _sr.n_articles_scored > 0:
+                state.sentiment_result = {
+                    "n_articles_fetched": _sr.n_articles_fetched,
+                    "n_articles_scored": _sr.n_articles_scored,
+                    "scoring_method": _sr.scoring_method,
+                    "mean_sentiment": _sr.mean_sentiment,
+                    "latest_sentiment": _sr.latest_sentiment,
+                    "latest_label": _sr.latest_label,
+                }
         except Exception:
             pass
 
-        # Game theory
+        # Product catalysts (Fix 12: pass news_articles from sentiment step)
         try:
-            from operator1.models.game_theory import analyze_competitive_dynamics
-            _competitor_caches = {eid: state.linked_caches[eid]
-                                  for eid in _entity_groups.get("competitors", [])
-                                  if eid in (state.linked_caches or {})}
-            state.game_theory_result = analyze_competitive_dynamics(
-                target_cache=cache, target_name=state.target_profile.get("name", "target"),
-                competitor_caches=_competitor_caches or None,
-            )
-        except Exception:
-            pass
-
-        # Ownership contagion (parity with main.py lines 2014-2065)
-        if state.target_holders and state.linked_caches:
-            try:
-                _comp_holders: dict[str, list] = {}
-                _comp_ids = _entity_groups.get("competitors", []) if '_entity_groups' in dir() else []
-                for _cid in _comp_ids[:5]:
-                    try:
-                        _ch = pit_client.get_holders(_cid)
-                        if _ch:
-                            _comp_holders[_cid] = _ch
-                    except Exception:
-                        pass
-                from operator1.models.ownership_contagion import (
-                    compute_ownership_contagion, inject_contagion_into_cache,
-                    get_ownership_edge_weights,
-                )
-                state.contagion_result = compute_ownership_contagion(
-                    target_holders=state.target_holders,
-                    competitor_holders=_comp_holders, cache=cache,
-                )
-                if state.contagion_result and state.contagion_result.available:
-                    cache = inject_contagion_into_cache(cache, state.contagion_result)
-                    # Re-run graph risk with ownership edge weights
-                    _ow = get_ownership_edge_weights(state.contagion_result)
-                    if _ow and state.graph_risk_result is not None:
-                        state.graph_risk_result = compute_graph_risk_metrics(
-                            target_isin=state.target_profile.get("isin", ticker),
-                            relationships=rel_dicts, edge_weights=_ow,
-                            target_cache=cache, linked_caches=state.linked_caches or None,
-                        )
-                    logger.info("Ownership contagion: MHHI=%.3f, crowding=%.3f",
-                                state.contagion_result.mhhi_delta, state.contagion_result.crowding_score)
-            except Exception as exc:
-                logger.debug("Ownership contagion skipped: %s", exc)
-
-    # News sentiment
-    try:
-        from operator1.features.news_sentiment import compute_news_sentiment
-        cache, _sr = compute_news_sentiment(
-            cache, llm_client=state._llm_client, symbol=ticker,
-            market_id=state.market_id, company_name=company_name,
-        )
-        if _sr.n_articles_scored > 0:
-            state.sentiment_result = {
-                "n_articles_fetched": _sr.n_articles_fetched,
-                "n_articles_scored": _sr.n_articles_scored,
-                "scoring_method": _sr.scoring_method,
-                "mean_sentiment": _sr.mean_sentiment,
-                "latest_sentiment": _sr.latest_sentiment,
-                "latest_label": _sr.latest_label,
-            }
-    except Exception:
-        pass
-
-    # Product catalysts (Fix 12: pass news_articles from sentiment step)
-    try:
-        from operator1.features.product_catalysts import detect_product_catalysts
-        _news_articles = []
-        try:
-            _news_articles = _sr.articles if '_sr' in dir() and hasattr(_sr, 'articles') else []
-        except Exception:
+            from operator1.features.product_catalysts import detect_product_catalysts
             _news_articles = []
-        cache, state.catalyst_result = detect_product_catalysts(
-            cache, profile=state.target_profile,
-            news_articles=_news_articles if _news_articles else None,
-        )
-    except Exception:
-        pass
-
-    # Peer ranking
-    if state.linked_caches:
-        try:
-            from operator1.features.peer_ranking import compute_peer_ranking
-            _peer_caches = {eid: state.linked_caches[eid]
-                           for eid in _entity_groups.get("competitors", [])
-                           if eid in state.linked_caches} if '_entity_groups' in dir() else {}
-            cache, pr = compute_peer_ranking(
-                cache, linked_caches=_peer_caches if _peer_caches else state.linked_caches)
-            state.peer_ranking_result = {
-                "n_peers": pr.n_peers, "n_variables_ranked": pr.n_variables_ranked,
-                "latest_composite_rank": pr.latest_composite_rank,
-                "latest_label": pr.latest_label,
-            }
+            try:
+                _news_articles = _sr.articles if '_sr' in dir() and hasattr(_sr, 'articles') else []
+            except Exception:
+                _news_articles = []
+            cache, state.catalyst_result = detect_product_catalysts(
+                cache, profile=state.target_profile,
+                news_articles=_news_articles if _news_articles else None,
+            )
         except Exception:
             pass
 
-    # -- CHECKPOINT 1.6b: Entity data fetch + contagion + sentiment complete --
-    state.cache = cache
-    state.save("1.6b")
-    logger.info("Checkpoint 1.6b saved (entity data + contagion + sentiment)")
+        # Peer ranking
+        if state.linked_caches:
+            try:
+                from operator1.features.peer_ranking import compute_peer_ranking
+                _peer_caches = {eid: state.linked_caches[eid]
+                               for eid in _entity_groups.get("competitors", [])
+                               if eid in state.linked_caches} if '_entity_groups' in dir() else {}
+                cache, pr = compute_peer_ranking(
+                    cache, linked_caches=_peer_caches if _peer_caches else state.linked_caches)
+                state.peer_ranking_result = {
+                    "n_peers": pr.n_peers, "n_variables_ranked": pr.n_variables_ranked,
+                    "latest_composite_rank": pr.latest_composite_rank,
+                    "latest_label": pr.latest_label,
+                }
+            except Exception:
+                pass
+
+        # -- CHECKPOINT 1.6b: Entity data fetch + contagion + sentiment complete --
+        state.cache = cache
+        state.save("1.6b")
+        logger.info("Checkpoint 1.6b saved (entity data + contagion + sentiment)")
     if substage in ("1.6", "1.6b"):
         return
 
     # Adaptive thresholds
-    _t_17a = time.time()
-    try:
-        from operator1.analysis.adaptive_thresholds import compute_adaptive_thresholds, threshold_set_to_survival_dict
-        _competitor_caches_for_thresh = {eid: state.linked_caches[eid]
-                                       for eid in _entity_groups.get("competitors", [])
-                                       if eid in (state.linked_caches or {})} if '_entity_groups' in dir() else {}
-        state.adaptive_thresholds = compute_adaptive_thresholds(
-            cache, linked_caches=_competitor_caches_for_thresh or None,
-            fh_composite_scores=cache.get("fh_composite_score"),
-        )
-        if state.adaptive_thresholds.adapted:
-            adapted = threshold_set_to_survival_dict(state.adaptive_thresholds)
-            cache["company_survival_mode_flag"] = compute_company_survival_flag(
-                cache, thresholds=adapted, sector=state.target_profile.get("sector", ""))
-            cache["survival_probability"] = compute_survival_probability(cache, thresholds=adapted)
-            cache = compute_hierarchy_weights(cache)
-    except Exception:
-        pass
-    logger.info("  1.7a adaptive_thresholds: %.1fs", time.time() - _t_17a)
-
-    # Adaptive model parameters (Tier 2)
-    _t_17b = time.time()
-    try:
-        from operator1.analysis.adaptive_model_params import (
-            compute_blend_weights, compute_regime_risk_multiplier,
-            compute_garman_klass_factor, compute_transition_halflife,
-            compute_adaptive_mc_params, compute_adaptive_participation_rate,
-            AdaptiveModelParams,
-        )
-        state.adaptive_model_params = AdaptiveModelParams()
-        if "survival_probability" in cache.columns and "cox_survival_score" in cache.columns:
-            _sig = cache.get("survival_probability")
-            _cox = cache.get("cox_survival_score")
-            _actual = cache.get("company_survival_mode_flag", pd.Series(0, index=cache.index))
-            if _sig is not None and _cox is not None:
-                w_sig, w_cox = compute_blend_weights(_sig, _cox, _actual)
-                state.adaptive_model_params.blend_w_sig = w_sig
-                state.adaptive_model_params.blend_w_cox = w_cox
-                cache["survival_probability"] = w_sig * _sig + w_cox * _cox.fillna(_sig)
-        state.adaptive_model_params.survival_risk_multiplier = compute_regime_risk_multiplier(
-            state.regime_detector, cache,
-        )
-        state.adaptive_model_params.intraday_low_factor = compute_garman_klass_factor(cache)
-        state.adaptive_model_params.mc_n_paths, state.adaptive_model_params.mc_is_tilt = (
-            compute_adaptive_mc_params(cache)
-        )
-        state.adaptive_model_params.participation_rate = compute_adaptive_participation_rate(cache)
-        state.adaptive_model_params.adapted = True
-        logger.info("Adaptive model params computed")
-    except Exception as exc:
-        logger.debug("Adaptive model params skipped: %s", exc)
-    logger.info("  1.7b adaptive_model_params: %.1fs", time.time() - _t_17b)
-
-    # Adaptive windows (Tier 3)
-    _t_17c = time.time()
-    try:
-        from operator1.analysis.adaptive_windows import (
-            compute_adaptive_windows, compute_nn_hyperparams,
-            compute_pattern_thresholds, compute_stale_threshold,
-            AdaptiveTier3Params,
-        )
-        from operator1.analysis.adaptive_model_params import compute_effective_sample_size
-        _freq = (
-            state.filing_calendar_result.detected_frequency
-            if state.filing_calendar_result is not None
-            else "quarterly"
-        )
-        state.adaptive_tier3 = AdaptiveTier3Params()
-        state.adaptive_tier3.windows = compute_adaptive_windows(_freq)
-        state.adaptive_tier3.stale_threshold_days = compute_stale_threshold(_freq)
-        _n_eff = compute_effective_sample_size(cache, "close")
-        _n_feat = sum(1 for c in cache.columns if cache[c].dtype in ("float64", "float32") and cache[c].notna().sum() > 10)
-        state.adaptive_tier3.nn_params = compute_nn_hyperparams(n_eff=_n_eff, n_features=min(_n_feat, 30))
-        state.adaptive_tier3.pattern_body_threshold, state.adaptive_tier3.pattern_doji_threshold = (
-            compute_pattern_thresholds(cache, lookback=state.adaptive_tier3.windows.medium)
-        )
-        state.adaptive_tier3.adapted = True
-        logger.info("Adaptive windows computed")
-    except Exception as exc:
-        logger.debug("Adaptive windows skipped: %s", exc)
-    logger.info("  1.7c adaptive_windows: %.1fs", time.time() - _t_17c)
-
-    # Signal IC measurement
-    _t_17d = time.time()
-    try:
-        from operator1.analysis.signal_ic import compute_signal_ic, get_ic_weighted_signals
-        state.signal_ic_result = compute_signal_ic(cache)
-        if state.signal_ic_result and state.signal_ic_result.available:
-            logger.info(
-                "Signal IC: %d strong, best=%s (IC=%.4f)",
-                len(state.signal_ic_result.strong_signals),
-                state.signal_ic_result.best_signal, state.signal_ic_result.best_ic,
+    if "1.7" not in _skip:
+        _t_17a = time.time()
+        try:
+            from operator1.analysis.adaptive_thresholds import compute_adaptive_thresholds, threshold_set_to_survival_dict
+            _competitor_caches_for_thresh = {eid: state.linked_caches[eid]
+                                           for eid in _entity_groups.get("competitors", [])
+                                           if eid in (state.linked_caches or {})} if '_entity_groups' in dir() else {}
+            state.adaptive_thresholds = compute_adaptive_thresholds(
+                cache, linked_caches=_competitor_caches_for_thresh or None,
+                fh_composite_scores=cache.get("fh_composite_score"),
             )
-    except Exception as exc:
-        logger.debug("Signal IC skipped: %s", exc)
-    logger.info("  1.7d signal_ic: %.1fs", time.time() - _t_17d)
+            if state.adaptive_thresholds.adapted:
+                adapted = threshold_set_to_survival_dict(state.adaptive_thresholds)
+                cache["company_survival_mode_flag"] = compute_company_survival_flag(
+                    cache, thresholds=adapted, sector=state.target_profile.get("sector", ""))
+                cache["survival_probability"] = compute_survival_probability(cache, thresholds=adapted)
+                cache = compute_hierarchy_weights(cache)
+        except Exception:
+            pass
+        logger.info("  1.7a adaptive_thresholds: %.1fs", time.time() - _t_17a)
 
-    # Fill actuals from previous prediction log
-    try:
-        from operator1.analysis.prediction_log import fill_actuals
-        state.prediction_log_summary = fill_actuals(
-            ticker=state.company, cache=cache,
-            reference_date=datetime.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None,
-        )
-    except Exception as exc:
-        logger.debug("Prediction log fill skipped: %s", exc)
+        # Adaptive model parameters (Tier 2)
+        _t_17b = time.time()
+        try:
+            from operator1.analysis.adaptive_model_params import (
+                compute_blend_weights, compute_regime_risk_multiplier,
+                compute_garman_klass_factor, compute_transition_halflife,
+                compute_adaptive_mc_params, compute_adaptive_participation_rate,
+                AdaptiveModelParams,
+            )
+            state.adaptive_model_params = AdaptiveModelParams()
+            if "survival_probability" in cache.columns and "cox_survival_score" in cache.columns:
+                _sig = cache.get("survival_probability")
+                _cox = cache.get("cox_survival_score")
+                _actual = cache.get("company_survival_mode_flag", pd.Series(0, index=cache.index))
+                if _sig is not None and _cox is not None:
+                    w_sig, w_cox = compute_blend_weights(_sig, _cox, _actual)
+                    state.adaptive_model_params.blend_w_sig = w_sig
+                    state.adaptive_model_params.blend_w_cox = w_cox
+                    cache["survival_probability"] = w_sig * _sig + w_cox * _cox.fillna(_sig)
+            state.adaptive_model_params.survival_risk_multiplier = compute_regime_risk_multiplier(
+                state.regime_detector, cache,
+            )
+            state.adaptive_model_params.intraday_low_factor = compute_garman_klass_factor(cache)
+            state.adaptive_model_params.mc_n_paths, state.adaptive_model_params.mc_is_tilt = (
+                compute_adaptive_mc_params(cache)
+            )
+            state.adaptive_model_params.participation_rate = compute_adaptive_participation_rate(cache)
+            state.adaptive_model_params.adapted = True
+            logger.info("Adaptive model params computed")
+        except Exception as exc:
+            logger.debug("Adaptive model params skipped: %s", exc)
+        logger.info("  1.7b adaptive_model_params: %.1fs", time.time() - _t_17b)
 
-    # -- CHECKPOINT 1.7: Adaptive calibration + Signal IC complete --
-    state.cache = cache
-    state.save("1.7")
-    logger.info("Checkpoint 1.7 saved (adaptive calibration)")
+        # Adaptive windows (Tier 3)
+        _t_17c = time.time()
+        try:
+            from operator1.analysis.adaptive_windows import (
+                compute_adaptive_windows, compute_nn_hyperparams,
+                compute_pattern_thresholds, compute_stale_threshold,
+                AdaptiveTier3Params,
+            )
+            from operator1.analysis.adaptive_model_params import compute_effective_sample_size
+            _freq = (
+                state.filing_calendar_result.detected_frequency
+                if state.filing_calendar_result is not None
+                else "quarterly"
+            )
+            state.adaptive_tier3 = AdaptiveTier3Params()
+            state.adaptive_tier3.windows = compute_adaptive_windows(_freq)
+            state.adaptive_tier3.stale_threshold_days = compute_stale_threshold(_freq)
+            _n_eff = compute_effective_sample_size(cache, "close")
+            _n_feat = sum(1 for c in cache.columns if cache[c].dtype in ("float64", "float32") and cache[c].notna().sum() > 10)
+            state.adaptive_tier3.nn_params = compute_nn_hyperparams(n_eff=_n_eff, n_features=min(_n_feat, 30))
+            state.adaptive_tier3.pattern_body_threshold, state.adaptive_tier3.pattern_doji_threshold = (
+                compute_pattern_thresholds(cache, lookback=state.adaptive_tier3.windows.medium)
+            )
+            state.adaptive_tier3.adapted = True
+            logger.info("Adaptive windows computed")
+        except Exception as exc:
+            logger.debug("Adaptive windows skipped: %s", exc)
+        logger.info("  1.7c adaptive_windows: %.1fs", time.time() - _t_17c)
+
+        # Signal IC measurement
+        _t_17d = time.time()
+        try:
+            from operator1.analysis.signal_ic import compute_signal_ic, get_ic_weighted_signals
+            state.signal_ic_result = compute_signal_ic(cache)
+            if state.signal_ic_result and state.signal_ic_result.available:
+                logger.info(
+                    "Signal IC: %d strong, best=%s (IC=%.4f)",
+                    len(state.signal_ic_result.strong_signals),
+                    state.signal_ic_result.best_signal, state.signal_ic_result.best_ic,
+                )
+        except Exception as exc:
+            logger.debug("Signal IC skipped: %s", exc)
+        logger.info("  1.7d signal_ic: %.1fs", time.time() - _t_17d)
+
+        # Fill actuals from previous prediction log
+        try:
+            from operator1.analysis.prediction_log import fill_actuals
+            state.prediction_log_summary = fill_actuals(
+                ticker=state.company, cache=cache,
+                reference_date=datetime.strptime(state.end_date, "%Y-%m-%d").date() if state.end_date else None,
+            )
+        except Exception as exc:
+            logger.debug("Prediction log fill skipped: %s", exc)
+
+        # -- CHECKPOINT 1.7: Adaptive calibration + Signal IC complete --
+        state.cache = cache
+        state.save("1.7")
+        logger.info("Checkpoint 1.7 saved (adaptive calibration)")
     if substage == "1.7":
         return
 
     # Enriched survival timeline
-    try:
-        from operator1.models.regime_detector import run_early_regime_detection
-        from operator1.analysis.survival_timeline import compute_enriched_survival_timeline
-        target_var = "equity_change_rate" if state.is_private else "return_1d"
-        cache, state.early_regime_result = run_early_regime_detection(cache, target_variable=target_var)
-        if state.early_regime_result and state.early_regime_result.fitted:
-            state.regime_detector = state.early_regime_result.detector
-        rl = state.early_regime_result.regime_labels if state.early_regime_result else None
-        rc = state.early_regime_result.regime_confidence if state.early_regime_result else None
-        state.enriched_timeline_result = compute_enriched_survival_timeline(cache, regime_labels=rl, regime_confidence=rc)
-        if state.enriched_timeline_result and state.enriched_timeline_result.fitted:
-            etl = state.enriched_timeline_result.timeline
-            for col in ["regime_state", "survival_intensity", "regime_confidence",
-                        "regime_switch", "regime_transition_prob", "survival_mode",
-                        "survival_mode_code", "switch_point", "days_in_mode", "stability_score_21d"]:
-                if col in etl.columns and col not in cache.columns:
-                    cache[col] = etl[col].reindex(cache.index)
-            logger.info("Enriched timeline: intensity=%.3f", state.enriched_timeline_result.mean_intensity)
-
-        # ChangeFinder online change point scores (no look-ahead)
+    if "1.8a" not in _skip:
         try:
-            from operator1.models.regime_detector import compute_online_change_scores
-            _regime_target = "equity_change_rate" if state.is_private else "return_1d"
-            _ret_for_cf = cache.get(_regime_target)
-            if _ret_for_cf is not None and _ret_for_cf.notna().sum() > 30:
-                _cf_scores = compute_online_change_scores(_ret_for_cf.fillna(0).values)
-                if _cf_scores is not None:
-                    cache["online_change_score"] = _cf_scores
-        except Exception:
-            pass
-    except Exception as exc:
-        logger.warning("Enriched timeline failed: %s", exc)
+            from operator1.models.regime_detector import run_early_regime_detection
+            from operator1.analysis.survival_timeline import compute_enriched_survival_timeline
+            target_var = "equity_change_rate" if state.is_private else "return_1d"
+            cache, state.early_regime_result = run_early_regime_detection(cache, target_variable=target_var)
+            if state.early_regime_result and state.early_regime_result.fitted:
+                state.regime_detector = state.early_regime_result.detector
+            rl = state.early_regime_result.regime_labels if state.early_regime_result else None
+            rc = state.early_regime_result.regime_confidence if state.early_regime_result else None
+            state.enriched_timeline_result = compute_enriched_survival_timeline(cache, regime_labels=rl, regime_confidence=rc)
+            if state.enriched_timeline_result and state.enriched_timeline_result.fitted:
+                etl = state.enriched_timeline_result.timeline
+                for col in ["regime_state", "survival_intensity", "regime_confidence",
+                            "regime_switch", "regime_transition_prob", "survival_mode",
+                            "survival_mode_code", "switch_point", "days_in_mode", "stability_score_21d"]:
+                    if col in etl.columns and col not in cache.columns:
+                        cache[col] = etl[col].reindex(cache.index)
+                logger.info("Enriched timeline: intensity=%.3f", state.enriched_timeline_result.mean_intensity)
 
-    # -- CHECKPOINT 1.8a: Regime detection + enriched timeline --
-    state.cache = cache
-    state.save("1.8a")
-    logger.info("Checkpoint 1.8a saved (regime detection + enriched timeline)")
+            # ChangeFinder online change point scores (no look-ahead)
+            try:
+                from operator1.models.regime_detector import compute_online_change_scores
+                _regime_target = "equity_change_rate" if state.is_private else "return_1d"
+                _ret_for_cf = cache.get(_regime_target)
+                if _ret_for_cf is not None and _ret_for_cf.notna().sum() > 30:
+                    _cf_scores = compute_online_change_scores(_ret_for_cf.fillna(0).values)
+                    if _cf_scores is not None:
+                        cache["online_change_score"] = _cf_scores
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.warning("Enriched timeline failed: %s", exc)
+
+        # -- CHECKPOINT 1.8a: Regime detection + enriched timeline --
+        state.cache = cache
+        state.save("1.8a")
+        logger.info("Checkpoint 1.8a saved (regime detection + enriched timeline)")
     if substage == "1.8a":
         return
 
     # Linked entity conflict propagation
-    if state.conflict_result is not None and state.relationships:
+    if "1.8b" not in _skip:
+        if state.conflict_result is not None and state.relationships:
+            try:
+                from operator1.features.conflict_risk import assess_linked_entity_conflict
+                state.linked_conflict = assess_linked_entity_conflict(
+                    linked_entities=state.relationships,
+                    target_conflict=state.conflict_result,
+                )
+            except Exception:
+                pass
+
+        # Supply chain stress
         try:
-            from operator1.features.conflict_risk import assess_linked_entity_conflict
-            state.linked_conflict = assess_linked_entity_conflict(
-                linked_entities=state.relationships,
-                target_conflict=state.conflict_result,
+            from operator1.features.conflict_risk import compute_supply_chain_stress
+            _scs = compute_supply_chain_stress(
+                conflict_result=state.conflict_result,
+                linked_caches=state.linked_caches if state.linked_caches else None,
+                relationships=state.relationships if state.relationships else None,
             )
+            if _scs and _scs.get("available"):
+                cache["supply_chain_stress_flag"] = int(_scs["supply_chain_stress_flag"])
+                cache["supply_chain_stress_score"] = _scs["supply_chain_stress_score"]
         except Exception:
             pass
 
-    # Supply chain stress
-    try:
-        from operator1.features.conflict_risk import compute_supply_chain_stress
-        _scs = compute_supply_chain_stress(
-            conflict_result=state.conflict_result,
-            linked_caches=state.linked_caches if state.linked_caches else None,
-            relationships=state.relationships if state.relationships else None,
-        )
-        if _scs and _scs.get("available"):
-            cache["supply_chain_stress_flag"] = int(_scs["supply_chain_stress_flag"])
-            cache["supply_chain_stress_score"] = _scs["supply_chain_stress_score"]
-    except Exception:
-        pass
+        # Linked aggregates (requires linked_caches from entity fetch above)
+        if state.linked_caches:
+            try:
+                from operator1.features.linked_aggregates import compute_linked_aggregates, compute_relative_metrics
+                _entity_groups = {}
+                for grp, ents in state.relationships.items():
+                    if isinstance(ents, list):
+                        ids = []
+                        for e in ents:
+                            eid = ""
+                            if isinstance(e, dict):
+                                eid = e.get("isin", "") or e.get("ticker", "")
+                            elif hasattr(e, "isin"):
+                                eid = e.isin or getattr(e, "ticker", "")
+                            if eid:
+                                ids.append(eid)
+                        _entity_groups[grp] = ids
+                state.linked_agg_df = compute_linked_aggregates(
+                    target_daily=cache, linked_daily=state.linked_caches,
+                    entity_groups=_entity_groups,
+                )
+                if state.linked_agg_df is not None and not state.linked_agg_df.empty:
+                    _new_agg = [c for c in state.linked_agg_df.columns if c not in cache.columns]
+                    if _new_agg:
+                        cache = cache.join(state.linked_agg_df[_new_agg], how="left")
+                    logger.info("Linked aggregates: %d columns merged", len(_new_agg))
+                    # Relative metrics
+                    _rel = compute_relative_metrics(cache, state.linked_agg_df)
+                    if _rel is not None and not _rel.empty:
+                        _new_rel = [c for c in _rel.columns if c not in cache.columns and _rel[c].notna().any()]
+                        if _new_rel:
+                            cache = cache.join(_rel[_new_rel], how="left")
+            except Exception as exc:
+                logger.debug("Linked aggregates skipped: %s", exc)
 
-    # Linked aggregates (requires linked_caches from entity fetch above)
-    if state.linked_caches:
+        # Ownership contagion
+        if state.target_holders:
+            try:
+                from operator1.models.ownership_contagion import compute_ownership_contagion, inject_contagion_into_cache
+                state.contagion_result = compute_ownership_contagion(
+                    target_holders=state.target_holders,
+                    competitor_holders={},
+                    cache=cache,
+                )
+                if state.contagion_result and state.contagion_result.available:
+                    cache = inject_contagion_into_cache(cache, state.contagion_result)
+                    logger.info("Ownership contagion: MHHI=%.3f", state.contagion_result.mhhi_delta)
+            except Exception as exc:
+                logger.debug("Ownership contagion skipped: %s", exc)
+
+        # Save segment result for Stage 3 profile injection
+        state.seg_result = _seg_result
+
+        # Product segment metrics (for _extra_vars + MC concentration risk)
+        if _seg_result and _seg_result.get("n_segments", 0) >= 2:
+            try:
+                from operator1.features.product_metrics import compute_product_metrics
+                cache = compute_product_metrics(cache, _seg_result)
+            except Exception as exc:
+                logger.debug("Product metrics computation failed: %s", exc)
+
+        # Geographic supply chain risk metrics (Gap 2)
+        if _seg_result:
+            try:
+                from operator1.features.product_metrics import compute_geographic_metrics
+                _geo_segs = _seg_result.get("geo_segments", {})
+                _gleif_subs = state.relationships.get("subsidiaries", [])
+                _sub_dicts = [
+                    s if isinstance(s, dict) else {"country": getattr(s, "country", "")}
+                    for s in _gleif_subs
+                ]
+                cache = compute_geographic_metrics(
+                    cache, geo_segments=_geo_segs, subsidiaries=_sub_dicts,
+                )
+            except Exception as exc:
+                logger.debug("Geographic metrics computation failed: %s", exc)
+
+        # Operational efficiency features
         try:
-            from operator1.features.linked_aggregates import compute_linked_aggregates, compute_relative_metrics
-            _entity_groups = {}
-            for grp, ents in state.relationships.items():
-                if isinstance(ents, list):
-                    ids = []
-                    for e in ents:
-                        eid = ""
-                        if isinstance(e, dict):
-                            eid = e.get("isin", "") or e.get("ticker", "")
-                        elif hasattr(e, "isin"):
-                            eid = e.isin or getattr(e, "ticker", "")
-                        if eid:
-                            ids.append(eid)
-                    _entity_groups[grp] = ids
-            state.linked_agg_df = compute_linked_aggregates(
-                target_daily=cache, linked_daily=state.linked_caches,
-                entity_groups=_entity_groups,
-            )
-            if state.linked_agg_df is not None and not state.linked_agg_df.empty:
-                _new_agg = [c for c in state.linked_agg_df.columns if c not in cache.columns]
-                if _new_agg:
-                    cache = cache.join(state.linked_agg_df[_new_agg], how="left")
-                logger.info("Linked aggregates: %d columns merged", len(_new_agg))
-                # Relative metrics
-                _rel = compute_relative_metrics(cache, state.linked_agg_df)
-                if _rel is not None and not _rel.empty:
-                    _new_rel = [c for c in _rel.columns if c not in cache.columns and _rel[c].notna().any()]
-                    if _new_rel:
-                        cache = cache.join(_rel[_new_rel], how="left")
-        except Exception as exc:
-            logger.debug("Linked aggregates skipped: %s", exc)
+            from operator1.features.product_metrics import compute_operational_efficiency
+            cache = compute_operational_efficiency(cache)
+        except Exception:
+            pass
 
-    # Ownership contagion
-    if state.target_holders:
+        # Behavioral finance signals
         try:
-            from operator1.models.ownership_contagion import compute_ownership_contagion, inject_contagion_into_cache
-            state.contagion_result = compute_ownership_contagion(
-                target_holders=state.target_holders,
-                competitor_holders={},
-                cache=cache,
-            )
-            if state.contagion_result and state.contagion_result.available:
-                cache = inject_contagion_into_cache(cache, state.contagion_result)
-                logger.info("Ownership contagion: MHHI=%.3f", state.contagion_result.mhhi_delta)
-        except Exception as exc:
-            logger.debug("Ownership contagion skipped: %s", exc)
+            from operator1.features.behavioral_signals import compute_behavioral_signals
+            cache = compute_behavioral_signals(cache)
+        except Exception:
+            pass
 
-    # Save segment result for Stage 3 profile injection
-    state.seg_result = _seg_result
-
-    # Product segment metrics (for _extra_vars + MC concentration risk)
-    if _seg_result and _seg_result.get("n_segments", 0) >= 2:
+        # Complexity / entropy signals
         try:
-            from operator1.features.product_metrics import compute_product_metrics
-            cache = compute_product_metrics(cache, _seg_result)
-        except Exception as exc:
-            logger.debug("Product metrics computation failed: %s", exc)
+            from operator1.features.complexity_signals import compute_complexity_signals
+            cache = compute_complexity_signals(cache)
+        except Exception:
+            pass
 
-    # Geographic supply chain risk metrics (Gap 2)
-    if _seg_result:
+        # Feature normalization (MUST run last before temporal models)
         try:
-            from operator1.features.product_metrics import compute_geographic_metrics
-            _geo_segs = _seg_result.get("geo_segments", {})
-            _gleif_subs = state.relationships.get("subsidiaries", [])
-            _sub_dicts = [
-                s if isinstance(s, dict) else {"country": getattr(s, "country", "")}
-                for s in _gleif_subs
-            ]
-            cache = compute_geographic_metrics(
-                cache, geo_segments=_geo_segs, subsidiaries=_sub_dicts,
-            )
-        except Exception as exc:
-            logger.debug("Geographic metrics computation failed: %s", exc)
+            from operator1.features.feature_normalization import compute_feature_normalization
+            cache = compute_feature_normalization(cache)
+        except Exception:
+            pass
 
-    # Operational efficiency features
-    try:
-        from operator1.features.product_metrics import compute_operational_efficiency
-        cache = compute_operational_efficiency(cache)
-    except Exception:
-        pass
-
-    # Behavioral finance signals
-    try:
-        from operator1.features.behavioral_signals import compute_behavioral_signals
-        cache = compute_behavioral_signals(cache)
-    except Exception:
-        pass
-
-    # Complexity / entropy signals
-    try:
-        from operator1.features.complexity_signals import compute_complexity_signals
-        cache = compute_complexity_signals(cache)
-    except Exception:
-        pass
-
-    # Feature normalization (MUST run last before temporal models)
-    try:
-        from operator1.features.feature_normalization import compute_feature_normalization
-        cache = compute_feature_normalization(cache)
-    except Exception:
-        pass
-
-    state.cache = cache
-    state.save("1.8")
-    state.save("1")  # backward compat
-    logger.info("STAGE 1 COMPLETE: %d rows x %d cols", len(cache), len(cache.columns))
+        state.cache = cache
+        state.save("1.8")
+        state.save("1")  # backward compat
+        logger.info("STAGE 1 COMPLETE: %d rows x %d cols", len(cache), len(cache.columns))
 
 
 # ---------------------------------------------------------------------------

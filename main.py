@@ -1847,8 +1847,8 @@ Non-interactive examples:
             from operator1.models.game_theory import analyze_competitive_dynamics
             # Note: _entity_groups is built later in Step 5f. At this point
             # linked_caches is empty (populated by Step 5f), so game_theory
-            # gets an empty dict. After Step 5f, game_theory is NOT re-run
-            # with filtered caches -- that happens in backtest_runner only.
+            # gets an empty dict. After Step 5f, game_theory IS re-run
+            # with competitor-filtered caches (see lines ~2077-2099 below).
             game_theory_result = analyze_competitive_dynamics(
                 target_cache=cache,
                 target_name=target_profile.get("name", "target"),
