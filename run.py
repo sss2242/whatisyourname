@@ -760,9 +760,9 @@ def main() -> int:
     _INPUT_HINTS: dict[str, str] = {
         "us_sec_edgar": "Enter a ticker (AAPL), CIK number (320193), or company name (Apple Inc)",
         "uk_companies_house": "Enter a company name (Unilever) or Companies House number (00041424)",
-        "eu_esef_xbrl": "Enter a company name (Siemens) or LEI code",
-        "eu_esef_france": "Enter a company name (LVMH) or SIREN number",
-        "eu_esef_germany": "Enter a company name (BMW) or LEI code",
+        "eu_esef": "Enter a company name (Siemens) or LEI code",
+        "fr_esef": "Enter a company name (LVMH) or SIREN number",
+        "de_esef": "Enter a company name (BMW) or LEI code",
         "jp_jquants": "Enter a Japanese ticker code (7203) or company name (Toyota Motor)",
         "kr_dart": "Enter a Korean stock code (005930) or company name (Samsung Electronics)",
         "tw_mops": "Enter a Taiwan stock code (2330) or company name (TSMC)",
