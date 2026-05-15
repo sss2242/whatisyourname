@@ -1423,9 +1423,9 @@ def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
     receivables = df.get("receivables")
     inventory = df.get("inventory")
     payables = df.get("payables")
+    gp = df.get("gross_profit")  # needed by COGS TTM derivation below
     cogs = df.get("cost_of_revenue")
     if cogs is None or (cogs is not None and cogs.isna().all()):
-        gp = df.get("gross_profit")
         if revenue is not None and gp is not None:
             cogs = (revenue.astype(float) - gp.astype(float)).clip(lower=eps)
 
