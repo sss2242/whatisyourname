@@ -139,6 +139,9 @@ def _run_freq_isolated(state: "PipelineState", freq: str, prior_context_freq: st
     )
 
     # Save to disk (unique file paths per freq -- no contention)
+    # Save the enriched MF cache (with derived variables, survival flags)
+    # so fusion (2.F) can read correct Q/A ratios for forward-fill.
+    state.save_mf_cache(freq, resampled)
     state.save_mf_result(freq, result)
     state.save_mf_context(freq, result.context_for_next)
     logger.info(

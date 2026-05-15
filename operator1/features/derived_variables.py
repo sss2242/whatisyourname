@@ -217,14 +217,29 @@ def _compute_returns_and_risk(df: pd.DataFrame) -> pd.DataFrame:
     df["is_missing_log_return_1d"] = df["log_return_1d"].isna().astype(int)
 
     # Rolling 21-day volatility (std of daily returns)
+    # Multi-period returns (used by signal IC, HF position, prediction aggregator)
+    df["return_5d"] = close.pct_change(5)
+    df["is_missing_return_5d"] = df["return_5d"].isna().astype(int)
+    df["return_21d"] = close.pct_change(21)
+    df["is_missing_return_21d"] = df["return_21d"].isna().astype(int)
+
     df["volatility_21d"] = df["return_1d"].rolling(window=21, min_periods=5).std()
     df["is_missing_volatility_21d"] = df["volatility_21d"].isna().astype(int)
+
+    df["volatility_63d"] = df["return_1d"].rolling(window=63, min_periods=10).std()
+    df["is_missing_volatility_63d"] = df["volatility_63d"].isna().astype(int)
 
     # EWMA volatility (RiskMetrics, JP Morgan 1996): gives more weight to
     # recent observations, adapting faster to regime changes than simple
     # rolling std.  Both are available for temporal models to choose from.
     df["volatility_ewma_21d"] = df["return_1d"].ewm(span=21, min_periods=5).std()
     df["is_missing_volatility_ewma_21d"] = df["volatility_ewma_21d"].isna().astype(int)
+
+    # IV-RV spread: implied volatility minus realized (computed here because
+    # volatility_21d is now available; was previously attempted at Step 4.bench.1
+    # before derived vars existed, so it was always NaN -- fix for M2).
+    if "iv30" in df.columns and df["iv30"].notna().any():
+        df["iv_rv_spread"] = df["iv30"] - df["volatility_21d"]
 
     # Rolling 252-day max drawdown
     rolling_max = close.rolling(window=252, min_periods=1).max()
@@ -250,6 +265,9 @@ def _compute_solvency(df: pd.DataFrame) -> pd.DataFrame:
     st_debt = df.get("short_term_debt", pd.Series(np.nan, index=df.index))
     lt_debt = df.get("long_term_debt", pd.Series(np.nan, index=df.index))
     df["total_debt_asof"] = st_debt.fillna(0) + lt_debt.fillna(0)
+    # Alias: some downstream modules look for "total_debt" not "total_debt_asof"
+    if "total_debt" not in df.columns:
+        df["total_debt"] = df["total_debt_asof"]
     # Mark missing only when *both* components are null
     df["is_missing_total_debt_asof"] = (st_debt.isna() & lt_debt.isna()).astype(int)
 
@@ -1414,9 +1432,9 @@ def _compute_credit_signals(df: pd.DataFrame) -> pd.DataFrame:
     receivables = df.get("receivables")
     inventory = df.get("inventory")
     payables = df.get("payables")
+    gp = df.get("gross_profit")  # needed by COGS TTM derivation below
     cogs = df.get("cost_of_revenue")
     if cogs is None or (cogs is not None and cogs.isna().all()):
-        gp = df.get("gross_profit")
         if revenue is not None and gp is not None:
             cogs = (revenue.astype(float) - gp.astype(float)).clip(lower=eps)
 

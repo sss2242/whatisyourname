@@ -714,6 +714,27 @@ def run_recursive_from_forecasts(
             if val is not None:
                 predicted[var] = val
 
+        # Band elasticity constraint: if today's prediction falls outside
+        # yesterday's uncertainty bands, pull it back toward the band edge.
+        # This prevents recursive drift where errors compound unchecked.
+        if step > 1:
+            _prev_label = None
+            for _sl, _sd in snapshot_days.items():
+                if _sd == step - 1:
+                    _prev_label = _sl
+                    break
+            _prev_snap = snapshots.get(_prev_label) if _prev_label else None
+            if _prev_snap is not None and _prev_snap.uncertainty:
+                _pullback = 0.30  # keep 30% of the overshoot, pull back 70%
+                for var, val in list(predicted.items()):
+                    _bnds = _prev_snap.uncertainty.get(var)
+                    if _bnds is not None:
+                        _lo, _hi = _bnds
+                        if val > _hi:
+                            predicted[var] = _hi + (val - _hi) * _pullback
+                        elif val < _lo:
+                            predicted[var] = _lo + (val - _lo) * _pullback
+
         if not predicted:
             break
 

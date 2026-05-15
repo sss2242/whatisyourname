@@ -149,10 +149,16 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
                     identifier = state.company
 
                 # Recover raw DataFrames (used by section 1.4a cache build)
-                income_df = getattr(state, "income_df", None) or pd.DataFrame()
-                balance_df = getattr(state, "balance_df", None) or pd.DataFrame()
-                cashflow_df = getattr(state, "cashflow_df", None) or pd.DataFrame()
-                quotes_df = getattr(state, "quotes_df", None) or pd.DataFrame()
+                # NOTE: Cannot use `df or pd.DataFrame()` because pandas raises
+                # "truth value of a DataFrame is ambiguous". Use explicit None check.
+                _inc = getattr(state, "income_df", None)
+                income_df = _inc if isinstance(_inc, pd.DataFrame) else pd.DataFrame()
+                _bal = getattr(state, "balance_df", None)
+                balance_df = _bal if isinstance(_bal, pd.DataFrame) else pd.DataFrame()
+                _cf = getattr(state, "cashflow_df", None)
+                cashflow_df = _cf if isinstance(_cf, pd.DataFrame) else pd.DataFrame()
+                _qt = getattr(state, "quotes_df", None)
+                quotes_df = _qt if isinstance(_qt, pd.DataFrame) else pd.DataFrame()
 
                 # Rebuild _entity_groups from state.relationships
                 _entity_groups = {}
@@ -503,6 +509,12 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             "receivables": ["AccountsReceivableNetCurrent"],
             "inventory": ["InventoryNet"],
             "payables": ["AccountsPayableCurrent"],
+            "goodwill": ["Goodwill"],
+            "intangible_assets": [
+                "IntangibleAssetsNetExcludingGoodwill",
+                "FiniteLivedIntangibleAssetsNet",
+                "IndefiniteLivedIntangibleAssetsExcludingGoodwill",
+            ],
             "shares_outstanding": [
                 "EntityCommonStockSharesOutstanding",
                 "CommonStockSharesOutstanding",
@@ -537,6 +549,10 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
                 "InterestExpense",
                 "InterestExpenseDebt",
                 "InterestPaid",
+            ],
+            "rd_expenses": [
+                "ResearchAndDevelopmentExpense",
+                "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
             ],
         }
         _all_critical_fields = {**_critical_balance_fields, **_critical_income_fields}
@@ -1164,6 +1180,51 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             except Exception:
                 pass
 
+        # LLM concept resolution: fill missing critical fields via LLM
+        # (Tier 3 fallback -- after CompanyFacts + keyword auto-discovery)
+        if state._llm_client is not None and state.market_id == "us_sec_edgar":
+            try:
+                _still_missing = [
+                    f for f in ("goodwill", "intangible_assets", "rd_expenses")
+                    if f not in cache.columns or cache[f].isna().all()
+                ]
+                if _still_missing:
+                    from operator1.clients.canonical_translator import resolve_unmapped_concepts_llm
+                    _llm_map = resolve_unmapped_concepts_llm(_still_missing, state._llm_client)
+                    if _llm_map:
+                        import requests as _req
+                        _cik = state.target_profile.get("cik", "")
+                        _cik_padded = str(_cik).zfill(10) if _cik else ""
+                        if _cik_padded:
+                            _headers = {"User-Agent": "Operator1/1.0", "Accept": "application/json"}
+                            try:
+                                _facts_resp = _req.get(
+                                    f"https://data.sec.gov/api/xbrl/companyfacts/CIK{_cik_padded}.json",
+                                    headers=_headers, timeout=30,
+                                )
+                                if _facts_resp.status_code == 200:
+                                    _usgaap = _facts_resp.json().get("facts", {}).get("us-gaap", {})
+                                    for _field, _concept in _llm_map.items():
+                                        if not _concept or (_field in cache.columns and not cache[_field].isna().all()):
+                                            continue
+                                        _cdata = _usgaap.get(_concept, {})
+                                        _entries = _cdata.get("units", {}).get("USD", [])
+                                        _rows = []
+                                        for _e in _entries:
+                                            if _e.get("form") in ("10-K", "10-Q") and _e.get("val") is not None and _e.get("end"):
+                                                _rows.append({"date": pd.Timestamp(_e["end"]), "value": float(_e["val"])})
+                                        if _rows:
+                                            _fdf = pd.DataFrame(_rows).drop_duplicates(subset=["date"], keep="last").set_index("date").sort_index()
+                                            _ci = cache.index.union(_fdf.index).sort_values()
+                                            _aligned = _fdf["value"].reindex(_ci).ffill().reindex(cache.index)
+                                            if _aligned.notna().sum() > 0:
+                                                cache[_field] = _aligned
+                                                logger.info("LLM concept resolution filled '%s' from '%s': %d vals", _field, _concept, _aligned.notna().sum())
+                            except Exception:
+                                pass
+            except Exception as exc:
+                logger.debug("LLM concept resolution failed: %s", exc)
+
         # -- CHECKPOINT 1.6b: Entity data fetch + contagion + sentiment complete --
         state.cache = cache
         state.save("1.6b")
@@ -1406,6 +1467,9 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
                 logger.debug("Ownership contagion skipped: %s", exc)
 
         # Save segment result for Stage 3 profile injection
+        # Recover _seg_result from state if loaded from checkpoint (1.3 sets it)
+        if '_seg_result' not in dir():
+            _seg_result = getattr(state, 'seg_result', {}) or {}
         state.seg_result = _seg_result
 
         # Product segment metrics (for _extra_vars + MC concentration risk)
@@ -1459,6 +1523,22 @@ def run_stage1(state: PipelineState, substage: str = "all") -> None:
             cache = compute_feature_normalization(cache)
         except Exception:
             pass
+
+        # Build USS controller (parity with main.py Step 5-USS)
+        try:
+            from operator1.analysis.survival_regime_controller import SurvivalRegimeController
+            state.survival_controller = SurvivalRegimeController.from_cache(cache)
+            if state.survival_controller is not None:
+                if not state.survival_controller.early_warning.empty:
+                    cache["early_warning_score"] = state.survival_controller.early_warning
+                logger.info(
+                    "USS controller: regime=%s, survival=%s, frozen=%d vars",
+                    state.survival_controller.current_regime,
+                    state.survival_controller.is_survival,
+                    len(state.survival_controller.get_frozen_variables()),
+                )
+        except Exception as exc:
+            logger.warning("USS controller failed: %s", exc)
 
         state.cache = cache
         state.save("1.8")
@@ -2025,6 +2105,30 @@ def run_stage3(state: PipelineState) -> None:
             }
         except Exception:
             profile["position_signal"] = {"available": False}
+
+        # ---------------------------------------------------------------
+        # Fix C1: PID controller in profile (forward_pass has pid_summary)
+        # ---------------------------------------------------------------
+        if state.forward_pass_result is not None:
+            _fp = state.forward_pass_result
+            _pid = getattr(_fp, "pid_summary", None)
+            if _pid and isinstance(_pid, dict):
+                profile["pid_controller"] = {"available": True, **_pid}
+
+        # ---------------------------------------------------------------
+        # Fix H4: model_metrics.best_model_per_variable (metrics is a list)
+        # ---------------------------------------------------------------
+        if state.forecast_result is not None:
+            _metrics = getattr(state.forecast_result, "metrics", None)
+            if isinstance(_metrics, list) and _metrics:
+                _best = {}
+                for _mm in _metrics:
+                    _var = getattr(_mm, "variable", "")
+                    _model = getattr(_mm, "model_name", "unknown")
+                    if _var and _var not in _best:
+                        _best[_var] = _model
+                profile.setdefault("model_metrics", {})["best_model_per_variable"] = _best
+                profile["model_metrics"]["available"] = True
 
         profile = _sanitize(profile)
         with open(profile_path, "w") as f:

@@ -1,155 +1,67 @@
-# Global pipeline configuration for Operator 1.
-
-# HTTP request settings
 timeout_s: 30
-max_retries: 5             # retry count (spec says "cap retries so notebook cannot hang")
-backoff_factor: 2.0        # exponential backoff multiplier (2s, 4s, 8s, 16s, 32s)
-retry_on_status: [429, 500, 502, 503, 504]  # per spec Section D.4
-
-# Rate limiting (token-bucket style, per-host)
-# Per-host limits are configured in http_utils.py (_HOST_RATE_LIMITS).
-# Default rate below applies to hosts without a specific limit.
-rate_limit_calls_per_second: 2.0   # max sustained request rate per host
-rate_limit_burst: 5                # max burst size before throttling
-
-# Disk cache TTL for HTTP responses (hours)
+max_retries: 5
+backoff_factor: 2.0
+retry_on_status:
+- 429
+- 500
+- 502
+- 503
+- 504
+rate_limit_calls_per_second: 2.0
+rate_limit_burst: 5
 http_cache_ttl_hours: 24
-
-# Entity discovery budgets (increased for 3-call LLM strategy)
-search_budget_per_group: 15   # max search calls per relationship group
-search_budget_global: 80      # max total search calls across all groups
-entity_discovery_timeout_s: 120  # wall-clock timeout for entity resolution (seconds)
-
-# Cross-region entity discovery: search all 25+ PIT clients when resolving
-# linked entities from other regions.  Set to false to only search the
-# primary market (much faster, works for most US/EU companies).
+search_budget_per_group: 15
+search_budget_global: 80
+entity_discovery_timeout_s: 120
 cross_region_discovery: false
-
-# Per-group entity fetch caps (max entities to download financial data for).
-# Replaces the old flat _MAX_LINKED_ENTITIES=10 global cap.
-# Each group gets its own budget so competitors don't crowd out suppliers.
 entity_fetch_caps:
-  competitors: 5         # peer ranking + game theory
-  suppliers: 3           # supply chain risk + contagion
-  customers: 3           # revenue exposure
-  financial_institutions: 2  # credit risk + contagion
-  parent_companies: 1    # GLEIF parent
-  subsidiaries: 0        # skip (no PIT data for subsidiaries)
-  logistics: 1           # supply chain
-  regulators: 0          # skip (no financial data)
-  _default: 2            # for any unlisted group
-
-# Cache rebuild control
-# Set to true to force re-fetching all data even when caches exist.
+  competitors: 5
+  suppliers: 3
+  customers: 3
+  financial_institutions: 2
+  parent_companies: 1
+  subsidiaries: 0
+  logistics: 1
+  regulators: 0
+  _default: 2
 FORCE_REBUILD: false
-
-# Estimation settings
-# Imputer method: "split" (default, classifies MAR vs MNAR),
-# "bayesian_ridge" (legacy linear), or "vae" (legacy nonlinear)
 estimation_imputer: split
-# VAE hyperparameters (only used when estimation_imputer is "vae")
 vae_latent_dim: 8
 vae_hidden_dim: 32
 vae_epochs: 80
 vae_kl_weight: 0.5
-
-# LLM provider for report generation, entity discovery, and sentiment.
-# Supported values: "gemini" (default), "claude", "openrouter"
-# Can also be set via the LLM_PROVIDER environment variable.
-# If left empty, auto-detects based on which API key is available.
-llm_provider: ""
-
-# LLM key rotation strategy for multi-key setups (comma-separated keys in .env):
-#   auto       -- auto-detect: proactive for free-tier models (:free), reactive for paid
-#   per_call   -- rotate to next key after every successful call (best for free-tier keys)
-#   on_failure -- rotate only when a key gets 429/exhausted (best for paid keys)
-llm_key_rotation: "per_call"
-
-# LLM model override (optional). Leave empty to use the provider default.
-# Can also be set via the LLM_MODEL environment variable.
-# Use "auto" to let the factory pick the best report-capable model.
-#
-# Gemini models:  gemini-2.0-flash (default), gemini-2.5-flash-preview-05-20,
-#                 gemini-2.5-pro-preview-05-06
-# Claude models:  claude-sonnet-4-20250514 (default), claude-opus-4-20250514,
-#                 claude-3-5-sonnet-20241022, claude-3-5-haiku-20241022
-# OpenRouter:     google/gemini-2.0-flash-exp:free (default),
-#                 anthropic/claude-sonnet-4, meta-llama/llama-3.1-405b-instruct,
-#                 mistralai/mistral-large-latest, deepseek/deepseek-chat
-llm_model: ""
-
-# Filing extraction rate limiting
-# Controls how LLM extraction of PDF filings is paced to stay within
-# free-tier rate limits (e.g. Gemini 15 RPM per key).
-filing_extraction_max_filings: 8     # max filings to extract per ticker
-filing_extraction_stage_size: 2      # filings per stage
-filing_extraction_stage_pause_s: 15  # seconds pause between stages
-
-# ---------------------------------------------------------------------------
-# Prediction Contract
-# ---------------------------------------------------------------------------
-# Declares what the system is trying to predict and how to evaluate it.
-# primary_target: The main prediction target (return_5d recommended).
-# secondary_targets: Additional targets for multi-horizon coverage.
-# evaluation_metric: How to score prediction quality (spearman_ic, rmse, mae).
+llm_provider: ''
+llm_key_rotation: per_call
+llm_model: ''
+filing_extraction_max_filings: 8
+filing_extraction_stage_size: 2
+filing_extraction_stage_pause_s: 15
 prediction_contract:
-  primary_target: "return_5d"
-  secondary_targets: ["return_21d", "return_1d"]
-  evaluation_metric: "spearman_ic"
-  # Signal decay rates (fraction per day) by signal speed category
+  primary_target: return_5d
+  secondary_targets:
+  - return_21d
+  - return_1d
+  evaluation_metric: spearman_ic
   signal_decay:
-    slow: 0.003       # fundamentals (Altman Z, balance sheet ratios): ~0.3%/day
-    medium: 0.05      # momentum (EPS revision, PEAD): ~5%/day
-    fast: 0.30        # technicals (RSI, MACD, patterns): ~30%/day
-  # IC thresholds for signal inclusion
-  ic_inclusion_threshold: 0.02   # minimum |IC| to include signal in ensemble
-  icir_inclusion_threshold: 0.3  # minimum |ICIR| to include signal
-
-# ---------------------------------------------------------------------------
-# Forecasting Configuration
-# ---------------------------------------------------------------------------
-# Three modes controlling speed vs model complexity trade-off.
-# Tier1/2 (survival-critical) always keep their Kalman path unchanged.
+    slow: 0.003
+    medium: 0.05
+    fast: 0.3
+  ic_inclusion_threshold: 0.02
+  icir_inclusion_threshold: 0.3
 forecasting:
-  # Forecasting execution mode (2 modes):
-  #   fast -- ETS fast ensemble for Tier3+, Kalman for Tier1/2 (~13s)
-  #   full -- Parallel per-variable cascade + batched LSTM + global
-  #           LightGBM (~15-30s, replaces old 40min sequential LSTM)
-  mode: "full"
-  # Number of parallel workers for distributional model fitting.
-  # Set to 1 for sequential execution (deterministic results).
+  mode: full
   parallel_workers: 4
-  # Tiers that use the fast ensemble (only in express and balanced modes).
-  # Set to [] to disable fast path and use the full cascade for all tiers.
-  fast_ensemble_tiers: [3, 4, 5]
-  # Enable LSTM in the cascade (only effective in full mode).
-  # In express/balanced modes, LSTM is always skipped.
+  fast_ensemble_tiers:
+  - 3
+  - 4
+  - 5
   lstm_enabled: true
-  # Only these variables get the distributional model (fit_distributional).
-  # All others skip it for speed (~2s per var, 31 vars -> 5 vars = 50s saved).
   distributional_vars:
-    - close
-    - return_1d
-    - volatility_21d
-    - revenue
-    - fcf_yield
-
-# ---------------------------------------------------------------------------
-# Frequency Pipeline Configuration
-# ---------------------------------------------------------------------------
-# Controls how the multi-frequency pipeline (Stage 2) executes.
+  - close
+  - return_1d
+  - volatility_21d
+  - revenue
+  - fcf_yield
 frequency_pipeline:
-  # Execution mode:
-  #   parallel   -- 2-wave parallel (A+Q+S then M+W+D), fastest on 4+ cores
-  #   sequential -- one frequency at a time (A->Q->S->M->W->D), lower memory
-  #                 Better cascading context (A informs Q, Q informs D).
-  #                 Per-frequency checkpoint resume on crash.
-  #                 Peak memory = 1x base instead of 3x.
-  mode: "parallel"
-  # Which frequencies to run. Default: all detected from filing data.
-  # Set fewer for speed on weak devices: ["Q", "D"] is the minimum for
-  # correct Q/A ratios in the daily cache.
-  # frequencies: ["A", "Q", "S", "M", "W", "D"]
-
-# Logging
+  mode: parallel
 log_level: INFO

@@ -115,13 +115,28 @@ def fetch_macro_fred(
         return {}
 
     from datetime import date, timedelta
-    start = date.today() - timedelta(days=365 * years)
+    # For index series that need YoY % change (e.g. CPI), we need 12+
+    # extra months of history so the pct_change(12) covers the actual
+    # requested period.  Always fetch at least 2 extra years of padding.
+    start = date.today() - timedelta(days=365 * max(years + 2, 4))
     results: dict[str, pd.Series] = {}
+
+    # Series that return INDEX levels (not rates) -- need YoY % change
+    _INDEX_SERIES = {"CPIAUCSL"}
 
     for canonical_name, series_id in _FRED_SERIES.items():
         try:
             series = fred.get_series(series_id, observation_start=start)
             if series is not None and not series.empty:
+                # Convert CPI index level to YoY percentage change.
+                # CPIAUCSL returns values like 332.4 (index), but we need
+                # the inflation rate ~2.7% (YoY % change).
+                if series_id in _INDEX_SERIES:
+                    yoy = series.pct_change(12) * 100  # 12-month % change for monthly data
+                    yoy = yoy.dropna()
+                    if not yoy.empty:
+                        series = yoy
+                        logger.debug("FRED %s: converted index to YoY rate (%d obs)", series_id, len(series))
                 series.name = canonical_name
                 results[canonical_name] = series
                 logger.debug("FRED %s: %d observations", series_id, len(series))

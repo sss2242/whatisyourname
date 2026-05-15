@@ -170,7 +170,9 @@ class PooledLLMClient:
 
         Unlike ``_rotate()``, this does NOT log a WARNING when all keys
         have been used -- that is expected on the last call of a normal
-        3-key run.  Silently stays on the current key if no others remain.
+        3-key run.  When every key has been cycled through, the exhausted
+        set is cleared and rotation restarts from key 0 so the pool is
+        never permanently stuck.
         """
         self._exhausted.add(self._current_idx)
         for i in range(len(self._all_clients)):
@@ -182,12 +184,13 @@ class PooledLLMClient:
                 )
                 self._current_idx = i
                 return
-        # All keys used -- this is normal after the last call in a
-        # proactive rotation pool.  Log at DEBUG, not WARNING.
-        logger.debug(
-            "Proactive rotate: all %d keys used (normal after last call)",
+        # All keys cycled through -- reset and start over from key 0.
+        logger.info(
+            "Proactive rotate: all %d keys cycled -- resetting pool to key 1",
             len(self._all_clients),
         )
+        self._exhausted.clear()
+        self._current_idx = 0
 
     @staticmethod
     def _is_exhaustion_error(exc: Exception) -> bool:

@@ -43,6 +43,33 @@ def run_5_1_forward_pass(state: PipelineState) -> None:
             extra_variables=state.extra_vars,
         )
         logger.info("Forward pass complete: %d steps", state.forward_pass_result.total_days)
+
+        # Extract SHAP-equivalent feature importance from tree models
+        # while they're alive (before pickle strips them in staged mode).
+        # Stored in shap_inline dict: {var: {feature_importance: {feat: score}}}
+        _ms = getattr(state.forward_pass_result, "model_states", {})
+        if _ms:
+            _inline: dict = {}
+            for _var, _wrapper in _ms.items():
+                try:
+                    _model = getattr(_wrapper, "model", None) or getattr(_wrapper, "_model", None)
+                    if _model is None:
+                        continue
+                    _fi = getattr(_model, "feature_importances_", None)
+                    if _fi is None:
+                        continue
+                    _fn = getattr(_wrapper, "feature_names", None) or getattr(_model, "feature_names_in_", None)
+                    if _fn is not None and len(_fn) == len(_fi):
+                        _pairs = sorted(zip(_fn, _fi), key=lambda x: -abs(x[1]))[:10]
+                        _inline[_var] = {
+                            "feature_importance": {str(k): round(float(v), 6) for k, v in _pairs},
+                            "model_type": type(_model).__name__,
+                        }
+                except Exception:
+                    continue
+            if _inline:
+                state.forward_pass_result.shap_inline = _inline
+                logger.info("Extracted inline SHAP importance for %d variables", len(_inline))
     except Exception as exc:
         import traceback
         logger.warning("Forward pass failed: %s\n%s", exc, traceback.format_exc())

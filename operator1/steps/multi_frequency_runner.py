@@ -393,6 +393,11 @@ def run_single_frequency_pipeline(
         context_for_next=context_for_next,
     )
 
+    # Write modified cache back to the resampled object so callers
+    # (e.g. _run_freq_isolated) can persist the enriched cache with
+    # derived variables, survival flags, and other per-freq features.
+    resampled.cache = cache
+
     logger.info(
         "[%s] Complete: %d periods, trend=%s, regime=%s, survival=%.3f (%.1fs)",
         freq, resampled.n_periods, trend, regime_label, survival_prob, elapsed,

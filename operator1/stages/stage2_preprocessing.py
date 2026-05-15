@@ -28,6 +28,20 @@ def run_2_1_frequency_separation(state: PipelineState) -> None:
     """
     logger.info("Sub-stage 2.1: Frequency separation")
 
+    # Ensure raw statement DFs are loaded from parquet (they may be
+    # missing from pickle state if loaded from a checkpoint -- the
+    # staged runner serializes DFs separately as parquet files).
+    import pandas as pd
+    from pathlib import Path
+    _run_dir = Path(state.output_dir)
+    for _df_name in ("income_df", "balance_df", "cashflow_df"):
+        _df = getattr(state, _df_name, None)
+        if _df is None or (isinstance(_df, pd.DataFrame) and _df.empty):
+            _pq = _run_dir / f"{_df_name}.parquet"
+            if _pq.exists():
+                setattr(state, _df_name, pd.read_parquet(_pq))
+                logger.info("Loaded %s from parquet: %d rows", _df_name, len(getattr(state, _df_name)))
+
     try:
         from operator1.clients.frequency_separator import (
             separate_by_period_type,
