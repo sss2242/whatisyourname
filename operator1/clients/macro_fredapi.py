@@ -115,7 +115,10 @@ def fetch_macro_fred(
         return {}
 
     from datetime import date, timedelta
-    start = date.today() - timedelta(days=365 * years)
+    # For index series that need YoY % change (e.g. CPI), we need 12+
+    # extra months of history so the pct_change(12) covers the actual
+    # requested period.  Always fetch at least 2 extra years of padding.
+    start = date.today() - timedelta(days=365 * max(years + 2, 4))
     results: dict[str, pd.Series] = {}
 
     # Series that return INDEX levels (not rates) -- need YoY % change

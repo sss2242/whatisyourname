@@ -591,8 +591,14 @@ def compute_news_sentiment(
         article_count=("sentiment", "count"),
     )
 
-    # Reindex to cache dates with forward-fill
+    # Reindex to cache dates with forward-fill + backfill.
+    # Articles from GNews are from "now" which may be AFTER the backtest
+    # end date.  Forward-fill alone produces all-NaN in that case.
+    # Use bfill as fallback so the earliest available score propagates
+    # backward into the cache period.
     daily_sentiment = daily["sentiment_mean"].reindex(cache.index, method="ffill")
+    if daily_sentiment.isna().all() and not daily.empty:
+        daily_sentiment = daily["sentiment_mean"].reindex(cache.index, method="bfill")
     daily_count = daily["article_count"].reindex(cache.index, fill_value=0)
 
     # Inject columns
@@ -615,12 +621,14 @@ def compute_news_sentiment(
             policy_risk_mean=("policy_risk_score", "mean"),
             policy_risk_max=("policy_risk_score", "max"),
         )
-        cache["policy_risk_score"] = daily_policy["policy_risk_mean"].reindex(
-            cache.index, method="ffill",
-        )
-        cache["policy_risk_max"] = daily_policy["policy_risk_max"].reindex(
-            cache.index, method="ffill",
-        )
+        _pr_score = daily_policy["policy_risk_mean"].reindex(cache.index, method="ffill")
+        if _pr_score.isna().all() and not daily_policy.empty:
+            _pr_score = daily_policy["policy_risk_mean"].reindex(cache.index, method="bfill")
+        cache["policy_risk_score"] = _pr_score
+        _pr_max = daily_policy["policy_risk_max"].reindex(cache.index, method="ffill")
+        if _pr_max.isna().all() and not daily_policy.empty:
+            _pr_max = daily_policy["policy_risk_max"].reindex(cache.index, method="bfill")
+        cache["policy_risk_max"] = _pr_max
         # Dominant category for the most recent day
         _latest_cats = articles.groupby("date")["policy_risk_category"].agg(
             lambda x: x.value_counts().index[0] if len(x) > 0 else "none"
